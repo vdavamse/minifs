@@ -72,6 +72,11 @@ extent when the file ends mid-line, and compaction merges whole extents, so the 
 reads by line. Readers are `STABLE`, so all their statements share the caller's snapshot; `vfs_file` is their
 unlocked counterpart of `vfs_lock_file`. Raw inserts into `vfs_extents` (tests) must give both line columns.
 
+Search (migration 008) scans those extents: `vfs_search` filters each extent with a pattern's file form, splits
+only the extents that pass into lines, and returns the matching ones with their line numbers and byte offsets;
+`vfs_utf8` decodes an extent, NULL when it isn't UTF-8 so that it is skipped. The scope comes from `vfs_glob` in a
+statement of its own, so `minifs.vfs.search` can refuse it over the file and byte caps before content is read.
+
 Functions report errors with `PERFORM vfs_raise('ENOENT', detail)`, which raises SQLSTATE `MFnnn` (`nnn` = the
 Linux errno number) with the errno name as the message. `minifs.db.errors.errno_name(exc)` maps it back. Add a
 new errno to both `vfs_raise` and `SQLSTATE_BY_ERRNO`.
@@ -83,7 +88,8 @@ that.
 ## VFS library
 
 `minifs.vfs.client.VFSClient` takes absolute paths and wraps one SQL function per operation (`stat`, `readdir`,
-`pread`, `pread_lines`, `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
+`pread`, `pread_lines`, `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `grep`
+(the same, then `vfs_search`, under a 2 s `statement_timeout`; `SearchRefused` over the scope caps or on timeout), `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
 statement in its own transaction, resolving its paths on the server with `vfs_resolve` in a subquery, and raises
 `minifs.vfs.core.VFSError(errno, path, message, detail)` for every errno the SQL layer reports. `detail` (the
 server's DETAIL, with node ids and real path components) and `db_error` are for logs only: a view that rewrites

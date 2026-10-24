@@ -29,6 +29,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import retry_serializable
 from minifs.vfs import glob as globbing
+from minifs.vfs import search as searching
 from minifs.vfs.core import (
     Entry,
     FileVersion,
@@ -46,6 +47,7 @@ DEFAULT_LINE_LIMIT = 2000
 DEFAULT_LINE_BYTES = 50 * 1024
 _MAX_INT = 2**31 - 1  # vfs_pread's limit, vfs_pread_lines' limits and vfs_compact's target are int
 _MAX_BIGINT = 2**63 - 1
+_MAX_TIMEOUT = _MAX_INT / 1000  # statement_timeout is an int of milliseconds
 _log = logging.getLogger(__name__)
 _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache links
 
@@ -90,7 +92,7 @@ _ROOT = _Ref("%s::uuid", [None])
 class VFSClient:
     """Path-based filesystem operations over the minifs SQL functions.
 
-    ``pool`` serves every operation; ``search_pool`` (default: ``pool``) serves the scans (glob; grep with #10).
+    ``pool`` serves every operation; ``search_pool`` (default: ``pool``) serves the scans (glob, grep).
     Both come from ``minifs.db.pool``. ``cache`` is an optional ``DirCache``.
     """
 
@@ -243,6 +245,88 @@ class VFSClient:
             raise
         self._checked(ref, root)
         return [Entry(join(*segments, m.path), m.id, "file", m.size, m.mtime) for m in matches]
+
+    async def grep(
+        self,
+        pattern: str,
+        path: str = "/",
+        *,
+        include: str | None = None,
+        excludes: Sequence[str] = (),
+        ignore_case: bool = False,
+        fixed: bool = False,
+        hidden: bool = True,
+        limit: int = searching.DEFAULT_LIMIT,
+        max_files: int = searching.MAX_FILES,
+        max_bytes: int = searching.MAX_BYTES,
+        max_line_chars: int | None = searching.MAX_LINE_CHARS,
+        timeout: float = searching.TIMEOUT,
+    ) -> searching.GrepResult:
+        """The lines matching ripgrep ``pattern`` (``fixed``: a literal string) in the files below directory
+        ``path`` that match glob ``include`` (None: all) and none of ``excludes`` (as in ``glob``), or in file ``path``
+        alone (``include``, ``excludes`` and ``hidden`` don't apply, as for a path given to rg), in order of path
+        (bytewise), then line, at most ``limit`` (``minifs.vfs.search``). Unlike ``glob``, hidden files are searched
+        unless ``hidden`` is false, as ladderframe's Grep does; ``.git`` never is. Files that aren't UTF-8 are skipped.
+
+        One snapshot on a search-pool connection, each statement under ``timeout`` seconds: the scope is read from
+        the tree first, and refused over ``max_files`` files or ``max_bytes`` bytes before any content is read.
+        ``SearchRefused`` for a refused or timed-out search; ``RegexError`` for a bad pattern, ``GlobError`` for a
+        bad ``include`` or exclude; ENOENT, ENOTDIR for ``path``; EINVAL for a bad limit or timeout."""
+        segments = split(path)
+        if not 0 <= limit < _MAX_INT:  # limit + 1 is asked for
+            raise VFSError("EINVAL", join(*segments), f"invalid limit {limit}")
+        if not 0 <= max_files < _MAX_INT or max_bytes < 0:
+            raise VFSError("EINVAL", join(*segments), f"invalid caps {max_files} files, {max_bytes} bytes")
+        if max_line_chars is not None and not 0 <= max_line_chars <= _MAX_INT:
+            raise VFSError("EINVAL", join(*segments), f"invalid line length {max_line_chars}")
+        if not 0 < timeout <= _MAX_TIMEOUT:
+            raise VFSError("EINVAL", join(*segments), f"invalid timeout {timeout}")
+        # Bad patterns are reported before anything about the path.
+        matcher = searching.compile_pattern(pattern, ignore_case=ignore_case, fixed=fixed)
+        if include is not None:
+            globbing.compile_glob(include)
+        globbing.compile_excludes(excludes)
+        ref = self._dir_ref(segments)
+
+        async def attempt() -> tuple[UUID | None, searching.GrepResult]:
+            async with self.search_pool.connection() as conn, conn.transaction():
+                await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # one snapshot for both
+                await searching.set_timeout(conn, timeout)
+                try:
+                    node: UUID | None = None
+                    scope: searching.Scope | None = None
+                    if segments:
+                        query = f"SELECT id, kind, size FROM vfs_nodes WHERE id = {ref.sql}"
+                        cur = await conn.execute(cast(Any, query), ref.params)
+                        row = await cur.fetchone()
+                        assert row is not None  # vfs_resolve raised otherwise
+                        node = row[0]
+                        if row[1] == "file":
+                            scope = searching.Scope((row[0],), (join(*segments),), row[2])
+                    if scope is None:
+                        scope = await searching.find_scope(
+                            conn,
+                            node,
+                            join(*segments, ""),
+                            include,
+                            excludes=excludes,
+                            hidden=hidden,
+                            max_files=max_files,
+                        )
+                    searching.check_scope(scope, max_files=max_files, max_bytes=max_bytes)
+                    result = await searching.search(conn, scope, matcher, limit=limit, max_line_chars=max_line_chars)
+                except psycopg.errors.QueryCanceled:
+                    raise searching.timed_out() from None
+                return node, result
+
+        try:
+            node, result = await _mapped(path, attempt)
+        except VFSError as e:
+            if e.errno in ("ENOENT", "ENOTDIR"):
+                await self._await_eviction([ref])
+            raise
+        self._checked(ref, node)
+        return result
 
     # Writes
 

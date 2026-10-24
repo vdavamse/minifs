@@ -538,7 +538,7 @@ Line-aware extents aren't a line table either. There's no row per line and no in
 ripgrep matches line by line, and models write patterns that assume it: `^def `, `foo$`, `.*`. The search keeps those semantics without storing lines.
 
 1. **Scope.** `vfs_glob` picks the files (see Glob) and reads their sizes from `vfs_nodes`, before any content is touched.
-2. **Extent filter.** Each extent of a file's current generation holds whole lines and never splits a UTF-8 character, so it is decoded on its own and tested once against the pattern in newline-sensitive mode (`(?n)`). In that mode `^` and `$` match at line breaks, and `.` and `[^...]` don't cross them. Every extent with a matching line passes, since a line never spans two extents, plus the occasional extent without one (for example when `\s` matches a newline).
+2. **Extent filter.** Each extent of a file's current generation holds whole lines and never splits a UTF-8 character, so it is decoded on its own and tested once against the pattern in newline-sensitive mode (`(?n)`). In that mode `^` and `$` match at line breaks, and `.` and `[^...]` don't cross them. An extent passes exactly when one of its lines matches, since a line never spans two extents and the translator keeps `\n` out of every class.
 3. **Line check.** Only the extents that pass are split on `\n`, and each line is tested on its own. This step is exact and decides the results. Line k of an extent is file line `line_start + k`, starting at file byte `byte_offset + line_offsets[k]`.
 
 ### The search query
@@ -559,14 +559,14 @@ WITH extents AS (
       JOIN vfs_nodes n ON n.id = g.id
       JOIN vfs_extents e ON e.node_id = n.id AND e.generation = n.generation
 ), hits AS (                                        -- step 2: one regex test per extent
-    SELECT path, byte_offset, line_start, line_offsets,
-           CASE WHEN right(body, 1) = E'\n' THEN left(body, -1) ELSE body END AS body
-      FROM extents
-     WHERE body ~ $file_pattern                     -- '(?n)' plus the translated pattern
+    SELECT * FROM extents
+     WHERE CASE WHEN right(body, 1) = E'\n' THEN left(body, -1) ELSE body END
+           ~ $file_pattern                          -- '(?n)' plus the translated pattern
 ), lines AS (                                       -- step 3: lines exist only here
     SELECT h.path, h.line_start + l.k AS line_no, h.byte_offset + h.line_offsets[l.k] AS byte_offset, l.text
       FROM hits h,
-           regexp_split_to_table(h.body, E'\n') WITH ORDINALITY AS l(text, k)
+           string_to_table(h.body, E'\n') WITH ORDINALITY AS l(text, k)
+     WHERE l.k <= cardinality(h.line_offsets)       -- no empty piece after the final \n
 )
 SELECT path, line_no, byte_offset, text
   FROM lines
@@ -576,29 +576,30 @@ SELECT path, line_no, byte_offset, text
 ```
 
 - **`vfs_utf8`** (#10) is `convert_from(data, 'UTF8')` in a PL/pgSQL function that returns NULL on `character_not_in_repertoire`, so content that isn't UTF-8 is skipped without failing the query.
-- **Trailing newline.** Each extent's final `\n` is dropped before splitting, so it yields exactly its own lines, and a file ending in a newline doesn't gain an empty phantom line that `^$` would match.
+- **Trailing newline.** Each extent yields exactly its own `cardinality(line_offsets)` lines: the empty piece after its final `\n` is dropped, so a file ending in a newline doesn't gain an empty phantom line that `^$` would match. The filter tests the extent without its final `\n`, for the same reason.
+- **The real query** is `vfs_search(ids, paths, file_pattern, line_pattern, fixed, limit, max_chars)` (migration 008), which also cuts each hit's line to 2,000 characters by default and reports whether it did.
 - **Byte offsets.** Each hit's offset comes from `line_offsets`, in the same currency as `vfs.pread(offset=...)`. The `Grep` tool shows only line numbers.
 - **One snapshot.** The two statements run in one `REPEATABLE READ` transaction, so the scope and every extent are read as of the same moment.
 - **Caps before content.** Step 1 reads only `vfs_nodes`. The client checks the file and byte caps on its result, so an oversized scope is refused before any extent is read. The search costs two round trips.
 
-The `Grep` tool takes only ladderframe's parameters: `pattern`, `path` (a directory, or a single file, which searches just that file) and `include`. The other rg features are options of the library's `vfs.search`; a model gets case-insensitive search by writing `(?i)` in the pattern.
+The `Grep` tool takes only ladderframe's parameters: `pattern`, `path` (a directory, or a single file, which searches just that file) and `include`. The other rg features are options of the library's `VFSClient.grep` (`minifs.vfs.search`); a model gets case-insensitive search by writing `(?i)` in the pattern.
 
 | rg feature | Implementation |
 | --- | --- |
 | `-i` | The translator case-folds the pattern itself (`[Ee]`), so both steps still use `~`. ARE's `~*` would depend on the database's locale (see Regex dialect). |
 | `-F` (fixed strings) | `strpos(body, $s) > 0` for the file filter and `strpos(text, $s) > 0` for lines. With `-i` too, the escaped literal goes through the translator instead. |
-| `-C n` (context) | Keep the lines `line_no BETWEEN hit - n AND hit + n` from the same split of the matching files |
+| `-C n` (context) | Not in v1. Would keep the lines `line_no BETWEEN hit - n AND hit + n`, reading neighbouring extents for context that crosses one |
 | `-g` / `--glob` (the tool's `include`) | Through the `vfs_glob` scope |
-| `--max-count` | `row_number() OVER (PARTITION BY path)` plus a filter |
-| Byte offset per hit | The running sum above, which `vfs.pread(offset=...)` accepts directly |
+| `--max-count` | Not in v1. Would be `row_number() OVER (PARTITION BY path)` plus a filter |
+| Byte offset per hit | `byte_offset + line_offsets[k]` (see above), which `vfs.pread(offset=...)` accepts directly |
 | `-U` (multiline) | Not supported in v1. A literal `\n` in the pattern is rejected, as rg does without `-U`. |
 
 ### Cost and limits
 
-- Work grows with the bytes in scope, not with the number of matches. The extent filter costs one regex pass over the bytes, and only matching extents (about 64 KB each at most) are split into lines.
+- Work grows with the bytes scanned, not with the number of matches. The extent filter costs one regex pass over the bytes, and only matching extents (about 64 KB each at most) are split into lines. Files are searched in path order and the scan stops once it has the hits it needs, so a common pattern reads only the first files, while one with few hits reads the whole scope (about 0.7 s for 45 MB on a laptop).
 - The total size of the scope comes from `vfs_nodes` before any content is read. A search over more than a configured cap (for example 50 MB) is refused with `ModelRetry: Search scope is 120 MB; narrow the path or include pattern`.
 - Every search runs under `SET LOCAL statement_timeout`.
-- Content that isn't valid UTF-8 is skipped, extent by extent: a file with one stray Latin-1 byte still returns hits from its other extents (#10 may choose to skip the whole file instead). It's still readable with `vfs.pread`, and with `Read` unless it looks binary.
+- A file with content that isn't valid UTF-8 is skipped whole, so the result doesn't depend on how its bytes are cut into extents. It's still readable with `vfs.pread`, and with `Read` unless it looks binary.
 
 ### Output format for the agent
 
@@ -852,7 +853,7 @@ Three things matter most in production: credential handling, LISTEN connections 
 
 ### Protecting the database
 
-- **Every search runs under `SET LOCAL statement_timeout = '2s'`,** which applies to each of its two statements. On timeout, raise `ModelRetry: Search timed out; narrow the pattern or path`.
+- **Every search runs under `SET LOCAL statement_timeout = '2s'`,** which applies to each of its statements (resolving the path, the scope, the scan). On timeout, raise `ModelRetry: Search timed out; narrow the pattern or path`.
 - **Cap the files in scope.** The scope query (step 1 of the search) asks for one file more than the cap (for example 10,000). If it gets it, the search is refused with a `ModelRetry` to narrow the `path` or `include`, rather than silently dropping the oldest files.
 - **Cap the bytes scanned.** Refuse a search whose scope is larger than the configured cap, with a hint to narrow the `path` or `include`. The size comes from `vfs_nodes`, so the check reads no content.
 - **Cap output:** `Grep` and `Glob` return at most 100 results by default, as in ladderframe, each with a "narrow it" hint.
@@ -903,7 +904,7 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Glob pruning | Results with all hints enabled equal results with none | Differential |
 | Regex translator | A corpus of real model patterns plus generated ones, compared with Rust's `regex` crate, in a `C`-locale and a UTF-8 database | Differential |
 | Regex rejections | Every pattern the translator rejects at parse time is also rejected by the `rg` binary | Differential |
-| Search scope | `vfs.search(p, glob=X)` hits exactly the files that `vfs.glob(X)` returns | Integration |
+| Search scope | `vfs.grep(p, include=X)` hits only files that `vfs.glob(X)` returns | Integration |
 | Glob and Grep tools | Output equals ladderframe's `Glob` and `Grep` on the same tree written to disk, apart from the documented differences. The disk copy gets a `.gitignore` built from the exclude list as directory patterns (`node_modules/`), path prefixes are mapped, and results are compared as sets, and only when they're under the limit | Differential |
 | Agent tools | Retryable mistakes raise `ModelRetry`; permission denials come back as strings; the chroot blocks `..` escapes; the write policy blocks writes outside allowed paths; `Write` over a file changed since its last `Read` (including a concurrent create, or a recreated file of the same size) raises `ModelRetry`; a second `Write` without a `Read` in between succeeds | Unit |
 | Write check | `vfs_write` with a stale expected generation, size, parent or name raises `ESTALE` and changes nothing; a partial expectation raises `EINVAL`; after the read file was renamed away, a `Write` raises `ModelRetry` if another file is now at the path and creates a new file if the path is empty, and in both cases leaves the moved file unchanged | Unit |
