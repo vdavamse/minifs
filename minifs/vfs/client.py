@@ -47,7 +47,8 @@ _RESOLVE_CACHED = """(SELECT CASE WHEN v.ok THEN v.last ELSE (SELECT id FROM vfs
 
 
 class DirCache(Protocol):
-    """The directory-entry cache hook: ``(parent id, name) -> (id, kind)``, with None for the root."""
+    """The directory-entry cache hook: ``(parent id, name) -> (id, kind)``, with None for the root. Implemented by
+    ``minifs.vfs.cache.DirEntryCache``."""
 
     def lookup(self, parent: UUID | None, name: str) -> tuple[UUID, Kind] | None: ...
 
@@ -56,12 +57,15 @@ class DirCache(Protocol):
     def evict(self, node: UUID) -> None: ...
 
 
+type _Link = tuple[UUID, UUID | None, str]  # a cached (id, parent id, name)
+
+
 class _Ref:
     """A node argument of a statement: SQL that yields the node's id (NULL for the root), and its parameters.
     ``links`` is the cached ``(id, parent id, name)`` of every component, if the cache held the whole path;
     ``cached`` the last id."""
 
-    def __init__(self, sql: str, params: Sequence[object], links: Sequence[tuple[UUID, UUID | None, str]] = ()) -> None:
+    def __init__(self, sql: str, params: Sequence[object], links: Sequence[_Link] = ()) -> None:
         self.sql = sql
         self.params = list(params)
         self.links = list(links)
@@ -89,6 +93,7 @@ class VFSClient:
         self.search_pool = search_pool or pool
         self.cache = cache
         self._background: set[asyncio.Task[None]] = set()
+        self._evicting: dict[tuple[_Link, ...], asyncio.Task[None]] = {}  # by links, see _evict_stale_task
 
     # Reads
 
@@ -191,7 +196,7 @@ class VFSClient:
             root, matches = await _mapped(path, attempt)
         except VFSError as e:
             if e.errno in ("ENOENT", "ENOTDIR"):
-                await self._evict_stale([ref])
+                await self._await_eviction([ref])
             raise
         self._checked(ref, root)
         return [Entry(join(*segments, m.path), m.id, "file", m.size, m.mtime) for m in matches]
@@ -419,9 +424,38 @@ class VFSClient:
         background (see ``settle``), so a slow pool can't widen the window in which a cancelled caller sees a
         committed write as failed. (A cancellation from COMMIT on is ambiguous anyway: re-check with ``stat``.)"""
         if self.cache is not None and ref.cached is not None and ref.cached != resolved:
-            task = asyncio.create_task(self._evict_stale([ref]))
+            self._evict_stale_task([ref])
+
+    def _evict_stale_task(self, refs: Sequence[_Ref]) -> asyncio.Task[None] | None:
+        """A background ``_evict_stale(refs)``, shared by every caller that finds the same links stale before it sends
+        its query (typically while it waits for a connection): concurrent operations on one stale path cost one
+        query, not one each. A caller that comes later gets a new task, since the running query may predate what
+        that caller saw. None if there is nothing to check."""
+        key = tuple(link for ref in refs for link in ref.links)
+        if self.cache is None or not key:
+            return None
+        task = self._evicting.get(key)
+        if task is None:
+            task = asyncio.create_task(
+                self._evict_stale(refs, started=lambda: self._unshare(key, asyncio.current_task()))
+            )
+            self._evicting[key] = task
             self._background.add(task)
+            task.add_done_callback(lambda done: self._unshare(key, done))
             task.add_done_callback(self._background_done)
+        return task
+
+    def _unshare(self, key: tuple[_Link, ...], task: asyncio.Task[Any] | None) -> None:
+        if self._evicting.get(key) is task:
+            del self._evicting[key]
+
+    async def _await_eviction(self, refs: Sequence[_Ref]) -> None:
+        """Evicts the stale links of ``refs`` before an error is raised, so a retry doesn't reuse them. Cancelling
+        the wait doesn't cancel the shared eviction, and the eviction failing or being cancelled doesn't change what
+        the caller raises (``_background_done`` logs a failure)."""
+        task = self._evict_stale_task(refs)
+        if task is not None:
+            await asyncio.wait({task})
 
     def _background_done(self, task: asyncio.Task[None]) -> None:
         self._background.discard(task)
@@ -435,15 +469,19 @@ class VFSClient:
         if pending:
             await asyncio.wait(pending)
 
-    async def _evict_stale(self, refs: Sequence[_Ref]) -> None:
+    async def _evict_stale(self, refs: Sequence[_Ref], started: Callable[[], None] | None = None) -> None:
         """Evicts the cached links of ``refs`` that no longer hold, found in one query. Links are keyed by parent id
-        and ids are never reused, so the links below a stale one stay valid and are kept."""
+        and ids are never reused, so the links below a stale one stay valid and are kept. ``started`` is called once,
+        just before the query is sent (or when getting a connection fails)."""
         links = [link for ref in refs for link in ref.links]
         if self.cache is None or not links:
             return
         try:
             # A short wait: on the error path, the caller's error waits for this.
             async with self.pool.connection(timeout=_EVICT_TIMEOUT) as conn:
+                if started is not None:
+                    started()
+                    started = None
                 cur = await conn.execute(
                     "SELECT c.id FROM unnest(%s::uuid[], %s::uuid[], %s::text[]) AS c(id, parent, name)"
                     " WHERE NOT EXISTS (SELECT FROM vfs_nodes n"
@@ -453,6 +491,8 @@ class VFSClient:
                 )
                 stale = {row[0] for row in await cur.fetchall()}
         except psycopg.Error:
+            if started is not None:
+                started()
             stale = {link[0] for link in links}  # can't tell: drop them all
         for node in stale:
             self.cache.evict(node)
@@ -478,7 +518,7 @@ class VFSClient:
             return await _mapped(path, attempt)
         except VFSError as e:
             if e.errno in ("ENOENT", "ENOTDIR"):
-                await self._evict_stale(refs)
+                await self._await_eviction(refs)
             raise
 
 

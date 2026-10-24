@@ -83,7 +83,8 @@ server's DETAIL, with node ids and real path components) and `db_error` are for 
 paths (the chroot) translates `path` and never shows `detail`. Paths go through
 `minifs.vfs.core.normalize` first. With a `DirCache` (the hook for #19's directory-entry cache), a fully cached
 path is checked link by link in the same statement instead of walked, and falls back to `vfs_resolve` if any link
-went stale, so a stale cache never reaches the wrong node.
+went stale, so a stale cache never reaches the wrong node. `minifs.vfs.cache.DirEntryCache` is that cache: positive
+entries with a 2 s TTL, kept fresh by `follow(watcher)` (evict by id on `move` and `delete`, clear on `rescan`).
 
 Connections come from `minifs.db.pool`: a `Connector` (a static conninfo, plus an optional callable that returns
 a fresh password per connection, for Lakebase OAuth tokens) is also the `ConnectionFactory` for LISTEN, and
