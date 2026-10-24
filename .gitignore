@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+# The extension module built in place by `uv sync` / `maturin develop`
+minifs/_regex*.so
+minifs/_regex*.pyd
+
+# Rust
+target/

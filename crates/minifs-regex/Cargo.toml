@@ -1,0 +1,22 @@
+[package]
+name = "minifs-regex"
+version = "0.1.0"
+description = "Rust regex syntax to PostgreSQL ARE translator, built as minifs._regex"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "_regex"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The Rust `regex` crate as a differential-testing oracle. Enabled for `cargo test` and
+# the development build (`uv sync`), never in release wheels.
+oracle = ["dep:regex"]
+
+[dependencies]
+pyo3 = { version = "0.30", features = ["abi3-py312"] }
+regex-syntax = "0.8"
+regex = { version = "1.13", optional = true }

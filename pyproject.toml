@@ -1,0 +1,82 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "minifs"
+version = "0.1.0"
+description = "Postgres based VFS for agents"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg>=3.2",
+    "psycopg-pool>=3.2",
+]
+
+[project.optional-dependencies]
+# Bundled libpq; without it psycopg needs a system libpq.
+binary = ["psycopg[binary]>=3.2"]
+
+[project.scripts]
+minifs = "minifs.cli:main"
+
+[dependency-groups]
+dev = [
+    "psycopg[binary]>=3.2",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "testcontainers>=4.9",
+    "ruff>=0.9",
+    "pyright>=1.1.390",
+    "maturin>=1.9,<2",
+]
+
+[tool.maturin]
+manifest-path = "crates/minifs-regex/Cargo.toml"
+module-name = "minifs._regex"
+python-packages = ["minifs"]
+include = [{ path = "minifs/db/migrations/*.sql", format = ["sdist", "wheel"] }]
+
+[tool.uv]
+# The development build (uv sync) enables the regex oracle; release wheels don't.
+config-settings = { build-args = "--features oracle" }
+# Rebuild the extension when the Rust sources change.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "crates/**/Cargo.toml" },
+    { file = "crates/**/*.rs" },
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["UP046", "UP047"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["minifs"]
+
+[tool.ruff.lint.per-file-ignores]
+"minifs/tools/*.py" = ["E501"]  # tool prompts are long prose lines
+
+[tool.ruff.format]
+quote-style = "double"
+# The README's code blocks are illustrative sketches, not formatted source.
+exclude = ["*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.pyright]
+include = ["minifs", "tests"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
