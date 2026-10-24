@@ -24,7 +24,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --features oracle
 ```
 
-CI runs all of these, with the tests on PG 16 and 18. Install ripgrep (`rg`) locally to run the tests that
+CI runs all of these, with the tests on PG 16, 17 and 18: the versions Databricks Lakebase, the production
+target, offers. Install ripgrep (`rg`) locally to run the tests that
 cross-check against it; without it they skip, while in CI they fail.
 
 ## Layout
@@ -52,6 +53,20 @@ so create them idempotently (`DO $$ ... IF NOT EXISTS ...`).
 
 `minifs db status` prints each migration as `applied`, `pending` or `modified` (changed since it was applied),
 and versions the database has but this checkout doesn't as `unknown`.
+
+## SQL functions and errors
+
+The tree lives in `vfs_nodes` (migration 003). Every operation is a SQL function (`vfs_resolve`, `vfs_readdir`,
+`vfs_create`, `vfs_mkdir_p`, `vfs_rename`, `vfs_unlink`); the header comment of each says what it does and
+raises. A NULL directory id stands for the virtual root `/`.
+
+Functions report errors with `PERFORM vfs_raise('ENOENT', detail)`, which raises SQLSTATE `MFnnn` (`nnn` = the
+Linux errno number) with the errno name as the message. `minifs.db.errors.errno_name(exc)` maps it back. Add a
+new errno to both `vfs_raise` and `SQLSTATE_BY_ERRNO`.
+
+Production runs on Databricks Lakebase (PostgreSQL 16 to 18, no superuser, no `pg_uuidv7`, default collation
+`C.UTF-8`), so SQL must work as a plain role that owns its database; `test_migrations_need_no_superuser` checks
+that.
 
 ## Database fixtures
 

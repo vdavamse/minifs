@@ -19,6 +19,9 @@ from psycopg.pq import TransactionStatus
 # Arbitrary constant key for pg_advisory_xact_lock, shared by every minifs migration runner.
 _LOCK_KEY = 0x6D696E6966730001
 
+# UNIQUE NULLS NOT DISTINCT, which vfs_nodes relies on, is new in PostgreSQL 15.
+MIN_SERVER_VERSION = 150000
+
 _FILENAME = re.compile(r"^(?P<version>\d{3})_(?P<name>[a-z0-9_]+)\.sql$")
 
 _CREATE_VERSION_TABLE = """
@@ -99,6 +102,8 @@ async def migrate(conn: AsyncConnection, migrations: list[Migration] | None = No
         raise MigrationError("migrate() needs an autocommit connection")
     if conn.info.transaction_status != TransactionStatus.IDLE:
         raise MigrationError("migrate() needs a connection that is not inside a transaction")
+    if conn.info.server_version < MIN_SERVER_VERSION:
+        raise MigrationError(f"minifs needs PostgreSQL 15 or later, the server is {conn.info.server_version}")
     migrations = load_migrations() if migrations is None else migrations
     schema = await _current_schema(conn)
     table = _version_table(schema)

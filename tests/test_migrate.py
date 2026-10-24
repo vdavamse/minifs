@@ -1,11 +1,17 @@
 import asyncio
+import uuid
 from pathlib import Path
+from typing import cast
 
+import psycopg
 import pytest
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
+from psycopg.conninfo import make_conninfo
+from psycopg.pq import TransactionStatus
 
 from minifs.cli import main
 from minifs.db.migrate import Migration, MigrationError, applied_versions, load_migrations, migrate
+from tests.conftest import PgServer
 
 
 def _write(directory: Path, files: dict[str, str]) -> Path:
@@ -168,3 +174,55 @@ def test_cli_status_reports_modified_and_unknown(empty_db: str, capsys: pytest.C
 def test_cli_reports_connection_errors(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["db", "status", "--dsn", "postgresql://nobody@127.0.0.1:1/none?connect_timeout=2"]) == 1
     assert capsys.readouterr().err.startswith("minifs db status: ")
+
+
+def test_migrations_need_no_superuser(pg_server: PgServer) -> None:
+    # Managed Postgres such as Databricks Lakebase has no real superuser: the schema must install as an ordinary
+    # role that owns its database.
+    role, database = f"minifs_owner_{uuid.uuid4().hex[:8]}", f"test_{uuid.uuid4().hex}"
+    with psycopg.connect(pg_server.conninfo, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD 'pw' NOSUPERUSER").format(sql.Identifier(role)))
+        admin.execute(
+            sql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE template0").format(
+                sql.Identifier(database), sql.Identifier(role)
+            )
+        )
+        try:
+            conninfo = make_conninfo(pg_server.database(database), user=role, password="pw")
+            # public belongs to pg_database_owner since PostgreSQL 15; give it to the role, as a managed
+            # service's database owner has it.
+            with psycopg.connect(pg_server.database(database), autocommit=True) as conn:
+                conn.execute(sql.SQL("ALTER SCHEMA public OWNER TO {}").format(sql.Identifier(role)))
+
+            async def run() -> None:
+                async with await AsyncConnection.connect(conninfo, autocommit=True) as conn:
+                    assert await migrate(conn)
+                    cur = await conn.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+                    assert await cur.fetchone() == (False,)
+                    await conn.execute("SELECT vfs_mkdir_p(ARRAY['tasks', 'new'])")
+                    cur = await conn.execute("SELECT id FROM vfs_resolve(ARRAY['tasks', 'new'])")
+                    row = await cur.fetchone()
+                    assert row is not None
+                    # A directory move takes the ancestor-walk locks; unlink takes FOR UPDATE.
+                    await conn.execute("SELECT vfs_rename(%s, NULL, 'new')", (row[0],))
+                    await conn.execute("SELECT vfs_unlink(%s)", (row[0],))
+                    cur = await conn.execute("SELECT name FROM vfs_readdir(NULL)")
+                    assert await cur.fetchall() == [("tasks",)]
+
+            asyncio.run(run())
+        finally:
+            admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
+            admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+async def test_refuses_servers_older_than_15() -> None:
+    class Info:
+        server_version = 140011
+        transaction_status = TransactionStatus.IDLE
+
+    class OldServer:
+        autocommit = True
+        info = Info()
+
+    with pytest.raises(MigrationError, match="PostgreSQL 15"):
+        await migrate(cast(AsyncConnection, OldServer()), [])
