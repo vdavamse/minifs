@@ -36,12 +36,13 @@ fn regex_error(py: Python<'_>, err: translate::Error) -> PyErr {
     }
 }
 
-/// Translates `pattern` into ARE, returning `(line_form, file_form)`.
+/// Translates `pattern` into ARE, returning the line form. The file form is
+/// `FILE_FORM_PREFIX` plus the line form.
 #[pyfunction(name = "translate")]
 #[pyo3(signature = (pattern, ignore_case = false))]
-fn py_translate(py: Python<'_>, pattern: &str, ignore_case: bool) -> PyResult<(String, String)> {
+fn py_translate(py: Python<'_>, pattern: &str, ignore_case: bool) -> PyResult<String> {
     translate::translate(pattern, ignore_case)
-        .map(|t| (t.line_form, t.file_form))
+        .map(|t| t.line_form)
         .map_err(|e| regex_error(py, e))
 }
 
@@ -69,6 +70,7 @@ fn py_oracle_random_pattern(seed: u64) -> String {
 fn _regex(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", VERSION)?;
     m.add("HAS_ORACLE", HAS_ORACLE)?;
+    m.add("FILE_FORM_PREFIX", translate::FILE_FORM_PREFIX)?;
     m.add("RegexError", m.py().get_type::<RegexError>())?;
     m.add_function(wrap_pyfunction!(py_translate, m)?)?;
     m.add_function(wrap_pyfunction!(py_escape, m)?)?;

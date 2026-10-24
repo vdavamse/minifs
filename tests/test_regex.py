@@ -18,6 +18,9 @@ from minifs.vfs.regex import RegexError, RegexTooExpensive, RegexTranslationBug,
 from tests.conftest import PgServer
 from tests.regex_corpus import LINES, PATTERNS
 
+# The oracle and the random patterns exist only in development builds; test_regex_extension.py fails without them.
+pytestmark = pytest.mark.skipif(not _regex.HAS_ORACLE, reason="minifs._regex was built without the oracle feature")
+
 # Patterns regex-syntax rejects, so ripgrep must reject them too.
 SYNTAX_ERRORS = [
     "(",
@@ -42,6 +45,9 @@ SYNTAX_ERRORS = [
     r"\x{110000}",
     "(?i",
     "\\",
+    # rg wraps patterns in (?:...), so a (?x) comment swallows the closing paren.
+    "(?x)a#c",
+    r"(?x) \d+ # digits",
 ]
 
 # Patterns ripgrep also rejects without -U, though regex-syntax parses them.
@@ -56,7 +62,8 @@ UNSUPPORTED = {
     r"(?-u:[^a])": "byte class",
     r"\b\w\b" * 20: "too large",
     r"(?:a{255}){255}": "expand to",
-    r"(?:a{0,100}){50}": "expand to",
+    r"(?:a{0,100}){100}": "expand to",
+    r"(?-u:\B)": "use \\B",
 }
 
 
@@ -117,6 +124,11 @@ def test_random_patterns_agree_with_oracle(db_any_locale: str) -> None:
     assert not problems, "\n".join(problems[:50])
 
 
+def _split_lines(body: str) -> list[str]:
+    """Lines as the search query splits them: the final newline dropped, then split on LF (CR stays in the line)."""
+    return body.removesuffix("\n").split("\n")
+
+
 def test_file_form_matches_every_file_with_a_matching_line(db_any_locale: str) -> None:
     rng = random.Random(18)
     problems: list[str] = []
@@ -125,10 +137,13 @@ def test_file_form_matches_every_file_with_a_matching_line(db_any_locale: str) -
             translation = regex.translate(pattern)
             files = [[_random_line(rng) for _ in range(rng.randrange(1, 6))] for _ in range(8)]
             files += [LINES[i : i + 5] for i in range(0, len(LINES), 25)]
-            file_hits = _matches(conn, translation.file_form, ["\n".join(f) for f in files])
-            for lines, file_hit in zip(files, file_hits, strict=True):
+            # As files are stored: with or without a final newline, and with LF or CRLF line ends.
+            bodies = [body for f in files for body in ("\n".join(f), "\n".join(f) + "\n", "\r\n".join(f) + "\r\n")]
+            file_hits = _matches(conn, translation.file_form, bodies)
+            for body, file_hit in zip(bodies, file_hits, strict=True):
+                lines = _split_lines(body)
                 if not file_hit and any(_matches(conn, translation.line_form, lines)):
-                    problems.append(f"{pattern!r}: file form misses {lines!r}")
+                    problems.append(f"{pattern!r}: file form misses {body!r}")
     assert not problems, "\n".join(problems[:50])
 
 
@@ -189,8 +204,18 @@ def test_translate_is_cached_and_file_form_is_newline_sensitive() -> None:
 
 def test_translate_fixed_escapes_metacharacters(db_any_locale: str) -> None:
     translation = regex.translate_fixed("a.b(c)*", ignore_case=True)
+    long_text = "lorem ipsum " * 400
     with psycopg.connect(db_any_locale) as conn:
         assert _matches(conn, translation.line_form, ["x A.B(C)* y", "aXb(c)*", "a.b(c)"]) == [True, False, False]
+        # Long literals aren't counted as repetitions.
+        long = regex.translate_fixed(long_text, ignore_case=True)
+        assert _matches(conn, long.line_form, [long_text.upper(), long_text[1:]]) == [True, False]
+
+
+def test_patterns_are_parsed_as_rg_wraps_them() -> None:
+    # rg parses (?:PATTERN), so a stray closing paren is accepted, as it is by rg.
+    assert regex.translate("a)(b").line_form == "a(?:b)"
+    assert regex.translate("a)|(b").line_form == "(?:a|(?:b))"
 
 
 async def test_validate_accepts_translations_and_restores_the_timeout(conn: AsyncConnection) -> None:
@@ -228,6 +253,9 @@ async def test_validate_reports_expensive_patterns_to_the_model(
     with caplog.at_level(logging.ERROR, logger="minifs.vfs.regex"), pytest.raises(RegexTooExpensive) as info:
         await regex.validate(conn, too_complex)
     assert isinstance(info.value, RegexError) and "too complex" in info.value.message
+    # A pattern the translator accepts, which Postgres still finds too complex.
+    with caplog.at_level(logging.ERROR, logger="minifs.vfs.regex"), pytest.raises(RegexTooExpensive):
+        await regex.validate(conn, regex.translate(r"(?:.*\b){20}"))
     monkeypatch.setattr(regex, "_VALIDATE_TIMEOUT", "1ms")
     slow = Translation("(?:[a-z]{0,255}){80}", False, "(?:[a-z]{0,255}){80}")
     with caplog.at_level(logging.ERROR, logger="minifs.vfs.regex"), pytest.raises(RegexTooExpensive) as info:

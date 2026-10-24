@@ -258,7 +258,7 @@ PATTERNS: list[str] = [
     r"`[^`]+`",
     r"\*\*\w+\*\*",
     # Flags and extended mode
-    r"(?x) \d+ \s* # a comment",
+    r"(?x) \d+ \s* [a-z]+",
     r"(?x) foo \x20 bar",
     r"(?U)a+",
     r"(?i-u)error",

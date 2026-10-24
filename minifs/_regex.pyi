@@ -2,6 +2,8 @@
 
 __version__: str
 HAS_ORACLE: bool
+FILE_FORM_PREFIX: str
+"""``(?n)``: prepended to the line form, it gives the file form (ARE's newline-sensitive mode)."""
 
 class RegexError(ValueError):
     """A pattern the translator rejects.
@@ -15,8 +17,8 @@ class RegexError(ValueError):
     span: tuple[int, int] | None
     syntax: bool
 
-def translate(pattern: str, ignore_case: bool = False) -> tuple[str, str]:
-    """Translate a Rust regex, parsed as ripgrep parses it, into PostgreSQL ARE: ``(line_form, file_form)``.
+def translate(pattern: str, ignore_case: bool = False) -> str:
+    """Translate a Rust regex, parsed as ripgrep parses it, into PostgreSQL ARE (the line form).
 
     Raises ``RegexError`` for a pattern ripgrep rejects or that has no ARE equivalent.
     """
@@ -24,7 +26,7 @@ def translate(pattern: str, ignore_case: bool = False) -> tuple[str, str]:
 def escape(text: str) -> str:
     """Escape regex metacharacters, so the result matches ``text`` literally."""
 
-# Only present when the crate was built with the `oracle` feature (development builds).
+# Only present when the crate was built with the `oracle` feature (development builds, where HAS_ORACLE is true).
 ORACLE_CHARS: str
 
 def oracle_is_match(pattern: str, haystack: str, ignore_case: bool = False) -> bool: ...

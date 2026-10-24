@@ -54,7 +54,6 @@ const LOOKS: &[Look] = &[
     Look::StartLF,
     Look::EndLF,
     Look::WordAscii,
-    Look::WordAsciiNegate,
     Look::WordUnicode,
     Look::WordUnicodeNegate,
     Look::WordStartAscii,
