@@ -408,6 +408,8 @@ The caches live in each process's memory and are never shared between processes.
 - The cache also keeps `id -> (parent_id, name)`. A `move` or `delete` notification carries the node id, so it evicts the right entry without knowing the old name.
 - The TTL only covers notifications lost while the LISTEN connection reconnects. After a reconnect, the whole cache is cleared.
 
+In the library this is `minifs.vfs.cache.DirEntryCache`, kept fresh by `async with cache.follow(watcher)` and passed to `VFSClient(pool, cache=cache)`. Its `stats()` gives the hit rate. Concurrent operations that find the same cached path stale share one eviction query.
+
 ### File content
 
 A cached read is one statement, the same as an uncached one:

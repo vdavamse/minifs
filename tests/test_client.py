@@ -4,7 +4,7 @@ import asyncio
 import pickle
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -545,9 +545,9 @@ async def test_no_await_after_commit(pool: Pool, monkeypatch: pytest.MonkeyPatch
     release = asyncio.Event()
     original = VFSClient.__dict__["_evict_stale"]
 
-    async def slow_evict(self: VFSClient, refs: Any) -> None:
+    async def slow_evict(self: VFSClient, refs: Any, started: Any = None) -> None:
         await release.wait()  # as if the pool were saturated
-        await original(self, refs)
+        await original(self, refs, started)
 
     monkeypatch.setattr(VFSClient, "_evict_stale", slow_evict)
     assert await asyncio.wait_for(vfs.append("/f", b"data"), 2) == 0  # returns without waiting for the eviction
@@ -584,3 +584,81 @@ async def test_glob(pool: Pool) -> None:
     await vfs.rename("/w", "/w.old")
     await vfs.create("/w/new.py", parents=True)
     assert [e.path for e in await cached.glob("*.py", "/w")] == ["/w/new.py"]
+
+
+async def test_concurrent_stale_hits_share_one_eviction(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = DictCache()
+    vfs, other = VFSClient(pool, cache=cache), VFSClient(pool)
+    old = await vfs.create("/f")
+    await other.unlink("/f")
+    new = await other.create("/f")
+    calls = waiting = 0
+    release = asyncio.Event()
+    evict_stale = VFSClient.__dict__["_evict_stale"]
+    await_eviction = VFSClient.__dict__["_await_eviction"]
+
+    async def counted(self: VFSClient, refs: Any, started: Any = None) -> None:
+        nonlocal calls
+        calls += 1
+        await release.wait()  # as if waiting for a connection: the eviction can still be shared
+        await evict_stale(self, refs, started)
+
+    async def counted_wait(self: VFSClient, refs: Any) -> None:
+        nonlocal waiting
+        waiting += 1
+        await await_eviction(self, refs)
+
+    monkeypatch.setattr(VFSClient, "_evict_stale", counted)
+    monkeypatch.setattr(VFSClient, "_await_eviction", counted_wait)
+    # Every read finds the cached link stale; one query evicts it for all of them.
+    results = await asyncio.gather(*(vfs.stat("/f") for _ in range(5)))
+    assert {r.id for r in results} == {new.id}
+    assert calls == 1
+    release.set()
+    await vfs.settle()
+    assert all(v[0] != old.id for v in cache.entries.values())
+
+    # Once that eviction is done, a new stale link gets a new one, which the error paths share and wait for.
+    release.clear()
+    cache.store(None, "f", old.id, "file")
+    await other.unlink("/f")
+    stats = [asyncio.create_task(vfs.stat("/f")) for _ in range(3)]
+    for _ in range(500):
+        if waiting >= 3:
+            break
+        await asyncio.sleep(0.01)
+    assert (waiting, calls) == (3, 2)
+    stats[0].cancel()  # a caller giving up doesn't cancel the eviction the others wait for
+    release.set()
+    errors = await asyncio.gather(*stats, return_exceptions=True)
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert all(isinstance(e, VFSError) and e.errno == "ENOENT" for e in errors[1:])
+    assert calls == 2
+    assert all(v[0] != old.id for v in cache.entries.values())
+
+
+async def test_a_later_stale_hit_does_not_join_a_started_eviction(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = DictCache()
+    vfs = VFSClient(pool, cache=cache)
+    cache.store(None, "x", uuid4(), "file")
+    ref = vfs._ref(("x",))  # pyright: ignore[reportPrivateUsage]
+    sent, release = asyncio.Event(), asyncio.Event()
+    evict_stale = VFSClient.__dict__["_evict_stale"]
+
+    async def paused(self: VFSClient, refs: Any, started: Any = None) -> None:
+        def on_start() -> None:
+            started()
+            sent.set()
+
+        await evict_stale(self, refs, on_start)
+        await release.wait()
+
+    monkeypatch.setattr(VFSClient, "_evict_stale", paused)
+    first = vfs._evict_stale_task([ref])  # pyright: ignore[reportPrivateUsage]
+    assert vfs._evict_stale_task([ref]) is first  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(sent.wait(), 10)
+    assert first is not None and not first.done()
+    second = vfs._evict_stale_task([ref])  # pyright: ignore[reportPrivateUsage]  # its query may predate this hit
+    assert second is not None and second is not first
+    release.set()
+    await vfs.settle()
