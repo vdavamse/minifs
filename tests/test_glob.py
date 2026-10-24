@@ -327,13 +327,12 @@ def test_excludes_agree_with_rg(prune: bool) -> None:
     cases = _cases(seed=33, n=800)
     extra = [
         "**/node_modules/**", "build/", "{a/,b}", "b{a,/}", "{node_modules/,dist/}", "a/*", "a**/", "*/", "#a", "!a",
-        "\\!a", "#*/", "!",
+        "\\!a", "#*/", "!!a", "#",
     ]  # fmt: skip
-    for pattern, paths in [*cases, *((p, [_gen_path(rng, _ASCII_NAME_CHARS) for _ in range(40)]) for p in extra)]:
-        try:
-            ex = compile_excludes([pattern], prune=prune)
-        except GlobError:
-            continue
+    # Paths that the extras with a leading '!' or '#' (a character in an exclude) do and don't match.
+    fixed = ["#a", "x/!a", "!a/y", "a", "!!a", "\\!a", "x/#a/z", "#", "#b/c", "!a"]
+    for pattern, paths in [*cases, *((p, [*fixed, *_paths_for(rng, p)]) for p in extra)]:
+        ex = compile_excludes([pattern], prune=prune)  # any include compiles as an exclude too
         oracle = _oracle_pattern(pattern)
         for path in paths:
             p = _oracle_path(pattern, path)
