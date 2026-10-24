@@ -428,97 +428,56 @@ Line numbers are derived on the client and never stored in Postgres.
 | `?` | One character other than `/` | `[^/]` |
 | `**/` | Zero or more directories | `(?:[^/]+/)*` |
 | `**` at the end | Everything below | `.*` |
-| `[abc]`, `[a-z]`, `[!x]` | A character class (`!` negates) | `[abc]`, `[a-z]`, `[^x]` |
-| `{md,txt}` | Alternatives (may nest) | `(?:md\|txt)` |
+| `[abc]`, `[a-z]`, `[!x]` | A character class (`!` or `^` negates), never matching `/` | `[a-c]`, `[a-z]`, `[^x\u002f]` |
+| `*.{md,txt}` | Alternatives (may nest) | `(?:[^/]*\.md\|[^/]*\.txt)` |
 | `\*` | A literal `*` | `\*` |
 | A pattern with no `/`, e.g. `*.md` | The file name at any depth (the gitignore/rg rule) | `^(?:.*/)?[^/]*\.md$` |
 | A pattern with `/`, e.g. `src/*.py` | Anchored at the search root | `^src/[^/]*\.py$` |
-| `exclude=["**/node_modules/**"]` (library only) | Like rg's `-g '!...'` | `AND NOT path ~ ANY(...)` |
+| `exclude=["**/node_modules/**"]` (library only) | Like rg's `-g '!...'`: matching files are dropped, matching directories not walked | `NOT path ~ ANY(...)` |
 
 The defaults follow rg. Only files are returned (directories are walked, not listed). For `Glob`, hidden directories (names starting with `.`) are never descended into, and a hidden file is returned whenever the pattern matches it, as `rg --files` does: `*.yml` finds `.foo.yml`, but `.github/**` finds nothing. `Grep` searches hidden files and directories, as ladderframe's `Grep` runs `rg --hidden`. Both skip `.git/`. `Glob` results are sorted by `mtime`, newest first (see Differences from ladderframe).
 
 ### Translator
 
-```python
-ARE_SPECIAL = set(r".^$|()[]{}*+?\\")
+`minifs/vfs/glob.py` translates in three steps:
 
-def glob_to_regex(pat: str) -> str:
-    """Translate a ripgrep/gitignore-style glob to an anchored Postgres ARE."""
-    body = _translate(pat)
-    return f"^(?:.*/)?{body}$" if "/" not in pat else f"^{body}$"
+1. **Expand braces** into alternatives, nested ones included (at most 1,024). `**` is special only as a whole path segment, and whether it is one can depend on the alternative: in `{a,}**/x` it is for the empty alternative only.
+2. **Tokenize each alternative and split it into segments.** A segment that is exactly `**` is a globstar; `**` anywhere else is a `*`. A backslash makes the next character literal.
+3. **Emit** each alternative and join them as `(?:alt1|alt2)`. Literals escape only ARE's special characters: a backslash before a letter is a meaningful ARE escape (`\y`, `\m`), so letters stay bare.
 
-def _translate(p: str) -> str:
-    out, i = [], 0
-    while i < len(p):
-        if p.startswith("**/", i):
-            out.append("(?:[^/]+/)*"); i += 3
-        elif p.startswith("**", i):
-            out.append(".*"); i += 2
-        elif p[i] == "*":
-            out.append("[^/]*"); i += 1
-        elif p[i] == "?":
-            out.append("[^/]"); i += 1
-        elif p[i] == "[":
-            j = p.find("]", i + 2)
-            if j < 0:
-                raise GlobError(p, "unclosed '['")
-            cls = p[i + 1:j]
-            out.append("[^" + cls[1:] + "]" if cls.startswith("!") else "[" + cls + "]"); i = j + 1
-        elif p[i] == "{":
-            j = _matching_brace(p, i)                    # depth-aware
-            alts = _split_top_level(p[i + 1:j], ",")
-            out.append("(?:" + "|".join(_translate(a) for a in alts) + ")"); i = j + 1
-        elif p[i] == "\\" and i + 1 < len(p):
-            out.append("\\" + p[i + 1] if p[i + 1] in ARE_SPECIAL else p[i + 1]); i += 2
-        else:
-            out.append("\\" + p[i] if p[i] in ARE_SPECIAL else p[i]); i += 1
-    return "".join(out)
-```
+Character classes are parsed into code-point ranges and emitted as explicit ranges, with every character except ASCII letters and digits written as `\uXXXX`. A class never matches `/`: it is removed from ranges such as `[+-0]`, and added to negated classes, so `[!x]` becomes `[^x/]`. POSIX classes such as `[[:alpha:]]` are ASCII only, as in wcmatch. Nothing relies on ARE's own classes or case folding, so a translated pattern means the same under every database locale.
 
-Only the special characters are escaped. In Postgres ARE, a backslash before a letter is a meaningful escape (`\y`, `\m`), so letters must stay bare.
+An unclosed `[` or `{` raises `GlobError`, as does an empty pattern. `{a}` is an alternation of one, as in rg (bash would keep it literal).
 
 ### Pruning hints
 
 | Hint | Example | Effect |
 | --- | --- | --- |
-| Literal prefix | `docs/guides/**/*.md` gives `docs/guides` | Resolve that directory once and walk only its subtree. If it doesn't exist, return an empty result, not an error. A prefix through a hidden directory (for `Glob`) or an excluded one also gives an empty result, as in rg. The walk's paths are seeded with the prefix (`p_prefix`), so the pattern and excludes still match paths relative to the tool's `path`, and results don't depend on the hint. |
-| Max depth | `src/*/*.py` gives 3 | Stop the recursion at that depth. Only when the pattern has no `**`. |
-| Name filter | Last segment `*.md` gives `LIKE '%.md'` | A cheap filter on the name before the full regex. Only when the last segment has no `[` or `{`. |
+| Literal prefix | `docs/guides/**/*.md` gives `docs/guides` | `vfs_glob` resolves that directory and walks only its subtree. If it doesn't exist or is a file, the result is empty, not an error. A prefix through a hidden directory (for `Glob`) or an excluded one also gives an empty result, as in rg. Paths stay relative to the search root, so results don't depend on the hint. For alternatives, the prefix they share. |
+| Max depth | `src/*/*.py` gives 2 below `src` | Stop the recursion at that depth. Only when no alternative has a globstar. |
+| Name filter | Last segment `*.md` gives `LIKE '%.md'` | A cheap filter on the name before the full regex. Only when the last segment has no class and is the same in every alternative. |
 
 ### The SQL
 
 ```sql
-CREATE FUNCTION vfs_glob(
-    p_root UUID, p_regex TEXT, p_name_like TEXT, p_max_depth INT,
-    p_excludes TEXT[], p_hidden BOOLEAN, p_limit INT,
-    p_prefix TEXT DEFAULT NULL, p_prune_dirs TEXT[] DEFAULT '{.git}'
-) RETURNS TABLE (id UUID, path TEXT, size BIGINT, mtime TIMESTAMPTZ) AS $$
-    WITH RECURSIVE t(id, path, kind, size, mtime, depth) AS (
-        SELECT id, concat_ws('/', p_prefix, name), kind, size, mtime, 1   -- paths stay relative to the tool's path
-          FROM vfs_nodes
-         WHERE parent_id IS NOT DISTINCT FROM p_root
-           AND (p_hidden OR kind = 'file' OR name NOT LIKE '.%')   -- rg: hidden dirs aren't walked
-           AND NOT (kind = 'dir' AND name = ANY (p_prune_dirs))     -- excluded dirs aren't walked
-        UNION ALL
-        SELECT c.id, t.path || '/' || c.name, c.kind, c.size, c.mtime, t.depth + 1
-          FROM vfs_nodes c JOIN t ON c.parent_id = t.id
-         WHERE t.kind = 'dir'
-           AND (p_max_depth IS NULL OR t.depth < p_max_depth)
-           AND (p_hidden OR c.kind = 'file' OR c.name NOT LIKE '.%')
-           AND NOT (c.kind = 'dir' AND c.name = ANY (p_prune_dirs))
-    )
-    SELECT id, path, size, mtime
-      FROM t
-     WHERE kind = 'file'
-       AND (p_name_like IS NULL OR path LIKE '%/' || p_name_like OR path LIKE p_name_like)
-       AND path ~ p_regex
-       AND NOT (path ~ ANY (p_excludes))
-     ORDER BY mtime DESC, path
-     LIMIT p_limit
-$$ LANGUAGE sql STABLE;
+vfs_glob(
+    p_root uuid,                    -- the search root (NULL: "/"); paths are relative to it
+    p_regex text,                   -- glob_to_regex(pattern)
+    p_name_like text DEFAULT NULL,  -- hint
+    p_max_depth int DEFAULT NULL,   -- hint, counted below the prefix
+    p_excludes text[] DEFAULT '{}', -- exclude regexes: matching files are dropped, matching directories not walked
+    p_hidden boolean DEFAULT false, -- walk directories whose names start with '.'
+    p_limit int DEFAULT NULL,
+    p_prefix text[] DEFAULT '{}',   -- hint: literal leading directories
+    p_prune_dirs text[] DEFAULT '{}'  -- directory names never walked; '.git' always is
+) RETURNS TABLE (id uuid, path text, size bigint, mtime timestamptz)   -- files only, ORDER BY mtime DESC, path
 ```
 
-Excludes of the form `**/<name>/**`, which covers all the defaults, are also passed as `p_prune_dirs`, so those directories are never walked; `.git` is always among them. Other exclude patterns are tested on each path at the end. Each directory level is an index lookup on `UNIQUE (parent_id, name)`. A few thousand nodes take milliseconds. For trees of 100k+ nodes, the literal-prefix and depth hints keep the walk small, and an optional trigram index on `vfs_nodes.name` (`pg_trgm`) speeds up `*foo*` patterns.
+It is a recursive CTE over the parent pointers (migration `006_vfs_glob.sql`). Each directory level is an index lookup on `UNIQUE (parent_id, name)`: the walk seeds from the root's entries or the start directory's in two branches, never `parent_id IS NOT DISTINCT FROM`, which can't use the index. Directory rules (pruned name, hidden, excluded path) and the name filter apply inside the recursion, so skipped directories are never expanded; the regex and file excludes apply once at the end. Paths are `COLLATE "C"`, like `name`, so ordering and matching don't depend on the locale. ENOENT if `p_root` doesn't exist, ENOTDIR if it is a file.
+
+In Python, `minifs.vfs.glob.glob(conn, root, pattern, excludes=..., hidden=..., limit=...)` compiles the pattern and excludes and calls `vfs_glob`. Excludes of the form `**/<name>/**`, which covers all the defaults, become `p_prune_dirs` instead of regexes, so those directories are never walked. A smoke benchmark finds `src/**/*.py` in a 10k-node tree in about 15 ms. For trees of 100k+ nodes, the literal-prefix and depth hints keep the walk small, and an optional trigram index on `vfs_nodes.name` (`pg_trgm`) speeds up `*foo*` patterns.
+
+The tests compare the translator with `wcmatch.glob` (GLOBSTAR, BRACE and DOTGLOB) on generated patterns and paths, Postgres's matching with Python's on the same regexes in a `C` and a UTF-8 database, and `vfs_glob` with all hints against no hints.
 
 ## Search (rg in Postgres)
 

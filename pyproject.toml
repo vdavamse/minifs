@@ -31,6 +31,7 @@ dev = [
     "ruff>=0.9",
     "pyright>=1.1.390",
     "maturin>=1.9,<2",
+    "wcmatch>=11.2",
 ]
 
 [tool.maturin]
