@@ -171,11 +171,11 @@ Every operation is a SQL function, so every client (agent tools, ingestion, a fu
 | Operation | Function | POSIX analogue | Locking |
 | --- | --- | --- | --- |
 | Append | `vfs_append(node, data) -> offset` | `write` with `O_APPEND` | Inode `FOR UPDATE` until commit |
-| Overwrite | `vfs_write(node, data, expect_gen, expect_size) -> (generation, size)` | `open` with `O_TRUNC`, then `write` | Inode `FOR UPDATE`; optional version check |
+| Overwrite | `vfs_write(node, data, expect_gen, expect_size, expect_parent, expect_name) -> (generation, size)` | `open` with `O_TRUNC`, then `write` | Inode `FOR UPDATE`; optional compare-and-swap |
 | Positional read | `vfs_pread(node, offset, limit)` | `pread` | None (MVCC snapshot) |
 | Resolve path | `vfs_resolve(path) -> id` | `namei` | None |
 | List directory | `vfs_readdir(dir)` | `readdir` | None |
-| Create, mkdir | `vfs_create(parent, name, kind)` | `open` with `O_CREAT\|O_EXCL`, `mkdir` | Unique constraint |
+| Create, mkdir | `vfs_create(parent, name, kind, data DEFAULT NULL) -> (id, generation, size)` | `open` with `O_CREAT\|O_EXCL`, `mkdir` | Unique constraint |
 | Rename, move | `vfs_rename(node, new_parent, new_name, expect_parent)` | `rename` | Row lock; checks for cycles |
 | Unlink, rmdir | `vfs_unlink(node)` | `unlink`, `rmdir` | Child check plus FK |
 | Watch | `LISTEN vfs` | `inotify` | — |
@@ -201,16 +201,21 @@ The inode lock is held until commit, so concurrent appenders take turns and **of
 
 ```sql
 CREATE FUNCTION vfs_write(p_node UUID, p_data BYTEA,
-                          p_expect_gen INT DEFAULT NULL, p_expect_size BIGINT DEFAULT NULL)
+                          p_expect_gen INT DEFAULT NULL, p_expect_size BIGINT DEFAULT NULL,
+                          p_expect_parent UUID DEFAULT NULL, p_expect_name TEXT DEFAULT NULL)
 RETURNS TABLE (generation INT, size BIGINT) AS $$
-DECLARE v_gen INT; v_size BIGINT;
+DECLARE v_gen INT; v_size BIGINT; v_parent UUID; v_name TEXT;
 BEGIN
-    SELECT n.generation, n.size INTO v_gen, v_size
+    SELECT n.generation, n.size, n.parent_id, n.name INTO v_gen, v_size, v_parent, v_name
       FROM vfs_nodes n WHERE n.id = p_node AND n.kind = 'file' FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'ENOENT' USING ERRCODE = 'P0002'; END IF;
+    IF num_nulls(p_expect_gen, p_expect_size, p_expect_name) NOT IN (0, 3) THEN
+        RAISE EXCEPTION 'EINVAL';                   -- a compare-and-swap is all or nothing
+    END IF;
     IF p_expect_gen IS NOT NULL                     -- compare-and-swap for the Write tool
-       AND (v_gen, v_size) IS DISTINCT FROM (p_expect_gen, p_expect_size) THEN
-        RAISE EXCEPTION 'ESTALE';              -- P0001; the client maps the message
+       AND ((v_gen, v_size, v_name) IS DISTINCT FROM (p_expect_gen, p_expect_size, p_expect_name)
+            OR v_parent IS DISTINCT FROM p_expect_parent) THEN
+        RAISE EXCEPTION 'ESTALE';                   -- P0001; the client maps the message
     END IF;
     DELETE FROM vfs_extents WHERE node_id = p_node;
     INSERT INTO vfs_extents VALUES (p_node, v_gen + 1, 0, p_data);
@@ -353,8 +358,8 @@ The tool takes ladderframe's `Read` parameters and returns its output format.
 
 - **Lines come from the line map.** The map turns line N into a byte offset, then `vfs_pread` reads forward through the content cache until K lines or the byte cap. Lines split on `\n` only and drop a trailing `\r`, so line numbers agree with `Grep` hits.
 - **Bounded output, as in ladderframe.** A line longer than 2,000 characters is cut and gets `... (line truncated to 2000 chars)`, and output stops at 50 KB with `(Output capped at 50 KB. Showing lines a-b. Use offset=b+1 to continue.)`. The last page ends with `(End of file - total n lines)`.
-- **Text only.** Bytes are decoded as UTF-8 with replacement characters. A file that looks binary (PNG, JPEG, GIF, WEBP or `%PDF-` magic bytes, a known binary extension, a NUL byte in the first 4 KB, or more than 30% non-printable bytes there) gets `ModelRetry: Cannot read binary file: <path>`. ladderframe's `Read` attaches images and PDFs; minifs's `Read` doesn't, so they get the same binary-file error (see Differences from ladderframe).
-- **Nearby instructions.** As in ladderframe: for a file below `/workspace`, each directory from the file's parent up to, but not including, `/workspace` is checked for `AGENTS.md`, then `CLAUDE.md`, taking the first found. Each instruction file not already shown in this conversation is appended, headed `Instructions from: <path>`, in one `<system-reminder>` block. Files outside `/workspace`, such as `/docs/**`, get none. The ancestor ids are already known from path resolution, so one query finds every candidate (`WHERE parent_id = ANY($ancestors) AND name IN ('AGENTS.md', 'CLAUDE.md')`), sent in the same round trip as the read.
+- **Text only.** Bytes are decoded as UTF-8 with replacement characters. A file that looks binary (PNG, JPEG, GIF, WEBP or `%PDF-` magic bytes, an image or PDF extension, which ladderframe would attach, or another known binary extension, a NUL byte in the first 4 KB, or more than 30% non-printable bytes there) gets `ModelRetry: Cannot read binary file: <path>`. ladderframe's `Read` attaches images and PDFs; minifs's `Read` doesn't, so they get the same binary-file error (see Differences from ladderframe).
+- **Nearby instructions.** As in ladderframe: for a file below `/workspace`, each directory from the file's parent up to, but not including, `/workspace` is checked for `AGENTS.md`, then `CLAUDE.md`, taking the first found. Each instruction file not already shown in this conversation is appended, headed `Instructions from: <path>`, in one `<system-reminder>` block. Files outside `/workspace`, such as `/docs/**`, get none. The ancestor ids are already known from path resolution, so one query finds every candidate (`WHERE parent_id = ANY($ancestors) AND kind = 'file' AND name IN ('AGENTS.md', 'CLAUDE.md') AND id <> $node`), sent in the same round trip as the read. The client takes `AGENTS.md` over `CLAUDE.md` per directory and skips empty files, as ladderframe does.
 - **Stateless.** There is no `offset=None` auto-continue and no per-agent cursor in the tool. To tail a log, the agent calls `Read` again with the `offset` its last footer gave. Generation-aware tailing is a library feature.
 
 ### Line numbers in the tools, byte offsets in the library
@@ -733,8 +738,8 @@ Paths are absolute in the agent's chroot view; a relative path resolves against 
 
 **Write.** ladderframe has no `Write` yet. Until it lands, minifs follows opencode's `write`, which ladderframe's tools track: `filePath` and `content`, creating the file and any missing parent directories, or replacing the whole file as a new generation. Details, from opencode:
 
-- **Read before overwrite.** Overwriting an existing file requires a `Read` of it earlier in the run, and the file must be unchanged since. The tool records each path's `(node_id, generation, size)` at its last `Read`, writes by that `node_id`, and passes the generation and size to `vfs_write`, which compares them under the inode lock (`ESTALE` on a mismatch). The check and the write are one atomic step. A file deleted and recreated, or renamed into the path, is a different node and fails too. Messages: `ModelRetry: You must Read <path> before overwriting it.` when there is no record, and `ModelRetry: File has been modified since it was last read. Read it again before overwriting.` on a mismatch. The same check stops two agents from silently clobbering each other's `notes.md`.
-- **Writes refresh the record.** A successful create or overwrite stores the `(node_id, generation, size)` that `vfs_create` or `vfs_write` returned, so an agent can write the same file twice without reading it in between.
+- **Read before overwrite.** Overwriting an existing file requires a `Read` of it earlier in the run, and the file must be unchanged since. The tool records each path's `(node_id, generation, size)` at its last `Read`. It writes by that `node_id` and passes the recorded generation and size, plus the parent id and name it resolves `filePath` to, to `vfs_write`, which compares all four under the inode lock (`ESTALE` on a mismatch). The check and the write are one atomic step. A file renamed away from the path fails on its parent or name, so a `Write` never lands on a file at a different path, outside the policy checked for `filePath`. A file deleted (`ENOENT`) or recreated (a different node) fails too, and both get the "modified" message. Messages: `ModelRetry: You must Read <path> before overwriting it.` when there is no record, and `ModelRetry: File has been modified since it was last read. Read it again before overwriting.` on a mismatch. The same check stops two agents from silently clobbering each other's `notes.md`.
+- **Writes refresh the record.** A successful create or overwrite stores the `(node_id, generation, size)` that `vfs_create` (which takes the initial content) or `vfs_write` returned, so an agent can write the same file twice without reading it in between.
 - **Create races.** If `vfs_create` hits the `UNIQUE` constraint because another client created the file first, the call becomes the overwrite case above and fails the read check.
 - **Other errors.** `filePath` naming a directory, or content over the file size cap, raises `ModelRetry`. A write the policy denies (for example to `/docs/**`, or a `Write` to the append-only `/workspace/log.md`) is a returned string.
 - **Success** returns `Wrote file successfully.`
@@ -745,12 +750,12 @@ When ladderframe's `Write` lands, minifs adopts its signature and messages.
 
 ladderframe's tools run over a disk, `Glob` and `Grep` through ripgrep; minifs implements the same contracts in Postgres. These differences remain, by design:
 
-- **No `.gitignore`.** ladderframe's `Glob` and `Grep` both honour `.gitignore`, `.ignore` and git's excludes, as rg does by default. minifs has no ignore files. In their place, `Glob` and `Grep` apply a default exclude list limited to unambiguous caches (`**/node_modules/**`, `**/.venv/**`, `**/__pycache__/**`, `**/.mypy_cache/**`), configurable per workspace. As rg never ignores a path it's given, excludes don't apply at or below an explicit `path`. When excludes removed files and nothing matched, the result says so: `No files found (skipped excluded directories: node_modules/)`. `**/.git/**` is always excluded, outside the configurable list, as ladderframe hard-codes it. Hidden files follow ladderframe (see Glob). Honouring `.gitignore` files stored in the tree can come later.
+- **No `.gitignore`.** ladderframe's `Glob` and `Grep` both honour `.gitignore`, `.ignore` and git's excludes, as rg does by default. minifs has no ignore files. In their place, `Glob` and `Grep` apply a default exclude list limited to unambiguous caches (`**/node_modules/**`, `**/.venv/**`, `**/__pycache__/**`, `**/.mypy_cache/**`), configurable per workspace. As in rg, excludes match each path relative to the search root: a `path` inside an excluded directory is searched, and excluded directories below `path` are still skipped. When nothing matched, a cheap existence query over `vfs_nodes` checks for excluded directories in scope, and the result names them: `No files found (skipped excluded directories: node_modules/)`. `**/.git/**` is always excluded, outside the configurable list, as ladderframe hard-codes it. Hidden files follow ladderframe (see Glob). Honouring `.gitignore` files stored in the tree can come later.
 - **ARE underneath.** Patterns are parsed as rg parses them and translated to Postgres ARE (see Regex dialect). A few constructs rg accepts are refused with a `ModelRetry` that names them: byte classes outside ASCII, repetition counts above 255, and patterns whose translation exceeds the size cap.
 - **mtime order.** `Glob` returns paths newest first, as opencode does; ladderframe's `Glob` and `Grep` return them in rg's walk order, which varies between runs because rg searches in parallel. `Grep` orders hits by path, then line. Above the result limit, minifs returns the first 100 in its order, where ladderframe returns an arbitrary 100.
 - **No attachments.** `Read` doesn't attach images or PDFs (see Read contract).
 - **Non-UTF-8 files aren't searched.** rg searches them and ladderframe decodes hits with replacement characters; minifs's `Grep` skips them (see Search).
-- **Guard rails.** minifs refuses searches over the file cap or byte cap, and stops them after a 2-second timeout. ladderframe's `Grep` has no such limits.
+- **Guard rails.** minifs refuses searches over the file cap or byte cap, and stops each of a search's two statements after 2 seconds. ladderframe's `Grep` has no such limits.
 
 ### Package layout
 
@@ -842,7 +847,7 @@ Three things matter most in production: credential handling, LISTEN connections 
 
 ### Protecting the database
 
-- **Every search runs under `SET LOCAL statement_timeout = '2s'`.** On timeout, raise `ModelRetry: Search timed out; narrow the pattern or path`.
+- **Every search runs under `SET LOCAL statement_timeout = '2s'`,** which applies to each of its two statements. On timeout, raise `ModelRetry: Search timed out; narrow the pattern or path`.
 - **Cap the files in scope.** The scope query (step 1 of the search) asks for one file more than the cap (for example 10,000). If it gets it, the search is refused with a `ModelRetry` to narrow the `path` or `include`, rather than silently dropping the oldest files.
 - **Cap the bytes scanned.** Refuse a search whose scope is larger than the configured cap, with a hint to narrow the `path` or `include`. The size comes from `vfs_nodes`, so the check reads no content.
 - **Cap output:** `Grep` and `Glob` return at most 100 results by default, as in ladderframe, each with a "narrow it" hint.
@@ -896,7 +901,7 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Search scope | `vfs.search(p, glob=X)` hits exactly the files that `vfs.glob(X)` returns | Integration |
 | Glob and Grep tools | Output equals ladderframe's `Glob` and `Grep` on the same tree written to disk, apart from the documented differences. The disk copy gets a `.gitignore` built from the exclude list, path prefixes are mapped, and results are compared as sets, and only when they're under the limit | Differential |
 | Agent tools | Retryable mistakes raise `ModelRetry`; permission denials come back as strings; the chroot blocks `..` escapes; the write policy blocks writes outside allowed paths; `Write` over a file changed since its last `Read` (including a concurrent create, or a recreated file of the same size) raises `ModelRetry`; a second `Write` without a `Read` in between succeeds | Unit |
-| Write check | `vfs_write` with a stale expected generation or size raises `ESTALE` and changes nothing | Unit |
+| Write check | `vfs_write` with a stale expected generation, size, parent or name raises `ESTALE` and changes nothing; a partial expectation raises `EINVAL`; a `Write` after the read file was renamed away raises `ModelRetry` and leaves the moved file unchanged | Unit |
 | Evals | A set of recorded coding tasks run against the VFS tools: track task success and tool calls per task | Eval |
 
 ## Roadmap
