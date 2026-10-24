@@ -351,6 +351,69 @@ async def test_failed_check_after_rescan_ends_the_watch(conn: AsyncConnection, d
         assert calls == 4
 
 
+async def test_a_check_from_before_a_later_rescan_is_not_reused(conn: AsyncConnection, db: str) -> None:
+    """A check that finished before a second gap can't answer the rescan for that gap."""
+    slow = asyncio.Event()
+    gate = asyncio.Event()
+    gate.set()
+    connect = factory(db)
+
+    async def gated() -> AsyncConnection[Any]:
+        await gate.wait()
+        if slow.is_set():
+            await asyncio.sleep(0.5)
+        return await connect()
+
+    async def reconnected(watcher: Watcher) -> None:
+        while watcher.backend_pid is None:
+            await asyncio.sleep(0.01)
+
+    d = await mkdir_p(conn, "d")
+    assert d is not None
+    async with Watcher(gated, retry_min=0.01) as watcher, watcher.watch("d") as events:
+        await terminate(conn, watcher.backend_pid)
+        await reconnected(watcher)
+        slow.set()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(events.get(), 0.1)  # gives up while the check runs; the check finds d
+        await asyncio.sleep(1)
+        slow.clear()
+        gate.clear()
+        await terminate(conn, watcher.backend_pid)
+        await unlink(conn, d)  # lost in the gap
+        gate.set()
+        await reconnected(watcher)
+        assert await drain(events) == [RESCAN]  # checked again: d is gone, so the watch ends
+
+
+async def test_close_during_a_check_ends_the_consumer(conn: AsyncConnection, db: str) -> None:
+    calls = 0
+    connect = factory(db)
+
+    async def slow_check() -> AsyncConnection[Any]:
+        nonlocal calls
+        calls += 1
+        if calls >= 4:  # listen, resolve, listen again, then the check
+            await asyncio.sleep(2)
+        return await connect()
+
+    await mkdir_p(conn, "d")
+    got: list[Event] = []
+    async with Watcher(slow_check, retry_min=0.01) as watcher:
+        async with watcher.watch("d") as events:
+
+            async def consume() -> None:
+                async for event in events:
+                    got.append(event)
+
+            consumer = asyncio.create_task(consume())
+            await terminate(conn, watcher.backend_pid)
+            while calls < 4:  # the consumer is waiting on the check
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(consumer, 5)  # ends: not cancelled, no error
+    assert got == []
+
+
 async def test_forged_delete_does_not_end_the_watch(conn: AsyncConnection, watcher: Watcher) -> None:
     d = await mkdir_p(conn, "d")
     assert d is not None

@@ -134,10 +134,15 @@ class Subscription:
         if len(self._events) >= self._maxsize:
             self._events.clear()
             event = RESCAN
-        if event is RESCAN and self._events and self._events[-1] is RESCAN:
-            return  # one rescan covers both
+        if event is RESCAN:
+            self._on_rescan()
+            if self._events and self._events[-1] is RESCAN:
+                return  # one rescan covers both
         self._events.append(event)
         self._wakeup.set()
+
+    def _on_rescan(self) -> None:
+        """Called whenever a rescan is queued, including one folded into the last or made by an overflow."""
 
     def _end(self) -> None:
         self._closed = True
@@ -227,6 +232,11 @@ class PathWatch(Subscription):
             )
             return False
 
+    def _on_rescan(self) -> None:
+        # Events may have been lost since a pending check started, so its answer can't serve this rescan. Stop
+        # reusing it (without cancelling it: a get() may be awaiting it for an earlier event).
+        self._check = None
+
     def _finish(self) -> None:
         self._gone = True
         self.close()
@@ -248,15 +258,20 @@ class PathWatch(Subscription):
             if event.op == "rescan" or (event.op == "delete" and event.id == self.node):
                 if self._check is None:
                     self._check = asyncio.ensure_future(self._still_there())
+                check = self._check
                 try:
-                    there = await asyncio.shield(self._check)
+                    there = await asyncio.shield(check)
                 except asyncio.CancelledError:
+                    task = asyncio.current_task()
+                    if self._closed and task is not None and task.cancelling() == 0:
+                        raise StopAsyncIteration from None  # close() cancelled the check, not our caller
                     # The caller gave up waiting (a timeout around get()). Keep the event and the check running,
                     # so the next get() resumes the check rather than restarting it, and a rescan is never lost.
                     self._events.appendleft(event)
                     self._wakeup.set()
                     raise
-                self._check = None
+                if self._check is check:
+                    self._check = None
                 if not there:
                     self._finish()
             return event
