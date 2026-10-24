@@ -1,104 +1,90 @@
 # minifs: Everything Is a File for Agents
 
-Oct 24, 2026
+A small POSIX-like virtual filesystem stored entirely in PostgreSQL, built for coding assistants and other LLM agents.
 
 ## Overview
 
-An agent sees one small POSIX-like filesystem, stored entirely in Lakebase, and works on it with five tools: `ls`, `read`, `write`, `glob` and `rg`. Transcript, steering, working memory and ingested docs are all ordinary files in that tree. Nothing is mounted, so it runs where FUSE and root are unavailable, including Databricks Apps.
+An agent sees one filesystem tree, stored entirely in Postgres, and works on it with five tools: `ls`, `read`, `write`, `glob` and `rg`. Source files, notes, logs, working memory and ingested documents are all ordinary files in that tree. Nothing is mounted, so it runs where FUSE and root are unavailable: sandboxes, serverless containers and managed app platforms.
 
 **Goals**
 
-- One storage model and one set of operations for every kind of data. There are no special tables for the transcript or for steering.
+- One storage model and one set of operations for every kind of data. There are no special tables for logs, memory or task queues.
 - Claude-Code-style tool semantics (Read with offset and limit, Glob, Grep), which models already use well.
-- Incremental transcript reads: each read returns only what is new since the last one, using byte offsets.
+- Incremental reads: an agent can tail a growing file and get only what is new since its last read, using byte offsets.
 - Search and glob run inside Postgres, so there's no local mirror, no sync and no `rg` binary.
 - PostgreSQL is the single source of truth, and every read reflects the latest committed write.
-- Latency fits a live voice call: a steer should land within about a second of the user's words.
+- Low latency: a tool call is one or two SQL round trips.
 
 **Non-goals**
 
-- Kernel mounts (FUSE or NFS) inside the app. A later TigerFS integration can provide these where they're allowed (see Roadmap).
+- Kernel mounts (FUSE or NFS). A later TigerFS integration can provide these where they're allowed (see Roadmap).
 - Full POSIX: no hard links, permission bits, xattrs or random-offset writes in v1.
-- Large binary files. The design targets text, mostly markdown, from kilobytes to a few megabytes per file.
+- Large binary files. The design targets text (source code, markdown, logs) from kilobytes to a few megabytes per file.
 
-**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly extents in `vfs_extents`. SQL functions implement append, overwrite, positional read, rename and watch (via NOTIFY). A trigger keeps a line index (`vfs_lines`, with a trigram index) in step with every write, which powers `rg`. A recursive walk over the parent pointers powers `glob`. The Python VFS library wraps these functions; PydanticAI tools wrap the library; and a tick loop wakes the agent on each transcript append, pre-filling the new chunk into its prompt.
+**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly extents in `vfs_extents`. SQL functions implement append, overwrite, positional read, rename and watch (via NOTIFY). A trigger keeps a line index (`vfs_lines`, with a trigram index) in step with every write, which powers `rg`. A recursive walk over the parent pointers powers `glob`. A Python VFS library wraps these functions, and agent tools (for example PydanticAI tools) wrap the library.
 
 ## Context
 
-The motivating app is a live voice assistant. gpt-realtime-2.1 (the Talker) holds the live voice conversation, gpt-transcribe produces the transcript, and a long-running PydanticAI agent reads that transcript, reasons about it and steers the Talker. The agent needs to do three things:
+**Why files?** Models are heavily trained on shell and file work. A small, uniform tool set over one tree is easy to discover with `ls`, needs no new tools when a data source is added, and gives humans the same view when debugging. Every agent, ingestion job and human operator follows one UNIX-style model instead of a set of purpose-built tables.
 
-1. Read the transcript incrementally: only what was said since its last read.
-2. Write steering instructions that the Talker bridge applies to the realtime session.
-3. Search ingested markdown documents with ripgrep-style queries. This comes later.
-
-**Platform constraints.** The app runs as a Databricks App. Apps run as a non-privileged user, can't install system packages, must serve on `DATABRICKS_APP_PORT`, and have no FUSE ([Databricks Apps best practices](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/best-practices)). Every kernel-mount approach needs `CAP_SYS_ADMIN` or `/dev/fuse`, so any filesystem has to live in the tool layer, not the kernel. The same constraint applies on AWS Fargate, which allows only `SYS_PTRACE` to be added ([ECS KernelCapabilities](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_KernelCapabilities.html)).
-
-**Why files?** Models are heavily trained on shell and file work. A small, uniform tool set over one tree is easy to discover with `ls`, needs no new tools when a data source is added, and gives humans the same view when debugging. We first considered separate tables for the transcript and for steering, and rejected that so the whole system follows one UNIX-style model.
+**Why not a real filesystem?** Many places agents run don't allow one. Managed platforms run apps as a non-privileged user with no system packages and no FUSE ([Databricks Apps best practices](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/best-practices)), and AWS Fargate allows only `SYS_PTRACE` to be added ([ECS KernelCapabilities](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_KernelCapabilities.html)). Every kernel-mount approach needs `CAP_SYS_ADMIN` or `/dev/fuse`, so the filesystem lives in the tool layer, not the kernel. Postgres also gives durability, transactions, concurrent access from many agents and change notifications for free.
 
 **What we take from TigerFS.** TigerFS exposes PostgreSQL as a mountable filesystem. Its file-first workspaces already use a parent-pointer directory model (ADR-017: `parent_id`, `filename`, `UNIQUE NULLS NOT DISTINCT`, a one-round-trip `resolve_path`, and a 2-second path cache). Its consistency rule is: never cache content, cache only metadata. This design adopts all of that. It adds extent-based content for appends and offset reads, and replaces kernel mounts with tools.
 
 ## Architecture
 
-Three app processes share one VFS library and one set of SQL functions. Lakebase holds every byte, and NOTIFY at commit is the only wake-up signal.
+Any number of clients share one VFS library and one set of SQL functions. Postgres holds every byte, and NOTIFY at commit is the only wake-up signal.
 
-&#91;embedded content: architecture · 3 app processes over one Lakebase VFS\]
+```
+  agent tools        ingestion jobs       CLI / humans
+ (ls read write        (write docs)        (debugging)
+   glob rg)
+        \                  |                  /
+         \                 |                 /
+          +-------- VFS library (Python) ---+
+                           |
+                    SQL functions
+                           |
+                      PostgreSQL
+        vfs_nodes · vfs_extents · vfs_lines · NOTIFY vfs
+```
 
-Arrows down are VFS calls. Arrows up are change events from `NOTIFY vfs`: the bridge watches `steering/new/`, and the agent wakes when `transcript.md` grows.
-
-| Component | Role | Talks to |
-| --- | --- | --- |
-| OpenAI realtime session | The Talker (gpt-realtime-2.1) holds the call; gpt-transcribe produces caller transcripts | The bridge, over the realtime API |
-| Talker bridge | Appends finished segments to `transcript.md`; claims steers from `new/` and applies them to the session | OpenAI; the VFS |
-| Agent | One short PydanticAI run per tick, using five file tools | The VFS only |
-| Ingestion | Writes markdown files under `/docs` | The VFS only |
-| VFS library | Python wrapper for path resolution, the chroot view, write policy, glob and regex translation, and watch | The SQL functions |
-| Lakebase | Tables, SQL functions, triggers for the line index and NOTIFY | — |
+| Component | Role |
+| --- | --- |
+| Agent tools | `ls`, `read`, `write`, `glob`, `rg` exposed to the model, with shell-style errors |
+| VFS library | Path resolution, the chroot view, write policy, glob and regex translation, and watch |
+| SQL functions | Append, overwrite, positional read, resolve, readdir, create, rename, unlink |
+| PostgreSQL | Tables, triggers for the line index and NOTIFY |
 
 ## Filesystem tree and conventions
 
-All participants share one tree. A file's purpose comes from where it sits and how it's used, never from how it's stored.
+All clients share one tree. A file's purpose comes from where it sits and how it's used, never from how it's stored. An example layout:
 
 ```
-/sessions/<session_id>/
-    meta.md              app writes at session start (caller, goal, start time)
-    transcript.md        bridge APPENDS one line per finished segment
-    notes.md             agent overwrites: its working memory across ticks
-    steering/
-        new/             agent creates files here           = pending
-        cur/             bridge renames here when applied   = applied
-        dropped/         bridge renames here if stale       = dropped
+/workspaces/<workspace_id>/
+    src/...              the code or documents the agent works on
+    notes.md             agent overwrites: its working memory across runs
+    log.md               append-only activity log
+    tasks/
+        new/             tasks waiting to be picked up      = pending
+        cur/             renamed here when claimed          = in progress
+        done/            renamed here when finished         = done
 /docs/                   ingestion writes; everyone reads
-    policies/refunds.md
-    product/pricing.md
+    guides/style.md
+    api/reference.md
 ```
 
-**The agent's view (a chroot).** The agent sees `/session` mapped to `/sessions/<its session_id>`, and `/docs` read-only. It can't reach another call's data. The mapping lives in the tool layer, like a bind mount.
+**The agent's view (a chroot).** An agent sees `/workspace` mapped to `/workspaces/<its workspace_id>`, plus shared read-only trees such as `/docs`. It can't reach another workspace's data. The mapping lives in the tool layer, like a bind mount.
 
-**Write policy, per actor.** Instead of permission bits, each actor has a list of path rules, like mount options:
+**Write policy, per actor.** Instead of permission bits, each actor has a list of path rules, like mount options. For example:
 
-| Path | Bridge | Agent | Ingestion | App |
-| --- | --- | --- | --- | --- |
-| `transcript.md` | append | read | — | create |
-| `steering/new/*` | read, rename out | create | — | — |
-| `steering/cur/*`, `dropped/*` | rename in | read | — | — |
-| `notes.md` | — | read, overwrite | — | create |
-| `meta.md` | read | read | — | write |
-| `/docs/**` | read | read | write | — |
+| Path | Agent | Ingestion | Operator |
+| --- | --- | --- | --- |
+| `/workspace/**` | read, write | — | read, write |
+| `/workspace/log.md` | append | — | read |
+| `/docs/**` | read | write | read |
 
-**Transcript line format.** Each finished segment becomes one line, `[mm:ss] speaker: text\n`, where `speaker` is `user` or `assistant` and newlines in the text become spaces. The format has to be fixed before launch, because every byte offset depends on it.
-
-**Steering files follow Maildir.** A steer's status is the directory it sits in. Its parameters are YAML frontmatter, validated when the file is written into `new/`:
-
-```markdown
----
-kind: inject_context        # instructions_patch | inject_context | interrupt
-based_on_offset: 4123       # transcript.md size the agent had seen
-supersedes: 0002-offer-discount.md   # optional
----
-Customer qualifies for a full refund under policy 3. Offer it proactively.
-```
-
-File names are `NNNN-<slug>.md`, with `NNNN` increasing per session, so the files sort in the order they were written. The agent writes to `steering/new/<any>.md`, and the VFS assigns the final name and returns it.
+**Coordination through rename (Maildir).** When several agents or workers share work, a file's status can be the directory it sits in. Claiming a file is an atomic rename (see Core operations), so exactly one worker wins.
 
 ## Storage model
 
@@ -132,7 +118,7 @@ Each column choice, and why:
 | --- | --- | --- |
 | `UNIQUE NULLS NOT DISTINCT (parent_id, name)` | Root entries have `parent_id IS NULL`. A plain `UNIQUE` treats NULLs as distinct, so it would allow two `/docs` entries. Needs PostgreSQL 15+. | Plain `UNIQUE (parent_id, name)` |
 | `parent_id` uses `RESTRICT` | POSIX `rmdir` on a non-empty directory returns `ENOTEMPTY`. `CASCADE` would silently delete a whole subtree. | `ON DELETE CASCADE` |
-| `uuidv7()` ids | Time-ordered: inserts stay local in the B-tree, and the id records creation time. Built in from PostgreSQL 18. The pg\_uuidv7 extension isn't available on Lakebase, so on PG 16 or 17 generate the ids in the app. | `gen_random_uuid()` |
+| `uuidv7()` ids | Time-ordered: inserts stay local in the B-tree, and the id records creation time. Built in from PostgreSQL 18. On PG 16 or 17, use the pg\_uuidv7 extension where available, or generate the ids in the app. | `gen_random_uuid()` |
 | Variable-length extents | An append is one INSERT and never rewrites earlier bytes. A positional read selects only the overlapping extents. | Inline `body TEXT` (each append rewrites the whole value) or fixed-size chunks (each append rewrites the last block) |
 | `generation` | Lets readers and cursors tell an append (same generation, larger size) from a rewrite (new generation). | Comparing content hashes |
 | `size` stored on the inode | `stat` without scanning extents. It's always updated in the same transaction as the extent, so it can't drift. | Computing `sum(length(data))` on every stat |
@@ -144,11 +130,11 @@ Each column choice, and why:
 
 **Moves must not create cycles.** `rename` of a directory checks that the destination isn't inside the source. A recursive CTE walks up from the destination's parent within the same transaction, so a move like `mv /a /a/b/c` returns `EINVAL`.
 
-**Extent count.** An hour-long call is roughly 1,000 to 2,000 one-line extents in `transcript.md`. A full read is still a single indexed range scan. If it ever matters, an optional compaction job can merge extents into about 64 KB pieces under the inode lock, without changing the bytes or the generation.
+**Extent count.** A log appended one line at a time gains one extent per append. A few thousand extents still read in a single indexed range scan. If it ever matters, an optional compaction job can merge extents into about 64 KB pieces under the inode lock, without changing the bytes or the generation.
 
 ## Core operations
 
-Every operation is a SQL function. The bridge, the agent, ingestion and a future TigerFS front end all get the same semantics from the database. The Python library is a thin wrapper.
+Every operation is a SQL function, so every client (agent tools, ingestion, a future TigerFS front end) gets the same semantics from the database. The Python library is a thin wrapper.
 
 | Operation | Function | POSIX analogue | Locking |
 | --- | --- | --- | --- |
@@ -177,7 +163,7 @@ BEGIN
 END $$ LANGUAGE plpgsql;
 ```
 
-The inode lock is held until commit, so concurrent appenders take turns and **offset order always equals commit order**. A reader at `offset > cursor` can never miss bytes that commit late at a lower offset. This is the guarantee that makes incremental transcript reads correct. Because it comes from the lock, it holds for any number of writers.
+The inode lock is held until commit, so concurrent appenders take turns and **offset order always equals commit order**. A reader at `offset > cursor` can never miss bytes that commit late at a lower offset. This is the guarantee that makes incremental reads correct. Because it comes from the lock, it holds for any number of writers.
 
 ### Overwrite
 
@@ -204,7 +190,7 @@ UPDATE vfs_nodes SET parent_id = $cur_dir, mtime = now()
  WHERE id = $file AND parent_id = $new_dir;     -- 0 rows = already claimed by someone else
 ```
 
-This is how the bridge claims a steer from `new/` to `cur/`. If two bridge replicas race, exactly one wins.
+This is how a worker claims a file from `tasks/new/` to `tasks/cur/`. If two workers race, exactly one wins.
 
 ### Path resolution
 
@@ -228,13 +214,13 @@ CREATE TRIGGER trg_vfs_notify AFTER INSERT OR UPDATE OR DELETE ON vfs_nodes
     FOR EACH ROW EXECUTE FUNCTION vfs_notify();
 ```
 
-- An append updates `size`, so it emits `modify`. A Maildir claim emits `move`.
+- An append updates `size`, so it emits `modify`. A Maildir-style claim emits `move`.
 - Notifications are delivered **at commit**, so a watcher is never woken for data it can't read yet.
 - In Python, `vfs.watch(path)` is an async iterator that filters the single `vfs` channel by node id (a file) or parent id (a directory).
 
 ## Read contract
 
-Every file is read the same way, by byte offset. The transcript, a 200 KB doc, `notes.md` and a steering file all page and tail identically.
+Every file is read the same way, by byte offset. A source file, a 200 KB doc, `notes.md` and a growing log all page and tail identically.
 
 ```
 read(path, offset=None, limit=16_000) -> {content, offset, next_offset, size, generation, eof}
@@ -274,21 +260,21 @@ $$ LANGUAGE sql STABLE;
 ```
 
 - **Trimming happens in Postgres.** A 16 KB read of a 5 MB doc sends 16 KB.
-- **It's one statement, so one MVCC snapshot.** `size` and `generation` describe exactly the bytes returned, even while the bridge is appending.
+- **It's one statement, so one MVCC snapshot.** `size` and `generation` describe exactly the bytes returned, even while another client is appending.
 - **The `LEFT JOIN`** returns a single row with NULL data when nothing overlaps, so a read past EOF or of an empty file still returns `size` and `generation`.
 
 ### Two layers, two precisions
 
 | Layer | Users | Behavior |
 | --- | --- | --- |
-| Library `vfs.pread` | Bridge, ingestion, tests | Exact bytes, never adjusted |
-| Agent tool `read` | The agent | Snaps to whole lines. The start moves back to the beginning of its line, the end is cut at the last newline within `limit`, and at least one line is always returned. A single line longer than `limit` is cut at a UTF-8 boundary. |
+| Library `vfs.pread` | Ingestion, other services, tests | Exact bytes, never adjusted |
+| Agent tool `read` | The model | Snaps to whole lines. The start moves back to the beginning of its line, the end is cut at the last newline within `limit`, and at least one line is always returned. A single line longer than `limit` is cut at a UTF-8 boundary. |
 
-Line snapping reads up to 4 KB before the requested offset to find the line start. The model never sees half a sentence or a split multi-byte character.
+Line snapping reads up to 4 KB before the requested offset to find the line start. The model never sees half a line or a split multi-byte character.
 
 ### Per-path cursors and generations
 
-The tool keeps `path -> (generation, next_offset)` in the PydanticAI deps and saves it to a `agent_cursors` table for crash recovery.
+The tool keeps `path -> (generation, next_offset)` in the agent's run state and can save it to an `agent_cursors` table for crash recovery.
 
 | Since the last read | `generation` | What `read(path)` with no offset does |
 | --- | --- | --- |
@@ -298,9 +284,8 @@ The tool keeps `path -> (generation, next_offset)` in the PydanticAI deps and sa
 
 ### Offsets as one currency
 
-- `rg` hits carry byte offsets (`refunds.md @18234`), so the agent can follow up with `read(path, offset=18234 - 500, limit=2000)`.
-- Steering frontmatter `based_on_offset` is a position in `transcript.md`. The bridge drops a steer once the transcript has grown too far past it.
-- The tick pre-fill is just a `read` with the agent's own cursor.
+- `rg` hits carry byte offsets (`style.md @18234`), so the agent can follow up with `read(path, offset=18234 - 500, limit=2000)`.
+- A cursor is just a saved `next_offset`, so tailing a log is a `read` with no offset.
 
 ## Glob
 
@@ -318,8 +303,8 @@ The tool keeps `path -> (generation, next_offset)` in the PydanticAI deps and sa
 | `{md,txt}` | Alternatives (may nest) | `(?:md\|txt)` |
 | `\*` | A literal `*` | `\*` |
 | A pattern with no `/`, e.g. `*.md` | The file name at any depth (the gitignore/rg rule) | `^(?:.*/)?[^/]*\.md$` |
-| A pattern with `/`, e.g. `steering/cur/*.md` | Anchored at the search root | `^steering/cur/[^/]*\.md$` |
-| `exclude=["**/dropped/**"]` | Like rg's `-g '!...'` | `AND NOT path ~ ANY(...)` |
+| A pattern with `/`, e.g. `src/*.py` | Anchored at the search root | `^src/[^/]*\.py$` |
+| `exclude=["**/node_modules/**"]` | Like rg's `-g '!...'` | `AND NOT path ~ ANY(...)` |
 
 The defaults follow rg. Only files are returned (directories are walked, not listed). Entries starting with `.` are skipped unless the pattern segment itself starts with `.`. Results are sorted by `mtime`, newest first, as in Claude Code's Glob tool.
 
@@ -367,8 +352,8 @@ Only the special characters are escaped. In Postgres ARE, a backslash before a l
 
 | Hint | Example | Effect |
 | --- | --- | --- |
-| Literal prefix | `docs/policies/**/*.md` gives `docs/policies` | Resolve that directory once and walk only its subtree. If it doesn't exist, return an empty result, not an error. |
-| Max depth | `steering/*/*.md` gives 3 | Stop the recursion at that depth. Only when the pattern has no `**`. |
+| Literal prefix | `docs/guides/**/*.md` gives `docs/guides` | Resolve that directory once and walk only its subtree. If it doesn't exist, return an empty result, not an error. |
+| Max depth | `src/*/*.py` gives 3 | Stop the recursion at that depth. Only when the pattern has no `**`. |
 | Name filter | Last segment `*.md` gives `LIKE '%.md'` | A cheap filter on the name before the full regex. Only when the last segment has no `[` or `{`. |
 
 ### The SQL
@@ -405,14 +390,14 @@ Each directory level is an index lookup on `UNIQUE (parent_id, name)`. A few tho
 
 ## Search (rg in Postgres)
 
-`rg` runs entirely in Lakebase. A line index (`vfs_lines`) is kept in step with every write by a trigger, and a `pg_trgm` GIN index speeds up regex matching on it. There's no local mirror, no sync and no `rg` binary, and a search sees every committed append, even one from a millisecond ago.
+`rg` runs entirely in Postgres. A line index (`vfs_lines`) is kept in step with every write by a trigger, and a `pg_trgm` GIN index speeds up regex matching on it. There's no local mirror, no sync and no `rg` binary, and a search sees every committed write, even one from a millisecond ago.
 
 ### Why not search the extents directly
 
 Extents are append fragments: a match can cross an extent boundary, extents have no line numbers, and a trigram index on fragments would miss matches. ripgrep works on lines, so the index stores lines. It's derived data, like a filesystem's search index, never a second source of truth.
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS pg_trgm;           -- supported on Lakebase PG 16-18
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE vfs_lines (
     node_id     UUID    NOT NULL REFERENCES vfs_nodes(id) ON DELETE CASCADE,
@@ -468,7 +453,7 @@ CREATE TRIGGER trg_vfs_index AFTER INSERT ON vfs_extents
     FOR EACH ROW EXECUTE FUNCTION vfs_index_extent();
 ```
 
-- **Appends are cheap.** A transcript append is one whole line, so it adds one index row and touches nothing earlier.
+- **Appends are cheap.** An append of one whole line adds one index row and touches nothing earlier.
 - **Overwrites re-index.** `vfs_write` deletes the node's lines, and the new generation's single extent indexes it again.
 - **Writers must append whole UTF-8 strings.** A multi-byte character split across two extents would make `convert_from` fail on both halves. The library guarantees this, and a test enforces it.
 
@@ -501,23 +486,23 @@ SELECT g.path, l.line_no, l.byte_offset, l.text
 
 ### Index behavior
 
-The `pg_trgm` GIN and GiST indexes support `~` and `~*`. They extract trigrams from the regex, and "a pattern with no extractable trigrams will degenerate to a full-index scan" ([pg\_trgm docs](https://www.postgresql.org/docs/current/pgtrgm.html)). Patterns with a literal run of 3+ characters (`refund`, `cancel.*plan`) are fast. For patterns like `\d+` or `.`, require a `path` or `glob` scope.
+The `pg_trgm` GIN and GiST indexes support `~` and `~*`. They extract trigrams from the regex, and "a pattern with no extractable trigrams will degenerate to a full-index scan" ([pg\_trgm docs](https://www.postgresql.org/docs/current/pgtrgm.html)). Patterns with a literal run of 3+ characters (`refund`, `parse.*config`) are fast. For patterns like `\d+` or `.`, require a `path` or `glob` scope.
 
 ### Output format for the agent
 
 ```
-/docs/policies/refunds.md:42 @18234: Refunds are issued within 14 days of cancellation.
-/session/transcript.md:17 @2210: [03:12] user: I want to cancel and get a refund
+/docs/guides/style.md:42 @18234: Prefer early returns over nested conditionals.
+/workspace/src/config.py:17 @2210: def parse_config(path: str) -> Config:
 ... 38 more matches; narrow the pattern or path
 ```
 
 ## Regex dialect and translation
 
-We need our own translator from rg-style (Rust/PCRE) patterns to Postgres ARE. No open-source translator in that direction exists, and the extensions that bring PCRE or RE2 into Postgres aren't available on Lakebase. The translator is small, but it is the riskiest part of search: when it gets something wrong, it fails silently.
+We need our own translator from rg-style (Rust/PCRE) patterns to Postgres ARE. No open-source translator in that direction exists, and the extensions that bring PCRE or RE2 into Postgres aren't available on most managed Postgres services. The translator is small, but it is the riskiest part of search: when it gets something wrong, it fails silently.
 
 ### Why it's needed: patterns that silently change meaning
 
-Postgres documents these incompatibilities with Perl: "\\b, \\B, the lack of special treatment for a trailing newline, ... the restrictions on parentheses and back references in lookahead/lookbehind constraints, and the longest/shortest-match (rather than first-match) matching semantics" ([PostgreSQL 9.7.3.6](https://www.postgresql.org/docs/current/functions-matching.html)). For a model writing patterns, the dangerous case is `\b`: in ARE it means **backspace**, so `\brefund\b` silently matches nothing. The model concludes the text isn't there and may steer the Talker on that false belief.
+Postgres documents these incompatibilities with Perl: "\\b, \\B, the lack of special treatment for a trailing newline, ... the restrictions on parentheses and back references in lookahead/lookbehind constraints, and the longest/shortest-match (rather than first-match) matching semantics" ([PostgreSQL 9.7.3.6](https://www.postgresql.org/docs/current/functions-matching.html)). For a model writing patterns, the dangerous case is `\b`: in ARE it means **backspace**, so `\bparse_config\b` silently matches nothing. The model concludes the code isn't there and acts on that false belief.
 
 | The model writes | Rust/PCRE meaning | Postgres ARE | Translator action |
 | --- | --- | --- | --- |
@@ -543,15 +528,15 @@ Postgres documents these incompatibilities with Perl: "\\b, \\B, the lack of spe
 
 | Project | What it is | Usable here? |
 | --- | --- | --- |
-| [pgpcre](https://github.com/petere/pgpcre) | Postgres extension that adds PCRE as a `pcre` type with `~` and `=~` operators | No. It isn't on Lakebase's extension list, and it has no index support for pattern matching. |
-| [re2 (PGXN)](https://api.pgxn.org/src/re2/re2-0.4.0/doc/re2.md) | Postgres extension with ClickHouse-compatible RE2 functions; an `@~` operator with a `gin_re2_ops` trigram prefilter | No: not on Lakebase. It's the best design reference, though: RE2 syntax is close to Rust's, and its GIN trigram prefilter is the same strategy we use with `pg_trgm`. |
-| [omni\_regex (Omnigres)](https://docs.omnigres.org/omni_regex/regex/) | PCRE2-based match and capture functions | No: not on Lakebase |
-| [PL/Rust](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.Using.PL_Rust.html) | Postgres functions written in Rust, with the `regex` crate allowed | No: RDS only, not Lakebase |
+| [pgpcre](https://github.com/petere/pgpcre) | Postgres extension that adds PCRE as a `pcre` type with `~` and `=~` operators | Rarely: not offered by most managed services, and it has no index support for pattern matching. |
+| [re2 (PGXN)](https://api.pgxn.org/src/re2/re2-0.4.0/doc/re2.md) | Postgres extension with ClickHouse-compatible RE2 functions; an `@~` operator with a `gin_re2_ops` trigram prefilter | Rarely available, but the best design reference: RE2 syntax is close to Rust's, and its GIN trigram prefilter is the same strategy we use with `pg_trgm`. |
+| [omni\_regex (Omnigres)](https://docs.omnigres.org/omni_regex/regex/) | PCRE2-based match and capture functions | Rarely available |
+| [PL/Rust](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.Using.PL_Rust.html) | Postgres functions written in Rust, with the `regex` crate allowed | RDS only |
 | [PCRE2 `pcre2_convert`](https://git.stg.centos.org/source-git/pcre2/blob/c8s/f/src/pcre2_convert.c) | Converts POSIX patterns and globs into PCRE2 | Wrong direction. Useful as a reference for edge cases only. |
 | [RegexBuddy](https://www.regexbuddy.com/postgresql.html) | Commercial GUI that converts between regex flavors, including PostgreSQL | No: a GUI tool, not a library |
 | Python `re._parser` (formerly `sre_parse`) | CPython's internal regex parser, which produces an AST | It's a possible base for a translator, but it's an internal API that can change between Python versions. |
 
-The Lakebase extension list does include `pg_trgm` on PG 16, 17 and 18. It doesn't list `pgpcre`, `re2`, `omni_regex` or `plrust` ([Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions)). So we translate to ARE and use `pg_trgm`.
+`pg_trgm` ships with Postgres and is available almost everywhere, including managed services such as Databricks Lakebase ([Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions)). So we translate to ARE and use `pg_trgm`.
 
 ### Translator design
 
@@ -563,13 +548,13 @@ The Lakebase extension list does include `pg_trgm` on PG 16, 17 and 18. It doesn
 
 ### Differential testing (how we know it's right)
 
-- **A corpus of real patterns:** start with 200+ patterns collected from model transcripts (`\bcancel\b`, `refund|reimburse`, `(?i)price`, `\d{2}:\d{2}`, and so on), and add every new pattern seen in production logs.
+- **A corpus of real patterns:** start with 200+ patterns collected from model transcripts (`\bparse\b`, `TODO|FIXME`, `(?i)error`, `\d{2}:\d{2}`, and so on), and add every new pattern seen in production logs.
 - **An oracle:** for each pattern and each test line, compare Python `re.search(original)` with Postgres `line ~ translated`, for the subset where Python and Rust semantics agree. Every disagreement is either a translator bug or a construct that should be rejected.
 - **Property tests:** generate random patterns from the supported grammar and random lines, then compare the same way.
 
-## Agent integration (PydanticAI)
+## Agent integration
 
-The agent gets Claude Code's file toolset with the same semantics, so models apply what they already practice. The tick loop pre-fills the one read that happens every tick.
+Agents get Claude Code's file toolset with the same semantics, so models apply what they already practice. The examples use PydanticAI, but the tools are plain async functions over the VFS library and fit any agent framework or an MCP server.
 
 | Claude Code tool | VFS tool | Backed by |
 | --- | --- | --- |
@@ -582,20 +567,18 @@ The agent gets Claude Code's file toolset with the same semantics, so models app
 ### Package layout
 
 ```
-app/
+minifs/
   vfs/
     core.py      Entry, ReadResult, VFSError, path normalization, chroot mapping
     client.py    thin async wrappers over the SQL functions
-    policy.py    per-actor write rules, steering frontmatter validation
+    policy.py    per-actor write rules
     glob.py      glob translator and pruning hints
     regex.py     rg-pattern to ARE translator
     watch.py     LISTEN vfs and async iterators per path
-  agent/
+  tools/
     tools.py     ls / read / write / glob / rg
-    runner.py    Agent definition and instructions
-    tick.py      wake-up, debounce, pre-fill, run
   db/
-    pool.py      psycopg pool and Lakebase credential refresh
+    pool.py      psycopg pool and credential refresh
     schema.sql
 ```
 
@@ -605,11 +588,11 @@ app/
 @dataclass
 class Deps:
     vfs: VFSClient
-    session_id: UUID
-    actor: Literal["agent"] = "agent"
+    workspace_id: UUID
+    actor: str = "agent"
     cursors: dict[str, Cursor] = field(default_factory=dict)   # path -> (generation, next_offset)
 
-agent = Agent("openai:<reasoning-model>", deps_type=Deps, instructions=AGENT_PROMPT)
+agent = Agent("<model>", deps_type=Deps, instructions=AGENT_PROMPT)
 
 @agent.tool
 async def read(ctx: RunContext[Deps], path: str, offset: int | None = None, limit: int = 16_000) -> str:
@@ -620,7 +603,7 @@ async def read(ctx: RunContext[Deps], path: str, offset: int | None = None, limi
 @agent.tool
 async def glob(ctx: RunContext[Deps], pattern: str, path: str = "/",
                exclude: list[str] | None = None, max_results: int = 100) -> str:
-    """Find files by name pattern ("**/*.md", "steering/cur/*.md"). Newest first."""
+    """Find files by name pattern ("**/*.py", "src/*.md"). Newest first."""
     ...
 
 @agent.tool
@@ -630,90 +613,38 @@ async def rg(ctx: RunContext[Deps], pattern: str, path: str = "/", glob: str | N
     ...
 ```
 
-**Errors are returned, not raised.** Each tool catches `VFSError` and returns a shell-style message, such as `read: /session/foo.md: No such file or directory (hint: ls /session)`. Models recover from these naturally. Raising `ModelRetry` would spend the retry budget and can fail the run.
+**Errors are returned, not raised.** Each tool catches `VFSError` and returns a shell-style message, such as `read: /workspace/foo.md: No such file or directory (hint: ls /workspace)`. Models recover from these naturally. Raising an exception the framework treats as a retry spends the retry budget and can fail the run.
 
-### Why the hot path is pre-filled
+**Pre-fill reads that happen every time.** Each tool call costs a full extra LLM inference: the model stops, waits for the result, then reprocesses its whole context. The database query takes milliseconds; the extra inference takes roughly 0.5 to 1.5 s. If a harness always reads the same file at the start of a run (for example `notes.md`), it can run that `read` itself and put the result in the prompt as if the agent had run it. A read that depends on what the agent is thinking stays a tool call.
 
-Each tool call adds a second full LLM inference: the model stops, waits for the result, then reprocesses its whole context. The database query takes about 5 ms; the extra inference takes roughly 0.5 to 1.5 s, depending on the model and prompt size. In a live call, a steer that arrives 2.5 s late lands during or after the Talker's answer. It corrects a sentence that has already been spoken.
-
-The transcript read happens on every tick, the same way, so it isn't a decision the model needs to make. The harness runs the same `read` against the same path and presents the result as if the agent had run it:
-
-```python
-async def run_tick(deps: Deps) -> None:
-    chunk = await tool_read(deps, "/session/transcript.md")          # cursor read, advances deps.cursors
-    if not chunk.content:
-        return
-    notes = await tool_read(deps, "/session/notes.md", offset=0)
-    prompt = (f"$ cat /session/notes.md\n{notes.content}\n\n"
-              f"$ read /session/transcript.md --offset {chunk.offset}\n{chunk.content}\n\n"
-              "Steer the Talker if needed (write /session/steering/new/<slug>.md). "
-              "Update /session/notes.md with anything worth remembering.")
-    await agent.run(prompt, deps=deps)
-    await save_cursors(deps)
-```
-
-**Rule:** a read that happens on every tick is pre-filled by the harness. A read that depends on what the agent is thinking (older transcript, docs, steering history) stays a tool call.
-
-### Tick loop
-
-- **Wake-up:** `vfs.watch("/session/transcript.md")` yields on each `modify`.
-- **Debounce:** wait 300 ms after the last segment, so a burst of segments becomes one tick.
-- **One run at a time:** an `asyncio.Lock`. Segments that arrive during a run mark the session dirty, and another tick runs right after.
-- **Short runs with no message history:** each tick is a fresh `agent.run`, and `notes.md` is the memory. The context stays bounded however long the call lasts.
-- **Session end:** run one final tick when `meta.md` is marked ended, then stop the loop.
-
-## Bridge integration and steering lifecycle
-
-The Talker bridge uses the same VFS library as everyone else. It appends to `transcript.md` and watches `steering/new/`. A steer's whole lifecycle is a sequence of file operations.
-
-### Transcript writes
-
-1. gpt-transcribe emits `delta` events and then a `completed` event for each segment. Only completed segments are written; deltas never reach the VFS.
-2. The bridge renders the line `[mm:ss] user: text\n` and calls `vfs.append("/sessions/<id>/transcript.md", line)`.
-3. The bridge also appends the Talker's own output transcript as `assistant` lines, so the agent can check whether a steer was followed.
-4. The commit fires `vfs` NOTIFY (`modify`), which wakes the agent.
-
-### Steering lifecycle
-
-1. **Create.** The agent writes `steering/new/offer-refund.md` with its frontmatter. The policy layer validates `kind` and `based_on_offset`, assigns the final name `0003-offer-refund.md`, and returns it.
-2. **Notice.** The bridge's `vfs.watch("steering/new/")` yields a `create` event.
-3. **Check freshness.** If the transcript's `size` minus `based_on_offset` exceeds a threshold (start with 2 KB, about four or five segments), the bridge renames the file to `dropped/` and stops.
-4. **Claim.** `vfs_rename(file, cur_dir, expect_parent=new_dir)`. Zero rows updated means another bridge replica already claimed it.
-5. **Apply.** Map `kind` to the realtime API. `instructions_patch` becomes a `session.update` with the merged instructions. `inject_context` becomes a `conversation.item.create` with a system message. `interrupt` becomes `response.cancel`, followed by a new response with the injected context.
-6. **Supersede.** If the frontmatter names `supersedes`, the bridge removes the earlier instruction's effect before applying the new one. For `instructions_patch`, rebuild the instructions from the base prompt plus all non-superseded files in `cur/`.
-7. **Observe.** On its next tick, the agent can `glob("steering/cur/*.md")` (newest first) to see what was applied.
-
-**Should the claim come before the apply?** Yes. Claiming first guarantees the steer is applied at most once. If the bridge crashes between claim and apply, the steer stays in `cur/` without having been applied. Recover by re-applying the instructions in `cur/` when a session reconnects; `session.update` with the full instructions is idempotent.
-
-**Latency.** The bridge is latency-critical, so it uses its own dedicated LISTEN connection and its own small pool, separate from the agent's search queries.
+**Reacting to changes.** `vfs.watch(path)` lets a harness start an agent run when a file changes, for example when a new file appears in `tasks/new/` or a log grows.
 
 ## Operations
 
-Three things matter most in production: credential refresh, LISTEN connections that reconnect cleanly, and keeping search load away from the bridge's appends.
+Three things matter most in production: credential handling, LISTEN connections that reconnect cleanly, and keeping heavy search load away from latency-sensitive writes.
 
-### Lakebase specifics
+### Postgres specifics
 
 | Topic | Guidance |
 | --- | --- |
-| Credentials | Lakebase uses short-lived OAuth credentials as the Postgres password. Give the psycopg pool a connection factory that fetches a fresh credential through the Databricks SDK, not a fixed DSN. |
+| Credentials | Managed services often use short-lived tokens as the Postgres password. Give the psycopg pool a connection factory that fetches a fresh credential, not a fixed DSN. |
 | LISTEN | Use a direct, dedicated connection for LISTEN, never one through a transaction-mode pooler. |
-| Reconnect | When the LISTEN connection drops: reconnect, LISTEN again, then trigger one tick so nothing missed is skipped. The saved cursors make this safe. |
-| Postgres version | PG 18 has a built-in `uuidv7()`. `pg_uuidv7` isn't available on Lakebase, so on PG 16 or 17 generate UUIDv7 in the app ([Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions)). `UNIQUE NULLS NOT DISTINCT` needs PG 15+. |
-| Extensions | `pg_trgm` (required). `vector` (pgvector) is available for future semantic search over `vfs_lines`. |
-| Pools | Per process: one LISTEN connection, and a pool of about 5 for the tools. The bridge has its own pool. |
+| Reconnect | When the LISTEN connection drops: reconnect, LISTEN again, then re-check watched paths so nothing missed is skipped. Saved cursors make this safe. |
+| Postgres version | PG 15+ for `UNIQUE NULLS NOT DISTINCT`. PG 18 has a built-in `uuidv7()`; on older versions use `pg_uuidv7` where available, or generate UUIDv7 in the app. |
+| Extensions | `pg_trgm` (required). `vector` (pgvector) is an option for future semantic search over `vfs_lines`. |
+| Pools | Per process: one LISTEN connection, and a small pool (about 5) for the tools. |
 
 ### Protecting the database
 
 - **Every search runs under `SET LOCAL statement_timeout = '2s'`.** On timeout, return `rg: search timed out; narrow the pattern or path`.
 - **Guide patterns toward the index.** Require a `path` or `glob` scope when the pattern has no literal run of 3+ characters.
 - **Cap output:** at most 50 matches by default, and `glob` at most 100 results, each with a "narrow it" hint.
-- **Keep search off the audio path.** Search connections are separate from the bridge's. If CPU contention appears at scale, consider sending search to a read replica. That gives up read-your-latest-append consistency, so only do it if you need to.
+- **Separate pools for search and writes.** If CPU contention appears at scale, consider sending search to a read replica. That gives up read-your-latest-write consistency, so only do it if you need to.
 
 ### Capacity, rough estimates
 
 | Item | Estimate |
 | --- | --- |
-| Transcript growth | About 1 to 2 segments per 10 s, so 50 to 100 KB and 1,000 to 2,000 extents per hour |
 | Append cost | One inode row lock, one extent insert, one or two line-index rows, one NOTIFY |
 | Line index plus trigram GIN | Very roughly 2 to 4 times the text size |
 | `glob` over a few thousand nodes | Milliseconds |
@@ -722,10 +653,9 @@ Three things matter most in production: credential refresh, LISTEN connections t
 
 Metrics to track:
 
-- **Steer latency**, from the user segment's commit to the steer's insert, and from the steer's insert to its claim in `cur/`.
-- Tick duration, and tool calls per tick.
+- Tool call latency per operation, and tool calls per agent run.
 - Search duration, timeouts, and translator rejections by construct. Rejections show which constructs are worth supporting next.
-- How often steers get dropped, which shows whether the agent keeps up with the conversation.
+- Write-policy denials, which show whether agents try to write outside their allowed paths.
 
 ## Testing strategy
 
@@ -739,7 +669,7 @@ Most of the correctness rests on three properties, and each gets a test that com
 | Line snapping | Offset in the middle of a line or of a multi-byte character; a line longer than `limit`; no trailing newline | Unit |
 | Generations | An overwrite between two cursor reads produces the restart note; an append doesn't | Unit |
 | Tree | `UNIQUE NULLS NOT DISTINCT` rejects duplicate root names; `rmdir` on a non-empty directory gives `ENOTEMPTY`; a move into its own subtree gives `EINVAL` | Unit |
-| Claim | Two claimers racing for the same steer: exactly one wins | Concurrency |
+| Claim | Two claimers racing for the same file: exactly one wins | Concurrency |
 | Watch | Events arrive only after commit; `move` versus `modify` is classified correctly | Integration |
 | Line index | Partial-line merges across appends; overwrite re-indexes; non-UTF-8 content is skipped | Unit |
 | Glob translator | Compared with `PurePath.full_match` (Python 3.13+) or `wcmatch` (GLOBSTAR and BRACE flags) on generated patterns and paths | Differential |
@@ -747,46 +677,37 @@ Most of the correctness rests on three properties, and each gets a test that com
 | Regex translator | A corpus of real model patterns plus generated ones, compared with Python `re` on the shared subset | Differential |
 | rg scope | `rg(p, glob=X)` hits exactly the files that `glob(X)` returns | Integration |
 | Agent tools | Errors come back as shell-style strings; the chroot blocks `..` escapes; the write policy blocks writes outside allowed paths | Unit |
-| End to end | A scripted transcript is replayed; the expected steering files appear in `cur/` | Integration |
-| Evals | 10 to 20 recorded calls with the steers you'd expect: track hit rate and steer latency | Eval |
+| Evals | A set of recorded coding tasks run against the VFS tools: track task success and tool calls per task | Eval |
 
 ## Roadmap
 
-Plan A ships in five milestones, each with an exit gate. The TigerFS front end (Plan B) follows once the tree and tools are stable.
+The tool-based VFS ships first. A TigerFS front end follows once the tree and tools are stable.
 
-&#91;embedded content: roadmap · 5 milestones, then TigerFS\]
+**What stays frozen.** The five tool names and signatures, and the shell-style error format. The TigerFS work can then replace the VFS client with a thin MCP client, and prompts, tools and evals carry over unchanged.
 
-Read left to right, then the second row. The dashed box is the later TigerFS work, which starts only after M5.
+**What the TigerFS integration adds.** Three pieces of work in the TigerFS repo:
 
-**What stays frozen from M1.** The tree layout, the five tool names and signatures, and the shell-style error format. Plan B then replaces the VFS client with a thin MCP client, and the prompt, tools and evals carry over unchanged.
-
-**What Plan B adds to TigerFS.** Three pieces of work in the TigerFS repo:
-
-1. A `tigerfs mcp` front end over `fs.Operations`. PydanticAI connects to it with its built-in MCP client.
+1. A `tigerfs mcp` front end over `fs.Operations`, which agent frameworks connect to with their MCP clients.
 2. An extent-backed file workspace format, `vfs_nodes` plus `vfs_extents`. TigerFS's current synth workspaces store each file's body in a single row, so they can't do cheap appends or offset reads. With extents, a FUSE `Write` at an offset maps straight onto extents.
 3. `glob` and `rg` exposed through the same front end, so every client gets the same search results.
 
-The payoff is that the same tree mounts through FUSE on a laptop or NFS on Kubernetes for debugging, alongside the tool-based access on Databricks Apps.
+The payoff is that the same tree mounts through FUSE on a laptop or NFS on Kubernetes for debugging, alongside tool-based access where mounts aren't allowed.
 
 ## Open decisions
 
 | Decision | Options | Recommendation |
 | --- | --- | --- |
-| Transcript line format | `[mm:ss] speaker: text`, or with `seq`, or with a wall-clock time | `[mm:ss] speaker: text`. Fix it before launch, because it determines every byte offset. |
-| Steering kinds | `instructions_patch`, `inject_context`, `interrupt`, and others | Confirm against how the bridge drives gpt-realtime-2.1 |
-| Bridge access | Through the VFS library, or direct SQL | The VFS library, for one model end to end. Revisit only if profiling shows overhead. |
-| Sessions per process | One, or many | Many, with one LISTEN connection filtered by payload |
-| Postgres version | PG 16/17 (UUIDv7 generated in the app), or PG 18 (built-in `uuidv7()`) | PG 18 if the Lakebase project allows it |
-| Freshness threshold for dropping steers | A byte delta of 2 KB, or a time delta | Start at 2 KB and tune using the dropped-steer rate |
+| Client access | Through the VFS library, or direct SQL | The VFS library, for one model end to end. Revisit only if profiling shows overhead. |
+| Workspaces per process | One, or many | Many, with one LISTEN connection filtered by payload |
+| Postgres version | PG 15–17 (UUIDv7 from an extension or the app), or PG 18 (built-in `uuidv7()`) | PG 18 where available |
 | Line-based addressing | Add `read(path, line=, lines=)` | Not in v1. Byte offsets are the only addressing scheme, since `rg` hits already carry offsets. |
-| Semantic search | pgvector over windows of `vfs_lines` | After M4 |
+| Semantic search | pgvector over windows of `vfs_lines` | After the core tools are stable |
 
 ## Sources
 
 - [PostgreSQL 9.7 Pattern Matching](https://www.postgresql.org/docs/current/functions-matching.html): ARE syntax, Perl incompatibilities, and the statement-timeout advice
 - [PostgreSQL pg\_trgm](https://www.postgresql.org/docs/current/pgtrgm.html): regex index support and how it degrades
-- [Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions): `pg_trgm` available; `pg_uuidv7`, `pgpcre` and `re2` not listed
-- [Databricks Apps best practices](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/best-practices): no root, no system packages
-- [ECS KernelCapabilities](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_KernelCapabilities.html): Fargate allows only `SYS_PTRACE`
+- [Databricks Apps best practices](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/best-practices) and [ECS KernelCapabilities](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_KernelCapabilities.html): examples of platforms without FUSE or root
+- [Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions): an example of a managed Postgres extension list
 - [pgpcre](https://github.com/petere/pgpcre), [re2 for PostgreSQL (PGXN)](https://api.pgxn.org/src/re2/re2-0.4.0/doc/re2.md), [omni\_regex](https://docs.omnigres.org/omni_regex/regex/), [PL/Rust on RDS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.Using.PL_Rust.html), [PCRE2 pcre2\_convert](https://git.stg.centos.org/source-git/pcre2/blob/c8s/f/src/pcre2_convert.c), [RegexBuddy PostgreSQL](https://www.regexbuddy.com/postgresql.html): the translator survey
 - TigerFS repository: `docs/adr/017-relational-directory-structure.md` and `internal/tigerfs/fs/synth/build.go`
