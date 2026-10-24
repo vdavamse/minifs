@@ -331,29 +331,6 @@ async def test_failed_check_after_rescan_ends_the_watch(conn: AsyncConnection, d
         assert calls == 4
 
 
-async def test_cancelled_check_keeps_the_rescan(conn: AsyncConnection, db: str) -> None:
-    slow = asyncio.Event()
-    connect = factory(db)
-
-    async def gated() -> AsyncConnection[Any]:
-        if slow.is_set():
-            await asyncio.sleep(3600)
-        return await connect()
-
-    d = await mkdir_p(conn, "d")
-    async with Watcher(gated, retry_min=0.01) as watcher, watcher.watch("d") as events:
-        await terminate(conn, watcher.backend_pid)
-        while watcher.backend_pid is None:  # reconnected: the rescan is queued
-            await asyncio.sleep(0.01)
-        slow.set()
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(events.get(), 0.5)  # cancelled during the check
-        slow.clear()
-        assert await next_event(events) == RESCAN
-        f = await create(conn, d, "f")
-        assert (await next_event(events)).id == f
-
-
 async def test_forged_delete_does_not_end_the_watch(conn: AsyncConnection, watcher: Watcher) -> None:
     d = await mkdir_p(conn, "d")
     assert d is not None
@@ -374,15 +351,58 @@ async def test_consecutive_rescans_are_folded(db: str) -> None:
     assert await drain(events) == [RESCAN]
 
 
-async def test_aclose_keeps_the_callers_cancellation(db: str) -> None:
+async def test_aclose_keeps_the_callers_cancellation_and_still_cleans_up(db: str) -> None:
     watcher = Watcher(factory(db))
     await watcher.start()
+    events = watcher.subscribe()
+    pid = watcher.backend_pid
     task = asyncio.current_task()
     assert task is not None
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await watcher.aclose()
     task.uncancel()
+    assert watcher.backend_pid is None
+    assert await drain(events) == []
+    async with await AsyncConnection.connect(db, autocommit=True) as conn:
+        row = None
+        for _ in range(100):  # the backend exits shortly after the client closes
+            cur = await conn.execute("SELECT count(*) FROM pg_stat_activity WHERE pid = %s", (pid,))
+            row = await cur.fetchone()
+            if row == (0,):
+                break
+            await asyncio.sleep(0.05)
+        assert row == (0,)
+
+
+async def test_short_get_timeouts_resume_a_slow_check(conn: AsyncConnection, db: str) -> None:
+    """A caller polling get() with a timeout shorter than the check still gets the rescan and later events."""
+    slow = asyncio.Event()
+    connects = 0
+    connect = factory(db)
+
+    async def gated() -> AsyncConnection[Any]:
+        nonlocal connects
+        if slow.is_set():
+            connects += 1
+            await asyncio.sleep(1)
+        return await connect()
+
+    d = await mkdir_p(conn, "d")
+    async with Watcher(gated, retry_min=0.01) as watcher, watcher.watch("d") as events:
+        slow.set()
+        await terminate(conn, watcher.backend_pid)
+
+        async def poll() -> Event:
+            for _ in range(40):
+                with contextlib.suppress(TimeoutError):
+                    return await asyncio.wait_for(events.get(), 0.3)
+            raise AssertionError("no event")
+
+        assert await poll() == RESCAN
+        f = await create(conn, d, "f")
+        assert (await poll()).id == f
+        assert connects == 2  # the reconnect and one check, resumed rather than restarted
 
 
 async def test_watch_queries_use_the_pool(conn: AsyncConnection, db: str) -> None:

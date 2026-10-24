@@ -188,6 +188,7 @@ class PathWatch(Subscription):
         self.kind = "dir"
         self._resolved = False
         self._gone = False
+        self._check: asyncio.Task[bool] | None = None  # survives a cancelled get(), so the next one resumes it
 
     def _offer(self, event: Event) -> None:
         # Until the path is resolved every event is kept and filtered by _open, so none is lost between
@@ -230,6 +231,12 @@ class PathWatch(Subscription):
         self._gone = True
         self.close()
 
+    def close(self) -> None:
+        if self._check is not None:
+            self._check.cancel()
+            self._check = None
+        super().close()
+
     async def get(self) -> Event:
         while True:
             if self._gone:
@@ -239,13 +246,17 @@ class PathWatch(Subscription):
                 continue
             # Events are hints: a rescan or the node's own delete is confirmed against the database.
             if event.op == "rescan" or (event.op == "delete" and event.id == self.node):
+                if self._check is None:
+                    self._check = asyncio.ensure_future(self._still_there())
                 try:
-                    there = await self._still_there()
-                except BaseException:
-                    # Cancelled while checking: keep the event for the next get(), so a rescan is never lost.
+                    there = await asyncio.shield(self._check)
+                except asyncio.CancelledError:
+                    # The caller gave up waiting (a timeout around get()). Keep the event and the check running,
+                    # so the next get() resumes the check rather than restarting it, and a rescan is never lost.
                     self._events.appendleft(event)
                     self._wakeup.set()
                     raise
+                self._check = None
                 if not there:
                     self._finish()
             return event
@@ -306,13 +317,16 @@ class Watcher:
     async def aclose(self) -> None:
         """Closes the connection and ends every subscription."""
         self._closed = True
-        if self._task is not None:
-            self._task.cancel()
-            await asyncio.wait({self._task})  # unlike awaiting the task, never swallows a cancel aimed at the caller
-        await self._discard()
-        for subscription in list(self._subscriptions):
-            subscription._end()  # pyright: ignore[reportPrivateUsage]
-        self._subscriptions.clear()
+        try:
+            if self._task is not None:
+                self._task.cancel()
+                await asyncio.wait({self._task})  # unlike awaiting the task, never swallows a cancel aimed at us
+        finally:
+            # Runs even if we are cancelled while waiting; none of it suspends (close() only calls finish()).
+            await self._discard()
+            for subscription in list(self._subscriptions):
+                subscription._end()  # pyright: ignore[reportPrivateUsage]
+            self._subscriptions.clear()
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -437,11 +451,16 @@ class Watcher:
         the server, and how long depends on the psycopg and libpq versions.
         """
         probe = asyncio.ensure_future(conn.execute("SELECT 1"))
-        done, _ = await asyncio.wait({probe}, timeout=self._probe_timeout)
+        probe.add_done_callback(lambda task: task.cancelled() or task.exception())  # may be abandoned: retrieve it
+        try:
+            done, _ = await asyncio.wait({probe}, timeout=self._probe_timeout)
+        except BaseException:  # cancelled by aclose(): don't leave the probe running on a connection closed under it
+            await self._discard()
+            probe.cancel()
+            raise
         if probe in done:
             probe.result()
             return
-        probe.add_done_callback(lambda task: task.cancelled() or task.exception())  # abandoned: don't log its fate
         await self._discard()
         probe.cancel()
         raise TimeoutError(f"no answer to the keepalive probe within {self._probe_timeout}s")
