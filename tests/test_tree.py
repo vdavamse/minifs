@@ -328,6 +328,32 @@ async def test_many_concurrent_mkdir_p_agree(db: str) -> None:
     assert len(set(results)) == 1 and results[0] is not None
 
 
+async def test_mkdir_p_racing_rmdir_then_mkdir(conn: AsyncConnection, db: str) -> None:
+    old = await mkdir_p(conn, "a")
+    assert old is not None
+    async with await AsyncConnection.connect(db) as other:
+        await unlink(other, old)
+        new = await mkdir_p(other, "a")  # uncommitted: /a replaced by a new directory
+        task = asyncio.create_task(mkdir_p(conn, "a"))
+        await wait_until_blocked(other, conn.info.backend_pid)
+        await other.commit()
+    assert await task == new
+
+
+async def test_mkdir_p_racing_a_directory_swap(conn: AsyncConnection, db: str) -> None:
+    old = await mkdir_p(conn, "a")
+    staged = await mkdir_p(conn, "staging")
+    assert old is not None and staged is not None
+    async with await AsyncConnection.connect(db) as other:
+        await rename(other, old, None, "a.old")
+        await rename(other, staged, None, "a")  # uncommitted: another directory swapped into /a
+        task = asyncio.create_task(mkdir_p(conn, "a", "sub"))
+        await wait_until_blocked(other, conn.info.backend_pid)
+        await other.commit()
+    sub = await task
+    assert sub is not None and await resolve(conn, "a", "sub") == (sub, "dir")
+
+
 # vfs_rename
 
 

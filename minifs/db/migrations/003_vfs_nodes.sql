@@ -192,8 +192,11 @@ BEGIN
                  WHERE n.parent_id = v_id AND n.name = v_seg AND n.kind = 'dir' FOR KEY SHARE;
             END IF;
             EXIT WHEN FOUND;
-            IF (v_id IS NULL AND EXISTS (SELECT FROM vfs_nodes n WHERE n.parent_id IS NULL AND n.name = v_seg))
-               OR EXISTS (SELECT FROM vfs_nodes n WHERE n.parent_id = v_id AND n.name = v_seg) THEN
+            -- Only a file is an error. A directory that appears here (committed since the SELECT above, for
+            -- example replacing one that was removed while we waited) conflicts below and is found next time.
+            IF (v_id IS NULL AND EXISTS (SELECT FROM vfs_nodes n
+                                          WHERE n.parent_id IS NULL AND n.name = v_seg AND n.kind = 'file'))
+               OR EXISTS (SELECT FROM vfs_nodes n WHERE n.parent_id = v_id AND n.name = v_seg AND n.kind = 'file') THEN
                 PERFORM vfs_raise(CASE WHEN v_i = v_n THEN 'EEXIST' ELSE 'ENOTDIR' END,
                                   format('component %s of %L is a file', v_i, p_segments));
             END IF;
