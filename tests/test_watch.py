@@ -78,8 +78,7 @@ async def terminate(conn: AsyncConnection, pid: int | None) -> None:
 
 
 async def append(conn: AsyncConnection, node: UUID, size: int) -> None:
-    """What vfs_append does to the inode."""
-    await conn.execute("UPDATE vfs_nodes SET size = size + %s, mtime = now() WHERE id = %s", (size, node))
+    await conn.execute("SELECT vfs_append(%s, %s)", (node, b"x" * size))
 
 
 # The trigger
@@ -90,7 +89,7 @@ async def test_payload_of_each_op(conn: AsyncConnection, listener: AsyncConnecti
     e = await mkdir_p(conn, "e")
     f = await create(conn, d, "f")
     await append(conn, f, 5)
-    await conn.execute("UPDATE vfs_nodes SET generation = generation + 1, size = 2 WHERE id = %s", (f,))
+    await conn.execute("SELECT * FROM vfs_write(%s, %s)", (f, b"ab"))  # an overwrite: a new generation
     assert await rename(conn, f, e, "g")
     await unlink(conn, f)
     got = await payloads(listener, 7)
@@ -143,13 +142,34 @@ async def test_events_are_delivered_at_commit(conn: AsyncConnection, db: str, li
     assert second["id"] == str(late)
 
 
+async def test_compaction_emits_nothing(conn: AsyncConnection, listener: AsyncConnection) -> None:
+    f = await create(conn, None, "log")
+    for _ in range(5):
+        await append(conn, f, 10)
+    await payloads(listener, 6)
+    cur = await conn.execute("SELECT vfs_compact(%s)", (f,))
+    assert await cur.fetchone() == (4,)  # five extents merged into one
+    marker = await create(conn, None, "marker")
+    [event] = await payloads(listener, 1)
+    assert event["id"] == str(marker)
+
+
+async def test_create_with_content_is_one_create(conn: AsyncConnection, listener: AsyncConnection) -> None:
+    cur = await conn.execute("SELECT id FROM vfs_create(NULL, 'f', 'file', %s)", (b"hello",))
+    row = await cur.fetchone()
+    assert row is not None
+    marker = await create(conn, None, "marker")
+    assert [e["id"] for e in await payloads(listener, 2)] == [str(row[0]), str(marker)]
+
+
 async def test_unchanged_inode_emits_nothing(conn: AsyncConnection, listener: AsyncConnection) -> None:
-    """An UPDATE that changes nothing is silent. Compaction doesn't update vfs_nodes at all, so it's silent too."""
+    """An UPDATE that changes nothing is silent, and so is an empty append."""
     d = await mkdir_p(conn, "d")
     f = await create(conn, d, "f")
     await payloads(listener, 2)
     await conn.execute("UPDATE vfs_nodes SET size = size, mtime = mtime WHERE id = %s", (f,))
     assert await rename(conn, f, d, "f")  # to where it already is
+    await append(conn, f, 0)
     marker = await create(conn, None, "marker")
     [event] = await payloads(listener, 1)
     assert event["id"] == str(marker)
@@ -487,7 +507,7 @@ async def test_closed_subscription_stops_receiving(conn: AsyncConnection, watche
 
 async def test_truncate_is_a_rescan(conn: AsyncConnection, watcher: Watcher) -> None:
     events = watcher.subscribe()
-    await conn.execute("TRUNCATE vfs_nodes")
+    await conn.execute("TRUNCATE vfs_nodes, vfs_extents")
     assert await next_event(events) == RESCAN
 
 
