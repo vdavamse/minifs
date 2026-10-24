@@ -4,13 +4,13 @@ A small POSIX-like virtual filesystem stored entirely in PostgreSQL, built for c
 
 ## Overview
 
-An agent sees one filesystem tree, stored entirely in Postgres, and works on it with five tools: `ls`, `read`, `write`, `glob` and `rg`. Source files, notes, logs, working memory and ingested documents are all ordinary files in that tree. Nothing is mounted, so it runs where FUSE and root are unavailable: sandboxes, serverless containers and managed app platforms.
+An agent sees one filesystem tree, stored entirely in Postgres, and works on it with four tools: `Read`, `Write`, `Glob` and `Grep`. `Read` on a directory lists it, so there is no separate `ls`. Source files, notes, logs, working memory and ingested documents are all ordinary files in that tree. Nothing is mounted, so it runs where FUSE and root are unavailable: sandboxes, serverless containers and managed app platforms.
 
 **Goals**
 
 - One storage model and one set of operations for every kind of data. There are no special tables for logs, memory or task queues.
-- Claude-Code-style tool semantics (Read with offset and limit, Glob, Grep), which models already use well.
-- Incremental reads: an agent can tail a growing file and get only what is new since its last read, using byte offsets.
+- The tools follow ladderframe's tool contracts (`Read` with line-based `offset` and `limit`, `Glob`, `Grep`), which track opencode's and Claude Code's, so models already use them well.
+- Incremental reads: a reader can tail a growing file and get only what is new since its last read, by byte offset in the library and by line number in the tools.
 - Search and glob run inside Postgres, so there's no local mirror, no sync and no `rg` binary.
 - PostgreSQL is the single source of truth, and every read reflects the latest committed write.
 - Low latency: a tool call is one or two SQL round trips.
@@ -21,11 +21,11 @@ An agent sees one filesystem tree, stored entirely in Postgres, and works on it 
 - Full POSIX: no hard links, permission bits, xattrs or random-offset writes in v1.
 - Large binary files. The design targets text (source code, markdown, logs) from kilobytes to a few megabytes per file.
 
-**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly extents in `vfs_extents`. SQL functions implement append, overwrite, positional read, rename, compaction and watch (via NOTIFY). `rg` scans the current bytes of the files in scope inside Postgres, the way ripgrep scans a disk, so there is no line table or search index to keep in step with writes. A recursive walk over the parent pointers powers `glob`. A Python VFS library wraps these functions and caches what can't go stale: directory entries, and file bytes keyed by generation. Agent tools (for example PydanticAI tools) wrap the library.
+**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly extents in `vfs_extents`. SQL functions implement append, overwrite, positional read, rename, compaction and watch (via NOTIFY). Search scans the current bytes of the files in scope inside Postgres, the way ripgrep scans a disk, so there is no line table or search index to keep in step with writes. A recursive walk over the parent pointers powers `Glob`. A Python VFS library wraps these functions and caches what can't go stale: directory entries, and file bytes keyed by generation. Agent tools with ladderframe's contracts (for example PydanticAI tools) wrap the library and number lines on the client.
 
 ## Context
 
-**Why files?** Models are heavily trained on shell and file work. A small, uniform tool set over one tree is easy to discover with `ls`, needs no new tools when a data source is added, and gives humans the same view when debugging. Every agent, ingestion job and human operator follows one UNIX-style model instead of a set of purpose-built tables.
+**Why files?** Models are heavily trained on shell and file work. A small, uniform tool set over one tree is easy to discover by reading directories, needs no new tools when a data source is added, and gives humans the same view when debugging. Every agent, ingestion job and human operator follows one UNIX-style model instead of a set of purpose-built tables.
 
 **Why not a real filesystem?** Many places agents run don't allow one. Managed platforms run apps as a non-privileged user with no system packages and no FUSE ([Databricks Apps best practices](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/best-practices)), and AWS Fargate allows only `SYS_PTRACE` to be added ([ECS KernelCapabilities](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_KernelCapabilities.html)). Every kernel-mount approach needs `CAP_SYS_ADMIN` or `/dev/fuse`, so the filesystem lives in the tool layer, not the kernel. Postgres also gives durability, transactions, concurrent access from many agents and change notifications for free.
 
@@ -37,8 +37,8 @@ Any number of clients share one VFS library and one set of SQL functions. Postgr
 
 ```
   agent tools        ingestion jobs       CLI / humans
- (ls read write        (write docs)        (debugging)
-   glob rg)
+ (Read Write          (write docs)        (debugging)
+  Glob Grep)
         \                  |                  /
          \                 |                 /
           +-------- VFS library (Python) ---+
@@ -51,8 +51,8 @@ Any number of clients share one VFS library and one set of SQL functions. Postgr
 
 | Component | Role |
 | --- | --- |
-| Agent tools | `ls`, `read`, `write`, `glob`, `rg` exposed to the model, with shell-style errors |
-| VFS library | Path resolution, the chroot view, write policy, glob and regex translation, caching, and watch |
+| Agent tools | `Read`, `Write`, `Glob`, `Grep` exposed to the model, with ladderframe's signatures, output formats and errors |
+| VFS library | Path resolution, the chroot view, write policy, glob and regex translation, caching, the line map, cursors and watch |
 | SQL functions | Append, overwrite, positional read, resolve, readdir, create, rename, unlink, search, compact |
 | PostgreSQL | Tables, the NOTIFY trigger, and routine compaction |
 
@@ -81,8 +81,10 @@ All clients share one tree. A file's purpose comes from where it sits and how it
 | Path | Agent | Ingestion | Operator |
 | --- | --- | --- | --- |
 | `/workspace/**` | read, write | — | read, write |
-| `/workspace/log.md` | append | — | read |
+| `/workspace/log.md` | read (the harness appends) | — | read |
 | `/docs/**` | read | write | read |
+
+The most specific rule wins. `append` is a library permission (`vfs.append`): the agent's tools have no append, so an agent's log entries are appended by its harness.
 
 **Coordination through rename (Maildir).** When several agents or workers share work, a file's status can be the directory it sits in. Claiming a file is an atomic rename (see Core operations), so exactly one worker wins.
 
@@ -250,10 +252,12 @@ CREATE TRIGGER trg_vfs_notify AFTER INSERT OR UPDATE OR DELETE ON vfs_nodes
 
 ## Read contract
 
-Every file is read the same way, by byte offset. A source file, a 200 KB doc, `notes.md` and a growing log all page and tail identically.
+Reads come in two layers. The **library** addresses every file by byte offset, so a source file, a 200 KB doc, `notes.md` and a growing log all page and tail identically. The **tool** is ladderframe's line-numbered `Read`, and derives line numbers from the bytes through the client line map (see Caching).
+
+### Library contract: byte offsets
 
 ```
-read(path, offset=None, limit=16_000) -> {content, offset, next_offset, size, generation, eof}
+vfs.pread(path, offset, limit=16_000) -> {content, offset, next_offset, size, generation, eof}
 ```
 
 | Input | Meaning | UNIX equivalent |
@@ -261,8 +265,9 @@ read(path, offset=None, limit=16_000) -> {content, offset, next_offset, size, ge
 | `offset = N`, N ≥ 0 | Start at byte N | `pread(fd, buf, limit, N)` |
 | `offset = -N` | Start N bytes before the end | `tail -c N` |
 | `offset > size` | Empty content, `eof=true`, not an error | `pread` returning 0 |
-| `offset = None` (agent tool only) | Continue from where this agent last read this path | An open fd with its own file position |
 | `limit` | Maximum bytes returned | The `count` argument of `read(2)` |
+
+Library reads return exact bytes, never adjusted to line or character boundaries. Ingestion, other services, harnesses and tests use them.
 
 ### One snapshot for the bytes, size and generation
 
@@ -301,29 +306,53 @@ $$ LANGUAGE sql STABLE;
 - **It's one statement, so one MVCC snapshot.** `size` and `generation` describe exactly the bytes returned, even while another client is appending.
 - **The `LEFT JOIN`** returns a single row with NULL data when nothing overlaps, so a read past EOF or of an empty file still returns `size` and `generation`.
 
-### Two layers, two precisions
-
-| Layer | Users | Behavior |
-| --- | --- | --- |
-| Library `vfs.pread` | Ingestion, other services, tests | Exact bytes, never adjusted |
-| Agent tool `read` | The model | Snaps to whole lines. The start moves back to the beginning of its line, the end is cut at the last newline within `limit`, and at least one line is always returned. A single line longer than `limit` is cut at a UTF-8 boundary. |
-
-Line snapping reads up to 4 KB before the requested offset to find the line start. The model never sees half a line or a split multi-byte character.
-
 ### Per-path cursors and generations
 
-The tool keeps `path -> (generation, next_offset)` in the agent's run state and can save it to an `agent_cursors` table for crash recovery.
+A library caller that tails files (a harness, an ingestion job, a watcher) keeps a `Cursor`, `path -> (generation, next_offset)`, and can save it to a `vfs_cursors` table for crash recovery. `vfs.read_from(cursor)` continues where the cursor left off:
 
-| Since the last read | `generation` | What `read(path)` with no offset does |
+| Since the last read | `generation` | What `vfs.read_from(cursor)` does |
 | --- | --- | --- |
 | Bytes appended | Unchanged | Returns only the new bytes |
 | Nothing changed | Unchanged | Empty content, `eof=true` |
-| File overwritten (a doc re-ingested, `notes.md` rewritten) | Changed | Restarts at 0 and says "file was rewritten since your last read" |
+| File overwritten (a doc re-ingested, `notes.md` rewritten) | Changed | Restarts at 0 and flags the result as rewritten |
 
-### Offsets as one currency
+### Tool contract: numbered lines
 
-- `rg` hits carry byte offsets (`style.md @18234`), so the agent can follow up with `read(path, offset=18234 - 500, limit=2000)`.
-- A cursor is just a saved `next_offset`, so tailing a log is a `read` with no offset.
+```
+Read(filePath, offset=None, limit=None) -> str
+```
+
+The tool takes ladderframe's `Read` parameters and returns its output format.
+
+| Input | Meaning |
+| --- | --- |
+| `offset = N`, N ≥ 1 (default 1) | Start at line N (1-indexed). `offset=0` means 1 |
+| A negative `offset` or `limit` | `ModelRetry: offset and limit must be non-negative integers` |
+| `limit = K` (default 2000) | At most K lines |
+| `offset` past the last line | `ModelRetry`: `Offset 120 is out of range for this file (80 lines)` |
+| `filePath` is a directory | Its entries, hidden ones included, one per line and with `/` after subdirectories, between `<type>directory</type>` and `<entries>` tags. Sorted case-insensitively. `offset` and `limit` page through the entries; the footer is `(N entries)` or `(Showing X of Y entries. Use 'offset' parameter to read beyond entry Z)` |
+
+```
+<path>/workspace/src/config.py</path>
+<type>file</type>
+<content>
+17: def parse_config(path: str) -> Config:
+18:     with open(path) as f:
+
+(Showing lines 17-18 of 240. Use offset=19 to continue.)
+</content>
+```
+
+- **Lines come from the line map.** The map turns line N into a byte offset, then `vfs_pread` reads forward through the content cache until K lines or the byte cap. Lines split on `\n` only and drop a trailing `\r`, so line numbers agree with `Grep` hits.
+- **Bounded output, as in ladderframe.** A line longer than 2,000 characters is cut and gets `... (line truncated to 2000 chars)`, and output stops at 50 KB with `(Output capped at 50 KB. Showing lines a-b. Use offset=b+1 to continue.)`. The last page ends with `(End of file - total n lines)`.
+- **Text only.** Bytes are decoded as UTF-8 with replacement characters. A file that looks binary (a NUL byte in the first 4 KB, more than 30% non-printable bytes, or a known binary extension) gets `ModelRetry: Cannot read binary file: <path>`. ladderframe's `Read` attaches images and PDFs; minifs's `Read` doesn't, so they get the same binary-file error (see Differences from rg).
+- **Nearby instructions.** As in ladderframe, the first `Read` of a file below a directory holding an `AGENTS.md` or `CLAUDE.md` (up to `/workspace`) appends that file's text in a `<system-reminder>` block, headed `Instructions from: <path>`, once per conversation. The walk follows parent ids, so it costs one directory lookup per level, served from the directory cache.
+- **Stateless.** There is no `offset=None` auto-continue and no per-agent cursor in the tool. To tail a log, the agent calls `Read` again with the `offset` its last footer gave. Generation-aware tailing is a library feature.
+
+### Line numbers in the tools, byte offsets in the library
+
+- `Grep` hits carry line numbers (`Line 42: ...`), so the agent follows up with `Read(filePath, offset=32, limit=40)`.
+- Library search results also carry each hit's byte offset, in the same currency as `vfs.pread`. A cursor is just a saved `next_offset`.
 
 ## Caching
 
@@ -335,8 +364,8 @@ PostgreSQL stays the single source of truth: every read through a cache still re
 | Cache | Key → value | Kept fresh by | Used by |
 | --- | --- | --- | --- |
 | Directory entries | `(parent_id, name) -> (id, kind)` | NOTIFY `move` and `delete` evict; a 2 s TTL as a fallback | Every path resolution |
-| File content | `(node_id, generation) -> bytes [0, cached_size)` | The read itself (below) | Agent `read`, line snapping, the line map |
-| Line map | `(node_id, generation) ->` byte offset of every 1,000th line start, and the line count | Extended with the content | Line-numbered reads |
+| File content | `(node_id, generation) -> bytes [0, cached_size)` | The read itself (below) | `Read`, `vfs.pread`, the line map |
+| Line map | `(node_id, generation) ->` byte offset of every 1,000th line start, and the line count | Extended with the content | `Read` and its line numbers |
 
 The caches live in each process's memory and are never shared between processes. Search and glob results aren't cached, because they depend on the whole tree. Saved cursors aren't a cache: they're per-agent state.
 
@@ -362,11 +391,11 @@ Line numbers are derived on the client and never stored in Postgres.
 
 - The map holds the byte offset where every 1,000th line starts, plus the total line count. Reading lines N to N+k jumps to the nearest checkpoint at or before N, reads forward from that byte offset and splits on `\n`.
 - It is built from the content on first use and extended on append by scanning only the new bytes. A cold start on a large file reads that file once.
-- Lines split on `\n` only, as in ripgrep, so line numbers agree with `rg` hits.
+- Lines split on `\n` only, as in ripgrep and ladderframe's `Read`, so line numbers agree with `Grep` hits.
 
 ## Glob
 
-`glob` and `rg` share one walker and one glob matcher, as they do inside ripgrep (whose matcher is the `globset` crate). The walker is `vfs_glob`, a recursive CTE over the parent pointers that reads only `vfs_nodes`, never content.
+`Glob` and `Grep` share one walker and one glob matcher, as they do inside ripgrep (whose matcher is the `globset` crate). The walker is `vfs_glob`, a recursive CTE over the parent pointers that reads only `vfs_nodes`, never content.
 
 ### Semantics
 
@@ -381,9 +410,9 @@ Line numbers are derived on the client and never stored in Postgres.
 | `\*` | A literal `*` | `\*` |
 | A pattern with no `/`, e.g. `*.md` | The file name at any depth (the gitignore/rg rule) | `^(?:.*/)?[^/]*\.md$` |
 | A pattern with `/`, e.g. `src/*.py` | Anchored at the search root | `^src/[^/]*\.py$` |
-| `exclude=["**/node_modules/**"]` | Like rg's `-g '!...'` | `AND NOT path ~ ANY(...)` |
+| `exclude=["**/node_modules/**"]` (library only) | Like rg's `-g '!...'` | `AND NOT path ~ ANY(...)` |
 
-The defaults follow rg. Only files are returned (directories are walked, not listed). Entries starting with `.` are skipped unless the pattern segment itself starts with `.`. Results are sorted by `mtime`, newest first, as in Claude Code's Glob tool.
+The defaults follow rg. Only files are returned (directories are walked, not listed). For `Glob`, hidden directories (names starting with `.`) are never descended into, and a hidden file is returned whenever the pattern matches it, as `rg --files` does: `*.yml` finds `.foo.yml`, but `.github/**` finds nothing. `Grep` searches hidden files and directories, as ladderframe's `Grep` runs `rg --hidden`. Both skip `.git/`. `Glob` results are sorted by `mtime`, newest first (see Differences from rg).
 
 ### Translator
 
@@ -429,7 +458,7 @@ Only the special characters are escaped. In Postgres ARE, a backslash before a l
 
 | Hint | Example | Effect |
 | --- | --- | --- |
-| Literal prefix | `docs/guides/**/*.md` gives `docs/guides` | Resolve that directory once and walk only its subtree. If it doesn't exist, return an empty result, not an error. |
+| Literal prefix | `docs/guides/**/*.md` gives `docs/guides` | Resolve that directory once and walk only its subtree. If it doesn't exist, return an empty result, not an error. A prefix through a hidden directory also gives an empty result for `Glob`, as in rg. |
 | Max depth | `src/*/*.py` gives 3 | Stop the recursion at that depth. Only when the pattern has no `**`. |
 | Name filter | Last segment `*.md` gives `LIKE '%.md'` | A cheap filter on the name before the full regex. Only when the last segment has no `[` or `{`. |
 
@@ -444,13 +473,13 @@ CREATE FUNCTION vfs_glob(
         SELECT id, name, kind, size, mtime, 1
           FROM vfs_nodes
          WHERE parent_id IS NOT DISTINCT FROM p_root
-           AND (p_hidden OR name NOT LIKE '.%')
+           AND (p_hidden OR kind = 'file' OR name NOT LIKE '.%')   -- rg: hidden dirs aren't walked
         UNION ALL
         SELECT c.id, t.path || '/' || c.name, c.kind, c.size, c.mtime, t.depth + 1
           FROM vfs_nodes c JOIN t ON c.parent_id = t.id
          WHERE t.kind = 'dir'
            AND (p_max_depth IS NULL OR t.depth < p_max_depth)
-           AND (p_hidden OR c.name NOT LIKE '.%')
+           AND (p_hidden OR c.kind = 'file' OR c.name NOT LIKE '.%')
     )
     SELECT id, path, size, mtime
       FROM t
@@ -467,7 +496,7 @@ Each directory level is an index lookup on `UNIQUE (parent_id, name)`. A few tho
 
 ## Search (rg in Postgres)
 
-`rg` runs entirely in Postgres and scans the current bytes of the files in scope, the way ripgrep scans a disk. Nothing is derived at write time, so an append stays one INSERT, there's no index to keep in step, and a search sees every committed write, even one from a millisecond ago. There's no local mirror, no sync and no `rg` binary.
+`Grep` runs entirely in Postgres and scans the current bytes of the files in scope, the way ripgrep scans a disk. Nothing is derived at write time, so an append stays one INSERT, there's no index to keep in step, and a search sees every committed write, even one from a millisecond ago. There's no local mirror, no sync and no `rg` binary.
 
 ### Why there's no line index
 
@@ -503,7 +532,7 @@ SET LOCAL statement_timeout = '2s';
 
 WITH files AS (
     SELECT g.id, g.path, vfs_text(g.id) AS body
-      FROM vfs_glob($root, $glob_regex, $name_like, $depth, $excludes, false, 10000) g
+      FROM vfs_glob($root, $glob_regex, $name_like, $depth, $excludes, true, $file_cap + 1) g  -- hidden files included
 ), hits AS (                                        -- step 2: one regex test per file
     SELECT id, path,
            CASE WHEN right(body, 1) = E'\n' THEN left(body, -1) ELSE body END AS body
@@ -525,37 +554,51 @@ SELECT path, line_no, byte_offset, text
 ```
 
 - **Trailing newline.** The final `\n` is dropped before splitting, so a file ending in a newline doesn't gain an empty phantom line that `^$` would match.
-- **Byte offsets.** Each hit's offset is the running byte length of the lines before it, in the same currency as `read(offset=...)`.
+- **Byte offsets.** Each hit's offset is the running byte length of the lines before it, in the same currency as `vfs.pread(offset=...)`. The `Grep` tool shows only line numbers.
 - **One snapshot.** `vfs_text` is `STABLE`, so it reads with the query's snapshot, and every file is searched as of the same moment.
+
+The `Grep` tool takes only ladderframe's parameters: `pattern`, `path` (a directory or a single file) and `include`. The other rg features are options of the library's `vfs.search`; a model gets case-insensitive search by writing `(?i)` in the pattern.
 
 | rg feature | Implementation |
 | --- | --- |
 | `-i` | The translator case-folds the pattern itself (`[Ee]`), so both steps still use `~`. ARE's `~*` would depend on the database's locale (see Regex dialect). |
 | `-F` (fixed strings) | `strpos(body, $s) > 0` for the file filter and `strpos(text, $s) > 0` for lines. With `-i` too, the escaped literal goes through the translator instead. |
 | `-C n` (context) | Keep the lines `line_no BETWEEN hit - n AND hit + n` from the same split of the matching files |
-| `-g` / `--glob` | Through the `vfs_glob` scope |
+| `-g` / `--glob` (the tool's `include`) | Through the `vfs_glob` scope |
 | `--max-count` | `row_number() OVER (PARTITION BY path)` plus a filter |
-| Byte offset per hit | The running sum above, which `read(offset=...)` accepts directly |
+| Byte offset per hit | The running sum above, which `vfs.pread(offset=...)` accepts directly |
 | `-U` (multiline) | Not supported in v1. A literal `\n` in the pattern is rejected, as rg does without `-U`. |
 
 ### Cost and limits
 
 - Work grows with the bytes in scope, not with the number of matches. The file filter costs one regex pass per file, and only matching files are split into lines.
-- The total size of the scope comes from `vfs_nodes` before any content is read. A search over more than a configured cap (for example 50 MB) is refused with `rg: search scope is 120 MB; narrow the path or glob`.
+- The total size of the scope comes from `vfs_nodes` before any content is read. A search over more than a configured cap (for example 50 MB) is refused with `ModelRetry: Search scope is 120 MB; narrow the path or include pattern`.
 - Every search runs under `SET LOCAL statement_timeout`.
-- Files that aren't valid UTF-8 are skipped. They're still readable with `read`.
+- Files that aren't valid UTF-8 are skipped. They're still readable with `vfs.pread`, and with `Read` unless they look binary.
 
 ### Output format for the agent
 
+ladderframe's `Grep` format: a count, then hits grouped by file, at most 100 by default.
+
 ```
-/docs/guides/style.md:42 @18234: Prefer early returns over nested conditionals.
-/workspace/src/config.py:17 @2210: def parse_config(path: str) -> Config:
-... 38 more matches; narrow the pattern or path
+Found 100 matches (more matches available)
+/docs/guides/style.md:
+  Line 42: Prefer early returns over nested conditionals.
+
+/workspace/src/config.py:
+  Line 17: def parse_config(path: str) -> Config:
+  ...
+
+(Results truncated. Consider using a more specific path or pattern.)
 ```
+
+The example is a `Grep` with `path="/"`; the default path is `/workspace`. A search with no hits returns `No files found`. A trailing `\r` is dropped from each hit line, as in ladderframe, and lines longer than 2,000 characters are cut, with `...` appended.
+
+`Glob` output is ladderframe's too: one absolute path per line, `No files found` when nothing matches, and `(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)` past the limit.
 
 ## Regex dialect and translation
 
-`rg` patterns are Rust regexes, and Postgres speaks ARE (Advanced Regular Expressions). We parse each pattern with [`regex-syntax`](https://docs.rs/regex-syntax), the parser behind Rust's `regex` crate and therefore behind ripgrep, and emit ARE from its output. No open-source translator in that direction exists, and the extensions that bring PCRE or RE2 into Postgres aren't available on most managed services. The translator is the riskiest part of search: when it gets something wrong, it fails silently.
+`Grep` patterns are Rust regexes, as in rg, and Postgres speaks ARE (Advanced Regular Expressions). We parse each pattern with [`regex-syntax`](https://docs.rs/regex-syntax), the parser behind Rust's `regex` crate and therefore behind ripgrep, and emit ARE from its output. No open-source translator in that direction exists, and the extensions that bring PCRE or RE2 into Postgres aren't available on most managed services. The translator is the riskiest part of search: when it gets something wrong, it fails silently.
 
 ### Why it's needed: patterns that silently change meaning
 
@@ -609,7 +652,7 @@ Rejected, each with a message in ripgrep's format:
 | A repetition count above 255 | ARE's limit |
 | A translated pattern over the size cap (for example 256 KB) | Keeps compilation bounded. One `\w` is about 10 KB; one `\b` is four of them. |
 
-**Longest-match versus first-match** semantics don't matter here. `rg` only asks whether a line matches and returns the whole line; it never extracts match spans.
+**Longest-match versus first-match** semantics don't matter here. Search only asks whether a line matches and returns the whole line; it never extracts match spans.
 
 ### Cost of explicit classes
 
@@ -663,15 +706,34 @@ Postgres's built-in ARE engine is the only regex engine available everywhere, so
 
 ## Agent integration
 
-Agents get Claude Code's file toolset with the same semantics, so models apply what they already practice. The examples use PydanticAI, but the tools are plain async functions over the VFS library and fit any agent framework or an MCP server.
+The agent tools follow ladderframe's tool contracts (`packages/harness/src/ladderframe/tools`): the same names, parameters, output formats and error handling as its `Read`, `Glob` and `Grep`, and as its upcoming `Write`. ladderframe's tools track opencode's, which mirror Claude Code's, so models apply what they already practice, and an agent moves between a ladderframe workspace on disk and minifs without prompt changes. The examples use PydanticAI, but the tools are plain async functions over the VFS library and fit any agent framework or an MCP server.
 
-| Claude Code tool | VFS tool | Backed by |
+| Tool | Signature | Backed by |
 | --- | --- | --- |
-| Read (`offset`, `limit`) | `read(path, offset, limit)` | `vfs_pread` over `vfs_extents`, through the content cache |
-| Glob | `glob(pattern, path, exclude)` | `vfs_glob` over `vfs_nodes` |
-| Grep (ripgrep) | `rg(pattern, path, glob, ignore_case, fixed_strings, context)` | `vfs_glob` and a scan of `vfs_extents` |
-| LS | `ls(path)` | `vfs_readdir` |
-| Write | `write(path, content)` | `vfs_write` or `vfs_create`, subject to the write policy |
+| Read | `Read(filePath, offset, limit)`: numbered lines of a file, or the entries of a directory | The line map and `vfs_pread`, through the content cache; `vfs_readdir` for a directory |
+| Glob | `Glob(pattern, path)`: absolute paths, at most 100 | `vfs_glob` over `vfs_nodes` |
+| Grep | `Grep(pattern, path, include)`: hits grouped by file, at most 100 | `vfs_glob` and a scan of `vfs_extents` |
+| Write | `Write(filePath, content)` | `vfs_write` or `vfs_create`, subject to the write policy |
+
+Paths are absolute in the agent's chroot view; a relative path resolves against `/workspace`, the agent's working directory. Options without a ladderframe parameter (Glob's `exclude`, Grep's `ignore_case`, `fixed_strings`, `context` and `max_count`, byte offsets) stay in the library.
+
+**Write.** ladderframe has no `Write` yet. Until it lands, minifs follows opencode's `write`, which ladderframe's tools track: `filePath` and `content`, creating the file and any missing parent directories, or replacing the whole file as a new generation. Details, from opencode:
+
+- **Read before overwrite.** Overwriting an existing file requires a `Read` of it earlier in the run, and the file must be unchanged since. The tool records each file's `(generation, size)` at its last `Read`, and `vfs_write` compares them under the inode lock, so the check and the write are one atomic step. On a mismatch: `ModelRetry: File has been modified since it was last read. Read it again before overwriting.` The same check stops two agents from silently clobbering each other's `notes.md`.
+- **Create races.** If `vfs_create` hits the `UNIQUE` constraint because another client created the file first, the call becomes the overwrite case above and fails the read check.
+- **Other errors.** `filePath` naming a directory, or content over the file size cap, raises `ModelRetry`. A write the policy denies (for example to `/docs/**`, or to `/workspace/log.md`) is a returned string.
+- **Success** returns `Wrote file successfully.`
+
+When ladderframe's `Write` lands, minifs adopts its signature and messages.
+
+### Differences from rg
+
+ladderframe's `Glob` and `Grep` run ripgrep over a disk; minifs implements the same contracts in Postgres. Four differences remain, by design:
+
+- **No `.gitignore`.** ladderframe's `Glob` and `Grep` both honour `.gitignore`, `.ignore` and git's excludes, as rg does by default. minifs has no ignore files. In their place, `Glob` and `Grep` apply a default exclude list (`**/node_modules/**`, `**/.venv/**`, `**/__pycache__/**`, `**/.mypy_cache/**`, `**/dist/**`, `**/build/**`), configurable per workspace. Hidden files follow ladderframe (see Glob). Honouring `.gitignore` files stored in the tree can come later.
+- **ARE underneath.** Patterns are parsed as rg parses them and translated to Postgres ARE (see Regex dialect). A few constructs rg accepts are refused with a `ModelRetry` that names them: byte classes outside ASCII, repetition counts above 255, and patterns whose translation exceeds the size cap.
+- **mtime order.** `Glob` returns paths newest first, as opencode does; ladderframe's `Glob` and `Grep` return them in rg's walk order, which varies between runs because rg searches in parallel. `Grep` orders hits by path, then line. Above the result limit, minifs returns the first 100 in its order, where ladderframe returns an arbitrary 100.
+- **No attachments.** `Read` doesn't attach images or PDFs (see Read contract).
 
 ### Package layout
 
@@ -685,8 +747,9 @@ minifs/
     regex.py     thin wrapper over minifs._regex, with the translation cache
     watch.py     LISTEN vfs and async iterators per path
     cache.py     directory-entry cache, content and line-map cache, NOTIFY eviction
+    cursor.py    Cursor and read_from: generation-aware tailing for library callers
   tools/
-    tools.py     ls / read / write / glob / rg
+    tools.py     Read / Write / Glob / Grep, with ladderframe's contracts
   db/
     pool.py      psycopg pool and credential refresh
     schema.sql
@@ -702,32 +765,42 @@ class Deps:
     vfs: VFSClient
     workspace_id: UUID
     actor: str = "agent"
-    cursors: dict[str, Cursor] = field(default_factory=dict)   # path -> (generation, next_offset)
+    read_versions: dict[str, tuple[int, int]] = field(default_factory=dict)   # path -> (generation, size) at last Read, for Write
 
-agent = Agent("<model>", deps_type=Deps, instructions=AGENT_PROMPT)
+agent = Agent("<model>", deps_type=Deps, instructions=AGENT_PROMPT, retries=3)   # ladderframe's tool_retries
 
 @agent.tool
-async def read(ctx: RunContext[Deps], path: str, offset: int | None = None, limit: int = 16_000) -> str:
-    """Read any file by byte offset. Omit offset to continue where you last read this path;
-    offset=0 rereads from the start; negative offsets count from the end. Output is whole lines."""
+async def Read(ctx: RunContext[Deps], filePath: str, offset: int | None = None, limit: int | None = None) -> str:
+    """Read a file or directory.
+
+    Args:
+        filePath: The absolute path to the file or directory to read
+        offset: The line number to start reading from (1-indexed)
+        limit: The maximum number of lines to read (defaults to 2000)
+    """
     ...
 
 @agent.tool
-async def glob(ctx: RunContext[Deps], pattern: str, path: str = "/",
-               exclude: list[str] | None = None, max_results: int = 100) -> str:
-    """Find files by name pattern ("**/*.py", "src/*.md"). Newest first."""
+async def Glob(ctx: RunContext[Deps], pattern: str, path: str | None = None) -> str:
+    """Find files by glob pattern."""
     ...
 
 @agent.tool
-async def rg(ctx: RunContext[Deps], pattern: str, path: str = "/", glob: str | None = None,
-             ignore_case: bool = False, fixed_strings: bool = False, context: int = 0) -> str:
-    """Search file contents (Rust-style regex). Hits show path:line @byte_offset."""
+async def Grep(ctx: RunContext[Deps], pattern: str, path: str | None = None, include: str | None = None) -> str:
+    """Search file contents with a regular expression."""
+    ...
+
+@agent.tool
+async def Write(ctx: RunContext[Deps], filePath: str, content: str) -> str:
+    """Write a file, creating it or replacing its contents."""
     ...
 ```
 
-**Errors are returned, not raised.** Each tool catches `VFSError` and returns a shell-style message, such as `read: /workspace/foo.md: No such file or directory (hint: ls /workspace)`. Models recover from these naturally. Raising an exception the framework treats as a retry spends the retry budget and can fail the run.
+The tool descriptions start from ladderframe's text, so a model sees the same instructions on disk and in minifs. minifs drops the lines that point to tools or features it doesn't have (Bash with `rg`, the Agent tool, image and PDF attachments, "the local filesystem"). It adds one line to `Grep`'s description: use `(?i)` for case-insensitive search; lookaround and backreferences aren't supported.
 
-**Pre-fill reads that happen every time.** Each tool call costs a full extra LLM inference: the model stops, waits for the result, then reprocesses its whole context. The database query takes milliseconds; the extra inference takes roughly 0.5 to 1.5 s. If a harness always reads the same file at the start of a run (for example `notes.md`), it can run that `read` itself and put the result in the prompt as if the agent had run it. A read that depends on what the agent is thinking stays a tool call.
+**Errors follow ladderframe.** A mistake the model can fix by calling again raises `ModelRetry`, with a message that says what to change: a missing path (`File not found: /workspace/notes.md`, with up to three similar names), an offset past the end, a binary file, a `Glob` path that isn't a directory (`glob path must be a directory: ...`, `No such directory: ...`), a missing `Grep` path (`No such file or directory: ...`) or empty pattern (`pattern is required`), a pattern the translator rejects (ripgrep's message and position), a search scope over the cap, or a timeout. A path outside the agent's view is `File not found`, so the error doesn't reveal what exists beyond the chroot. A permission denial (the write policy) is returned as a string, as ladderframe's permission guard does: retrying won't help, and the model reads the refusal and moves on. Each tool maps `VFSError` to one of the two at its boundary, and nothing else escapes.
+
+**Pre-fill reads that happen every time.** Each tool call costs a full extra LLM inference: the model stops, waits for the result, then reprocesses its whole context. The database query takes milliseconds; the extra inference takes roughly 0.5 to 1.5 s. If a harness always reads the same file at the start of a run (for example `notes.md`), it can run that `Read` itself and put the result in the prompt as if the agent had run it. A read that depends on what the agent is thinking stays a tool call.
 
 **Reacting to changes.** `vfs.watch(path)` lets a harness start an agent run when a file changes, for example when a new file appears in `tasks/new/` or a log grows.
 
@@ -752,9 +825,10 @@ Three things matter most in production: credential handling, LISTEN connections 
 
 ### Protecting the database
 
-- **Every search runs under `SET LOCAL statement_timeout = '2s'`.** On timeout, return `rg: search timed out; narrow the pattern or path`.
-- **Cap the bytes scanned.** Refuse a search whose scope is larger than the configured cap, with a hint to narrow the `path` or `glob`. The size comes from `vfs_nodes`, so the check reads no content.
-- **Cap output:** at most 50 matches by default, and `glob` at most 100 results, each with a "narrow it" hint.
+- **Every search runs under `SET LOCAL statement_timeout = '2s'`.** On timeout, raise `ModelRetry: Search timed out; narrow the pattern or path`.
+- **Cap the files in scope.** The scope query asks for one file more than the cap (for example 10,000). If it gets it, the search is refused with a `ModelRetry` to narrow the `path` or `include`, rather than silently dropping the oldest files.
+- **Cap the bytes scanned.** Refuse a search whose scope is larger than the configured cap, with a hint to narrow the `path` or `include`. The size comes from `vfs_nodes`, so the check reads no content.
+- **Cap output:** `Grep` and `Glob` return at most 100 results by default, as in ladderframe, each with a "narrow it" hint.
 - **Separate pools for search and writes.** If CPU contention appears at scale, consider sending search to a read replica. That gives up read-your-latest-write consistency, so only do it if you need to.
 
 ### Capacity, rough estimates
@@ -764,7 +838,7 @@ Three things matter most in production: credential handling, LISTEN connections 
 | Append cost | One inode row lock, one extent insert, one NOTIFY |
 | Storage | The text itself, uncompressed (`STORAGE EXTERNAL`), plus about 30 bytes of row overhead per extent |
 | Search cost | One regex pass over the bytes in scope, plus a line split of the files that match |
-| `glob` over a few thousand nodes | Milliseconds |
+| `Glob` over a few thousand nodes | Milliseconds |
 
 ### Observability
 
@@ -786,9 +860,9 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Read | For random files and random `(offset, limit)` sequences, joining the `pread` chunks equals the full content, including while another task keeps appending | Property |
 | Read edges | Offsets `0`, `size`, `size+1`, `-1`, `-size`, `-(size+1)`; empty file; one extent larger than `limit`; a read spanning extents | Unit |
 | Read plan | On a file with 10,000+ extents, `EXPLAIN` of a read near the end shows a backward index descent and a bounded forward scan, not a scan from offset 0 | Unit |
-| Kinds | Creating a child under a file gives `ENOTDIR`; an extent on a directory is rejected by the foreign key; `read` of a directory gives `EISDIR` | Unit |
-| Line snapping | Offset in the middle of a line or of a multi-byte character; a line longer than `limit`; no trailing newline | Unit |
-| Generations | An overwrite between two cursor reads produces the restart note; an append doesn't | Unit |
+| Kinds | Creating a child under a file gives `ENOTDIR`; an extent on a directory is rejected by the foreign key; `vfs.pread` of a directory gives `EISDIR`, and `Read` of one lists its entries | Unit |
+| Read tool | Output equals ladderframe's `Read` on the same file written to disk, for random `offset` and `limit`, CRLF files, lines over 2,000 characters, the 50 KB cap, no trailing newline and directories | Differential |
+| Generations | An overwrite between two `vfs.read_from(cursor)` calls flags the restart; an append doesn't | Unit |
 | Tree | `UNIQUE NULLS NOT DISTINCT` rejects duplicate root names; `rmdir` on a non-empty directory gives `ENOTEMPTY`; a move into its own subtree gives `EINVAL` | Unit |
 | Claim | Two claimers racing for the same file: exactly one wins | Concurrency |
 | Watch | Events arrive only after commit; `move` versus `modify` is classified correctly | Integration |
@@ -802,21 +876,22 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Glob pruning | Results with all hints enabled equal results with none | Differential |
 | Regex translator | A corpus of real model patterns plus generated ones, compared with Rust's `regex` crate, in a `C`-locale and a UTF-8 database | Differential |
 | Regex rejections | Every pattern the translator rejects at parse time is also rejected by the `rg` binary | Differential |
-| rg scope | `rg(p, glob=X)` hits exactly the files that `glob(X)` returns | Integration |
-| Agent tools | Errors come back as shell-style strings; the chroot blocks `..` escapes; the write policy blocks writes outside allowed paths | Unit |
+| Search scope | `vfs.search(p, glob=X)` hits exactly the files that `vfs.glob(X)` returns | Integration |
+| Glob and Grep tools | Output equals ladderframe's `Glob` and `Grep` on the same tree written to disk, apart from the documented differences (default excludes instead of `.gitignore`, order). Results are compared as sets, and only when they're under the limit | Differential |
+| Agent tools | Retryable mistakes raise `ModelRetry`; permission denials come back as strings; the chroot blocks `..` escapes; the write policy blocks writes outside allowed paths; `Write` over a file changed since its last `Read` (including a concurrent create) raises `ModelRetry` | Unit |
 | Evals | A set of recorded coding tasks run against the VFS tools: track task success and tool calls per task | Eval |
 
 ## Roadmap
 
 The tool-based VFS ships first. A TigerFS front end follows once the tree and tools are stable.
 
-**What stays frozen.** The five tool names and signatures, and the shell-style error format. The TigerFS work can then replace the VFS client with a thin MCP client, and prompts, tools and evals carry over unchanged.
+**What stays frozen.** The ladderframe-style tools: `Read`, `Write`, `Glob` and `Grep`, with ladderframe's signatures, output formats and error handling. The TigerFS work can then replace the VFS client with a thin MCP client, and prompts, tools and evals carry over unchanged.
 
 **What the TigerFS integration adds.** Three pieces of work in the TigerFS repo:
 
 1. A `tigerfs mcp` front end over `fs.Operations`, which agent frameworks connect to with their MCP clients.
 2. An extent-backed file workspace format, `vfs_nodes` plus `vfs_extents`. TigerFS's current synth workspaces store each file's body in a single row, so they can't do cheap appends or offset reads. With extents, a FUSE `Write` at an offset maps straight onto extents.
-3. `glob` and `rg` exposed through the same front end, so every client gets the same search results.
+3. `Glob` and `Grep` exposed through the same front end, so every client gets the same search results.
 
 The payoff is that the same tree mounts through FUSE on a laptop or NFS on Kubernetes for debugging, alongside tool-based access where mounts aren't allowed.
 
@@ -827,8 +902,9 @@ The payoff is that the same tree mounts through FUSE on a laptop or NFS on Kuber
 | Client access | Through the VFS library, or direct SQL | The VFS library, for one model end to end. Revisit only if profiling shows overhead. |
 | Workspaces per process | One, or many | Many, with one LISTEN connection filtered by payload |
 | Postgres version | PG 15–17 (UUIDv7 from an extension or the app), or PG 18 (built-in `uuidv7()`) | PG 18 where available |
-| Line-numbered reads | A stored line table, or derived on the client | Derived, from the line map (see Caching). If cold reads of large logs prove slow, store each extent's count of preceding newlines: one integer per extent, set by `vfs_append` and kept by compaction. |
+| Line-numbered reads | A stored line table, or derived on the client | **Decided for v1:** derived on the client from the line map (see Caching), and used by `Read`. If cold reads of large logs prove slow, store each extent's count of preceding newlines: one integer per extent, set by `vfs_append` and kept by compaction. |
 | Search index | None (scan), or a trigram GIN index | Scan in v1. If bytes scanned per search grow too large, index whole-file text refreshed by compaction, and keep scanning the newer appends. An index on raw extents would be unsound, because a match can cross an extent boundary. |
+| Write contract | opencode's `write`, or ladderframe's `Write` | opencode's until ladderframe's `Write` lands, then ladderframe's |
 | Semantic search | pgvector over windows of file text | After the core tools are stable |
 
 ## Sources
