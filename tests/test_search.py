@@ -1,8 +1,10 @@
 """Search (migration 008, minifs.vfs.search, VFSClient.grep): vfs_search, the scope and its caps."""
 
 import json
+import random
 import subprocess
 import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -379,25 +381,56 @@ async def test_stops_at_the_limit(vfs: VFSClient, conn: AsyncConnection) -> None
 
 
 async def test_stops_inside_a_file(vfs: VFSClient, conn: AsyncConnection) -> None:
-    # One large file of matching lines, in many extents, holding all of vfs_extents: with statistics that say
-    # so, the planner may sort the file's extents rather than walk the index, and the search must still stop
-    # at the first extents instead of filtering the whole file.
-    await put(vfs, "/app.log", b"".join(f"INFO request {i}\n".encode() for i in range(600_000)))
+    # One large file in many extents, holding all of vfs_extents: with statistics that say so, the planner may sort
+    # the file's extents rather than walk the index, and the search must still stop at the extent with its last
+    # hit. Measured in TOAST blocks read: every search reads each block once for the file's UTF-8 check, and a
+    # full pass reads it again; a stop at the first extents barely does.
+    rng = random.Random(10)
+    lines = [f"INFO request {rng.getrandbits(64):016x}\n" for _ in range(300_000)]  # random: stored out of line
+    for i in range(0, 300_000, 30_000):
+        lines[i] = "NEEDLE\n"
+    await put(vfs, "/app.log", "".join(lines).encode())
     await conn.execute("ANALYZE vfs_extents")
-    await vfs.grep("absent")  # validated and warm
-    await vfs.grep("INFO")
-    start = time.monotonic()
-    result = await vfs.grep("INFO")
-    limited = time.monotonic() - start
-    assert [h.line for h in result.hits] == list(range(1, 101))
-    assert result.truncated
-    start = time.monotonic()
-    assert (await vfs.grep("absent", timeout=60)).hits == []  # filters every extent
-    absent = time.monotonic() - start
-    assert limited * 3 < absent, (limited, absent)
+    cur = await conn.execute(
+        "SELECT count(*), (SELECT reltoastrelid FROM pg_class WHERE oid = 'vfs_extents'::regclass),"
+        " (SELECT array_agg(id) FROM vfs_nodes WHERE kind = 'file') FROM vfs_extents"
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    extents, toast, ids = row
+    assert extents > 100
+
+    async def blocks_read(pattern: str, limit: int | None) -> tuple[int, int]:
+        translation = regex.translate(pattern)
+        async with conn.transaction():
+            cur = await conn.execute(
+                "SELECT pg_stat_get_xact_blocks_fetched(%s),"
+                " (SELECT count(*) FROM vfs_search(%s, %s, %s, %s, false, %s)),"
+                " pg_stat_get_xact_blocks_fetched(%s)",
+                (toast, ids, ["/app.log"], translation.file_form, translation.line_form, limit, toast),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            before, found, after = row
+        return found, after - before
+
+    found, full = await blocks_read(r"\bABSENT\b", None)
+    assert found == 0
+    found, all_hits = await blocks_read("NEEDLE", None)
+    assert found == 10
+    assert all_hits < full * 1.1  # a hit's extent reads its offsets once, not once per line
+    assert full > 2 * extents  # the extents are stored out of line, so the count measures what was read
+    for pattern, limit in (("INFO", 100), ("NEEDLE", 1), ("NEEDLE", 2)):
+        found, read = await blocks_read(pattern, limit)
+        assert found == limit
+        assert read < full * 0.6, (pattern, limit, read, full)  # about half: the check, plus a few extents
+    result = await vfs.grep("NEEDLE", limit=1)
+    assert hits(result.hits) == [("/app.log", 1, 0, "NEEDLE")]
 
 
-async def test_validation_under_a_short_timeout(conn: AsyncConnection) -> None:
+async def test_validation_under_a_short_timeout(conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(regex, "_validated", OrderedDict[tuple[str, bool], None]())  # whatever earlier tests validated
+    monkeypatch.setattr(regex, "_too_expensive", OrderedDict[tuple[str, bool], str]())
     slow = regex.translate(r"(?:.*\b){19}x")
     async with conn.transaction():
         with pytest.raises(psycopg.errors.QueryCanceled):

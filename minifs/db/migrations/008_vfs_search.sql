@@ -32,7 +32,8 @@
 --
 -- A file with any content that isn't UTF-8 is skipped whole, so results don't depend on how its bytes happen to
 -- be cut into extents. That is checked first, in one subtransaction per file (an EXCEPTION block per extent
--- would cost one per extent). As in rg, a UTF-8 byte order mark at the start of a file isn't part of line 1, whose offset is then 3.
+-- would cost one per extent), and costs a decode of the whole file even when its first extent has the hits. As
+-- in rg, a UTF-8 byte order mark at the start of a file isn't part of line 1, whose offset is then 3.
 CREATE FUNCTION vfs_search(
     p_ids uuid[],
     p_paths text[],
@@ -49,6 +50,7 @@ DECLARE
     v_rows bigint;
     f record;
     x record;
+    c refcursor;
 BEGIN
     IF v_left IS NOT NULL AND v_left <= 0 THEN
         RETURN;
@@ -65,42 +67,52 @@ BEGIN
         EXCEPTION WHEN character_not_in_repertoire OR untranslatable_character THEN
             CONTINUE files;
         END;
-        -- Fetched as the loop goes, so extents after the last one needed aren't tested or split. The order is
-        -- taken below the decode and the filter (OFFSET 0 keeps it there): if the planner sorts instead of
-        -- walking vfs_extents_line_key, as it may for a file holding most of the table, it sorts raw rows and
-        -- still filters one extent at a time.
-        FOR x IN SELECT e.byte_offset, e.line_start, e.line_offsets, m.bom, b.body
-                   FROM (SELECT e.byte_offset, e.line_start, e.line_offsets, e.data
-                           FROM vfs_extents e
-                          WHERE e.node_id = f.id AND e.generation = f.generation
-                          ORDER BY e.line_start
-                         OFFSET 0) e
-                        CROSS JOIN LATERAL (SELECT convert_from(e.data, 'UTF8') AS raw OFFSET 0) d
-                        CROSS JOIN LATERAL (SELECT e.line_start = 0 AND left(d.raw, 1) = c_bom AS bom) m
-                        CROSS JOIN LATERAL (SELECT CASE WHEN m.bom THEN substr(d.raw, 2) ELSE d.raw END AS body
-                                            OFFSET 0) b
-                  WHERE CASE WHEN p_fixed THEN strpos(b.body, p_file_pattern) > 0
-                             ELSE (CASE WHEN right(b.body, 1) = E'\n' THEN left(b.body, -1) ELSE b.body END)
-                                  ~ p_file_pattern
-                        END
-                  ORDER BY e.line_start             -- already the subquery's order: no second sort
+        -- Fetched one row at a time (an explicit FETCH; a FOR loop would fetch them 10, then 50 at a time), so
+        -- extents after the last one needed aren't tested or split. The order is taken below the decode and the
+        -- filter (OFFSET 0 keeps it there): if the planner sorts instead of walking vfs_extents_line_key, as it
+        -- may for a file holding most of the table, it sorts raw rows and still filters one extent at a time.
+        OPEN c FOR
+            SELECT e.byte_offset, e.line_start, e.line_offsets, m.bom, b.body
+              FROM (SELECT e.byte_offset, e.line_start, e.line_offsets, e.data
+                      FROM vfs_extents e
+                     WHERE e.node_id = f.id AND e.generation = f.generation
+                     ORDER BY e.line_start
+                    OFFSET 0) e
+                   CROSS JOIN LATERAL (SELECT convert_from(e.data, 'UTF8') AS raw OFFSET 0) d
+                   CROSS JOIN LATERAL (SELECT e.line_start = 0 AND left(d.raw, 1) = c_bom AS bom) m
+                   CROSS JOIN LATERAL (SELECT CASE WHEN m.bom THEN substr(d.raw, 2) ELSE d.raw END AS body
+                                       OFFSET 0) b
+             WHERE CASE WHEN p_fixed THEN strpos(b.body, p_file_pattern) > 0
+                        ELSE (CASE WHEN right(b.body, 1) = E'\n' THEN left(b.body, -1) ELSE b.body END)
+                             ~ p_file_pattern
+                   END
+             ORDER BY e.line_start;                 -- already the subquery's order: no second sort
         LOOP
+            FETCH c INTO x;
+            EXIT WHEN NOT FOUND;
+            -- The lines zipped with their offsets: unnest reads line_offsets once, where a subscript per line would
+            -- detoast it again for every line (an extent of 2000 lines has 8 KB of offsets, stored out of line).
+            -- string_to_table's extra empty piece after a final \n pairs with no offset and is dropped.
             RETURN QUERY
             SELECT f.path, x.line_start + l.k,
-                   x.byte_offset + x.line_offsets[l.k::int] + CASE WHEN x.bom AND l.k = 1 THEN 3 ELSE 0 END,
+                   x.byte_offset + l.off + CASE WHEN x.bom AND l.k = 1 THEN 3 ELSE 0 END,
                    CASE WHEN p_max_chars IS NULL THEN l.text ELSE left(l.text, p_max_chars) END,
                    p_max_chars IS NOT NULL
                        AND char_length(l.text) - (right(l.text, 1) = E'\r')::int > p_max_chars
-              FROM string_to_table(x.body, E'\n') WITH ORDINALITY AS l(text, k)
-             WHERE l.k <= cardinality(x.line_offsets)
+              FROM ROWS FROM (string_to_table(x.body, E'\n'), unnest(x.line_offsets)) WITH ORDINALITY AS l(text, off, k)
+             WHERE l.off IS NOT NULL
                AND CASE WHEN p_fixed THEN strpos(l.text, p_line_pattern) > 0 ELSE l.text ~ p_line_pattern END
              ORDER BY l.k
              LIMIT v_left;
             IF v_left IS NOT NULL THEN
                 GET DIAGNOSTICS v_rows = ROW_COUNT;
                 v_left := v_left - v_rows;
-                EXIT files WHEN v_left <= 0;
+                IF v_left <= 0 THEN
+                    CLOSE c;
+                    EXIT files;
+                END IF;
             END IF;
         END LOOP;
+        CLOSE c;
     END LOOP;
 END $$;

@@ -554,8 +554,8 @@ SELECT count(*) AS files, coalesce(sum(size), 0) AS bytes,
 
 -- steps 2 and 3: vfs_search($ids, $paths, $file_pattern, $line_pattern, $fixed, $max_plus_one, 2000), which does,
 -- for each file in path order, until it has the hits it needs:
---   skip the file if any extent fails convert_from(data, 'UTF8')   (one subtransaction per file)
---   for each extent in line_start order:                            (fetched one at a time)
+--   skip the file if any extent fails convert_from(data, 'UTF8')   (one subtransaction and one decode per file)
+--   for each extent in line_start order:                            (FETCHed one at a time from a cursor)
 --     body := convert_from(data, 'UTF8')
 --     continue unless body (without its final \n) ~ $file_pattern  -- step 2: '(?n)' plus the translated pattern
 SELECT $path, x.line_start + l.k AS line_no, x.byte_offset + x.line_offsets[l.k] AS byte_offset, l.text
