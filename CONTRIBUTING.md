@@ -76,7 +76,7 @@ that.
 ## VFS library
 
 `minifs.vfs.client.VFSClient` takes absolute paths and wraps one SQL function per operation (`stat`, `readdir`,
-`pread`, `glob`, `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
+`pread`, `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
 statement in its own transaction, resolving its paths on the server with `vfs_resolve` in a subquery, and raises
 `minifs.vfs.core.VFSError(errno, path, message, detail)` for every errno the SQL layer reports. `detail` (the
 server's DETAIL, with node ids and real path components) and `db_error` are for logs only: a view that rewrites

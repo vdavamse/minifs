@@ -162,18 +162,39 @@ class VFSClient:
         limit: int | None = None,
     ) -> list[Entry]:
         """The files below directory ``path`` that match glob ``pattern`` (``minifs.vfs.glob``), newest first, at
-        most ``limit``. Runs on the search pool. ``GlobError`` for a bad pattern; ENOENT, ENOTDIR for ``path``."""
+        most ``limit``. Resolving ``path`` and the walk share one snapshot on a search-pool connection, so the
+        returned paths describe the tree the walk saw. ``GlobError`` for a bad pattern; ENOENT, ENOTDIR for ``path``;
+        EINVAL for a bad ``limit``."""
         segments = split(path)
-        root = await self.stat(path)
-        if not root.is_dir:
-            raise VFSError("ENOTDIR", join(*segments))
+        if limit is not None and not 0 <= limit <= _MAX_INT:
+            raise VFSError("EINVAL", join(*segments), f"invalid limit {limit}")
+        globbing.compile_glob(pattern)  # a bad pattern is reported before anything about the path
+        globbing.compile_excludes(excludes)
+        ref = self._dir_ref(segments)
 
-        async def attempt() -> list[globbing.GlobMatch]:
+        async def attempt() -> tuple[UUID | None, list[globbing.GlobMatch]]:
             async with self.search_pool.connection() as conn, conn.transaction():
-                return await globbing.glob(conn, root.id, pattern, excludes=excludes, hidden=hidden, limit=limit)
+                await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # one snapshot for both
+                root: UUID | None = None
+                if segments:
+                    query = f"SELECT id, kind FROM vfs_nodes WHERE id = {ref.sql}"
+                    cur = await conn.execute(cast(Any, query), ref.params)
+                    row = await cur.fetchone()
+                    assert row is not None  # vfs_resolve raised otherwise
+                    if row[1] != "dir":
+                        raise VFSError("ENOTDIR", join(*segments))
+                    root = row[0]
+                matches = await globbing.glob(conn, root, pattern, excludes=excludes, hidden=hidden, limit=limit)
+                return root, matches
 
-        matches = await _mapped(path, attempt)
-        return [Entry(join(*segments, *m.path.split("/")), m.id, "file", m.size, m.mtime) for m in matches]
+        try:
+            root, matches = await _mapped(path, attempt)
+        except VFSError as e:
+            if e.errno in ("ENOENT", "ENOTDIR"):
+                await self._evict_stale([ref])
+            raise
+        self._checked(ref, root)
+        return [Entry(join(*segments, m.path), m.id, "file", m.size, m.mtime) for m in matches]
 
     # Writes
 

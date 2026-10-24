@@ -571,3 +571,16 @@ async def test_glob(pool: Pool) -> None:
     await raises("ENOTDIR", vfs.glob("*", "/w/src/a.py"), "/w/src/a.py")
     with pytest.raises(GlobError):
         await vfs.glob("src/", "/w")
+    with pytest.raises(GlobError):  # the pattern is checked first
+        await vfs.glob("src/", "/nope")
+    await raises("EINVAL", vfs.glob("*", limit=-1))
+    await raises("EINVAL", vfs.glob("*", limit=2**31))
+    assert len(await vfs.glob("*.py", limit=1)) == 1
+    # A cached root is used, and its stale links evicted.
+    cache = DictCache()
+    cached = VFSClient(pool, cache=cache)
+    await cached.readdir("/")
+    await cached.readdir("/w")
+    await vfs.rename("/w", "/w.old")
+    await vfs.create("/w/new.py", parents=True)
+    assert [e.path for e in await cached.glob("*.py", "/w")] == ["/w/new.py"]
