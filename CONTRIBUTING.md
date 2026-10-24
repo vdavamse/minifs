@@ -60,6 +60,11 @@ The tree lives in `vfs_nodes` (migration 003). Every operation is a SQL function
 `vfs_create`, `vfs_mkdir_p`, `vfs_rename`, `vfs_unlink`); the header comment of each says what it does and
 raises. A NULL directory id stands for the virtual root `/`.
 
+File bytes live in `vfs_extents` (migration 004): `vfs_append`, `vfs_write`, `vfs_pread` and `vfs_compact`, and
+`vfs_create` takes optional initial content. The extents of a file's current generation tile `[0, size)` with no
+gaps. Every function that changes an existing file's content keeps that invariant under the inode lock
+(`vfs_lock_file`); `vfs_create` needs no lock, since nobody else can see the new file yet. Readers take no locks.
+
 Functions report errors with `PERFORM vfs_raise('ENOENT', detail)`, which raises SQLSTATE `MFnnn` (`nnn` = the
 Linux errno number) with the errno name as the message. `minifs.db.errors.errno_name(exc)` maps it back. Add a
 new errno to both `vfs_raise` and `SQLSTATE_BY_ERRNO`.

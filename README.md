@@ -290,7 +290,8 @@ CREATE FUNCTION vfs_pread(p_node UUID, p_offset BIGINT, p_limit INT)
 RETURNS TABLE (size BIGINT, generation INT, byte_offset BIGINT, data BYTEA) AS $$
     WITH n AS (
         SELECT id, size, generation,
-               CASE WHEN p_offset < 0 THEN greatest(size + p_offset, 0) ELSE p_offset END AS off
+               CASE WHEN p_offset < 0 THEN greatest(size + p_offset, 0)
+                    ELSE least(p_offset, size) END AS off   -- clamped, so off + p_limit can't overflow
           FROM vfs_nodes WHERE id = p_node AND kind = 'file'
     ), s AS (                                       -- step 1: the extent that contains off
         SELECT n.*, coalesce((SELECT e.byte_offset FROM vfs_extents e
@@ -311,6 +312,7 @@ RETURNS TABLE (size BIGINT, generation INT, byte_offset BIGINT, data BYTEA) AS $
             AND e.byte_offset >= s.start
             AND e.byte_offset <  s.off + p_limit
             AND e.byte_offset + length(e.data) > s.off
+            AND p_limit > 0
      ORDER BY e.byte_offset
 $$ LANGUAGE sql STABLE;
 ```
@@ -318,7 +320,8 @@ $$ LANGUAGE sql STABLE;
 - **Two index steps, like walking ext4's extent tree.** Only `byte_offset < off + limit` can bound a scan of the primary key; the overlap test `byte_offset + length(data) > off` can't. A single range scan would therefore read every extent from the start of the file. Step 1 descends backward to the extent that contains `off`, and step 2 scans forward from it, so a read costs O(log E + extents returned) for a file with E extents. On a 20,000-extent file, a read at the end touches 3 index pages.
 - **Trimming happens in Postgres.** A 16 KB read of a 5 MB doc sends 16 KB. `length(data)` reads the size from the TOAST pointer without fetching the value.
 - **It's one statement, so one MVCC snapshot.** `size` and `generation` describe exactly the bytes returned, even while another client is appending.
-- **The `LEFT JOIN`** returns a single row with NULL data when nothing overlaps, so a read past EOF or of an empty file still returns `size` and `generation`.
+- **The `LEFT JOIN`** returns a single row with NULL data when nothing overlaps, so a read past EOF or of an empty file still returns `size` and `generation`, and `byte_offset` is the resolved start offset.
+- **The real function** (migration 004) is this query inside a PL/pgSQL `STABLE` function, still one snapshot, which raises `ENOENT` or `EISDIR` when the query returns no row.
 
 ### Per-path cursors and generations
 

@@ -4,9 +4,10 @@ Each function raises SQLSTATE ``MFnnn``, where ``nnn`` is the Linux errno number
 message and the context in DETAIL (see ``vfs_raise`` in migration 003). The codes don't depend on the client
 platform's errno numbering.
 
-The constraints on ``vfs_nodes`` are the backstop for raw SQL and for the rare races the functions don't
-pre-check; their violations map to errnos too, on a best-effort basis: a foreign-key error can't tell a missing
-parent from a parent that is a file, so both map to ENOTDIR. The functions report each case precisely.
+The constraints on ``vfs_nodes`` and ``vfs_extents`` are the backstop for raw SQL and for the rare races the
+functions don't pre-check; their violations map to errnos too, on a best-effort basis: a foreign-key error can't
+tell a missing parent from a parent that is a file, so both map to ENOTDIR, and an extent on a missing node maps
+to EISDIR like one on a directory. The functions report each case precisely.
 """
 
 from __future__ import annotations
@@ -42,6 +43,16 @@ def errno_name(error: psycopg.Error) -> str | None:
         return "EEXIST"
     if sqlstate == _CHECK_VIOLATION and constraint == "vfs_nodes_name_check":
         return "EINVAL"
+    if sqlstate == _CHECK_VIOLATION and constraint == "vfs_extents_node_kind_check":
+        return "EISDIR"
+    if sqlstate == _CHECK_VIOLATION and constraint == "vfs_extents_data_check":
+        return "EINVAL"
+    if (
+        sqlstate == _FOREIGN_KEY_VIOLATION
+        and constraint == "vfs_extents_node_fkey"
+        and "is not present in table" in (error.diag.message_detail or "")
+    ):
+        return "EISDIR"
     if constraint == "vfs_nodes_parent_fkey":
         if sqlstate == _RESTRICT_VIOLATION:
             return "ENOTEMPTY"
