@@ -552,34 +552,24 @@ SELECT count(*) AS files, coalesce(sum(size), 0) AS bytes,
        array_agg(id) AS ids, array_agg(path) AS paths
   FROM vfs_glob($root, $glob_regex, $name_like, $depth, $excludes, true, $file_cap + 1, $prefix, $prune_dirs);  -- hidden included
 
-WITH extents AS (
-    SELECT g.path, e.byte_offset, e.line_start, e.line_offsets,
-           vfs_utf8(e.data) AS body                 -- NULL if it isn't UTF-8 (see below): skipped
-      FROM unnest($ids::uuid[], $paths::text[]) AS g(id, path)
-      JOIN vfs_nodes n ON n.id = g.id
-      JOIN vfs_extents e ON e.node_id = n.id AND e.generation = n.generation
-), hits AS (                                        -- step 2: one regex test per extent
-    SELECT * FROM extents
-     WHERE CASE WHEN right(body, 1) = E'\n' THEN left(body, -1) ELSE body END
-           ~ $file_pattern                          -- '(?n)' plus the translated pattern
-), lines AS (                                       -- step 3: lines exist only here
-    SELECT h.path, h.line_start + l.k AS line_no, h.byte_offset + h.line_offsets[l.k] AS byte_offset, l.text
-      FROM hits h,
-           string_to_table(h.body, E'\n') WITH ORDINALITY AS l(text, k)
-     WHERE l.k <= cardinality(h.line_offsets)       -- no empty piece after the final \n
-)
-SELECT path, line_no, byte_offset, text
-  FROM lines
- WHERE text ~ $line_pattern                         -- always ~: case folding is in the pattern
- ORDER BY path, line_no
- LIMIT $max_plus_one;
+-- steps 2 and 3: vfs_search($ids, $paths, $file_pattern, $line_pattern, $fixed, $max_plus_one, 2000), which does,
+-- for each file in path order, until it has the hits it needs:
+--   skip the file if any extent fails convert_from(data, 'UTF8')   (one subtransaction per file)
+--   for each extent in line_start order:                            (fetched one at a time)
+--     body := convert_from(data, 'UTF8')
+--     continue unless body (without its final \n) ~ $file_pattern  -- step 2: '(?n)' plus the translated pattern
+SELECT $path, x.line_start + l.k AS line_no, x.byte_offset + x.line_offsets[l.k] AS byte_offset, l.text
+  FROM string_to_table(x.body, E'\n') WITH ORDINALITY AS l(text, k)       -- step 3: lines exist only here
+ WHERE l.k <= cardinality(x.line_offsets)           -- no empty piece after the final \n
+   AND l.text ~ $line_pattern                       -- always ~: case folding is in the pattern
+ ORDER BY l.k
+ LIMIT $hits_still_needed;
 ```
 
-- **`vfs_utf8`** (#10) is `convert_from(data, 'UTF8')` in a PL/pgSQL function that returns NULL on `character_not_in_repertoire`, so content that isn't UTF-8 is skipped without failing the query.
 - **Trailing newline.** Each extent yields exactly its own `cardinality(line_offsets)` lines: the empty piece after its final `\n` is dropped, so a file ending in a newline doesn't gain an empty phantom line that `^$` would match. The filter tests the extent without its final `\n`, for the same reason.
-- **The real query** is `vfs_search(ids, paths, file_pattern, line_pattern, fixed, limit, max_chars)` (migration 008), which also cuts each hit's line to 2,000 characters by default and reports whether it did.
+- **Cut lines.** `vfs_search` also cuts each hit's line to 2,000 characters by default and reports whether it did.
 - **Byte offsets.** Each hit's offset comes from `line_offsets`, in the same currency as `vfs.pread(offset=...)`. The `Grep` tool shows only line numbers.
-- **One snapshot.** The two statements run in one `REPEATABLE READ` transaction, so the scope and every extent are read as of the same moment.
+- **One snapshot.** The statements run in one `REPEATABLE READ` transaction, so the scope and every extent are read as of the same moment.
 - **Caps before content.** Step 1 reads only `vfs_nodes`. The client checks the file and byte caps on its result, so an oversized scope is refused before any extent is read. The search costs two round trips.
 
 The `Grep` tool takes only ladderframe's parameters: `pattern`, `path` (a directory, or a single file, which searches just that file) and `include`. The other rg features are options of the library's `VFSClient.grep` (`minifs.vfs.search`); a model gets case-insensitive search by writing `(?i)` in the pattern.
@@ -894,7 +884,7 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Tree | `UNIQUE NULLS NOT DISTINCT` rejects duplicate root names; `rmdir` on a non-empty directory gives `ENOTEMPTY`; a move into its own subtree gives `EINVAL` | Unit |
 | Claim | Two claimers racing for the same file: exactly one wins | Concurrency |
 | Watch | Events arrive only after commit; `move` versus `modify` is classified correctly | Integration |
-| Search | Hits match a per-line search in Python over the same files; a trailing newline adds no phantom line; a UTF-8 character split across two appends still matches; extents that aren't UTF-8 are skipped; the scope cap refuses before reading content | Integration |
+| Search | Hits match a per-line search in Python over the same files; a trailing newline adds no phantom line; a UTF-8 character split across two appends still matches; files that aren't UTF-8 are skipped; the scope cap refuses before reading content | Integration |
 | File filter | Whenever a line matches the line form, the file matches the file form | Property |
 | Compaction | Bytes, `size`, `lines`, `generation` and `mtime` are unchanged; appends running during compaction keep gap-free offsets | Concurrency |
 | Content cache (deferred) | Reads through the cache equal uncached `pread` while another client appends, overwrites and compacts | Property |

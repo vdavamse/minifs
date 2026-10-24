@@ -9,17 +9,6 @@
 -- holds whole lines and never splits a UTF-8 character: each one is decoded and tested on its own.
 
 
--- p_data decoded as UTF-8, or NULL if it isn't valid UTF-8 (or holds a NUL, which text can't): a decode that
--- never fails a query. One subtransaction per call, so vfs_search checks whole files itself instead.
-CREATE FUNCTION vfs_utf8(p_data bytea) RETURNS text
-LANGUAGE plpgsql IMMUTABLE STRICT SET search_path FROM CURRENT AS $$
-BEGIN
-    RETURN convert_from(p_data, 'UTF8');
-EXCEPTION WHEN character_not_in_repertoire OR untranslatable_character THEN
-    RETURN NULL;
-END $$;
-
-
 -- The lines of files p_ids that match, in order of path then line, at most p_limit (NULL: all). p_paths are the
 -- files' paths as the caller wants them back, in the same order as p_ids; an id that is no longer a file gives
 -- nothing. Each hit has its 1-based line number, the file byte offset of the line's start (vfs_pread's
@@ -42,8 +31,8 @@ END $$;
 -- database's locale).
 --
 -- A file with any content that isn't UTF-8 is skipped whole, so results don't depend on how its bytes happen to
--- be cut into extents. That is checked first, in one subtransaction per file (vfs_utf8 would cost one per
--- extent). As in rg, a UTF-8 byte order mark at the start of a file isn't part of line 1, whose offset is then 3.
+-- be cut into extents. That is checked first, in one subtransaction per file (an EXCEPTION block per extent
+-- would cost one per extent). As in rg, a UTF-8 byte order mark at the start of a file isn't part of line 1, whose offset is then 3.
 CREATE FUNCTION vfs_search(
     p_ids uuid[],
     p_paths text[],
@@ -76,19 +65,25 @@ BEGIN
         EXCEPTION WHEN character_not_in_repertoire OR untranslatable_character THEN
             CONTINUE files;
         END;
-        -- Fetched as the loop goes, so extents after the last one needed are neither decoded nor tested.
+        -- Fetched as the loop goes, so extents after the last one needed aren't tested or split. The order is
+        -- taken below the decode and the filter (OFFSET 0 keeps it there): if the planner sorts instead of
+        -- walking vfs_extents_line_key, as it may for a file holding most of the table, it sorts raw rows and
+        -- still filters one extent at a time.
         FOR x IN SELECT e.byte_offset, e.line_start, e.line_offsets, m.bom, b.body
-                   FROM vfs_extents e
+                   FROM (SELECT e.byte_offset, e.line_start, e.line_offsets, e.data
+                           FROM vfs_extents e
+                          WHERE e.node_id = f.id AND e.generation = f.generation
+                          ORDER BY e.line_start
+                         OFFSET 0) e
                         CROSS JOIN LATERAL (SELECT convert_from(e.data, 'UTF8') AS raw OFFSET 0) d
                         CROSS JOIN LATERAL (SELECT e.line_start = 0 AND left(d.raw, 1) = c_bom AS bom) m
                         CROSS JOIN LATERAL (SELECT CASE WHEN m.bom THEN substr(d.raw, 2) ELSE d.raw END AS body
                                             OFFSET 0) b
-                  WHERE e.node_id = f.id AND e.generation = f.generation
-                    AND CASE WHEN p_fixed THEN strpos(b.body, p_file_pattern) > 0
+                  WHERE CASE WHEN p_fixed THEN strpos(b.body, p_file_pattern) > 0
                              ELSE (CASE WHEN right(b.body, 1) = E'\n' THEN left(b.body, -1) ELSE b.body END)
                                   ~ p_file_pattern
                         END
-                  ORDER BY e.line_start
+                  ORDER BY e.line_start             -- already the subquery's order: no second sort
         LOOP
             RETURN QUERY
             SELECT f.path, x.line_start + l.k,

@@ -1,4 +1,4 @@
-"""Search (migration 008, minifs.vfs.search, VFSClient.grep): vfs_utf8, vfs_search, the scope and its caps."""
+"""Search (migration 008, minifs.vfs.search, VFSClient.grep): vfs_search, the scope and its caps."""
 
 import json
 import subprocess
@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import pytest
 from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
@@ -14,6 +15,7 @@ from psycopg_pool import AsyncConnectionPool
 from minifs import _regex
 from minifs.cli import main
 from minifs.db.pool import Connector, open_pool
+from minifs.vfs import regex
 from minifs.vfs import search as searching
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import VFSError
@@ -218,14 +220,6 @@ async def test_non_utf8_is_skipped(vfs: VFSClient, conn: AsyncConnection) -> Non
     assert hits((await vfs.grep("foo")).hits) == [("/ok", 1, 0, "foo")]
 
 
-async def test_vfs_utf8(conn: AsyncConnection) -> None:
-    cur = await conn.execute(
-        "SELECT vfs_utf8(%s), vfs_utf8(%s), vfs_utf8(%s), vfs_utf8(%s), vfs_utf8(NULL)",
-        (b"caf\xc3\xa9", b"caf\xe9", b"a\x00b", b""),
-    )
-    assert (await cur.fetchone()) == ("café", None, None, "", None)
-
-
 async def test_sees_a_write_committed_just_before(vfs: VFSClient, db: str) -> None:
     await put(vfs, "/log", b"start\n")
     async with open_pool(Connector(db), max_size=1) as search_pool:
@@ -384,19 +378,33 @@ async def test_stops_at_the_limit(vfs: VFSClient, conn: AsyncConnection) -> None
     assert (len(result.hits), result.truncated) == (1500, True)
 
 
-async def test_stops_inside_a_file(vfs: VFSClient) -> None:
-    # One large file of matching lines, in many extents: the first hits come from its first extents.
+async def test_stops_inside_a_file(vfs: VFSClient, conn: AsyncConnection) -> None:
+    # One large file of matching lines, in many extents, holding all of vfs_extents: with statistics that say
+    # so, the planner may sort the file's extents rather than walk the index, and the search must still stop
+    # at the first extents instead of filtering the whole file.
     await put(vfs, "/app.log", b"".join(f"INFO request {i}\n".encode() for i in range(600_000)))
+    await conn.execute("ANALYZE vfs_extents")
+    await vfs.grep("absent")  # validated and warm
+    await vfs.grep("INFO")
     start = time.monotonic()
     result = await vfs.grep("INFO")
     limited = time.monotonic() - start
     assert [h.line for h in result.hits] == list(range(1, 101))
     assert result.truncated
     start = time.monotonic()
-    everything = await vfs.grep("INFO", limit=1_000_000, timeout=60)
-    full = time.monotonic() - start
-    assert len(everything.hits) == 600_000
-    assert limited * 3 < full, (limited, full)
+    assert (await vfs.grep("absent", timeout=60)).hits == []  # filters every extent
+    absent = time.monotonic() - start
+    assert limited * 3 < absent, (limited, absent)
+
+
+async def test_validation_under_a_short_timeout(conn: AsyncConnection) -> None:
+    slow = regex.translate(r"(?:.*\b){19}x")
+    async with conn.transaction():
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            await regex.validate(conn, slow, timeout=0.001)
+        # The connection's transaction is still usable, and the pattern wasn't judged by the caller's timeout.
+        await conn.execute("SELECT 1")
+    assert (slow.pattern, False) not in regex._too_expensive  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_byte_order_mark(vfs: VFSClient, rg_path: str, tmp_path: Path) -> None:

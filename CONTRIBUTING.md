@@ -74,8 +74,7 @@ unlocked counterpart of `vfs_lock_file`. Raw inserts into `vfs_extents` (tests) 
 
 Search (migration 008) scans those extents: `vfs_search` filters each extent with a pattern's file form, splits
 only the extents that pass into lines, and returns the matching ones with their line numbers and byte offsets,
-stopping at the limit; a file with content that isn't UTF-8 is skipped whole (`vfs_utf8` is the decode that returns
-NULL instead of failing). The scope comes from `vfs_glob` in a
+stopping at the limit; a file with content that isn't UTF-8 is skipped whole. The scope comes from `vfs_glob` in a
 statement of its own, so `minifs.vfs.search` can refuse it over the file and byte caps before content is read.
 
 Functions report errors with `PERFORM vfs_raise('ENOENT', detail)`, which raises SQLSTATE `MFnnn` (`nnn` = the
