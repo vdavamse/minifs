@@ -36,14 +36,15 @@ ALTER TABLE vfs_extents ALTER COLUMN data SET STORAGE EXTENDED;
 -- the next line would take the extent past p_target bytes. A line longer than p_target is an extent of its own;
 -- only the last extent may end without a \n. Returns, in order, each extent's offset in p_data, the number of
 -- \n before it, its bytes and its line_offsets. No rows for empty or NULL data; EINVAL for a NULL or
--- non-positive p_target.
+-- non-positive p_target. With p_split_tail, a last line without \n goes in an extent of its own, so the next
+-- append, which re-cuts the last extent (vfs_append), rewrites only that partial line.
 --
 -- The lines are found in C, not byte by byte: encode(..., 'escape') turns bytea into text that keeps every \n
 -- byte as a newline (it escapes only NUL, high-bit bytes and backslashes, never in a way that produces one), so
 -- splitting that text on newlines and decoding each piece gives the length of each line. It encodes 1 MB at a
 -- time: escaping can make the text 4 times longer than the bytes, and a text value can't pass 1 GB. A line may
 -- span windows, so the last piece of a window carries on into the next.
-CREATE FUNCTION vfs_cut(p_data bytea, p_target int DEFAULT 65536)
+CREATE FUNCTION vfs_cut(p_data bytea, p_target int DEFAULT 65536, p_split_tail boolean DEFAULT false)
 RETURNS TABLE (rel_offset bigint, rel_line bigint, data bytea, line_offsets int4[])
 LANGUAGE plpgsql IMMUTABLE SET search_path FROM CURRENT AS $$
 DECLARE
@@ -52,6 +53,7 @@ DECLARE
     v_open bigint := 0;                             -- the length so far of a line that spans windows
     v_len bigint;
     v_last boolean;
+    v_tail boolean;                                 -- the last line has no \n
     v_pos bigint := 0;                              -- where the current line starts
 BEGIN
     IF p_target IS NULL OR p_target < 1 THEN
@@ -75,14 +77,17 @@ BEGIN
             END IF;
         END LOOP;
     END LOOP;
-    IF v_open > 0 THEN
+    v_tail := v_open > 0;
+    IF v_tail THEN
         v_lens := v_lens || v_open;                 -- the last line, with no \n
     END IF;
     rel_offset := 0;
     rel_line := 0;
     line_offsets := '{}';
-    FOREACH v_len IN ARRAY v_lens LOOP
-        IF v_pos > rel_offset AND v_pos - rel_offset + v_len > p_target THEN
+    FOR i IN 1 .. cardinality(v_lens) LOOP
+        v_len := v_lens[i];
+        IF v_pos > rel_offset AND (v_pos - rel_offset + v_len > p_target
+                                   OR (p_split_tail AND v_tail AND i = cardinality(v_lens))) THEN
             data := substring(p_data FROM (rel_offset + 1)::int FOR (v_pos - rel_offset)::int);
             RETURN NEXT;
             rel_line := rel_line + cardinality(line_offsets);
@@ -127,7 +132,8 @@ END $$;
 ALTER TABLE vfs_extents
     ALTER COLUMN line_start SET NOT NULL,
     ALTER COLUMN line_offsets SET NOT NULL,
-    ADD CONSTRAINT vfs_extents_line_offsets_check CHECK (line_offsets[1] = 0),   -- an extent starts a line
+    ADD CONSTRAINT vfs_extents_line_offsets_check CHECK (cardinality(line_offsets) > 0 AND array_ndims(line_offsets) = 1   -- never NULL, unlike '{}'[1]
+                                                   AND line_offsets[1] = 0),       -- the extent starts a line
     -- Line lookups (vfs_pread_lines). Every extent starts a line, so line_start is distinct in a generation.
     ADD CONSTRAINT vfs_extents_line_key UNIQUE (node_id, generation, line_start);
 
@@ -139,8 +145,10 @@ ALTER TABLE vfs_extents
 -- earlier commits later (now() is the transaction's start time).
 --
 -- When the file ends mid-line, its last extent is deleted and cut again together with p_data, so extents keep
--- starting at line starts. That rewrites one extent: about 64 KB at most, unless its last line is longer, in
--- which case all of that line (a file with no newlines: all of it). The bytes before the end are unchanged.
+-- starting at line starts. A trailing partial line is cut into an extent of its own, so a writer whose appends
+-- end mid-line rewrites only that partial line each time. The bytes before the end are unchanged. The first
+-- such append after an overwrite or a compaction rewrites the whole last extent, up to the cut's or the
+-- compaction's target (more if its last line is longer), and a file with no newlines is rewritten whole.
 CREATE OR REPLACE FUNCTION vfs_append(p_node uuid, p_data bytea) RETURNS bigint
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
@@ -176,7 +184,7 @@ BEGIN
     WITH ins AS (
         INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)
         SELECT p_node, v_gen, v_off + c.rel_offset, v_line + c.rel_line, c.data, c.line_offsets
-          FROM vfs_cut(v_last || p_data) c
+          FROM vfs_cut(v_last || p_data, 65536, true) c
         RETURNING vfs_extents.line_start + cardinality(vfs_extents.line_offsets) AS lines_after
     )
     SELECT max(ins.lines_after) INTO v_lines FROM ins;
@@ -413,6 +421,7 @@ END $$;
 -- Returns one row: the file's size, generation and line count, p_first_line, the byte offset where that line
 -- starts (so callers can mix line and byte reads) and the bytes. A p_first_line past the last line returns no
 -- bytes (an empty bytea), byte_offset = size and the line count, so the tool can say the offset is out of range.
+-- The bytes are one value, so a read can't return more than bytea's 1 GB; read larger ranges with vfs_pread.
 --
 -- One snapshot, as in vfs_pread: every statement of this STABLE function runs on the caller's snapshot, even
 -- while another session appends. Takes no locks.

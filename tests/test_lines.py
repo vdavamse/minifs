@@ -4,6 +4,7 @@ import asyncio
 import random
 from uuid import UUID
 
+import psycopg
 import pytest
 from psycopg import AsyncConnection
 
@@ -410,3 +411,58 @@ async def test_migration_cuts_existing_content(empty_db: str) -> None:
         assert len(await extent_rows(conn, b)) == 2
         await check_layout(conn, empty, b"")
         assert await one(conn, "SELECT lines FROM vfs_nodes WHERE id = %s", (d[0],)) == (0,)
+
+
+@pytest.mark.parametrize(
+    ("data", "pieces"),
+    [
+        (b"a\nb", [(0, 0, b"a\n", [0]), (2, 1, b"b", [0])]),
+        (b"a\nb\n", [(0, 0, b"a\nb\n", [0, 2])]),  # no partial line: nothing to split
+        (b"b", [(0, 0, b"b", [0])]),  # the partial line alone
+    ],
+)
+async def test_cut_can_split_off_a_partial_last_line(
+    conn: AsyncConnection, data: bytes, pieces: list[tuple[int, int, bytes, list[int]]]
+) -> None:
+    cur = await conn.execute("SELECT * FROM vfs_cut(%s, 100, true)", (data,))
+    assert [(o, n, bytes(d), list(lo)) for o, n, d, lo in await cur.fetchall()] == pieces
+
+
+async def test_appends_ending_mid_line_rewrite_only_the_partial_line(conn: AsyncConnection) -> None:
+    f = await create_file(conn, "out")
+    content = b""
+    for i in range(300):  # like stdout copied in chunks: every append ends mid-line
+        part = f"{i:04}-tail\n{i:04}-head".encode()
+        await append(conn, f, part)
+        content += part
+        rows = await extent_rows(conn, f)
+        assert len(rows[-1][3]) <= 2 * len(part), "the last extent is only the partial line plus this append"
+    await check_layout(conn, f, content)
+
+
+async def test_line_offsets_must_be_a_list_starting_at_zero(conn: AsyncConnection) -> None:
+    f = await create_file(conn, "f")
+    for offsets in ["{}", "{1}", "{{0,1},{2,3}}"]:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            await conn.execute(
+                "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
+                " VALUES (%s, 0, 0, 0, 'a', %s)",
+                (f, offsets),
+            )
+
+
+async def test_repeatable_read_append_after_a_line_after_a_concurrent_compaction(
+    conn: AsyncConnection, db: str
+) -> None:
+    # The file ends with \n, so the append deletes nothing, and compaction only locked the inode, so nothing
+    # conflicts: the append counts lines from the last extent its snapshot sees, whose numbers compaction kept.
+    f = await create_file(conn, "log")
+    for part in [b"a\n", b"b\n", b"c\n"]:
+        await append(conn, f, part)
+    async with await AsyncConnection.connect(db) as late:
+        await late.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
+        await late.execute("SELECT 1")  # takes the snapshot
+        assert await compact(conn, f) == 2
+        assert await append(late, f, b"d") == 6
+        await late.commit()
+    await check_layout(conn, f, b"a\nb\nc\nd")

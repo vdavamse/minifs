@@ -142,7 +142,7 @@ Each column choice, and why:
 | `generation` | Lets readers and cursors tell an append (same generation, larger size) from a rewrite (new generation). | Comparing content hashes |
 | `size` stored on the inode | `stat` without scanning extents. It's always updated in the same transaction as the extent, so it can't drift. | Computing `sum(length(data))` on every stat |
 | `BYTEA` content | True byte offsets, and safe for binary content. Python decodes UTF-8. | `TEXT` (offsets would be in characters) |
-| `STORAGE EXTENDED` on `data` (the default) | Writers cut extents of about 64 KB (a longer one is a single line), and compaction merges up to its target, 64 KB by default. Extents that size are read whole, so decompressing one costs little, and text compresses 3 to 4 times. | `EXTERNAL` (uncompressed), whose slice reads fetch only the TOAST chunks they cover: that paid off for multi-megabyte extents, which line alignment no longer makes |
+| `STORAGE EXTENDED` on `data` (the default) | Writers cut extents of about 64 KB (a longer one is a single line), and compaction merges up to its target, 64 KB by default. Extents that size are read whole, so decompressing one costs little, and text compresses 3 to 4 times. | `EXTERNAL` (uncompressed), whose slice reads fetch only the TOAST chunks they cover: that paid off for multi-megabyte extents, which line alignment now makes only for a single line longer than the target. Reading the tail of such a line decompresses it from the start (about 5 ms for an 18 MB line, against 0.6 ms uncompressed) |
 
 **Directory entry and inode in one row.** Without hard links, every inode has exactly one name, so splitting them gains nothing. If hard links are ever needed, split this into `inodes(id, size, generation, nlink, ...)` and `dentries(parent_id, name, inode_id)`.
 
@@ -222,7 +222,7 @@ BEGIN
 END $$ LANGUAGE plpgsql;
 ```
 
-Appends keep extents line-aligned, so an append to a file that ends mid-line rewrites the file's last extent: those bytes are unchanged, but their row is replaced. That's at most about 64 KB unless the last line is longer, and a log appended a line at a time never pays it. A file with no newlines at all is the worst case: every append rewrites the whole file.
+Appends keep extents line-aligned, so an append to a file that ends mid-line rewrites the file's last extent: those bytes are unchanged, but their row is replaced. A trailing partial line goes in an extent of its own, so a writer whose appends end mid-line (stdout copied in chunks, a token stream) rewrites only that partial line each time, and a log appended a line at a time never rewrites anything. The first such append after an overwrite or a compaction rewrites the whole last extent once, up to the cut's or the compaction's target. A file with no newlines at all is the worst case: every append rewrites the whole file.
 
 The inode lock is held until commit, so concurrent appenders take turns and **offset order always equals commit order**. A reader at `offset > cursor` can never miss bytes that commit late at a lower offset. This is the guarantee that makes incremental reads correct. Because it comes from the lock, it holds for any number of writers.
 
@@ -417,7 +417,7 @@ The tool takes ladderframe's `Read` parameters and returns its output format.
 </content>
 ```
 
-- **Lines come from Postgres.** One `vfs_pread_lines(node, N, K, 50 KB)` call returns lines N to N+K-1, the total line count and the snapshot's generation, with no full-file read. Lines split on `\n` only, and the tool drops a trailing `\r`, so line numbers agree with `Grep` hits.
+- **Lines come from Postgres.** One `vfs_pread_lines(node, N, K, 50 KB)` call returns lines N to N+K-1, the total line count and the snapshot's generation, with no full-file read. The 50 KB cap applies to the raw bytes, before the tool cuts each line to 2,000 characters, so when a long line came back cut, the tool calls again from the line after it to fill the page as ladderframe does. Lines split on `\n` only, and the tool drops a trailing `\r`, so line numbers agree with `Grep` hits.
 - **Bounded output, as in ladderframe.** A line longer than 2,000 characters is cut and gets `... (line truncated to 2000 chars)`, and output stops at 50 KB with `(Output capped at 50 KB. Showing lines a-b. Use offset=b+1 to continue.)`. The last page ends with `(End of file - total n lines)`.
 - **Text only.** Bytes are decoded as UTF-8 with replacement characters. A file that looks binary (PNG, JPEG, GIF, WEBP or `%PDF-` magic bytes, a `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.pdf` extension, which ladderframe would attach, or another known binary extension, a NUL byte in the first 4 KB, or more than 30% non-printable bytes there) gets `ModelRetry: Cannot read binary file: <path>`. ladderframe's `Read` attaches images and PDFs; minifs's `Read` doesn't, so they get the same binary-file error (see Differences from ladderframe).
 - **Nearby instructions.** As in ladderframe: for a file below `/workspace`, each directory from the file's parent up to, but not including, `/workspace` is checked for `AGENTS.md`, then `CLAUDE.md`, taking the first that exists, with no fallback. That file is then omitted if it's the file being read, was already shown in this conversation, or is blank. Each remaining instruction file is appended, headed `Instructions from: <path>`, in one `<system-reminder>` block. Files outside `/workspace`, such as `/docs/**`, get none. The ancestor ids are already known from path resolution, so one query finds every candidate (`WHERE parent_id = ANY($ancestors) AND kind = 'file' AND name IN ('AGENTS.md', 'CLAUDE.md')`, returning each candidate's content), sent in the same round trip as the read. The client applies the per-directory choice and the omissions above.
@@ -554,7 +554,7 @@ SELECT count(*) AS files, coalesce(sum(size), 0) AS bytes,
 
 WITH extents AS (
     SELECT g.path, e.byte_offset, e.line_start, e.line_offsets,
-           vfs_utf8(e.data) AS body                 -- NULL if it isn't UTF-8: skipped, not an error
+           vfs_utf8(e.data) AS body                 -- NULL if it isn't UTF-8 (see below): skipped
       FROM unnest($ids::uuid[], $paths::text[]) AS g(id, path)
       JOIN vfs_nodes n ON n.id = g.id
       JOIN vfs_extents e ON e.node_id = n.id AND e.generation = n.generation
@@ -575,6 +575,7 @@ SELECT path, line_no, byte_offset, text
  LIMIT $max_plus_one;
 ```
 
+- **`vfs_utf8`** (#10) is `convert_from(data, 'UTF8')` in a PL/pgSQL function that returns NULL on `character_not_in_repertoire`, so content that isn't UTF-8 is skipped without failing the query.
 - **Trailing newline.** Each extent's final `\n` is dropped before splitting, so it yields exactly its own lines, and a file ending in a newline doesn't gain an empty phantom line that `^$` would match.
 - **Byte offsets.** Each hit's offset comes from `line_offsets`, in the same currency as `vfs.pread(offset=...)`. The `Grep` tool shows only line numbers.
 - **One snapshot.** The two statements run in one `REPEATABLE READ` transaction, so the scope and every extent are read as of the same moment.
@@ -597,7 +598,7 @@ The `Grep` tool takes only ladderframe's parameters: `pattern`, `path` (a direct
 - Work grows with the bytes in scope, not with the number of matches. The extent filter costs one regex pass over the bytes, and only matching extents (about 64 KB each at most) are split into lines.
 - The total size of the scope comes from `vfs_nodes` before any content is read. A search over more than a configured cap (for example 50 MB) is refused with `ModelRetry: Search scope is 120 MB; narrow the path or include pattern`.
 - Every search runs under `SET LOCAL statement_timeout`.
-- Content that isn't valid UTF-8 is skipped. It's still readable with `vfs.pread`, and with `Read` unless it looks binary.
+- Content that isn't valid UTF-8 is skipped, extent by extent: a file with one stray Latin-1 byte still returns hits from its other extents (#10 may choose to skip the whole file instead). It's still readable with `vfs.pread`, and with `Read` unless it looks binary.
 
 ### Output format for the agent
 
@@ -892,7 +893,7 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Tree | `UNIQUE NULLS NOT DISTINCT` rejects duplicate root names; `rmdir` on a non-empty directory gives `ENOTEMPTY`; a move into its own subtree gives `EINVAL` | Unit |
 | Claim | Two claimers racing for the same file: exactly one wins | Concurrency |
 | Watch | Events arrive only after commit; `move` versus `modify` is classified correctly | Integration |
-| Search | Hits match a per-line search in Python over the same files; a trailing newline adds no phantom line; a UTF-8 character split across two appends still matches; non-UTF-8 files are skipped; the scope cap refuses before reading content | Integration |
+| Search | Hits match a per-line search in Python over the same files; a trailing newline adds no phantom line; a UTF-8 character split across two appends still matches; extents that aren't UTF-8 are skipped; the scope cap refuses before reading content | Integration |
 | File filter | Whenever a line matches the line form, the file matches the file form | Property |
 | Compaction | Bytes, `size`, `lines`, `generation` and `mtime` are unchanged; appends running during compaction keep gap-free offsets | Concurrency |
 | Content cache (deferred) | Reads through the cache equal uncached `pread` while another client appends, overwrites and compacts | Property |
