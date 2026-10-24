@@ -406,9 +406,9 @@ The caches live in each process's memory and are never shared between processes.
 
 - Only positive entries are cached. A missing name is never cached, so a file another client creates is visible at once.
 - The cache also keeps `id -> (parent_id, name)`. A `move` or `delete` notification carries the node id, so it evicts the right entry without knowing the old name.
-- The TTL only covers notifications lost while the LISTEN connection reconnects. After a reconnect, the whole cache is cleared.
+- The TTL only covers what notifications can't: those lost while the LISTEN connection reconnects (after a reconnect, the whole cache is cleared), and a listing whose snapshot predates a move or delete but which is stored after that change's notification was handled.
 
-In the library this is `minifs.vfs.cache.DirEntryCache`, kept fresh by `async with cache.follow(watcher)` and passed to `VFSClient(pool, cache=cache)`. Its `stats()` gives the hit rate. Concurrent operations that find the same cached path stale share one eviction query.
+In the library this is `minifs.vfs.cache.DirEntryCache`, kept fresh by `async with cache.follow(watcher)` and passed to `VFSClient(pool, cache=cache)`. Its `stats()` gives the hit rate. Concurrent operations that find the same cached path stale share one eviction query, as long as it hasn't been sent yet. Each entry costs about 500 bytes; `max_entries` (default 10,000) caps the total.
 
 ### File content
 

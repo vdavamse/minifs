@@ -325,6 +325,11 @@ class Watcher:
         self._closed = False
 
     @property
+    def started(self) -> bool:
+        """Whether ``start()`` ran (entering the watcher runs it), so events are delivered. Stays True after close."""
+        return self._task is not None
+
+    @property
     def backend_pid(self) -> int | None:
         """The backend pid of the LISTEN connection, None while reconnecting."""
         return None if self._conn is None else self._conn.info.backend_pid

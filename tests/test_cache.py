@@ -172,6 +172,15 @@ def test_bad_arguments() -> None:
         DirEntryCache(ttl=0)
     with pytest.raises(ValueError, match="max_entries"):
         DirEntryCache(max_entries=0)
+    for ttl in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="ttl"):
+            DirEntryCache(ttl=ttl)
+
+
+async def test_follow_needs_a_started_watcher(db: str) -> None:
+    with pytest.raises(RuntimeError, match="started"):
+        async with DirEntryCache().follow(Watcher(factory(db))):
+            pass
 
 
 # Through a Watcher and a client

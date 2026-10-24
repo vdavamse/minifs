@@ -12,8 +12,8 @@ cache only has to keep stale entries rare:
   reconnects, when the subscription overflows, or on a TRUNCATE) clears everything.
 - Every entry expires ``ttl`` seconds (2 by default) after it was stored, whatever its use. The TTL is the fallback
   for what notifications can't cover: events lost while the LISTEN connection is down (the ``rescan`` only comes
-  once it is back), and a listing whose snapshot predates a move but which is stored after the move's notification
-  was handled.
+  once it is back), and a listing whose snapshot predates a move or delete but which is stored after that change's
+  notification was handled.
 
 ``evict`` removes whatever name the node has now. When the client evicts links it found stale, a fresher name
 stored meanwhile can go too: that costs a miss, never a wrong answer.
@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
@@ -40,15 +41,15 @@ from minifs.vfs.watch import Event, Subscription, Watcher
 _log = logging.getLogger(__name__)
 
 DEFAULT_TTL = 2.0
-DEFAULT_MAX_ENTRIES = 100_000
+DEFAULT_MAX_ENTRIES = 10_000  # about 500 bytes each, so about 5 MB per process
 
 
 @dataclass(frozen=True, slots=True)
 class CacheStats:
     """Counters since the cache was created. ``misses`` includes ``expired``: lookups that found an entry past its
     TTL. ``evictions`` counts entries removed by ``evict`` (by the client, for its own renames and removals and for
-    links it found stale, or by a notification), ``clears`` the calls to ``clear`` (each ``rescan``); entries dropped
-    by the TTL or the size cap count as neither.
+    links it found stale, or by a notification), ``clears`` the calls to ``clear`` (each ``rescan``, and entering
+    ``follow``); entries dropped by the TTL or the size cap count as neither.
 
     ``hit_rate`` counts path components, not paths: a path resolves from the cache only if all its components hit.
     A path is cached when a listing of its directory or its creation went through this process, so a low rate with
@@ -81,8 +82,9 @@ type _Key = tuple[UUID | None, str]
 class DirEntryCache:
     """Positive directory entries with a reverse map by node id, a TTL and a size cap (see the module docstring).
 
-    ``max_entries`` bounds memory under a burst of stores: past it, the oldest entries go first. ``clock`` (seconds,
-    monotonic) is for tests.
+    ``max_entries`` bounds memory under a burst of stores: past it, the oldest entries go first. An entry costs about
+    500 bytes, so the default of 10,000 is about 5 MB; within a 2 s TTL, that is more than a process's agents list.
+    ``clock`` (seconds, monotonic) is for tests.
     """
 
     def __init__(
@@ -92,8 +94,8 @@ class DirEntryCache:
         max_entries: int = DEFAULT_MAX_ENTRIES,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if ttl <= 0:
-            raise ValueError("ttl must be positive")
+        if not math.isfinite(ttl) or ttl <= 0:
+            raise ValueError("ttl must be a positive finite number")
         if max_entries < 1:
             raise ValueError("max_entries must be at least 1")
         self._ttl = ttl
@@ -175,9 +177,11 @@ class DirEntryCache:
     async def follow(self, watcher: Watcher) -> AsyncGenerator[DirEntryCache]:
         """Keeps the cache fresh from ``watcher``'s events until the block exits.
 
-        Clears the cache first, since entries stored before may have missed events. If the watcher closes while
-        the block runs, eviction falls back to the TTL alone.
+        Clears the cache first, since entries stored before may have missed events. RuntimeError if the watcher was
+        not started. If the watcher closes while the block runs, eviction falls back to the TTL alone.
         """
+        if not watcher.started:
+            raise RuntimeError("follow() needs a started Watcher: no events would arrive")
         subscription = watcher.subscribe(lambda e: e.op in ("move", "delete"))
         self.clear()
         leaving = asyncio.Event()
