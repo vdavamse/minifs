@@ -25,7 +25,7 @@
 -- 2. Line check: only passing extents are split on \n into their cardinality(line_offsets) lines (so a final
 --    \n adds no empty phantom line after it, and an extent that is one empty line still yields it), and each
 --    line is tested against p_line_pattern. Line k of an extent is file line line_start + k, starting at file
---    byte byte_offset + line_offsets[k].
+--    byte byte_offset + line_offsets[k] (the pieces are zipped with unnest(line_offsets), see below).
 -- With p_fixed, both patterns are literal strings tested with strpos instead of regexes. Case-insensitive
 -- search is in the translated pattern, so the regexes are always tested with ~, never ~* (which depends on the
 -- database's locale).

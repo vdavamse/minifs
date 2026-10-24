@@ -558,9 +558,10 @@ SELECT count(*) AS files, coalesce(sum(size), 0) AS bytes,
 --   for each extent in line_start order:                            (FETCHed one at a time from a cursor)
 --     body := convert_from(data, 'UTF8')
 --     continue unless body (without its final \n) ~ $file_pattern  -- step 2: '(?n)' plus the translated pattern
-SELECT $path, x.line_start + l.k AS line_no, x.byte_offset + x.line_offsets[l.k] AS byte_offset, l.text
-  FROM string_to_table(x.body, E'\n') WITH ORDINALITY AS l(text, k)       -- step 3: lines exist only here
- WHERE l.k <= cardinality(x.line_offsets)           -- no empty piece after the final \n
+SELECT $path, x.line_start + l.k AS line_no, x.byte_offset + l.off AS byte_offset, l.text
+  FROM ROWS FROM (string_to_table(x.body, E'\n'), unnest(x.line_offsets))  -- step 3: lines exist only here,
+       WITH ORDINALITY AS l(text, off, k)                                  -- zipped with their offsets
+ WHERE l.off IS NOT NULL                            -- no empty piece after the final \n
    AND l.text ~ $line_pattern                       -- always ~: case folding is in the pattern
  ORDER BY l.k
  LIMIT $hits_still_needed;

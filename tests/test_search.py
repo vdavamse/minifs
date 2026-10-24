@@ -420,6 +420,8 @@ async def test_stops_inside_a_file(vfs: VFSClient, conn: AsyncConnection) -> Non
     assert found == 10
     assert all_hits < full * 1.1  # a hit's extent reads its offsets once, not once per line
     assert full > 2 * extents  # the extents are stored out of line, so the count measures what was read
+    # INFO stops in the first extent. NEEDLE, limit 1 and 2 (hits 1 and 2 are 30,000 lines apart) also fail if
+    # the extents are fetched ahead in batches, as a FOR loop does: that filters the file up to the tenth hit.
     for pattern, limit in (("INFO", 100), ("NEEDLE", 1), ("NEEDLE", 2)):
         found, read = await blocks_read(pattern, limit)
         assert found == limit
