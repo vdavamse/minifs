@@ -78,7 +78,8 @@ async def terminate(conn: AsyncConnection, pid: int | None) -> None:
 
 
 async def append(conn: AsyncConnection, node: UUID, size: int) -> None:
-    await conn.execute("SELECT vfs_append(%s, %s)", (node, b"x" * size))
+    """Appends a line of ``size`` bytes (nothing for 0), so each append is an extent of its own."""
+    await conn.execute("SELECT vfs_append(%s, %s)", (node, (b"x" * (size - 1) + b"\n") if size else b""))
 
 
 # The trigger

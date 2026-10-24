@@ -21,7 +21,7 @@ An agent sees one filesystem tree, stored entirely in Postgres, and works on it 
 - Full POSIX: no hard links, permission bits, xattrs or random-offset writes in v1.
 - Large binary files. The design targets text (source code, markdown, logs) from kilobytes to a few megabytes per file.
 
-**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly extents in `vfs_extents`. SQL functions implement append, overwrite, positional read, rename, compaction and watch (via NOTIFY). Search scans the current bytes of the files in scope inside Postgres, the way ripgrep scans a disk, so there is no line table or search index to keep in step with writes. A recursive walk over the parent pointers powers `Glob`. A Python VFS library wraps these functions and caches what can't go stale: directory entries, and file bytes keyed by generation. Agent tools with ladderframe's contracts (for example PydanticAI tools) wrap the library and number lines on the client.
+**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly, line-aligned extents in `vfs_extents`: each starts at a line start and knows its first line number and where its lines start. SQL functions implement append, overwrite, positional and line reads, rename, compaction and watch (via NOTIFY). Search scans the current bytes of the files in scope inside Postgres, extent by extent, the way ripgrep scans a disk, so there is no line table or search index to keep in step with writes. A recursive walk over the parent pointers powers `Glob`. A Python VFS library wraps these functions and caches what can't go stale: directory entries. Agent tools with ladderframe's contracts (for example PydanticAI tools) wrap the library; `Read` and `Grep` get their line numbers from Postgres.
 
 ## Context
 
@@ -52,8 +52,8 @@ Any number of clients share one VFS library and one set of SQL functions. Postgr
 | Component | Role |
 | --- | --- |
 | Agent tools | `Read`, `Write`, `Glob`, `Grep` exposed to the model, with ladderframe's signatures, output formats and errors |
-| VFS library | Path resolution, the chroot view, write policy, glob and regex translation, caching, the line map, cursors and watch |
-| SQL functions | Append, overwrite, positional read, resolve, readdir, create, rename, unlink, search, compact |
+| VFS library | Path resolution, the chroot view, write policy, glob and regex translation, caching, cursors and watch |
+| SQL functions | Append, overwrite, positional and line reads, resolve, readdir, create, rename, unlink, search, compact |
 | PostgreSQL | Tables, the NOTIFY trigger, and routine compaction |
 
 ## Filesystem tree and conventions
@@ -90,7 +90,7 @@ The most specific rule wins. The agent's tools have no append (`Write` replaces 
 
 ## Storage model
 
-The model has two tables: `vfs_nodes` holds inodes and directory entries, and `vfs_extents` holds file bytes as variable-length extents at byte offsets. An append is one INSERT, an overwrite is a new generation, and a read is a range scan.
+The model has two tables: `vfs_nodes` holds inodes and directory entries, and `vfs_extents` holds file bytes as variable-length extents at byte offsets. Every extent starts at a line start. An append is an INSERT (plus, when the file ends mid-line, a rewrite of its last extent), an overwrite is a new generation, and a read, by bytes or by lines, is a range scan.
 
 ```sql
 CREATE TABLE vfs_nodes (                         -- inode + directory entry (no hard links)
@@ -99,6 +99,7 @@ CREATE TABLE vfs_nodes (                         -- inode + directory entry (no 
     name        TEXT NOT NULL,
     kind        TEXT NOT NULL CHECK (kind IN ('file','dir')),   -- never changes after create
     size        BIGINT NOT NULL DEFAULT 0,       -- exact; maintained under the inode lock; 0 for dirs
+    lines       BIGINT NOT NULL DEFAULT 0,       -- line count, updated with size; 0 for dirs
     generation  INT    NOT NULL DEFAULT 0,       -- +1 on overwrite/truncate; appends keep it
     ctime       TIMESTAMPTZ NOT NULL DEFAULT now(),
     mtime       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -112,14 +113,17 @@ CREATE TABLE vfs_nodes (                         -- inode + directory entry (no 
 CREATE TABLE vfs_extents (                       -- data blocks
     node_id     UUID   NOT NULL,
     generation  INT    NOT NULL,
-    byte_offset BIGINT NOT NULL,
-    data        BYTEA  NOT NULL,
+    byte_offset BIGINT NOT NULL,                 -- always at a line start
+    line_start  BIGINT NOT NULL,                 -- the number of \n before byte_offset
+    data        BYTEA  NOT NULL,                 -- whole lines; only the last extent may end mid-line
+    line_offsets INT4[] NOT NULL CHECK (line_offsets[1] = 0),   -- where each of its lines starts, in data
     node_kind   TEXT   NOT NULL DEFAULT 'file' CHECK (node_kind = 'file'),
     PRIMARY KEY (node_id, generation, byte_offset),
+    UNIQUE (node_id, generation, line_start),    -- line lookups; each extent starts a different line
     FOREIGN KEY (node_id, node_kind)             -- only files have extents
         REFERENCES vfs_nodes (id, kind) ON DELETE CASCADE
 );
-ALTER TABLE vfs_extents ALTER COLUMN data SET STORAGE EXTERNAL;   -- slice reads without decompressing
+ALTER TABLE vfs_extents ALTER COLUMN data SET STORAGE EXTENDED;   -- compressed: extents are small, read whole
 ```
 
 Each column choice, and why:
@@ -129,13 +133,16 @@ Each column choice, and why:
 | `UNIQUE NULLS NOT DISTINCT (parent_id, name)` | Root entries have `parent_id IS NULL`. A plain `UNIQUE` treats NULLs as distinct, so it would allow two `/docs` entries. Needs PostgreSQL 15+. | Plain `UNIQUE (parent_id, name)` |
 | The parent foreign key uses `RESTRICT` | POSIX `rmdir` on a non-empty directory returns `ENOTEMPTY`. `CASCADE` would silently delete a whole subtree. | `ON DELETE CASCADE` |
 | Foreign keys on `(id, kind)` | The schema itself rejects a child under a file and an extent on a directory. The constant columns `parent_kind = 'dir'` and `node_kind = 'file'` make that a plain foreign key. A root's `parent_id` is NULL, so the check skips it. | A trigger, or trusting every SQL function to check |
-| `fillfactor = 80` on `vfs_nodes` | Every append updates `size` and `mtime`, which aren't indexed. With free space in the page, Postgres makes that a HOT update: no new index entries, and the dead version is pruned in place. | The default 100, where a full page forces a non-HOT update |
+| `fillfactor = 80` on `vfs_nodes` | Every append updates `size`, `lines` and `mtime`, which aren't indexed. With free space in the page, Postgres makes that a HOT update: no new index entries, and the dead version is pruned in place. | The default 100, where a full page forces a non-HOT update |
 | `uuidv7()` ids | Time-ordered: inserts stay local in the B-tree, and the id records creation time. Built in from PostgreSQL 18. On PG 16 or 17, use the pg\_uuidv7 extension where available, or generate the ids in the app. | `gen_random_uuid()` |
-| Variable-length extents | An append is one INSERT and never rewrites earlier bytes. A positional read selects only the overlapping extents. | Inline `body TEXT` (each append rewrites the whole value) or fixed-size chunks (each append rewrites the last block) |
+| Variable-length extents | An append that follows a complete line is one INSERT. A positional read selects only the overlapping extents. | Inline `body TEXT` (each append rewrites the whole value) or fixed-size chunks (each append rewrites the last block) |
+| Line-aligned extents | Every extent starts at a line start, and every extent but a file's last ends with `\n`. So line N is found with one index descent on `line_start` plus `line_offsets[N - line_start]`, search can decode and split each extent on its own, and no extent splits a UTF-8 character (`\n` never occurs inside one). The price: an append to a file that ends mid-line rewrites the last extent, at most about 64 KB unless its last line is longer. A file with no newlines at all is one line, so each append rewrites all of it, and a line can't grow past bytea's 1 GB limit. The workload is read-heavy and its files are text with lines, so work moves from reads to writes. | A line table (a row per line), a `text[]` of lines per file, or line numbers derived on the client from the bytes |
+| `line_start` and `line_offsets` | The extent's first line number and the start of each line in it: an 8-byte integer and 4 bytes per line, computed by `vfs_cut` as the content is written. Compaction concatenates them; nothing else maintains them. | Counting newlines at read time, from the start of the file |
+| `lines` stored on the inode | The total for `Read`'s footers and its out-of-range message, without scanning. Split on `\n`, and a trailing `\n` adds no empty last line, so `a\nb\n` and `a\nb` both have 2 lines. | Computing it from the last extent on every read |
 | `generation` | Lets readers and cursors tell an append (same generation, larger size) from a rewrite (new generation). | Comparing content hashes |
 | `size` stored on the inode | `stat` without scanning extents. It's always updated in the same transaction as the extent, so it can't drift. | Computing `sum(length(data))` on every stat |
 | `BYTEA` content | True byte offsets, and safe for binary content. Python decodes UTF-8. | `TEXT` (offsets would be in characters) |
-| `STORAGE EXTERNAL` on `data` | TOAST stores values over about 2 KB in roughly 2 KB chunks. Uncompressed, a `substring` fetches only the chunks it covers, so a 16 KB read of a 5 MB extent touches about 8 chunks. | The default `EXTENDED`: text compresses 3 to 4 times, but a slice read may decompress from the start of the value |
+| `STORAGE EXTENDED` on `data` (the default) | Writers cut extents of about 64 KB (a longer one is a single line), and compaction merges up to its target, 64 KB by default. Extents that size are read whole, so decompressing one costs little, and text compresses 3 to 4 times. | `EXTERNAL` (uncompressed), whose slice reads fetch only the TOAST chunks they cover: that paid off for multi-megabyte extents, which line alignment now makes only for a single line longer than the target. Reading the tail of such a line decompresses it from the start (in one review measurement on PG 16, about 5 ms for a 16 KB tail of an 18 MB line, against 0.6 ms uncompressed) |
 
 **Directory entry and inode in one row.** Without hard links, every inode has exactly one name, so splitting them gains nothing. If hard links are ever needed, split this into `inodes(id, size, generation, nlink, ...)` and `dentries(parent_id, name, inode_id)`.
 
@@ -158,9 +165,12 @@ Each column choice, and why:
 
 **Moves must not create cycles.** `rename` of a directory checks that the destination isn't inside the source. A recursive CTE walks up from the destination's parent within the same transaction, so a move like `mv /a /a/b/c` returns `EINVAL`.
 
-**Compaction.** Extent size isn't a tuning knob: an extent is exactly as big as the write that made it, and TOAST already splits large values into chunks. What grows is the extent count: a log appended one line at a time gains one extent per append. `vfs_compact(node)` merges a file's extents into pieces of about 64 KB under the inode lock.
+**Cutting.** Every writer cuts its content with `vfs_cut(data, target)` into consecutive whole lines of about 64 KB, always just after a `\n`. A line longer than the target is one extent of its own; a line is never cut. An overwrite or a create with content cuts all of it. An append cuts what it adds, together with the file's last extent when that ends mid-line (deleted and cut again), so the alignment holds whatever the appends contain: partial lines, a UTF-8 character split across two appends, or no newline at all.
 
-- It changes none of the bytes, `size`, `generation` or `mtime`, so readers, cursors and caches never notice. It doesn't update `vfs_nodes`, so it emits no NOTIFY.
+**Compaction.** Extent size isn't a tuning knob: an extent is as big as the write that made it, up to the cut's target. What grows is the extent count: a log appended one line at a time gains one extent per append. `vfs_compact(node)` merges a file's small neighbouring extents into pieces of about 64 KB under the inode lock.
+
+- It merges whole extents, so pieces stay line-aligned: a piece keeps its first extent's `line_start`, and its `line_offsets` are its extents' offsets, shifted.
+- It changes none of the bytes, `size`, `lines`, `generation` or `mtime`, so readers, cursors and caches never notice. It doesn't update `vfs_nodes`, so it emits no NOTIFY.
 - It runs as routine maintenance: a periodic job compacts files with more than 1,000 extents. `vfs_append` can also compact opportunistically when a file crosses that threshold.
 - The target size is forgiving. Anything from 16 KB to 1 MB behaves about the same, so it is set once, not tuned.
 
@@ -173,6 +183,7 @@ Every operation is a SQL function, so every client (agent tools, ingestion, a fu
 | Append | `vfs_append(node, data) -> offset` | `write` with `O_APPEND` | Inode `FOR UPDATE` until commit |
 | Overwrite | `vfs_write(node, data, expect_gen, expect_size, expect_parent, expect_name) -> (generation, size)` | `open` with `O_TRUNC`, then `write` | Inode `FOR UPDATE`; optional compare-and-swap |
 | Positional read | `vfs_pread(node, offset, limit)` | `pread` | None (MVCC snapshot) |
+| Line read | `vfs_pread_lines(node, first_line, max_lines, max_bytes)` | — | None (MVCC snapshot) |
 | Resolve path | `vfs_resolve(path) -> id` | `namei` | None |
 | List directory | `vfs_readdir(dir)` | `readdir` | None |
 | Create, mkdir | `vfs_create(parent, name, kind, data DEFAULT NULL) -> (id, generation, size)` | `open` with `O_CREAT\|O_EXCL`, `mkdir` | Unique constraint |
@@ -184,19 +195,34 @@ Every operation is a SQL function, so every client (agent tools, ingestion, a fu
 
 ```sql
 CREATE FUNCTION vfs_append(p_node UUID, p_data BYTEA) RETURNS BIGINT AS $$
-DECLARE v_size BIGINT; v_gen INT;
+DECLARE v_size BIGINT; v_gen INT; v_lines BIGINT; v_off BIGINT; v_line BIGINT; v_last BYTEA;
 BEGIN
-    SELECT size, generation INTO v_size, v_gen
+    SELECT size, generation, lines INTO v_size, v_gen, v_lines
       FROM vfs_nodes WHERE id = p_node AND kind = 'file' FOR UPDATE;
     IF NOT FOUND THEN PERFORM vfs_raise('ENOENT', p_node::text); END IF;   -- or EISDIR
     IF length(p_data) = 0 THEN RETURN v_size; END IF;   -- extents are never empty
-    INSERT INTO vfs_extents VALUES (p_node, v_gen, v_size, p_data);
+    SELECT byte_offset, line_start, data INTO v_off, v_line, v_last
+      FROM vfs_extents WHERE node_id = p_node AND generation = v_gen
+     ORDER BY byte_offset DESC LIMIT 1;                  -- the last extent
+    IF NOT FOUND OR get_byte(v_last, length(v_last) - 1) = 10 THEN
+        v_off := v_size; v_line := v_lines; v_last := '';   -- the file ends with \n (or is empty)
+    ELSE                                                 -- it ends mid-line: cut the last extent again
+        DELETE FROM vfs_extents WHERE node_id = p_node AND generation = v_gen AND byte_offset = v_off;
+    END IF;
+    INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)
+    SELECT p_node, v_gen, v_off + rel_offset, v_line + rel_line, data, line_offsets
+      FROM vfs_cut(v_last || p_data);
     UPDATE vfs_nodes SET size = v_size + length(p_data),
+                         lines = (SELECT line_start + cardinality(line_offsets) FROM vfs_extents
+                                   WHERE node_id = p_node AND generation = v_gen
+                                   ORDER BY byte_offset DESC LIMIT 1),
                          mtime = greatest(mtime, clock_timestamp())   -- never backwards
      WHERE id = p_node;
     RETURN v_size;                       -- the offset the data landed at
 END $$ LANGUAGE plpgsql;
 ```
+
+Appends keep extents line-aligned, so an append to a file that ends mid-line rewrites the file's last extent: those bytes are unchanged, but their row is replaced. A trailing partial line goes in an extent of its own, so a writer whose appends end mid-line (stdout copied in chunks, a token stream) rewrites only that partial line each time, and a log appended a line at a time never rewrites anything. Overwrites and creates split it off too, so only the first such append after a compaction rewrites the whole last extent once, up to the compaction's target. A file with no newlines at all is the worst case: every append rewrites the whole file.
 
 The inode lock is held until commit, so concurrent appenders take turns and **offset order always equals commit order**. A reader at `offset > cursor` can never miss bytes that commit late at a lower offset. This is the guarantee that makes incremental reads correct. Because it comes from the lock, it holds for any number of writers.
 
@@ -222,10 +248,12 @@ BEGIN
         PERFORM vfs_raise('ESTALE', p_node::text);  -- SQLSTATE MF116
     END IF;
     DELETE FROM vfs_extents WHERE node_id = p_node;
-    IF length(p_data) > 0 THEN
-        INSERT INTO vfs_extents VALUES (p_node, v_gen + 1, 0, p_data);
-    END IF;
+    INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)
+    SELECT p_node, v_gen + 1, rel_offset, rel_line, data, line_offsets
+      FROM vfs_cut(p_data);                         -- whole lines of about 64 KB each; none if empty
     UPDATE vfs_nodes SET generation = v_gen + 1, size = length(p_data),
+                         lines = (SELECT coalesce(max(line_start + cardinality(line_offsets)), 0)
+                                    FROM vfs_extents WHERE node_id = p_node AND generation = v_gen + 1),
                          mtime = greatest(mtime, clock_timestamp())
      WHERE id = p_node;
     RETURN QUERY SELECT v_gen + 1, length(p_data)::BIGINT;
@@ -282,7 +310,7 @@ async with Watcher(connect) as watcher:
 
 ## Read contract
 
-Reads come in two layers. The **library** addresses every file by byte offset, so a source file, a 200 KB doc, `notes.md` and a growing log all page and tail identically. The **tool** is ladderframe's line-numbered `Read`, and derives line numbers from the bytes through the client line map (see Caching).
+Reads come in two layers. The **library** addresses every file by byte offset, so a source file, a 200 KB doc, `notes.md` and a growing log all page and tail identically, and also by line (`vfs_pread_lines`). The **tool** is ladderframe's line-numbered `Read`, and reads its lines with `vfs_pread_lines`: Postgres finds line N from the extents' line numbers, so there's no client line map and no full-file read.
 
 ### Library contract: byte offsets
 
@@ -304,40 +332,53 @@ Library reads return exact bytes, never adjusted to line or character boundaries
 ```sql
 CREATE FUNCTION vfs_pread(p_node UUID, p_offset BIGINT, p_limit INT)
 RETURNS TABLE (size BIGINT, generation INT, byte_offset BIGINT, data BYTEA) AS $$
-    WITH n AS (
-        SELECT id, size, generation,
-               CASE WHEN p_offset < 0 THEN greatest(size + p_offset, 0)
-                    ELSE least(p_offset, size) END AS off   -- clamped, so off + p_limit can't overflow
-          FROM vfs_nodes WHERE id = p_node AND kind = 'file'
-    ), s AS (                                       -- step 1: the extent that contains off
-        SELECT n.*, coalesce((SELECT e.byte_offset FROM vfs_extents e
-                               WHERE e.node_id = n.id AND e.generation = n.generation
-                                 AND e.byte_offset <= n.off
-                               ORDER BY e.byte_offset DESC LIMIT 1), 0) AS start
-          FROM n
-    )
-    SELECT s.size, s.generation,
-           greatest(e.byte_offset, s.off),
+DECLARE v_size BIGINT; v_gen INT; v_off BIGINT; v_start BIGINT;
+BEGIN
+    SELECT n.size, n.generation INTO v_size, v_gen
+      FROM vfs_nodes n WHERE n.id = p_node AND n.kind = 'file';   -- ENOENT or EISDIR if none
+    v_off := CASE WHEN p_offset < 0 THEN greatest(v_size + p_offset, 0)
+                  ELSE least(p_offset, v_size) END;  -- clamped, so v_off + p_limit can't overflow
+    SELECT e.byte_offset INTO v_start FROM vfs_extents e   -- step 1: the extent that contains v_off
+     WHERE e.node_id = p_node AND e.generation = v_gen AND e.byte_offset <= v_off
+     ORDER BY e.byte_offset DESC LIMIT 1;
+    RETURN QUERY                                    -- step 2: range scan forward from there
+    SELECT v_size, v_gen, greatest(e.byte_offset, v_off),
            substring(e.data                         -- substring(bytea) takes int, not bigint
-                     FROM (greatest(s.off - e.byte_offset, 0) + 1)::int
-                     FOR  (least(e.byte_offset + length(e.data), s.off + p_limit)
-                         - greatest(e.byte_offset, s.off))::int)
-      FROM s
-      LEFT JOIN vfs_extents e                       -- step 2: range scan forward from there
-             ON e.node_id = s.id AND e.generation = s.generation
-            AND e.byte_offset >= s.start
-            AND e.byte_offset <  s.off + p_limit
-            AND e.byte_offset + length(e.data) > s.off
-            AND p_limit > 0
-     ORDER BY e.byte_offset
-$$ LANGUAGE sql STABLE;
+                     FROM (greatest(v_off - e.byte_offset, 0) + 1)::int
+                     FOR  (least(e.byte_offset + length(e.data), v_off + p_limit)
+                         - greatest(e.byte_offset, v_off))::int)
+      FROM vfs_extents e
+     WHERE e.node_id = p_node AND e.generation = v_gen
+       AND e.byte_offset >= v_start
+       AND e.byte_offset <  v_off + p_limit
+       AND e.byte_offset + length(e.data) > v_off
+       AND p_limit > 0
+     ORDER BY e.byte_offset;
+    IF NOT FOUND THEN                               -- nothing in range: still report size and generation
+        RETURN QUERY SELECT v_size, v_gen, v_off, NULL::BYTEA;
+    END IF;
+END $$ LANGUAGE plpgsql STABLE;
 ```
 
 - **Two index steps, like walking ext4's extent tree.** Only `byte_offset < off + limit` can bound a scan of the primary key; the overlap test `byte_offset + length(data) > off` can't. A single range scan would therefore read every extent from the start of the file. Step 1 descends backward to the extent that contains `off`, and step 2 scans forward from it, so a read costs O(log E + extents returned) for a file with E extents. On a 20,000-extent file, a read at the end touches 3 index pages.
-- **Trimming happens in Postgres.** A 16 KB read of a 5 MB doc sends 16 KB. `length(data)` reads the size from the TOAST pointer without fetching the value.
-- **It's one statement, so one MVCC snapshot.** `size` and `generation` describe exactly the bytes returned, even while another client is appending.
-- **The `LEFT JOIN`** returns a single row with NULL data when nothing overlaps, so a read past EOF or of an empty file still returns `size` and `generation`, and `byte_offset` is the resolved start offset.
-- **The real function** (migration 004, like the real `vfs_append` and `vfs_write`) is this query inside a PL/pgSQL `STABLE` function, still one snapshot, which raises `ENOENT` or `EISDIR` when the query returns no row.
+- **Each step is its own statement**, so the planner sees step 2's bounds as values. Written as one query, with the bounds computed in it, it can't tell how narrow they are, and may scan all of a file's extents instead (it did once the extents gained their line columns).
+- **Trimming happens in Postgres.** A 16 KB read of a 5 MB doc sends 16 KB. `length(data)` reads the size from the value's header without decompressing it.
+- **It's `STABLE`, so it reads one MVCC snapshot.** Every statement in a `STABLE` function runs on the snapshot of the statement that called it, so `size` and `generation` describe exactly the bytes returned, even while another client is appending.
+- **When nothing overlaps** it returns a single row with NULL data, so a read past EOF or of an empty file still returns `size` and `generation`, and `byte_offset` is the resolved start offset.
+- **The real function** (migration 007, like the real `vfs_append` and `vfs_write`) also validates its arguments and raises `ENOENT` or `EISDIR`.
+
+### Line reads
+
+```
+vfs_pread_lines(node, first_line, max_lines, max_bytes)
+    -> (size, generation, lines, first_line, byte_offset, data)
+```
+
+It returns the bytes from the start of line `first_line` (1-based) through at most `max_lines` whole lines, each with its `\n`, capped at `max_bytes` (so the last line may come back cut), in one row. With them come the file's `size`, `generation` and total `lines`, and the `byte_offset` where `first_line` starts, so a caller can switch between line and byte reads. A `first_line` past the last line returns no bytes, `byte_offset = size` and the total, which is what `Read` needs to report `Offset N is out of range for this file (T lines)`.
+
+- **Three index steps.** The extent with the largest `line_start < first_line` holds the start of `first_line`, at `byte_offset + line_offsets[first_line - line_start]`: one backward descent of the `(node_id, generation, line_start)` index, like `vfs_pread`'s step 1. A second descent finds where line `first_line + max_lines` starts, unless that is past the end, and a forward range scan of the primary key between the two reads the bytes. On a 20,000-line file a read at the start, the middle or the end touches a few pages.
+- **One snapshot**, as in `vfs_pread`: it is `STABLE`, and the total, the bytes and their offset come from the same moment.
+- **Lines split on `\n` only**, and a trailing `\n` adds no empty last line, so the line numbers are `Grep`'s, and `lines` is the count `Read` reports.
 
 ### Per-path cursors and generations
 
@@ -376,10 +417,10 @@ The tool takes ladderframe's `Read` parameters and returns its output format.
 </content>
 ```
 
-- **Lines come from the line map.** The map turns line N into a byte offset, then `vfs_pread` reads forward through the content cache until K lines or the byte cap. Lines split on `\n` only and drop a trailing `\r`, so line numbers agree with `Grep` hits.
+- **Lines come from Postgres.** One `vfs_pread_lines(node, N, K, 50 KB)` call returns lines N to N+K-1, the total line count and the snapshot's generation, with no full-file read. The 50 KB cap applies to the raw bytes, before the tool cuts each line to 2,000 characters, so when a long line came back cut, the tool calls again from the line after it to fill the page as ladderframe does. Lines split on `\n` only, and the tool drops a trailing `\r`, so line numbers agree with `Grep` hits.
 - **Bounded output, as in ladderframe.** A line longer than 2,000 characters is cut and gets `... (line truncated to 2000 chars)`, and output stops at 50 KB with `(Output capped at 50 KB. Showing lines a-b. Use offset=b+1 to continue.)`. The last page ends with `(End of file - total n lines)`.
 - **Text only.** Bytes are decoded as UTF-8 with replacement characters. A file that looks binary (PNG, JPEG, GIF, WEBP or `%PDF-` magic bytes, a `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.pdf` extension, which ladderframe would attach, or another known binary extension, a NUL byte in the first 4 KB, or more than 30% non-printable bytes there) gets `ModelRetry: Cannot read binary file: <path>`. ladderframe's `Read` attaches images and PDFs; minifs's `Read` doesn't, so they get the same binary-file error (see Differences from ladderframe).
-- **Nearby instructions.** As in ladderframe: for a file below `/workspace`, each directory from the file's parent up to, but not including, `/workspace` is checked for `AGENTS.md`, then `CLAUDE.md`, taking the first that exists, with no fallback. That file is then omitted if it's the file being read, was already shown in this conversation, or is blank. Each remaining instruction file is appended, headed `Instructions from: <path>`, in one `<system-reminder>` block. Files outside `/workspace`, such as `/docs/**`, get none. The ancestor ids are already known from path resolution, so one query finds every candidate (`WHERE parent_id = ANY($ancestors) AND kind = 'file' AND name IN ('AGENTS.md', 'CLAUDE.md')`, returning each candidate's `vfs_text`), sent in the same round trip as the read. The client applies the per-directory choice and the omissions above.
+- **Nearby instructions.** As in ladderframe: for a file below `/workspace`, each directory from the file's parent up to, but not including, `/workspace` is checked for `AGENTS.md`, then `CLAUDE.md`, taking the first that exists, with no fallback. That file is then omitted if it's the file being read, was already shown in this conversation, or is blank. Each remaining instruction file is appended, headed `Instructions from: <path>`, in one `<system-reminder>` block. Files outside `/workspace`, such as `/docs/**`, get none. The ancestor ids are already known from path resolution, so one query finds every candidate (`WHERE parent_id = ANY($ancestors) AND kind = 'file' AND name IN ('AGENTS.md', 'CLAUDE.md')`, returning each candidate's content), sent in the same round trip as the read. The client applies the per-directory choice and the omissions above.
 - **Stateless.** There is no `offset=None` auto-continue and no per-agent cursor in the tool. To tail a log, the agent calls `Read` again with the `offset` its last footer gave. Generation-aware tailing is a library feature.
 
 ### Line numbers in the tools, byte offsets in the library
@@ -391,16 +432,15 @@ The tool takes ladderframe's `Read` parameters and returns its output format.
 
 PostgreSQL stays the single source of truth: every read through a cache still reflects the latest committed write. Two properties make that cheap.
 
-- **File bytes never change in place.** An append adds bytes after the end, an overwrite starts a new generation, and compaction changes neither. Bytes cached under `(node_id, generation)` are valid forever. The only question is whether the file has grown or been rewritten.
+- **File bytes never change in place.** An append adds bytes after the end, an overwrite starts a new generation, and compaction changes neither. (An append that completes a partial line rewrites the last extent's row, but not its bytes.) Bytes cached under `(node_id, generation)` are valid forever. The only question is whether the file has grown or been rewritten.
 - **Directory entries are keyed by parent id, not by path.** Renaming `/a` to `/b` changes only the `(root, "a")` entry. Every entry below it is keyed by its parent's id, which didn't change, so it stays valid.
 
 | Cache | Key → value | Kept fresh by | Used by |
 | --- | --- | --- | --- |
 | Directory entries | `(parent_id, name) -> (id, kind)` | NOTIFY `move` and `delete` evict; a 2 s TTL as a fallback | Every path resolution |
-| File content | `(node_id, generation) -> bytes [0, cached_size)` | The read itself (below) | `Read`, `vfs.pread`, the line map |
-| Line map | `(node_id, generation) ->` byte offset of every 1,000th line start, and the line count | Extended with the content | `Read` and its line numbers |
+| File content (deferred) | `(node_id, generation) -> bytes [0, cached_size)` | The read itself (below) | `vfs.pread` |
 
-The caches live in each process's memory and are never shared between processes. Search and glob results aren't cached, because they depend on the whole tree. Saved cursors aren't a cache: they're per-caller state (see Per-path cursors and generations).
+The caches live in each process's memory and are never shared between processes. Search and glob results aren't cached, because they depend on the whole tree. Saved cursors aren't a cache: they're per-caller state (see Per-path cursors and generations). There's no line map: line numbers live in the extents, and `Read` gets its lines from `vfs_pread_lines` (see Line reads).
 
 ### Directory entries
 
@@ -412,21 +452,13 @@ In the library this is `minifs.vfs.cache.DirEntryCache`, kept fresh by `async wi
 
 ### File content
 
-A cached read is one statement, the same as an uncached one:
+Deferred: line reads come from the server, which sends only the lines asked for, so a content cache would save little. Revisit it if the metrics show bytes per read are a problem. If it's built, a cached read is one statement, the same as an uncached one:
 
 1. Call `vfs_pread(node, cached_size, limit)`. It returns the file's current `size` and `generation`, along with any bytes past the cached end.
 2. If the generation is unchanged, add the returned bytes (often none) to the entry and serve the request from memory.
 3. If the generation changed, drop the entry and read again from offset 0.
 
-The saving is bytes on the wire and the work of re-splitting lines, not round trips. Tailing a growing log fetches only the new tail on each read. Entries are evicted least-recently-used under a per-process byte budget. Files above a size cap keep only their line map, and their bytes are read by range as before.
-
-### Line map
-
-Line numbers are derived on the client and never stored in Postgres.
-
-- The map holds the byte offset where every 1,000th line starts, plus the total line count. Reading lines N to N+k jumps to the nearest checkpoint at or before N, reads forward from that byte offset and splits on `\n`.
-- It is built from the content on first use and extended on append by scanning only the new bytes. A cold start on a large file reads that file once.
-- Lines split on `\n` only, as in ripgrep and ladderframe's `Read`, so line numbers agree with `Grep` hits.
+The saving is bytes on the wire, not round trips. Tailing a growing log fetches only the new tail on each read. Entries are evicted least-recently-used under a per-process byte budget, and files above a size cap are read by range as before.
 
 ## Glob
 
@@ -493,33 +525,21 @@ The tests compare the translator with `wcmatch.glob` (GLOBSTAR, BRACE and DOTGLO
 
 ## Search (rg in Postgres)
 
-`Grep` runs entirely in Postgres and scans the current bytes of the files in scope, the way ripgrep scans a disk. Nothing is derived at write time, so an append stays one INSERT, there's no index to keep in step, and a search sees every committed write, even one from a millisecond ago. There's no local mirror, no sync and no `rg` binary.
+`Grep` runs entirely in Postgres and scans the current bytes of the files in scope, extent by extent, the way ripgrep scans a disk. No search index is kept in step with writes, so a search sees every committed write, even one from a millisecond ago. There's no local mirror, no sync and no `rg` binary.
 
 ### Why there's no line index
 
 An earlier draft kept every line in a `vfs_lines` table with a trigram index. It paid for that on every write: storage of 2 to 4 times the text, a trigger on each append, a full re-index on each overwrite, and a rule that writers never split a UTF-8 character across appends. The only gain was index lookups, which matter once the bytes in scope get large. The target is workspaces of files from kilobytes to a few megabytes, where a scan is enough. If measurements say otherwise, an index can be added without changing the storage model (see Open decisions).
+
+Line-aware extents aren't a line table either. There's no row per line and no index on content: each extent carries its first line number (`line_start`) and where its lines start (`line_offsets`), an 8-byte integer plus 4 bytes per line, about a tenth of typical source text before compression. The writing statement computes them with `vfs_cut` as it cuts the content, so there's no trigger, and compaction only concatenates them. Writers needn't care where an append ends: the cut keeps every extent on whole lines.
 
 ### Lines exist only inside the query
 
 ripgrep matches line by line, and models write patterns that assume it: `^def `, `foo$`, `.*`. The search keeps those semantics without storing lines.
 
 1. **Scope.** `vfs_glob` picks the files (see Glob) and reads their sizes from `vfs_nodes`, before any content is touched.
-2. **File filter.** Each file's current bytes are joined in offset order, decoded as UTF-8 and tested once against the pattern in newline-sensitive mode (`(?n)`). In that mode `^` and `$` match at line breaks, and `.` and `[^...]` don't cross them. Every file with a matching line passes, plus the occasional file without one (for example when `\s` matches a newline).
-3. **Line check.** Only the files that pass are split on `\n`, and each line is tested on its own. This step is exact and decides the results.
-
-```sql
-CREATE FUNCTION vfs_text(p_node UUID) RETURNS TEXT AS $$
-BEGIN
-    RETURN (SELECT convert_from(string_agg(e.data, ''::bytea ORDER BY e.byte_offset), 'UTF8')
-              FROM vfs_nodes n
-              JOIN vfs_extents e ON e.node_id = n.id AND e.generation = n.generation
-             WHERE n.id = p_node);
-EXCEPTION WHEN character_not_in_repertoire THEN
-    RETURN NULL;                                    -- binary content: readable, not searchable
-END $$ LANGUAGE plpgsql STABLE;
-```
-
-The bytes are decoded only after they're joined, so a UTF-8 character split across two appends decodes correctly, and writers need no rule about where an append ends.
+2. **Extent filter.** Each extent of a file's current generation holds whole lines and never splits a UTF-8 character, so it is decoded on its own and tested once against the pattern in newline-sensitive mode (`(?n)`). In that mode `^` and `$` match at line breaks, and `.` and `[^...]` don't cross them. Every extent with a matching line passes, since a line never spans two extents, plus the occasional extent without one (for example when `\s` matches a newline).
+3. **Line check.** Only the extents that pass are split on `\n`, and each line is tested on its own. This step is exact and decides the results. Line k of an extent is file line `line_start + k`, starting at file byte `byte_offset + line_offsets[k]`.
 
 ### The search query
 
@@ -532,21 +552,21 @@ SELECT count(*) AS files, coalesce(sum(size), 0) AS bytes,
        array_agg(id) AS ids, array_agg(path) AS paths
   FROM vfs_glob($root, $glob_regex, $name_like, $depth, $excludes, true, $file_cap + 1, $prefix, $prune_dirs);  -- hidden included
 
-WITH files AS (
-    SELECT g.id, g.path, vfs_text(g.id) AS body
+WITH extents AS (
+    SELECT g.path, e.byte_offset, e.line_start, e.line_offsets,
+           vfs_utf8(e.data) AS body                 -- NULL if it isn't UTF-8 (see below): skipped
       FROM unnest($ids::uuid[], $paths::text[]) AS g(id, path)
-), hits AS (                                        -- step 2: one regex test per file
-    SELECT id, path,
+      JOIN vfs_nodes n ON n.id = g.id
+      JOIN vfs_extents e ON e.node_id = n.id AND e.generation = n.generation
+), hits AS (                                        -- step 2: one regex test per extent
+    SELECT path, byte_offset, line_start, line_offsets,
            CASE WHEN right(body, 1) = E'\n' THEN left(body, -1) ELSE body END AS body
-      FROM files
+      FROM extents
      WHERE body ~ $file_pattern                     -- '(?n)' plus the translated pattern
 ), lines AS (                                       -- step 3: lines exist only here
-    SELECT h.path, l.line_no, l.text,
-           coalesce(sum(octet_length(l.text) + 1) OVER (
-               PARTITION BY h.id ORDER BY l.line_no
-               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS byte_offset
+    SELECT h.path, h.line_start + l.k AS line_no, h.byte_offset + h.line_offsets[l.k] AS byte_offset, l.text
       FROM hits h,
-           regexp_split_to_table(h.body, E'\n') WITH ORDINALITY AS l(text, line_no)
+           regexp_split_to_table(h.body, E'\n') WITH ORDINALITY AS l(text, k)
 )
 SELECT path, line_no, byte_offset, text
   FROM lines
@@ -555,9 +575,10 @@ SELECT path, line_no, byte_offset, text
  LIMIT $max_plus_one;
 ```
 
-- **Trailing newline.** The final `\n` is dropped before splitting, so a file ending in a newline doesn't gain an empty phantom line that `^$` would match.
-- **Byte offsets.** Each hit's offset is the running byte length of the lines before it, in the same currency as `vfs.pread(offset=...)`. The `Grep` tool shows only line numbers.
-- **One snapshot.** The two statements run in one `REPEATABLE READ` transaction and `vfs_text` is `STABLE`, so the scope and every file are read as of the same moment.
+- **`vfs_utf8`** (#10) is `convert_from(data, 'UTF8')` in a PL/pgSQL function that returns NULL on `character_not_in_repertoire`, so content that isn't UTF-8 is skipped without failing the query.
+- **Trailing newline.** Each extent's final `\n` is dropped before splitting, so it yields exactly its own lines, and a file ending in a newline doesn't gain an empty phantom line that `^$` would match.
+- **Byte offsets.** Each hit's offset comes from `line_offsets`, in the same currency as `vfs.pread(offset=...)`. The `Grep` tool shows only line numbers.
+- **One snapshot.** The two statements run in one `REPEATABLE READ` transaction, so the scope and every extent are read as of the same moment.
 - **Caps before content.** Step 1 reads only `vfs_nodes`. The client checks the file and byte caps on its result, so an oversized scope is refused before any extent is read. The search costs two round trips.
 
 The `Grep` tool takes only ladderframe's parameters: `pattern`, `path` (a directory, or a single file, which searches just that file) and `include`. The other rg features are options of the library's `vfs.search`; a model gets case-insensitive search by writing `(?i)` in the pattern.
@@ -574,10 +595,10 @@ The `Grep` tool takes only ladderframe's parameters: `pattern`, `path` (a direct
 
 ### Cost and limits
 
-- Work grows with the bytes in scope, not with the number of matches. The file filter costs one regex pass per file, and only matching files are split into lines.
+- Work grows with the bytes in scope, not with the number of matches. The extent filter costs one regex pass over the bytes, and only matching extents (about 64 KB each at most) are split into lines.
 - The total size of the scope comes from `vfs_nodes` before any content is read. A search over more than a configured cap (for example 50 MB) is refused with `ModelRetry: Search scope is 120 MB; narrow the path or include pattern`.
 - Every search runs under `SET LOCAL statement_timeout`.
-- Files that aren't valid UTF-8 are skipped. They're still readable with `vfs.pread`, and with `Read` unless they look binary.
+- Content that isn't valid UTF-8 is skipped, extent by extent: a file with one stray Latin-1 byte still returns hits from its other extents (#10 may choose to skip the whole file instead). It's still readable with `vfs.pread`, and with `Read` unless it looks binary.
 
 ### Output format for the agent
 
@@ -713,7 +734,7 @@ The agent tools follow ladderframe's tool contracts (`packages/harness/src/ladde
 
 | Tool | Signature | Backed by |
 | --- | --- | --- |
-| Read | `Read(filePath, offset, limit)`: numbered lines of a file, or the entries of a directory | The line map and `vfs_pread`, through the content cache; `vfs_readdir` for a directory |
+| Read | `Read(filePath, offset, limit)`: numbered lines of a file, or the entries of a directory | `vfs_pread_lines`; `vfs_readdir` for a directory |
 | Glob | `Glob(pattern, path)`: absolute paths, at most 100 | `vfs_glob` over `vfs_nodes` |
 | Grep | `Grep(pattern, path, include)`: hits grouped by file, at most 100 | `vfs_glob` and a scan of `vfs_extents` |
 | Write | `Write(filePath, content)` | `vfs_write` or `vfs_create`, subject to the write policy |
@@ -822,7 +843,7 @@ Three things matter most in production: credential handling, LISTEN connections 
 | LISTEN | Use a direct, dedicated connection for LISTEN, never one through a transaction-mode pooler. Its keepalive probe keeps a Lakebase compute from scaling to zero while a watcher runs. A listener the server still thinks is alive but that no longer reads holds back the shared NOTIFY queue; if the queue fills (8 GB), commits that notify fail. The server's `tcp_keepalives_*` settings decide how soon it drops a client that vanished; `keepalives` and `tcp_user_timeout` in the LISTEN conninfo make the client notice a dead server sooner. |
 | Reconnect | When the LISTEN connection drops: reconnect, LISTEN again, clear the directory cache, then re-check watched paths so nothing missed is skipped. Saved cursors make this safe. |
 | NOTIFY volume | A transaction that called NOTIFY takes a database-wide lock at commit, so every append commits through that lock. Cache eviction only needs `create`, `move` and `delete`; `modify` exists for watchers. If a hot log makes the lock a bottleneck, stop emitting `modify` for appends to it and have its watchers poll `size`. |
-| TOAST | `SET STORAGE EXTERNAL` on `vfs_extents.data`, so range reads fetch only the chunks they cover |
+| TOAST | `vfs_extents.data` returns to the default `STORAGE EXTENDED` (migration 004 had set `EXTERNAL`): extents are about 64 KB unless one line is longer, and are read whole, so they're stored compressed. Keep `vfs_compact`'s target near the default for the same reason. |
 | Vacuum | Appends leave a dead `vfs_nodes` row version each; overwrites and compaction leave dead extents. `fillfactor = 80` keeps the inode updates HOT, so they're pruned in place. Watch `n_dead_tup` on both tables, and lower autovacuum's scale factor on `vfs_extents` if overwrites are frequent. |
 | Compaction | A periodic job runs `vfs_compact` on files with more than 1,000 extents. It holds each inode lock only while merging that file. |
 | Postgres version | PG 15+ for `UNIQUE NULLS NOT DISTINCT`. PG 18 has a built-in `uuidv7()`; on older versions use `pg_uuidv7` where available, or generate UUIDv7 in the app. |
@@ -841,9 +862,9 @@ Three things matter most in production: credential handling, LISTEN connections 
 
 | Item | Estimate |
 | --- | --- |
-| Append cost | One inode row lock, one extent insert, one NOTIFY |
-| Storage | The text itself, uncompressed (`STORAGE EXTERNAL`), plus about 30 bytes of row overhead per extent |
-| Search cost | One regex pass over the bytes in scope, plus a line split of the files that match |
+| Append cost | One inode row lock, one extent insert (plus a rewrite of the last extent when the file ended mid-line), one NOTIFY |
+| Storage | The text, compressed 3 to 4 times when an extent is over about 2 KB, plus about 40 bytes of row overhead per extent and 4 bytes per line in `line_offsets` |
+| Search cost | One regex pass over the bytes in scope, plus a line split of the extents that match |
 | `Glob` over a few thousand nodes | Milliseconds |
 
 ### Observability
@@ -865,19 +886,19 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Append ordering | Two connections appending concurrently produce gap-free offsets, and offset order equals commit order | Concurrency |
 | Read | For random files and random `(offset, limit)` sequences, joining the `pread` chunks equals the full content, including while another task keeps appending | Property |
 | Read edges | Offsets `0`, `size`, `size+1`, `-1`, `-size`, `-(size+1)`; empty file; one extent larger than `limit`; a read spanning extents | Unit |
-| Read plan | On a file with 10,000+ extents, `EXPLAIN` of a read near the end shows a backward index descent and a bounded forward scan, not a scan from offset 0 | Unit |
+| Read plan | On a file with 10,000+ extents, `EXPLAIN` of a read near the end shows a backward index descent and a bounded forward scan, not a scan from offset 0; on a 20,000-line file, line reads at the start, middle and end touch a few pages | Unit |
 | Kinds | Creating a child under a file gives `ENOTDIR`; an extent on a directory is rejected by the foreign key; `vfs.pread` of a directory gives `EISDIR`, and `Read` of one lists its entries | Unit |
 | Read tool | Output equals ladderframe's `Read` on the same file written to disk, after mapping the disk path prefix to the VFS path and with no instruction files present, for random `offset` and `limit`, CRLF files, lines over 2,000 characters, the 50 KB cap, no trailing newline and directories | Differential |
 | Generations | An overwrite between two `vfs.read_from(cursor)` calls flags the restart; an append doesn't | Unit |
 | Tree | `UNIQUE NULLS NOT DISTINCT` rejects duplicate root names; `rmdir` on a non-empty directory gives `ENOTEMPTY`; a move into its own subtree gives `EINVAL` | Unit |
 | Claim | Two claimers racing for the same file: exactly one wins | Concurrency |
 | Watch | Events arrive only after commit; `move` versus `modify` is classified correctly | Integration |
-| Search | Hits match a per-line search in Python over the same files; a trailing newline adds no phantom line; a UTF-8 character split across two appends still matches; non-UTF-8 files are skipped; the scope cap refuses before reading content | Integration |
+| Search | Hits match a per-line search in Python over the same files; a trailing newline adds no phantom line; a UTF-8 character split across two appends still matches; extents that aren't UTF-8 are skipped; the scope cap refuses before reading content | Integration |
 | File filter | Whenever a line matches the line form, the file matches the file form | Property |
-| Compaction | Bytes, `size`, `generation` and `mtime` are unchanged; appends running during compaction keep gap-free offsets | Concurrency |
-| Content cache | Reads through the cache equal uncached `pread` while another client appends, overwrites and compacts | Property |
+| Compaction | Bytes, `size`, `lines`, `generation` and `mtime` are unchanged; appends running during compaction keep gap-free offsets | Concurrency |
+| Content cache (deferred) | Reads through the cache equal uncached `pread` while another client appends, overwrites and compacts | Property |
 | Directory cache | A rename or delete by another client is seen once its NOTIFY arrives; a dropped LISTEN connection clears the cache; a missing name is never cached | Integration |
-| Line map | Line N read through the map equals line N from splitting the whole file, across appends that end mid-line | Property |
+| Line-aware extents | After random appends (partial lines, a UTF-8 character split across appends, empty data, lines over 64 KB, no newline at all), overwrites and compactions: the extents tile the file, each non-final one ends with `\n`, `line_start` and `line_offsets` are exact, `lines` is right, and `vfs_pread_lines` from every line equals splitting the content in Python; concurrent appenders stay gap-free and line-aligned | Property |
 | Glob translator | Compared with `PurePath.full_match` (Python 3.13+) or `wcmatch` (GLOBSTAR and BRACE flags) on generated patterns and paths | Differential |
 | Glob pruning | Results with all hints enabled equal results with none | Differential |
 | Regex translator | A corpus of real model patterns plus generated ones, compared with Rust's `regex` crate, in a `C`-locale and a UTF-8 database | Differential |
@@ -909,8 +930,8 @@ The payoff is that the same tree mounts through FUSE on a laptop or NFS on Kuber
 | Client access | Through the VFS library, or direct SQL | The VFS library, for one model end to end. Revisit only if profiling shows overhead. |
 | Workspaces per process | One, or many | Many, with one LISTEN connection filtered by payload |
 | Postgres version | PG 15–17 (UUIDv7 from an extension or the app), or PG 18 (built-in `uuidv7()`) | PG 18 where available |
-| Line-numbered reads | A stored line table, or derived on the client | **Decided for v1:** derived on the client from the line map (see Caching), and used by `Read`. If cold reads of large logs prove slow, store each extent's count of preceding newlines: one integer per extent, set by `vfs_append` and kept by compaction. |
-| Search index | None (scan), or a trigram GIN index | Scan in v1. If bytes scanned per search grow too large, index whole-file text refreshed by compaction, and keep scanning the newer appends. An index on raw extents would be unsound, because a match can cross an extent boundary. |
+| Line-numbered reads | A `text[]` of lines per file, a row per line, or line-aware extents | **Decided (2026-10-24):** line-aware extents (see Storage model and Line reads). The workload is read-heavy, so lines are found in Postgres at read time from numbers computed at write time, with no client line map. |
+| Search index | None (scan), or a trigram GIN index | Scan in v1. If bytes scanned per search grow too large, index the extents' text: they hold whole lines, so a line match never crosses an extent boundary. |
 | Write contract | opencode's `write`, or ladderframe's `Write` | opencode's until ladderframe's `Write` lands, then ladderframe's |
 | Semantic search | pgvector over windows of file text | After the core tools are stable |
 

@@ -87,6 +87,27 @@ async def test_pread_ranges(vfs: VFSClient) -> None:
     assert (await vfs.pread("/f", -(2**63))).offset == 0
 
 
+async def test_pread_lines(vfs: VFSClient) -> None:
+    version = await vfs.create("/f", b"one\ntwo\n")
+    await vfs.append("/f", b"three\nfour")
+    r = await vfs.pread_lines("/f", 2, 2)
+    assert (r.content, r.first_line, r.offset, r.next_offset, r.lines, r.eof) == (b"two\nthree\n", 2, 4, 14, 4, False)
+    assert (r.id, r.size, r.generation) == (version.id, 18, 0)
+    r = await vfs.pread_lines("/f")
+    assert (r.content, r.eof) == (b"one\ntwo\nthree\nfour", True)
+    r = await vfs.pread_lines("/f", 1, 10, 6)
+    assert (r.content, r.next_offset, r.eof) == (b"one\ntw", 6, False)
+    r = await vfs.pread_lines("/f", 9)
+    assert (r.content, r.first_line, r.offset, r.lines, r.eof) == (b"", 9, 18, 4, True)
+    await raises("EINVAL", vfs.pread_lines("/f", 0))
+    await raises("EINVAL", vfs.pread_lines("/f", 1, -1))
+    await raises("EINVAL", vfs.pread_lines("/f", 1, 1, 2**31))
+    await raises("EISDIR", vfs.pread_lines("/"))
+    await vfs.mkdir("/d")
+    await raises("EISDIR", vfs.pread_lines("/d"), "/d")
+    await raises("ENOENT", vfs.pread_lines("/missing"), "/missing")
+
+
 async def test_write_and_compare_and_swap(vfs: VFSClient) -> None:
     created = await vfs.create("/n.md", b"v0")
     written = await vfs.write("/n.md", b"v1!")

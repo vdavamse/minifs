@@ -65,6 +65,13 @@ File bytes live in `vfs_extents` (migration 004): `vfs_append`, `vfs_write`, `vf
 gaps. Every function that changes an existing file's content keeps that invariant under the inode lock
 (`vfs_lock_file`); `vfs_create` needs no lock, since nobody else can see the new file yet. Readers take no locks.
 
+Extents are line-aware (migration 007): every extent starts at a line start, and all but a file's last end with
+`\n`. Each carries `line_start` (the number of `\n` before it) and `line_offsets` (where each of its lines starts),
+and `vfs_nodes.lines` holds the line count. Every writer cuts content with `vfs_cut`, an append re-cuts the last
+extent when the file ends mid-line, and compaction merges whole extents, so the alignment holds. `vfs_pread_lines`
+reads by line. Readers are `STABLE`, so all their statements share the caller's snapshot; `vfs_file` is their
+unlocked counterpart of `vfs_lock_file`. Raw inserts into `vfs_extents` (tests) must give both line columns.
+
 Functions report errors with `PERFORM vfs_raise('ENOENT', detail)`, which raises SQLSTATE `MFnnn` (`nnn` = the
 Linux errno number) with the errno name as the message. `minifs.db.errors.errno_name(exc)` maps it back. Add a
 new errno to both `vfs_raise` and `SQLSTATE_BY_ERRNO`.
@@ -76,7 +83,7 @@ that.
 ## VFS library
 
 `minifs.vfs.client.VFSClient` takes absolute paths and wraps one SQL function per operation (`stat`, `readdir`,
-`pread`, `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
+`pread`, `pread_lines`, `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
 statement in its own transaction, resolving its paths on the server with `vfs_resolve` in a subquery, and raises
 `minifs.vfs.core.VFSError(errno, path, message, detail)` for every errno the SQL layer reports. `detail` (the
 server's DETAIL, with node ids and real path components) and `db_error` are for logs only: a view that rewrites

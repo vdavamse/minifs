@@ -29,10 +29,22 @@ from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import retry_serializable
 from minifs.vfs import glob as globbing
-from minifs.vfs.core import Entry, FileVersion, Kind, ReadResult, VFSError, join, normalize, split
+from minifs.vfs.core import (
+    Entry,
+    FileVersion,
+    Kind,
+    LineReadResult,
+    ReadResult,
+    VFSError,
+    join,
+    normalize,
+    split,
+)
 
 DEFAULT_READ_LIMIT = 16_000
-_MAX_INT = 2**31 - 1  # vfs_pread's limit and vfs_compact's target are int
+DEFAULT_LINE_LIMIT = 2000
+DEFAULT_LINE_BYTES = 50 * 1024
+_MAX_INT = 2**31 - 1  # vfs_pread's limit, vfs_pread_lines' limits and vfs_compact's target are int
 _MAX_BIGINT = 2**63 - 1
 _log = logging.getLogger(__name__)
 _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache links
@@ -156,6 +168,37 @@ class VFSClient:
         content = b"".join(row[4] for row in rows if row[4] is not None)
         end = start + len(content)
         return ReadResult(node, content, start, end, size, generation, end >= size)
+
+    async def pread_lines(
+        self,
+        path: str,
+        first_line: int = 1,
+        max_lines: int = DEFAULT_LINE_LIMIT,
+        max_bytes: int = DEFAULT_LINE_BYTES,
+    ) -> LineReadResult:
+        """Up to ``max_lines`` whole lines of file ``path`` from line ``first_line`` (1-based), capped at
+        ``max_bytes`` bytes, so the last line may come back cut. Lines split on ``\\n`` only. Reading past the last
+        line returns no bytes and ``eof``, with the line count. ENOENT, EISDIR; EINVAL for a ``first_line`` below 1
+        or a negative limit."""
+        segments = split(path)
+        if not segments:
+            raise VFSError("EISDIR", "/")
+        if not 1 <= first_line <= _MAX_BIGINT:
+            raise VFSError("EINVAL", join(*segments), f"invalid first line {first_line}")
+        if not (0 <= max_lines <= _MAX_INT and 0 <= max_bytes <= _MAX_INT):
+            raise VFSError("EINVAL", join(*segments), f"invalid limits {max_lines} lines, {max_bytes} bytes")
+        ref = self._ref(segments)
+        rows = await self._run(
+            path,
+            f"SELECT r.id, p.size, p.generation, p.lines, p.byte_offset, p.data"
+            f" FROM (SELECT {ref.sql} AS id) r, vfs_pread_lines(r.id, %s::bigint, %s::int, %s::int) p",
+            [*ref.params, first_line, max_lines, max_bytes],
+            [ref],
+        )
+        node, size, generation, lines, start, content = rows[0]
+        self._checked(ref, node)
+        end = start + len(content)
+        return LineReadResult(node, content, first_line, start, end, size, generation, lines, end >= size)
 
     async def glob(
         self,
