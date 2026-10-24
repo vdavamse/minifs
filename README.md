@@ -249,26 +249,36 @@ This is how a worker claims a file from `tasks/new/` to `tasks/cur/`. If two wor
 
 ### Watch (inotify)
 
-```sql
-CREATE FUNCTION vfs_notify() RETURNS trigger AS $$
-DECLARE r vfs_nodes := coalesce(NEW, OLD);
-BEGIN
-    PERFORM pg_notify('vfs', json_build_object(
-        'id', r.id, 'parent', r.parent_id, 'size', r.size, 'gen', r.generation,
-        'op', CASE TG_OP WHEN 'INSERT' THEN 'create' WHEN 'DELETE' THEN 'delete'
-                 ELSE CASE WHEN OLD.parent_id IS DISTINCT FROM NEW.parent_id
-                             OR OLD.name <> NEW.name THEN 'move' ELSE 'modify' END END)::text);
-    RETURN NULL;
-END $$ LANGUAGE plpgsql;
+A trigger on `vfs_nodes` (migration `005_vfs_notify`) sends one NOTIFY on channel `vfs` per changed row, with a small JSON payload. Every event has `op`, `id` and `parent` (the node's directory after the change, `null` for the root):
 
-CREATE TRIGGER trg_vfs_notify AFTER INSERT OR UPDATE OR DELETE ON vfs_nodes
-    FOR EACH ROW EXECUTE FUNCTION vfs_notify();
+| `op` | Extra fields | Emitted by |
+| --- | --- | --- |
+| `create` | `name`, `kind` | create, mkdir |
+| `modify` | `size`, `gen` | append, overwrite |
+| `move` | `name`, `old_parent`, `old_name`, `kind` | rename, a Maildir claim |
+| `delete` | `name`, `kind` | unlink, rmdir |
+
+- An append updates `size`, so it emits `modify`. A Maildir-style claim (`tasks/new` → `tasks/cur`) emits one `move`, which watchers of both directories see through `parent` and `old_parent`.
+- Notifications are delivered **at commit**, so a watcher is never woken for data it can't read yet, and a rolled-back write emits nothing.
+- An `UPDATE` that changes no column emits nothing, and compaction doesn't touch `vfs_nodes`, so it emits nothing either. `TRUNCATE` emits one `{"op": "rescan"}`.
+- Events are hints. PostgreSQL drops a payload identical to one already sent in the same transaction, and any role that can connect can NOTIFY on `vfs`, so a watcher reads the database before it acts (a Maildir claim already does, through `vfs_rename`'s compare-and-swap).
+
+In Python, `minifs.vfs.watch.Watcher` holds the process's one LISTEN connection, which it gets from a connection factory (so each reconnect has fresh credentials):
+
+```python
+async with Watcher(connect) as watcher:
+    async with watcher.watch("tasks/new") as events:
+        async for event in events:      # Event(op, id, parent, name, kind, size, generation, old_parent, old_name)
+            if event.op == "rescan":
+                ...                     # events may have been lost: re-check the directory
 ```
 
-- An append updates `size`, so it emits `modify`. A Maildir-style claim emits `move`.
-- Notifications are delivered **at commit**, so a watcher is never woken for data it can't read yet.
-- In Python, `vfs.watch(path)` is an async iterator that filters the single `vfs` channel by node id (a file) or parent id (a directory).
-- The library's directory cache listens on the same channel and connection (see Caching).
+- `watch(path)` filters the single channel by node id (a file) or by parent id (a directory, plus the directory's own events). It subscribes before resolving the path, so a change committed after it returns is delivered, or covered by a later `rescan`; a change committed just before may be delivered too.
+- Like inotify, a watch follows the node the path named when it started: through renames, until the node is deleted. The `delete` (confirmed against the database, since events are hints) is its last event, and the watch ends. To follow whatever a path names now, watch it again.
+- When the connection drops, the watcher reconnects with jittered backoff, listens again, and only then sends every subscriber a `rescan` event. A watch then checks that its node still exists, and ends after the `rescan` if it doesn't, or if the check fails: it is never left on a node it can't vouch for. Consecutive `rescan`s are folded into one. A subscriber that falls more than `maxsize` events behind, or whose predicate raises, also gets a `rescan`.
+- Every `keepalive` seconds (30 by default) the watcher probes the connection with `SELECT 1`, so a connection that died silently is noticed within `keepalive + probe_timeout`. A probe that times out closes the connection without waiting for the server.
+- A watch's own queries (resolving the path, the check after a `rescan`) go through `pool` if one is given, else through a short-lived connection from the factory. With many watches per process, pass a pool, so a reconnect doesn't open one connection per watch at once.
+- `watcher.subscribe(predicate)` is the raw feed. The library's directory cache uses it on the same connection (see Caching).
 
 ## Read contract
 
@@ -848,7 +858,7 @@ Three things matter most in production: credential handling, LISTEN connections 
 | Topic | Guidance |
 | --- | --- |
 | Credentials | Managed services often use short-lived tokens as the Postgres password. Give the psycopg pool a connection factory that fetches a fresh credential, not a fixed DSN. |
-| LISTEN | Use a direct, dedicated connection for LISTEN, never one through a transaction-mode pooler. |
+| LISTEN | Use a direct, dedicated connection for LISTEN, never one through a transaction-mode pooler. Its keepalive probe keeps a Lakebase compute from scaling to zero while a watcher runs. A listener the server still thinks is alive but that no longer reads holds back the shared NOTIFY queue; if the queue fills (8 GB), commits that notify fail. The server's `tcp_keepalives_*` settings decide how soon it drops a client that vanished; `keepalives` and `tcp_user_timeout` in the LISTEN conninfo make the client notice a dead server sooner. |
 | Reconnect | When the LISTEN connection drops: reconnect, LISTEN again, clear the directory cache, then re-check watched paths so nothing missed is skipped. Saved cursors make this safe. |
 | NOTIFY volume | A transaction that called NOTIFY takes a database-wide lock at commit, so every append commits through that lock. Cache eviction only needs `create`, `move` and `delete`; `modify` exists for watchers. If a hot log makes the lock a bottleneck, stop emitting `modify` for appends to it and have its watchers poll `size`. |
 | TOAST | `SET STORAGE EXTERNAL` on `vfs_extents.data`, so range reads fetch only the chunks they cover |
