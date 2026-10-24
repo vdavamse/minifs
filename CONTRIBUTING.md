@@ -41,7 +41,8 @@ cross-check against it; without it they skip, while in CI they fail.
 
 Add a file `minifs/db/migrations/NNN_lower_snake.sql` with the next free number. Each file runs in one
 transaction with its row in `vfs_schema_version`, so don't use statements that can't run in a transaction
-(`CREATE INDEX CONCURRENTLY`). Never edit a migration once it's merged: the runner stores a checksum and refuses
+(`CREATE INDEX CONCURRENTLY`), and don't use `BEGIN`/`COMMIT` (the runner refuses a migration that does).
+`migrate()` needs an autocommit connection. Never edit a migration once it's merged: the runner stores a checksum and refuses
 a changed file. Add a new migration instead. A pending migration numbered below one already applied is refused
 too, so renumber a branch's migration after the latest one on `main` before merging.
 

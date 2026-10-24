@@ -43,9 +43,10 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install and import the wheel
         run: |
+          # Install from outside the checkout, so uv doesn't apply its uv.toml (the oracle build setting).
+          cd "$RUNNER_TEMP"
           uv venv --python 3.12 /tmp/smoke
-          uv pip install --python /tmp/smoke/bin/python dist/*.whl "psycopg[binary]"
-          cd /tmp
+          uv pip install --python /tmp/smoke/bin/python "$GITHUB_WORKSPACE"/dist/*.whl "psycopg[binary]"
           /tmp/smoke/bin/python -c "import minifs._regex as r; assert not r.HAS_ORACLE; from minifs.db.migrate import load_migrations; assert load_migrations()"
           /tmp/smoke/bin/minifs db --help
       - uses: actions/upload-artifact@v4
@@ -67,9 +68,9 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install and import the sdist
         run: |
+          cd "$RUNNER_TEMP"
           uv venv --python 3.12 /tmp/smoke
-          uv pip install --python /tmp/smoke/bin/python dist/*.tar.gz "psycopg[binary]"
-          cd /tmp
+          uv pip install --python /tmp/smoke/bin/python "$GITHUB_WORKSPACE"/dist/*.tar.gz "psycopg[binary]"
           /tmp/smoke/bin/python -c "import minifs._regex as r; assert not r.HAS_ORACLE; from minifs.db.migrate import load_migrations; assert load_migrations()"
       - uses: actions/upload-artifact@v4
         with:

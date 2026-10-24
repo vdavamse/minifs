@@ -7,6 +7,7 @@ import asyncio
 import os
 import sys
 
+import psycopg
 from psycopg import AsyncConnection
 
 from minifs.db.migrate import MigrationError, applied_versions, load_migrations, migrate
@@ -30,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.db_command == "migrate":
             return asyncio.run(_migrate(args.dsn))
         return asyncio.run(_status(args.dsn))
-    except MigrationError as e:
+    except (MigrationError, psycopg.Error) as e:
         print(f"minifs db {args.db_command}: {e}", file=sys.stderr)
         return 1
 

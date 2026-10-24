@@ -125,11 +125,23 @@ async def test_version_table_goes_in_current_schema(empty_db: str) -> None:
         assert await cur.fetchone() == ("vfs_schema_version", "t")
 
 
-async def test_refuses_connection_inside_transaction(empty_db: str) -> None:
+async def test_refuses_connection_without_autocommit(empty_db: str) -> None:
     async with await AsyncConnection.connect(empty_db) as conn:
-        await conn.execute("SELECT 1")
+        with pytest.raises(MigrationError, match="autocommit"):
+            await migrate(conn, [Migration(1, "a", "")])
+
+
+async def test_refuses_connection_inside_transaction(empty_db: str) -> None:
+    async with await AsyncConnection.connect(empty_db, autocommit=True) as conn, conn.transaction():
         with pytest.raises(MigrationError, match="inside a transaction"):
             await migrate(conn, [Migration(1, "a", "")])
+
+
+@pytest.mark.parametrize("body", ["CREATE TABLE x (); COMMIT;", "COMMIT; BEGIN; CREATE TABLE x ();"])
+async def test_refuses_transaction_control(empty_db: str, body: str) -> None:
+    async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
+        with pytest.raises(MigrationError, match="transaction control"):
+            await migrate(conn, [Migration(1, "a", body)])
 
 
 async def test_refuses_pending_migration_older_than_applied(empty_db: str) -> None:
@@ -151,3 +163,8 @@ def test_cli_status_reports_modified_and_unknown(empty_db: str, capsys: pytest.C
     assert "unknown 099" in out
     assert main(["db", "migrate", "--dsn", empty_db]) == 1
     assert "checksum mismatch" in capsys.readouterr().err
+
+
+def test_cli_reports_connection_errors(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["db", "status", "--dsn", "postgresql://nobody@127.0.0.1:1/none?connect_timeout=2"]) == 1
+    assert capsys.readouterr().err.startswith("minifs db status: ")

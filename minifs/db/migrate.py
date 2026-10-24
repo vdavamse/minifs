@@ -88,10 +88,15 @@ async def applied_versions(conn: AsyncConnection, schema: str | None = None) -> 
 async def migrate(conn: AsyncConnection, migrations: list[Migration] | None = None) -> list[Migration]:
     """Apply every pending migration in order and return the ones this call applied.
 
-    Safe to run concurrently from several processes. ``conn`` must not be inside a transaction. The version table
+    Safe to run concurrently from several processes. ``conn`` must be in autocommit mode and not inside a
+    transaction, so that each migration commits on its own. The version table
     and the migrations' objects go in the connection's ``current_schema()``; each migration starts with the
     caller's ``search_path``, and the caller gets it back afterwards even if a migration ran a plain ``SET``.
     """
+    # Without autocommit, the first query below would open a transaction that every migration then joins as a
+    # savepoint: nothing would commit until the caller did, and the lock would be held all along.
+    if not conn.autocommit:
+        raise MigrationError("migrate() needs an autocommit connection")
     if conn.info.transaction_status != TransactionStatus.IDLE:
         raise MigrationError("migrate() needs a connection that is not inside a transaction")
     migrations = load_migrations() if migrations is None else migrations
@@ -123,7 +128,12 @@ async def migrate(conn: AsyncConnection, migrations: list[Migration] | None = No
                         f"{migration.filename} is pending but {max(newer):03d} is already applied;"
                         " renumber it after the latest migration"
                     )
+                xid = await _xact_id(conn)
                 await conn.execute(migration.sql.encode())
+                # A COMMIT in the file would commit part of it and release the lock; catch it, including when a
+                # BEGIN after it leaves us in a new transaction.
+                if conn.info.transaction_status != TransactionStatus.INTRANS or await _xact_id(conn) != xid:
+                    raise MigrationError(f"{migration.filename} must not contain transaction control statements")
                 await conn.execute(
                     sql.SQL("INSERT INTO {} (version, name, checksum) VALUES (%s, %s, %s)").format(table),
                     (migration.version, migration.name, migration.checksum),
@@ -140,6 +150,13 @@ async def _current_schema(conn: AsyncConnection) -> str:
     row = await cur.fetchone()
     if row is None or row[0] is None:
         raise MigrationError("no schema to migrate: search_path names no existing schema")
+    return row[0]
+
+
+async def _xact_id(conn: AsyncConnection) -> str:
+    cur = await conn.execute("SELECT pg_current_xact_id()::text")
+    row = await cur.fetchone()
+    assert row is not None
     return row[0]
 
 
