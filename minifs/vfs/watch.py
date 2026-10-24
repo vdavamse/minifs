@@ -194,6 +194,7 @@ class PathWatch(Subscription):
         self._resolved = False
         self._gone = False
         self._check: asyncio.Task[bool] | None = None  # survives a cancelled get(), so the next one resumes it
+        self._checks: set[asyncio.Task[bool]] = set()  # every check still running, so closing can cancel them
 
     def _offer(self, event: Event) -> None:
         # Until the path is resolved every event is kept and filtered by _open, so none is lost between
@@ -241,11 +242,13 @@ class PathWatch(Subscription):
         self._gone = True
         self.close()
 
-    def close(self) -> None:
-        if self._check is not None:
-            self._check.cancel()
-            self._check = None
-        super().close()
+    def _end(self) -> None:
+        # Every way of closing (close(), _finish(), Watcher.aclose()) comes here: a consumer awaiting a check then
+        # ends at once instead of after the check, and no check outlives the watch.
+        for check in list(self._checks):
+            check.cancel()
+        self._check = None
+        super()._end()
 
     async def get(self) -> Event:
         while True:
@@ -257,7 +260,11 @@ class PathWatch(Subscription):
             # Events are hints: a rescan or the node's own delete is confirmed against the database.
             if event.op == "rescan" or (event.op == "delete" and event.id == self.node):
                 if self._check is None:
+                    if self._closed:
+                        raise StopAsyncIteration  # no queries for a watch that is already closed
                     self._check = asyncio.ensure_future(self._still_there())
+                    self._checks.add(self._check)
+                    self._check.add_done_callback(self._checks.discard)
                 check = self._check
                 try:
                     there = await asyncio.shield(check)

@@ -386,19 +386,23 @@ async def test_a_check_from_before_a_later_rescan_is_not_reused(conn: AsyncConne
         assert await drain(events) == [RESCAN]  # checked again: d is gone, so the watch ends
 
 
-async def test_close_during_a_check_ends_the_consumer(conn: AsyncConnection, db: str) -> None:
+@pytest.mark.parametrize("how", ["watch", "watch after a second rescan", "watcher"])
+async def test_close_during_a_check_ends_the_consumer(conn: AsyncConnection, db: str, how: str) -> None:
+    """Leaving the watch block (even after a later rescan orphaned the check) or the watcher's ends a consumer
+    that is waiting on a check at once, without cancelling it."""
     calls = 0
     connect = factory(db)
 
     async def slow_check() -> AsyncConnection[Any]:
         nonlocal calls
         calls += 1
-        if calls >= 4:  # listen, resolve, listen again, then the check
-            await asyncio.sleep(2)
+        if calls >= 4:  # listen, resolve, listen again, then checks
+            await asyncio.sleep(30)
         return await connect()
 
     await mkdir_p(conn, "d")
     got: list[Event] = []
+    consumer: asyncio.Task[None] | None = None
     async with Watcher(slow_check, retry_min=0.01) as watcher:
         async with watcher.watch("d") as events:
 
@@ -410,8 +414,14 @@ async def test_close_during_a_check_ends_the_consumer(conn: AsyncConnection, db:
             await terminate(conn, watcher.backend_pid)
             while calls < 4:  # the consumer is waiting on the check
                 await asyncio.sleep(0.01)
-        await asyncio.wait_for(consumer, 5)  # ends: not cancelled, no error
+            if how == "watch after a second rescan":
+                watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+            if how == "watcher":
+                await watcher.aclose()
+                await asyncio.wait_for(consumer, 2)
+        await asyncio.wait_for(consumer, 2)  # ends: not cancelled, no error, no wait for the check
     assert got == []
+    assert calls == 4  # no check started after closing
 
 
 async def test_forged_delete_does_not_end_the_watch(conn: AsyncConnection, watcher: Watcher) -> None:
