@@ -486,7 +486,7 @@ SELECT g.path, l.line_no, l.byte_offset, l.text
 
 ### Index behavior
 
-The `pg_trgm` GIN and GiST indexes support `~` and `~*`. They extract trigrams from the regex, and "a pattern with no extractable trigrams will degenerate to a full-index scan" ([pg\_trgm docs](https://www.postgresql.org/docs/current/pgtrgm.html)). Patterns with a literal run of 3+ characters (`refund`, `parse.*config`) are fast. For patterns like `\d+` or `.`, require a `path` or `glob` scope.
+The `pg_trgm` GIN and GiST indexes support `~` and `~*`. They extract trigrams from the regex, and "a pattern with no extractable trigrams will degenerate to a full-index scan" ([pg\_trgm docs](https://www.postgresql.org/docs/current/pgtrgm.html)). Patterns with a literal run of 3+ characters (`import`, `parse.*config`) are fast. For patterns like `\d+` or `.`, require a `path` or `glob` scope.
 
 ### Output format for the agent
 
