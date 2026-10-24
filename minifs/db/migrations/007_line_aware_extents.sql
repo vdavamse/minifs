@@ -132,8 +132,12 @@ END $$;
 ALTER TABLE vfs_extents
     ALTER COLUMN line_start SET NOT NULL,
     ALTER COLUMN line_offsets SET NOT NULL,
-    ADD CONSTRAINT vfs_extents_line_offsets_check CHECK (cardinality(line_offsets) > 0 AND array_ndims(line_offsets) = 1   -- never NULL, unlike '{}'[1]
-                                                   AND line_offsets[1] = 0),       -- the extent starts a line
+    -- A 1-based list without NULLs, starting at 0: the extent starts a line. (CASE, since a CHECK passes on NULL,
+    -- and array_ndims('{}') is NULL.) That the offsets increase is left to the writers.
+    ADD CONSTRAINT vfs_extents_line_offsets_check CHECK (
+        CASE WHEN array_ndims(line_offsets) = 1 AND array_lower(line_offsets, 1) = 1
+             THEN line_offsets[1] = 0 AND array_position(line_offsets, NULL) IS NULL
+             ELSE false END),
     -- Line lookups (vfs_pread_lines). Every extent starts a line, so line_start is distinct in a generation.
     ADD CONSTRAINT vfs_extents_line_key UNIQUE (node_id, generation, line_start);
 
@@ -146,9 +150,9 @@ ALTER TABLE vfs_extents
 --
 -- When the file ends mid-line, its last extent is deleted and cut again together with p_data, so extents keep
 -- starting at line starts. A trailing partial line is cut into an extent of its own, so a writer whose appends
--- end mid-line rewrites only that partial line each time. The bytes before the end are unchanged. The first
--- such append after an overwrite or a compaction rewrites the whole last extent, up to the cut's or the
--- compaction's target (more if its last line is longer), and a file with no newlines is rewritten whole.
+-- end mid-line rewrites only that partial line each time (vfs_write and vfs_create split it off too). The bytes
+-- before the end are unchanged. The first such append after a compaction rewrites the whole last extent, up to
+-- the compaction's target (more if its last line is longer), and a file with no newlines is rewritten whole.
 CREATE OR REPLACE FUNCTION vfs_append(p_node uuid, p_data bytea) RETURNS bigint
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
@@ -231,7 +235,7 @@ BEGIN
     DELETE FROM vfs_extents WHERE node_id = p_node;
     WITH ins AS (
         INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)
-        SELECT p_node, v_gen + 1, c.rel_offset, c.rel_line, c.data, c.line_offsets FROM vfs_cut(p_data) c
+        SELECT p_node, v_gen + 1, c.rel_offset, c.rel_line, c.data, c.line_offsets FROM vfs_cut(p_data, 65536, true) c
         RETURNING vfs_extents.line_start + cardinality(vfs_extents.line_offsets) AS lines_after
     )
     SELECT coalesce(max(ins.lines_after), 0) INTO v_lines FROM ins;
@@ -326,7 +330,7 @@ BEGIN
     -- One statement, so the inode is inserted with its line count (a later UPDATE would NOTIFY a modify). The
     -- extents' foreign key is checked at the end of the statement, after the inode is in.
     WITH c AS MATERIALIZED (
-        SELECT * FROM vfs_cut(p_data)
+        SELECT * FROM vfs_cut(p_data, 65536, true)
     ), n AS (
         INSERT INTO vfs_nodes (parent_id, name, kind, size, lines)
         SELECT p_parent, p_name, p_kind, v_size, coalesce((SELECT max(c.rel_line + cardinality(c.line_offsets)) FROM c), 0)

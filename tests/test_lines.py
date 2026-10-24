@@ -414,44 +414,62 @@ async def test_migration_cuts_existing_content(empty_db: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("data", "pieces"),
+    ("data", "target", "split", "pieces"),
     [
-        (b"a\nb", [(0, 0, b"a\n", [0]), (2, 1, b"b", [0])]),
-        (b"a\nb\n", [(0, 0, b"a\nb\n", [0, 2])]),  # no partial line: nothing to split
-        (b"b", [(0, 0, b"b", [0])]),  # the partial line alone
+        (b"a\nb", 100, True, [(0, 0, b"a\n", [0]), (2, 1, b"b", [0])]),
+        (b"a\nb", 100, False, [(0, 0, b"a\nb", [0, 2])]),  # without the flag the tail stays with its lines
+        (b"a\nb\n", 100, True, [(0, 0, b"a\nb\n", [0, 2])]),  # no partial line: nothing to split
+        (b"b", 100, True, [(0, 0, b"b", [0])]),  # the partial line alone
+        (b"", 100, True, []),
+        (b"a\nbcdefghij", 4, True, [(0, 0, b"a\n", [0]), (2, 1, b"bcdefghij", [0])]),  # a tail over the target
+        # The target cut and the tail split fall on the same line: one extent, never an empty one.
+        (b"aa\nbb\ncc\ndd", 6, True, [(0, 0, b"aa\nbb\n", [0, 3]), (6, 2, b"cc\n", [0]), (9, 3, b"dd", [0])]),
     ],
 )
 async def test_cut_can_split_off_a_partial_last_line(
-    conn: AsyncConnection, data: bytes, pieces: list[tuple[int, int, bytes, list[int]]]
+    conn: AsyncConnection, data: bytes, target: int, split: bool, pieces: list[tuple[int, int, bytes, list[int]]]
 ) -> None:
-    cur = await conn.execute("SELECT * FROM vfs_cut(%s, 100, true)", (data,))
+    cur = await conn.execute("SELECT * FROM vfs_cut(%s, %s, %s)", (data, target, split))
     assert [(o, n, bytes(d), list(lo)) for o, n, d, lo in await cur.fetchall()] == pieces
 
 
 async def test_appends_ending_mid_line_rewrite_only_the_partial_line(conn: AsyncConnection) -> None:
     f = await create_file(conn, "out")
     content = b""
+    query = "SELECT byte_offset, xmin::text FROM vfs_extents WHERE node_id = %s ORDER BY 1"
     for i in range(300):  # like stdout copied in chunks: every append ends mid-line
         part = f"{i:04}-tail\n{i:04}-head".encode()
+        before = await (await conn.execute(query, (f,))).fetchall()
         await append(conn, f, part)
         content += part
-        rows = await extent_rows(conn, f)
-        assert len(rows[-1][3]) <= 2 * len(part), "the last extent is only the partial line plus this append"
+        after = await (await conn.execute(query, (f,))).fetchall()
+        assert after[: max(len(before) - 1, 0)] == before[:-1], "only the last extent was rewritten"
+        assert (await extent_rows(conn, f))[-1][3] == f"{i:04}-head".encode()
     await check_layout(conn, f, content)
+
+
+async def test_create_and_write_split_off_a_partial_last_line(conn: AsyncConnection) -> None:
+    f = await create_file(conn, "f", b"a\nb\nc")
+    assert [d for _, _, _, d, _ in await extent_rows(conn, f)] == [b"a\nb\n", b"c"]
+    await write(conn, f, b"x\ny")
+    assert [d for _, _, _, d, _ in await extent_rows(conn, f)] == [b"x\n", b"y"]
 
 
 async def test_line_offsets_must_be_a_list_starting_at_zero(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
-    for offsets in ["{}", "{1}", "{{0,1},{2,3}}"]:
-        with pytest.raises(psycopg.errors.CheckViolation):
-            await conn.execute(
-                "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
-                " VALUES (%s, 0, 0, 0, 'a', %s)",
-                (f, offsets),
-            )
+    insert = (
+        "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
+        " VALUES (%s, 0, 0, 0, 'a', %s)"
+    )
+    await conn.execute(insert, (f, "{0}"))  # the control
+    await conn.execute("DELETE FROM vfs_extents WHERE node_id = %s", (f,))
+    for offsets in ["{}", "{1}", "{NULL}", "{0,NULL}", "{{0,1},{2,3}}", "[2:2]={0}", "[0:1]={5,0}"]:
+        with pytest.raises(psycopg.errors.CheckViolation) as info:
+            await conn.execute(insert, (f, offsets))
+        assert info.value.diag.constraint_name == "vfs_extents_line_offsets_check", offsets
 
 
-async def test_repeatable_read_append_after_a_line_after_a_concurrent_compaction(
+async def test_repeatable_read_append_to_a_newline_ended_file_after_a_concurrent_compaction(
     conn: AsyncConnection, db: str
 ) -> None:
     # The file ends with \n, so the append deletes nothing, and compaction only locked the inode, so nothing
