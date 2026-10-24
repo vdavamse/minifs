@@ -73,6 +73,24 @@ Production runs on Databricks Lakebase (PostgreSQL 16 to 18, no superuser, no `p
 `C.UTF-8`), so SQL must work as a plain role that owns its database; `test_migrations_need_no_superuser` checks
 that.
 
+## VFS library
+
+`minifs.vfs.client.VFSClient` takes absolute paths and wraps one SQL function per operation (`stat`, `readdir`,
+`pread`, `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
+statement in its own transaction, resolving its paths on the server with `vfs_resolve` in a subquery, and raises
+`minifs.vfs.core.VFSError(errno, path, message, detail)` for every errno the SQL layer reports. `detail` (the
+server's DETAIL, with node ids and real path components) and `db_error` are for logs only: a view that rewrites
+paths (the chroot) translates `path` and never shows `detail`. Paths go through
+`minifs.vfs.core.normalize` first. With a `DirCache` (the hook for #19's directory-entry cache), a fully cached
+path is checked link by link in the same statement instead of walked, and falls back to `vfs_resolve` if any link
+went stale, so a stale cache never reaches the wrong node.
+
+Connections come from `minifs.db.pool`: a `Connector` (a static conninfo, plus an optional callable that returns
+a fresh password per connection, for Lakebase OAuth tokens) is also the `ConnectionFactory` for LISTEN, and
+`open_pool` / `Pools` build psycopg pools on it that check each connection at checkout, so connections closed by
+scale-to-zero are replaced. Nothing may depend on session state across transactions (no session advisory locks
+or settings). A REPEATABLE READ transaction goes through `retry_serializable`, which reruns it on 40001 and 40P01.
+
 ## Database fixtures
 
 | Fixture | Gives |

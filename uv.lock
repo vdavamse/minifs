@@ -242,7 +242,7 @@ dev = [
 requires-dist = [
     { name = "psycopg", specifier = ">=3.3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'binary'", specifier = ">=3.3" },
-    { name = "psycopg-pool", specifier = ">=3.2" },
+    { name = "psycopg-pool", specifier = ">=3.3" },
 ]
 provides-extras = ["binary"]
 

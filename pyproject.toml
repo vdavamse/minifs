@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "psycopg>=3.3",  # watch relies on notifies(timeout=) keeping notifications that arrive between calls
-    "psycopg-pool>=3.2",
+    "psycopg-pool>=3.3",  # callable connection kwargs: a fresh credential per connection
 ]
 
 [project.optional-dependencies]
