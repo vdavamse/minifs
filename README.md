@@ -519,7 +519,7 @@ WITH files AS (
 )
 SELECT path, line_no, byte_offset, text
   FROM lines
- WHERE text ~ $line_pattern                         -- or ~* for ignore_case; built in Python
+ WHERE text ~ $line_pattern                         -- always ~: case folding is in the pattern
  ORDER BY path, line_no
  LIMIT $max_plus_one;
 ```
@@ -530,8 +530,8 @@ SELECT path, line_no, byte_offset, text
 
 | rg feature | Implementation |
 | --- | --- |
-| `-i` | `~*` instead of `~` in both steps. Build each predicate in Python rather than with a `CASE` around the operators. |
-| `-F` (fixed strings) | `strpos(body, $s) > 0` for the file filter and `strpos(text, $s) > 0` for lines |
+| `-i` | The translator case-folds the pattern itself (`[Ee]`), so both steps still use `~`. ARE's `~*` would depend on the database's locale (see Regex dialect). |
+| `-F` (fixed strings) | `strpos(body, $s) > 0` for the file filter and `strpos(text, $s) > 0` for lines. With `-i` too, the escaped literal goes through the translator instead. |
 | `-C n` (context) | Keep the lines `line_no BETWEEN hit - n AND hit + n` from the same split of the matching files |
 | `-g` / `--glob` | Through the `vfs_glob` scope |
 | `--max-count` | `row_number() OVER (PARTITION BY path)` plus a filter |
@@ -555,62 +555,111 @@ SELECT path, line_no, byte_offset, text
 
 ## Regex dialect and translation
 
-We need our own translator from rg-style (Rust/PCRE) patterns to Postgres ARE. No open-source translator in that direction exists, and the extensions that bring PCRE or RE2 into Postgres aren't available on most managed Postgres services. The translator is small, but it is the riskiest part of search: when it gets something wrong, it fails silently.
+`rg` patterns are Rust regexes, and Postgres speaks ARE (Advanced Regular Expressions). We parse each pattern with [`regex-syntax`](https://docs.rs/regex-syntax), the parser behind Rust's `regex` crate and therefore behind ripgrep, and emit ARE from its output. No open-source translator in that direction exists, and the extensions that bring PCRE or RE2 into Postgres aren't available on most managed services. The translator is the riskiest part of search: when it gets something wrong, it fails silently.
 
 ### Why it's needed: patterns that silently change meaning
 
-Postgres documents these incompatibilities with Perl: "\\b, \\B, the lack of special treatment for a trailing newline, ... the restrictions on parentheses and back references in lookahead/lookbehind constraints, and the longest/shortest-match (rather than first-match) matching semantics" ([PostgreSQL 9.7.3.6](https://www.postgresql.org/docs/current/functions-matching.html)). For a model writing patterns, the dangerous case is `\b`: in ARE it means **backspace**, so `\bparse_config\b` silently matches nothing. The model concludes the code isn't there and acts on that false belief.
+Postgres documents these incompatibilities with Perl: "\\b, \\B, the lack of special treatment for a trailing newline, ... the restrictions on parentheses and back references in lookahead/lookbehind constraints, and the longest/shortest-match (rather than first-match) matching semantics" ([PostgreSQL 9.7.3.6](https://www.postgresql.org/docs/current/functions-matching.html)). Two kinds of mismatch hurt a model most.
 
-| The model writes | Rust/PCRE meaning | Postgres ARE | Translator action |
-| --- | --- | --- | --- |
-| `\b` | Word boundary | Backspace | Rewrite to `\y` |
-| `\B` | Not a word boundary | Different meaning | Rewrite to `\Y` |
-| `\<`, `\>` (GNU grep) | Word start or end | Not supported | Rewrite to `\m`, `\M` |
-| `\z` | End of text | Not documented | Rewrite to `$`. rg's text is the line, and `$` ends the line in both forms (below). |
-| `\A`, `\Z` | Start or end of text | Start or end of the whole string | Rewrite to `^`, `$`. Passed through, they would match only at the start or end of the file in the file filter. |
-| A literal `\n` | Newline | Supported | Reject, as rg does without `-U`. No single line contains one. |
-| `(?P<n>...)`, `(?<n>...)` | Named group | Not documented | Remove the name, keep the group |
-| `\p{L}`, `\pL`, `\P{...}` | Unicode property class | Not supported | Reject, with the hint: use `[[:alpha:]]` |
-| `(?i)` at the start | Ignore case | Supported only at the start | Pass through |
-| `(?i)` mid-pattern, `(?i:...)` | Scoped flags | Not supported | Reject, with the hint: use `ignore_case=true` |
-| `\D`, `\S`, `\W` inside `[...]` | Negated class inside a class | Illegal | Reject, with the hint: use a POSIX class |
-| `\x{1F600}` | Code point | `\x` takes plain hex; `\U` takes 8 digits | Rewrite to `\U0001F600` |
-| `\Q...\E` (PCRE) | Literal span | Not supported | Escape the span |
-| `\h` (PCRE) | Horizontal whitespace | Not supported | Rewrite to `[ \t]` |
-| A literal `{` | Must be escaped | Ambiguous | Always emit `\{` |
-| `\d \w \s`, `[...]`, `(?:...)`, `+?`, `{n,m}`, `(?=...)`, `(?<=...)`, `\1` | — | Supported | Pass through |
+- **Different syntax.** In ARE, `\b` means **backspace**, so `\bparse_config\b` silently matches nothing. The model concludes the code isn't there and acts on that false belief.
+- **Different classes, depending on the database's locale.** ARE's `\w`, `[[:alpha:]]`, `\y` and `~*` classify characters by the database's ctype. Under the `C` locale, which some managed services use, they're ASCII-only. Measured on PostgreSQL 18: `'é' ~ '^\w$'` and `'É' ~* 'é'` are false under `C` and true under `en_US.utf8`, and `\ydéjà\y` finds nothing in `x déjà y` under `C`. ARE's `\d` matches only ASCII digits in every locale, while Rust's `\d` also matches digits like `٣`.
+
+So the translator never relies on ARE's classes, word boundaries or case folding. It spells each one out as explicit character ranges, which mean the same in every locale.
+
+### Why regex-syntax
+
+The patterns come from models trained on ripgrep, so the reference is ripgrep's own parser. It produces two levels of output:
+
+- **The AST** is the pattern as written, with a position for every node. Parse errors print exactly as ripgrep prints them:
+
+  ```
+  regex parse error:
+      foo(?=bar)
+         ^^^
+  error: look-around, including look-ahead and look-behind, is not supported
+  ```
+
+- **The HIR** (high-level intermediate representation) is what the pattern means, with everything resolved: flags are applied, `(?i:ab)` has become `[Aa][Bb]`, `\pL`, `\w` and `[a-z&&[^aeiou]]` are explicit sets of code-point ranges, `(?x)` whitespace and comments are gone, and `\x{1F600}` is the literal character. The HIR has only eight node kinds, so the emitter is one small function per kind.
+
+We emit from the HIR. It already contains the exact Rust semantics, so the emitter has nothing to interpret, only to spell.
+
+### Mapping
+
+| The model writes | HIR | Emitted ARE |
+| --- | --- | --- |
+| Literals, including `\x{1F600}` and `\t` | `Literal` | The characters, with ARE metacharacters escaped and control characters as `\uXXXX` |
+| `\w`, `\d`, `\s`, `.`, `[...]`, `\pL`, `\p{Greek}`, `[^\D]`, `[a-z&&[^aeiou]]` | `Class`: a set of ranges | A bracket expression listing the ranges, with `\n` removed as rg removes it (a line never contains one) and NUL excluded (Postgres text can't hold it) |
+| `(?i)` anywhere, `(?i:...)`, or `ignore_case=true` | Case-folded `Class` | Ranges such as `[Ee]`, so case-insensitive search uses `~`, never `~*` |
+| `^`, `$`, `\A`, `\z`, and `(?m)` forms | `Look::Start`, `End`, `StartLF`, `EndLF` | `^`, `$`. rg's text is the line. |
+| `\b`, `\B` | `Look::WordUnicode`, `WordUnicodeNegate` | Lookaround over the explicit `\w` class: `(?:(?<=W)(?!W)\|(?<!W)(?=W))` and its complement |
+| `\<`, `\>`, `\b{start}`, `\b{end}`, `\b{start-half}`, `\b{end-half}` | `Look::WordStart...`, `WordEnd...` | `(?<!W)(?=W)`, `(?<=W)(?!W)`, `(?<!W)`, `(?!W)` |
+| `(?-u:\b)` | `Look::WordAscii` | The same forms with `W = [0-9A-Za-z_]` |
+| `*`, `+`, `?`, `{n,m}`, lazy `+?` | `Repetition` | The same quantifier. Counts above 255 are rejected, because ARE's limit is 255. |
+| `(...)`, `(?P<n>...)`, `(?<n>...)`, `(?:...)` | `Capture`, or nothing | `(?:...)`. Captures are never used, and non-capturing groups compile smaller. |
+| Alternation, concatenation, empty | `Alternation`, `Concat`, `Empty` | `(?:a\|b)`, juxtaposition, `(?:)` |
+
+Rejected, each with a message in ripgrep's format:
+
+| Construct | Why |
+| --- | --- |
+| Lookaround `(?=...)`, `(?<=...)`, backreferences `\1` | regex-syntax rejects them, as rg does without `-P` |
+| `\Z`, `\Q...\E`, `\h`, unknown `\p{...}` names | regex-syntax rejects them, as rg does |
+| A literal `\n` | rg rejects it without `-U`; no single line contains one |
+| Byte classes from `(?-u)` outside ASCII | Lines are text, not bytes |
+| A repetition count above 255 | ARE's limit |
+| A translated pattern over the size cap (for example 256 KB) | Keeps compilation bounded. One `\w` is about 10 KB; one `\b` is four of them. |
 
 **Longest-match versus first-match** semantics don't matter here. `rg` only asks whether a line matches and returns the whole line; it never extracts match spans.
+
+### Cost of explicit classes
+
+Measured on PostgreSQL 18 over 200,000 lines (about 12 MB):
+
+| Pattern | Time |
+| --- | --- |
+| `config\(\w+\)` with ARE's `\w` | 138 ms |
+| The same with the 796-range Unicode `\w` | 150 ms |
+| `PARSE_CONFIG` with `~*` | 153 ms |
+| `[Pp][Aa][Rr][Ss][Ee]_...` with `~` | 154 ms |
+| `\yparse_config\y` (wrong under `C` for non-ASCII) | 190 ms |
+| The lookaround word boundary | 302 ms |
+
+Compiling the 796-range class takes about 0.7 ms, against 0.15 ms for ARE's `\w`. Correct semantics in every locale cost little, except word boundaries, which cost about 1.6 times as much. If that matters, a later optimization can probe the database's ctype once at startup and use `\y` where it's known to agree.
 
 ### What exists: survey
 
 | Project | What it is | Usable here? |
 | --- | --- | --- |
+| [regex-syntax](https://docs.rs/regex-syntax) | The parser of Rust's `regex` crate, used by ripgrep. Produces an AST with positions and a fully resolved HIR. | **Chosen.** Exact rg dialect and rg's error messages. |
+| [regex](https://docs.rs/regex) | Rust's regex engine | As the test oracle: same parser, real matching |
 | [pgpcre](https://github.com/petere/pgpcre) | Postgres extension that adds PCRE as a `pcre` type with `~` and `=~` operators | Rarely: not offered by most managed services, and it has no index support for pattern matching. |
-| [re2 (PGXN)](https://api.pgxn.org/src/re2/re2-0.4.0/doc/re2.md) | Postgres extension with ClickHouse-compatible RE2 functions; an `@~` operator with a `gin_re2_ops` trigram prefilter | Rarely available, but the best design reference: RE2 syntax is close to Rust's, and its GIN trigram prefilter is the model for an optional index (see Open decisions). |
+| [re2 (PGXN)](https://api.pgxn.org/src/re2/re2-0.4.0/doc/re2.md) | Postgres extension with ClickHouse-compatible RE2 functions; an `@~` operator with a `gin_re2_ops` trigram prefilter | Rarely available. Its GIN trigram prefilter is the model for an optional index (see Open decisions). |
 | [omni\_regex (Omnigres)](https://docs.omnigres.org/omni_regex/regex/) | PCRE2-based match and capture functions | Rarely available |
 | [PL/Rust](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.Using.PL_Rust.html) | Postgres functions written in Rust, with the `regex` crate allowed | RDS only |
-| [PCRE2 `pcre2_convert`](https://git.stg.centos.org/source-git/pcre2/blob/c8s/f/src/pcre2_convert.c) | Converts POSIX patterns and globs into PCRE2 | Wrong direction. Useful as a reference for edge cases only. |
+| [PCRE2 `pcre2_convert`](https://git.stg.centos.org/source-git/pcre2/blob/c8s/f/src/pcre2_convert.c) | Converts POSIX patterns and globs into PCRE2 | Wrong direction |
 | [RegexBuddy](https://www.regexbuddy.com/postgresql.html) | Commercial GUI that converts between regex flavors, including PostgreSQL | No: a GUI tool, not a library |
-| Python `re._parser` (formerly `sre_parse`) | CPython's internal regex parser, which produces an AST | It's a possible base for a translator, but it's an internal API that can change between Python versions. |
+| Python `re._parser` (formerly `sre_parse`) | CPython's internal regex parser | No: an internal API, and Python's dialect, not Rust's |
 
 Postgres's built-in ARE engine is the only regex engine available everywhere, so we translate to ARE. `pg_trgm`, which ships with Postgres and is offered on most managed services such as Databricks Lakebase ([Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions)), stays in reserve for an index if scans prove too slow.
 
 ### Translator design
 
-1. **Accepted dialect:** Rust regex syntax (what `rg` uses by default), plus lookaround and backreferences, since ARE supports both. The tool description says "Rust-style regex".
-2. **Tokenizer, then emitter.** Write a small hand-written tokenizer that understands escapes, classes, groups, quantifiers and flags, rather than depending on `re._parser`. Then emit ARE tokens using the table above. The amount of code is small; correctness comes from the tests.
-3. **Two forms.** The emitter returns the line form for the line check, and the file form for the file filter: the same pattern with `(?n)` in front, merged with a leading `(?i)` into `(?in)` where present.
-4. **Reject, don't guess.** Unsupported constructs return a shell-style error with a hint, such as `rg: \p{..} is not supported; use [[:alpha:]]`. An error is always better than a silent zero-match.
-5. **Validate in Postgres.** Compile the translated pattern once with `SELECT '' ~ $1` under a 100 ms timeout, so syntax errors come back as `rg: regex parse error: ...` before the real search runs. Cache translations per pattern.
-6. **Safety.** Postgres warns that "regular expressions can be contrived that take arbitrary amounts of time and memory" and advises a statement timeout for untrusted patterns. Every search runs under `SET LOCAL statement_timeout`.
+1. **A Rust extension module.** The translator is a small Rust crate, `minifs-regex`, built with PyO3 and maturin as the Python module `minifs._regex`. It's built as abi3 wheels (one per platform for every Python from 3.12) for Linux x86\_64 and aarch64 and macOS arm64. The rest of minifs stays Python.
+2. **Parse as rg does.** One call: `translate(pattern, ignore_case) -> (line_form, file_form)`. It configures regex-syntax the way ripgrep does (Unicode on, case-insensitivity from `ignore_case`), parses to the HIR and emits ARE using the mapping above. Errors raise `RegexError` carrying ripgrep's formatted message and the position.
+3. **Two forms.** The line form is for the line check. The file form is the same pattern with `(?n)` in front, for the file filter. Since classes never contain `\n`, `(?n)` only affects `^` and `$`.
+4. **Reject, don't guess.** Anything the mapping doesn't cover is an error with a hint. An error is always better than a silent zero-match.
+5. **Validate in Postgres.** Compile the translated pattern once with `SELECT '' ~ $1` under a 100 ms timeout. An error here is an emitter bug, reported as such, never shown to the model as a pattern problem.
+6. **Cache.** `vfs/regex.py` caches translations per `(pattern, ignore_case)`.
+7. **Safety.** Postgres warns that "regular expressions can be contrived that take arbitrary amounts of time and memory" and advises a statement timeout for untrusted patterns. Backreferences, the main cause of slow ARE matches, are rejected. Every search still runs under `SET LOCAL statement_timeout`.
 
 ### Differential testing (how we know it's right)
 
-- **A corpus of real patterns:** start with 200+ patterns collected from model transcripts (`\bparse\b`, `TODO|FIXME`, `(?i)error`, `\d{2}:\d{2}`, and so on), and add every new pattern seen in production logs.
-- **An oracle:** for each pattern and each test line, compare Python `re.search(original)` with Postgres `line ~ translated`, for the subset where Python and Rust semantics agree. Every disagreement is either a translator bug or a construct that should be rejected.
-- **Property tests:** generate random patterns from the supported grammar and random lines, then compare the same way.
-- **The file filter never drops a match:** for random patterns and files, whenever some line matches the line form, the whole file matches the file form. A failure here would be a silent missed hit, so it gets its own property test.
+- **The oracle is Rust's `regex` crate,** exposed by the same extension behind a test-only cargo feature. It uses the same parser and real Rust matching, so for every pattern and line, `regex.is_match(line)` must equal Postgres `line ~ line_form`. Every disagreement is an emitter bug: there is no "shared subset" to exclude.
+- **Two databases:** every comparison runs against a `C`-locale database and a UTF-8 one. Results must agree with the oracle, and therefore with each other.
+- **A corpus of real patterns:** start with 200+ patterns collected from model transcripts (`\bparse\b`, `TODO|FIXME`, `(?i)error`, `\d{2}:\d{2}`, and so on), with lines that include non-ASCII text, and add every new pattern seen in production logs.
+- **Property tests:** generate random HIR, print it as a Rust pattern (regex-syntax has a printer), and compare on random lines.
+- **Rejections match rg:** every pattern regex-syntax rejects is also rejected by the real `rg` binary, checked in CI.
+- **The file filter never drops a match:** whenever some line matches the line form, the whole file matches the file form. A failure here would be a silent missed hit, so it gets its own property test.
 
 ## Agent integration
 
@@ -633,7 +682,7 @@ minifs/
     client.py    thin async wrappers over the SQL functions
     policy.py    per-actor write rules
     glob.py      glob translator and pruning hints
-    regex.py     rg-pattern to ARE translator
+    regex.py     thin wrapper over minifs._regex, with the translation cache
     watch.py     LISTEN vfs and async iterators per path
     cache.py     directory-entry cache, content and line-map cache, NOTIFY eviction
   tools/
@@ -641,6 +690,8 @@ minifs/
   db/
     pool.py      psycopg pool and credential refresh
     schema.sql
+crates/
+  minifs-regex/  Rust: regex-syntax HIR to ARE, built as minifs._regex (PyO3, maturin)
 ```
 
 ### Deps and tools
@@ -749,7 +800,8 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Line map | Line N read through the map equals line N from splitting the whole file, across appends that end mid-line | Property |
 | Glob translator | Compared with `PurePath.full_match` (Python 3.13+) or `wcmatch` (GLOBSTAR and BRACE flags) on generated patterns and paths | Differential |
 | Glob pruning | Results with all hints enabled equal results with none | Differential |
-| Regex translator | A corpus of real model patterns plus generated ones, compared with Python `re` on the shared subset | Differential |
+| Regex translator | A corpus of real model patterns plus generated ones, compared with Rust's `regex` crate, in a `C`-locale and a UTF-8 database | Differential |
+| Regex rejections | Every pattern the translator rejects at parse time is also rejected by the `rg` binary | Differential |
 | rg scope | `rg(p, glob=X)` hits exactly the files that `glob(X)` returns | Integration |
 | Agent tools | Errors come back as shell-style strings; the chroot blocks `..` escapes; the write policy blocks writes outside allowed paths | Unit |
 | Evals | A set of recorded coding tasks run against the VFS tools: track task success and tool calls per task | Eval |
@@ -785,5 +837,6 @@ The payoff is that the same tree mounts through FUSE on a laptop or NFS on Kuber
 - [PostgreSQL pg\_trgm](https://www.postgresql.org/docs/current/pgtrgm.html): regex index support, for the optional search index
 - [Databricks Apps best practices](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/best-practices) and [ECS KernelCapabilities](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_KernelCapabilities.html): examples of platforms without FUSE or root
 - [Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions): an example of a managed Postgres extension list
+- [regex-syntax](https://docs.rs/regex-syntax) and [regex](https://docs.rs/regex): the parser the translator uses, and the test oracle
 - [pgpcre](https://github.com/petere/pgpcre), [re2 for PostgreSQL (PGXN)](https://api.pgxn.org/src/re2/re2-0.4.0/doc/re2.md), [omni\_regex](https://docs.omnigres.org/omni_regex/regex/), [PL/Rust on RDS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.Using.PL_Rust.html), [PCRE2 pcre2\_convert](https://git.stg.centos.org/source-git/pcre2/blob/c8s/f/src/pcre2_convert.c), [RegexBuddy PostgreSQL](https://www.regexbuddy.com/postgresql.html): the translator survey
 - TigerFS repository: `docs/adr/017-relational-directory-structure.md` and `internal/tigerfs/fs/synth/build.go`
