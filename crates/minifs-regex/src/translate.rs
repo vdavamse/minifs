@@ -25,10 +25,15 @@ pub const MAX_TRANSLATED_LEN: usize = 256 * 1024;
 /// Plain length isn't counted here; [`MAX_TRANSLATED_LEN`] bounds it.
 pub const MAX_EXTRA_ATOMS: u64 = 8192;
 
-/// Largest number of atoms before expansion. Bounds wide patterns: a 12,000-way alternation of
-/// short words (about 70,000 atoms) compiles in 0.08 s, but 16,000 ways makes Postgres fail an
-/// allocation.
+/// Largest number of atoms before expansion. Bounds wide patterns, with a margin: a 12,000-way
+/// alternation of short words (about 61,000 atoms) still compiles in 0.08 s, but 16,000 ways
+/// makes Postgres fail an allocation. Postgres's cost also grows with the number of distinct
+/// characters, so `validate` still has to classify allocation failures.
 pub const MAX_ATOMS: u64 = 50_000;
+
+/// Largest pattern accepted, in bytes, checked before parsing. Bounds parse time and the size of
+/// cache keys; `(?x)` whitespace and big classes can make a long pattern translate small.
+pub const MAX_PATTERN_LEN: usize = 64 * 1024;
 
 /// ARE's newline-sensitive mode: `^` and `$` also match at line breaks.
 pub const FILE_FORM_PREFIX: &str = "(?n)";
@@ -84,6 +89,13 @@ impl std::error::Error for Error {}
 
 /// Parses `pattern` as ripgrep does and translates it into ARE.
 pub fn translate(pattern: &str, ignore_case: bool) -> Result<Translation, Error> {
+    if pattern.len() > MAX_PATTERN_LEN {
+        return Err(Error::unsupported(format!(
+            "regex is too long ({} KB, the limit is {} KB); use a shorter pattern",
+            pattern.len() / 1024,
+            MAX_PATTERN_LEN / 1024
+        )));
+    }
     let hir = parse(pattern, ignore_case)?;
     let linear = atoms(&hir, false);
     if linear > MAX_ATOMS {
@@ -125,11 +137,16 @@ const RG_WRAP: (&str, &str) = ("(?:", ")");
 fn parse(pattern: &str, ignore_case: bool) -> Result<Hir, Error> {
     let wrapped = format!("{}{pattern}{}", RG_WRAP.0, RG_WRAP.1);
     let pattern_chars = pattern.chars().count();
-    // Spans count characters of the pattern as given, not of the wrapper.
-    let unwrap = |byte_offset| {
-        char_offset(&wrapped, byte_offset)
-            .saturating_sub(RG_WRAP.0.len())
-            .min(pattern_chars)
+    // Spans count characters of the pattern as given, not of the wrapper. An error at the
+    // wrapper's own parens has no position in the pattern; an empty span at a pattern character
+    // (where rg's caret points) covers that character.
+    let unwrap = |span: &regex_syntax::ast::Span| {
+        let start = char_offset(&wrapped, span.start.offset).checked_sub(RG_WRAP.0.len())?;
+        if start >= pattern_chars {
+            return None;
+        }
+        let end = char_offset(&wrapped, span.end.offset).saturating_sub(RG_WRAP.0.len());
+        Some((start, end.clamp(start + 1, pattern_chars)))
     };
     parser(ignore_case).parse(&wrapped).map_err(|err| {
         let span = match &err {
@@ -137,9 +154,7 @@ fn parse(pattern: &str, ignore_case: bool) -> Result<Hir, Error> {
             regex_syntax::Error::Translate(e) => Some(e.span()),
             _ => None,
         }
-        .map(|s| (unwrap(s.start.offset), unwrap(s.end.offset)))
-        // An error at the wrapper's own parens has no position in the pattern as given.
-        .filter(|(start, end)| start < end);
+        .and_then(unwrap);
         Error {
             message: err.to_string(),
             span,
@@ -605,6 +620,9 @@ mod tests {
         assert_eq!(err.span, None);
         assert_eq!(rejected("a)").span, None);
         assert_eq!(rejected("a))").span, Some((2, 3)));
+        // Zero-width positions inside the pattern cover the character rg's caret points at.
+        assert_eq!(rejected("a|*").span, Some((2, 3)));
+        assert_eq!(rejected("**").span, Some((0, 1)));
     }
 
     #[test]
@@ -646,6 +664,8 @@ mod tests {
             format!("{}{{100}}", WordClass::Unicode.bracket())
         );
         assert!(rejected(&r"\w".repeat(80)).message.contains("too large"));
+        let spaced = format!("(?x)a{}", " ".repeat(MAX_PATTERN_LEN));
+        assert!(rejected(&spaced).message.contains("too long"));
         // Emission stops at the limit instead of building the whole string first.
         assert!(rejected(&r"\b".repeat(1_000)).message.contains("too large"));
     }
@@ -665,7 +685,12 @@ mod tests {
                 .join("|")
         };
         assert!(translate(&words(5000), false).is_ok());
-        assert!(rejected(&words(16_000)).message.contains("too large"));
+        // 9,000 six-character words: 63 KB of pattern, over 50,000 atoms.
+        let wide = (0..9000)
+            .map(|i| format!("w{i:05}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(rejected(&wide).message.contains("too large"));
         assert_eq!(
             line(r"\w{255}").len(),
             WordClass::Unicode.bracket().len() + 5

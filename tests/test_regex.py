@@ -10,7 +10,7 @@ from pathlib import Path
 
 import psycopg
 import pytest
-from psycopg import AsyncConnection, sql
+from psycopg import AsyncConnection, errors, sql
 
 from minifs import _regex
 from minifs.vfs import regex
@@ -63,7 +63,8 @@ UNSUPPORTED = {
     r"\b\w\b" * 20: "too large",
     r"(?:a{255}){255}": "expand to",
     r"(?:a{0,100}){100}": "expand to",
-    "|".join(f"w{i}" for i in range(16000)): "too large",
+    "|".join(f"w{i:05}" for i in range(9000)): "too large",  # over 50,000 atoms
+    "(?x)a" + " " * 70_000: "too long",
     r"(?-u:\B)": "use \\B",
 }
 
@@ -269,17 +270,51 @@ async def test_validate_reports_expensive_patterns_to_the_model(
     assert "translator bug" not in caplog.text
 
 
-async def test_validate_remembers_expensive_patterns(conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_validate_remembers_only_deterministic_rejections(
+    conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A timeout depends on load: once the server has time, the same pattern validates.
     slow = Translation("(?:[a-z]{0,255}){40}", False, "(?:[a-z]{0,255}){40}")
     monkeypatch.setattr(regex, "_VALIDATE_TIMEOUT", "1ms")
-    with pytest.raises(RegexTooExpensive) as first:
+    with pytest.raises(RegexTooExpensive) as info:
         await regex.validate(conn, slow)
-    # Retried, the pattern is refused without compiling again: with time to spare, a compile would succeed.
+    assert "shorter pattern" in info.value.message
     monkeypatch.setattr(regex, "_VALIDATE_TIMEOUT", "10s")
+    await regex.validate(conn, slow)
+
+    # A refused allocation (XX000) is the same on any server, so a retry doesn't reach Postgres.
+    words = "|".join(f"w{i}" for i in range(16000))
+    wide = Translation("wide", False, f"(?:{words})")
+    with pytest.raises(RegexTooExpensive) as first:
+        await regex.validate(conn, wide)
+    assert "too large" in first.value.message
+
+    def no_database(*args: object, **kwargs: object) -> None:
+        raise AssertionError("validate reached the database")
+
+    monkeypatch.setattr(conn, "transaction", no_database)
     with pytest.raises(RegexTooExpensive) as second:
-        await regex.validate(conn, slow)
+        await regex.validate(conn, wide)
     assert second.value.message == first.value.message
-    assert "shorter pattern" in first.value.message
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (errors.InvalidRegularExpression("invalid regular expression: regular expression is too complex"), True),
+        (errors.InvalidRegularExpression("regular expression failed: out of memory"), False),
+        (errors.InvalidRegularExpression("invalid regular expression: brackets [] not balanced"), None),
+        (errors.QueryCanceled("canceling statement due to statement timeout"), False),
+        (errors.QueryCanceled("canceling statement due to user request"), None),
+        (errors.ProgramLimitExceeded("total size of jsonb array elements exceeds the maximum"), True),
+        (errors.InsufficientResources("out of memory"), False),
+        (errors.InternalError_("invalid memory alloc request size 1186638868"), True),
+        (errors.InternalError_("could not open relation"), None),
+    ],
+)
+def test_compile_expense_classifies_failures(error: errors.DatabaseError, expected: bool | None) -> None:
+    expense = regex.compile_expense(error)
+    assert (expense[1] if expense else None) == expected
 
 
 async def test_validate_refuses_a_non_utf8_database(pg_server: PgServer) -> None:
