@@ -39,9 +39,14 @@ from tests.test_tree import create, mkdir_p, raises_errno
         ("[.-0]", r"^(?:.*/)?[\u002e0]$"),  # the range loses '/'
         ("[]]", r"^(?:.*/)?[\u005d]$"),
         ("[[:digit:]]", r"^(?:.*/)?[0-9]$"),
-        ("*.{md,txt}", r"^(?:.*/)?(?:[^/]*\.md|[^/]*\.txt)$"),
-        ("{a,{b,c}}", r"^(?:.*/)?(?:a|b|c)$"),
-        ("{a,a}", r"^(?:.*/)?a$"),
+        ("*.{md,txt}", r"^(?:.*/)?[^/]*\.(?:md|txt)$"),
+        ("{a,{b,c}}", r"^(?:.*/)?(?:a|(?:b|c))$"),
+        ("{a,a}", r"^(?:.*/)?(?:a)$"),
+        ("{a,b}/*", r"^(?:a|b)/[^/]*$"),
+        ("{a/b,c}", r"^(?:a/b|c)$"),  # expanded: the alternatives have different segments
+        ("{a,}**/x", r"^(?:a[^/]*/x|(?:[^/]+/)*x)$"),  # ** is a globstar only in the second
+        ("[😀-😂]", r"^(?:.*/)?[\U0001f600-\U0001f602]$"),
+        ("[[:ascii:]]", r"^(?:.*/)?[\u0000-\u002e0-\u007f]$"),
         (r"\*", r"^(?:.*/)?\*$"),
         (r"\a", r"^(?:.*/)?a$"),
         ("a+b(c)$", r"^(?:.*/)?a\+b\(c\)\$$"),
@@ -63,7 +68,11 @@ def test_translation(pattern: str, regex: str) -> None:
         ("{a,[}]", "unclosed '{'"),  # [}] is a class
         ("{a,[b}", "unclosed '['"),
         ("a\0b", "NUL character"),
-        ("{a,b}" * 11, "more than 1024 brace alternatives"),
+        ("{a,b/c}" * 11, "more than 1024 brace alternatives"),
+        ("{a,b/c}" * 10 + "x" * 16 * 1024, "the translated regex is over 16 KB"),
+        ("{a/" * 1000 + "}" * 1000, "braces nested too deeply"),
+        ("src/", "a pattern ending in '/' matches only directories, and only files are listed"),
+        ("**/", "a pattern ending in '/' matches only directories, and only files are listed"),
     ],
 )
 def test_bad_patterns(pattern: str, message: str) -> None:
@@ -82,9 +91,10 @@ def test_bad_patterns(pattern: str, message: str) -> None:
         ("src/a.py", GlobPlan(r"^src/a\.py$", ("src",), 1, "a.py")),
         ("src/**", GlobPlan(r"^src/.*$", ("src",), None, None)),
         ("src/*.[ch]", GlobPlan(r"^src/[^/]*\.[ch]$", ("src",), 1, None)),
-        ("{src,lib}/x_1%.py", GlobPlan(r"^(?:src/x_1%\.py|lib/x_1%\.py)$", (), 2, r"x\_1\%.py")),
+        ("{src,lib}/x_1%.py", GlobPlan(r"^(?:src|lib)/x_1%\.py$", (), 2, r"x\_1\%.py")),
+        ("{src/a,src/b/c}/*.py", GlobPlan(r"^(?:src/a/[^/]*\.py|src/b/c/[^/]*\.py)$", ("src",), 3, "%.py")),
         ("{src/a,src/b}/c", GlobPlan(r"^(?:src/a/c|src/b/c)$", ("src",), 2, "c")),
-        ("src/*.{md,txt}", GlobPlan(r"^(?:src/[^/]*\.md|src/[^/]*\.txt)$", ("src",), 1, None)),
+        ("src/*.{md,txt}", GlobPlan(r"^src/[^/]*\.(?:md|txt)$", ("src",), 1, None)),
         ("a?b**c", GlobPlan(r"^(?:.*/)?a[^/]b[^/]*c$", name_like="a_b%c")),
     ],
 )
@@ -92,13 +102,21 @@ def test_hints(pattern: str, plan: GlobPlan) -> None:
     assert compile_glob(pattern) == plan
 
 
-def test_excludes_prune_literal_directories() -> None:
-    excludes = compile_excludes(["**/node_modules/**", "**/.venv/**", "*.log", "**/a*/**"])
-    assert excludes.prune_dirs == ("node_modules", ".venv")
-    assert excludes.regexes == (glob_to_regex("*.log"), glob_to_regex("**/a*/**"))
-    unpruned = compile_excludes(["**/node_modules/**"], prune=False)
+def test_braces_without_separators_are_not_expanded() -> None:
+    # Expanded, "*{a,b}" * 10 would be 1,024 alternatives of 70 characters each.
+    assert glob_to_regex("*{a,b}" * 10) == "^(?:.*/)?" + "[^/]*(?:a|b)" * 10 + "$"
+
+
+def test_exclude_regexes() -> None:
+    excludes = compile_excludes(["**/node_modules/**", "**/.venv/**", "*.log", "**/a*/**", "build/", "a/b/"])
+    assert excludes.prune_dirs == ("node_modules", ".venv", "build")
+    # Directories are tested as "path/": every exclude also matches them, the ones ending in '/' only them.
+    assert excludes.regexes == (r"^(?:.*/)?[^/]*\.log/?$", r"^(?:[^/]+/)*a[^/]*/.*/?$", r"^a/b/$")
+    unpruned = compile_excludes(["**/node_modules/**", "build/"], prune=False)
     assert unpruned.prune_dirs == ()
-    assert unpruned.regexes == (glob_to_regex("**/node_modules/**"),)
+    assert unpruned.regexes == (r"^(?:[^/]+/)*node_modules/.*/?$", r"^(?:.*/)?build/$")
+    with pytest.raises(TypeError):
+        compile_excludes("*.log")
 
 
 # Differential: the translator against wcmatch, on generated patterns and paths.
@@ -112,9 +130,11 @@ def test_excludes_prune_literal_directories() -> None:
 
 _WC_FLAGS = wcglob.GLOBSTAR | wcglob.BRACE | wcglob.DOTGLOB
 
-_NAME_CHARS = ["a", "b", "c", "é", "ö", "日", ".", "-", "*", "?", "[", "]", "{", "}", ",", "\\"]
+_NAME_CHARS = ["😁", "a", "b", "c", "é", "ö", "日", ".", "-", "*", "?", "[", "]", "{", "}", ",", "\\"]
 _LITERALS = ["a", "b", "c", "é", "日", ".", "-", r"\*", r"\?", r"\[", r"\{", r"\,", "\\\\"]
-_CLASSES = ["[ab]", "[!a]", "[^b]", "[a-c]", "[é-ö]", "[!é-ö]", "[]a]", "[.-]", "[[:alpha:]]", "[*?]", "[\\]]"]
+_CLASSES = [
+    "[ab]", "[!a]", "[^b]", "[a-c]", "[é-ö]", "[!é-ö]", "[😀-😂]", "[]a]", "[.-]", "[[:alpha:]]", "[*?]", "[\\]]",
+]  # fmt: skip
 
 
 def _gen_segment(rng: random.Random, depth: int = 0) -> str:
@@ -181,10 +201,11 @@ def _paths_for(rng: random.Random, pattern: str) -> list[str]:
 def _comparable(pattern: str) -> bool:
     # An empty alternative can leave an empty segment (x/{,a}/y gives x//y), which wcmatch collapses, or an
     # empty pattern, which our **/ prefix turns into a different one. (bracex drops an empty alternative at the
-    # pattern's edge, hence the sentinels.)
+    # pattern's edge, hence the sentinels.) Patterns over the size limits are refused, not compared.
     try:
+        compile_glob(pattern)
         wrapped = bracex.expand("<" + pattern.removeprefix("/") + ">", keep_escapes=True, limit=MAX_ALTERNATIVES)
-    except bracex.ExpansionLimitException:
+    except (GlobError, bracex.ExpansionLimitException):
         return False
     expansions = [e[1:-1] for e in wrapped]
     return all(e and "//" not in e and not e.startswith("/") and not e.endswith("/") for e in expansions)
@@ -313,9 +334,21 @@ async def test_excludes(conn: AsyncConnection) -> None:
     # A prefix through an excluded directory gives nothing, as the full walk would.
     assert await _paths(conn, None, "node_modules/*.py", excludes=["**/node_modules/**"]) == set()
     assert await _paths(conn, None, "build/*.py", excludes=["build"]) == set()
+    # A trailing '/' matches only directories, at any depth unless the pattern has another '/'.
+    await _tree(conn, None, ["a/build/d.py", "a/x/build"])
+    everything = await _paths(conn, None, "**")
+    assert everything - await _paths(conn, None, "**", excludes=["build/", "node_modules/"]) == {
+        "src/node_modules/m.py",
+        "node_modules/n.py",
+        "build/c.py",
+        "a/build/d.py",
+    }  # a/x/build is a file
+    assert everything - await _paths(conn, None, "**", excludes=["a/build/"]) == {"a/build/d.py"}
     # Excludes match paths relative to the search root.
     src = await mkdir_p(conn, "src")
     assert await _paths(conn, src, "*", excludes=["src/*"]) == {"a.py", "node_modules/m.py", "b.log"}
+    with pytest.raises(TypeError):
+        await glob(conn, None, "*", excludes="*.log")
 
 
 async def test_newest_first_and_limit(conn: AsyncConnection) -> None:
@@ -348,6 +381,8 @@ async def test_classes_on_non_ascii_names(db_any_locale: str) -> None:
         assert await _paths(conn, None, "??.md") == {"日本.md"}
         assert await _paths(conn, None, "[é-ö]/*") == {"ö/x.md"}
         assert await _paths(conn, None, "é*") == {"é.md"}  # no case folding
+        await _tree(conn, None, ["😁", "😃"])
+        assert await _paths(conn, None, "[😀-😂]") == {"😁"}
 
 
 async def test_like_wildcards_in_names_are_literal(conn: AsyncConnection) -> None:
@@ -376,9 +411,9 @@ async def test_hints_do_not_change_results(conn: AsyncConnection) -> None:
     patterns = [
         "*.py", "src/**/*.py", "src/*/*.md", "{src,lib}/**/x.py", "a/b/*", "a/**", "**/b/*.txt", "src/a/b/x.py",
         "src/{a,b}/*", "*/*/*", "node_modules/**", "*.{py,md}", "[ab]/*.py", "**/é.py", "docs/a/*.t?t",
-        ".hidden/*", "src/.hidden/**", "a/node_modules/x.py",
+        ".hidden/*", "src/.hidden/**", "a/node_modules/x.py", "{src/a,src/b/c}/*.py", "{a,b/a}/**/{x,y}.*",
     ]  # fmt: skip
-    excludes_options: list[list[str]] = [[], ["**/node_modules/**"], ["**/node_modules/**", "*.md", "b"]]
+    excludes_options = [[], ["**/node_modules/**"], ["**/node_modules/**", "*.md", "b"], ["a/", "src/b/"]]
     for pattern in patterns:
         for excludes in excludes_options:
             for hidden in (False, True):

@@ -441,13 +441,13 @@ The defaults follow rg. Only files are returned (directories are walked, not lis
 
 `minifs/vfs/glob.py` translates in three steps:
 
-1. **Expand braces** into alternatives, nested ones included (at most 1,024). `**` is special only as a whole path segment, and whether it is one can depend on the alternative: in `{a,}**/x` it is for the empty alternative only.
+1. **Expand braces that need it** into alternatives (at most 1,024): those whose alternatives contain `/` or `*`, or an empty alternative next to a `*`, because they can change the segments or whether a segment is a globstar (`**` is one only as a whole segment, so in `{a,}**/x` it is for the empty alternative only). Other braces, like `*.{md,txt}`, stay inline as `(?:md|txt)`, so `*{a,b}` repeated ten times is a short regex, not 1,024 alternatives.
 2. **Tokenize each alternative and split it into segments.** A segment that is exactly `**` is a globstar; `**` anywhere else is a `*`. A backslash makes the next character literal.
 3. **Emit** each alternative and join them as `(?:alt1|alt2)`. Literals escape only ARE's special characters: a backslash before a letter is a meaningful ARE escape (`\y`, `\m`), so letters stay bare.
 
 Character classes are parsed into code-point ranges and emitted as explicit ranges, with every character except ASCII letters and digits written as `\uXXXX`. A class never matches `/`: it is removed from ranges such as `[+-0]`, and added to negated classes, so `[!x]` becomes `[^x/]`. POSIX classes such as `[[:alpha:]]` are ASCII only, as in wcmatch. Nothing relies on ARE's own classes or case folding, so a translated pattern means the same under every database locale.
 
-An unclosed `[` or `{` raises `GlobError`, as does an empty pattern. `{a}` is an alternation of one, as in rg (bash would keep it literal).
+An unclosed `[` or `{` raises `GlobError`, as do an empty pattern, a pattern ending in `/` (it would match only directories, and only files are listed), braces nested too deeply and a translation over 16 KB, which would be slow to match against every path. In excludes, a trailing `/` limits the pattern to directories without anchoring it, as in gitignore: `build/` skips every directory named `build`, and `vfs_glob` tests each directory as its path plus `/`. `{a}` is an alternation of one, as in rg (bash would keep it literal).
 
 ### Pruning hints
 
@@ -475,7 +475,7 @@ vfs_glob(
 
 It is a recursive CTE over the parent pointers (migration `006_vfs_glob.sql`). Each directory level is an index lookup on `UNIQUE (parent_id, name)`: the walk seeds from the root's entries or the start directory's in two branches, never `parent_id IS NOT DISTINCT FROM`, which can't use the index. Directory rules (pruned name, hidden, excluded path) and the name filter apply inside the recursion, so skipped directories are never expanded; the regex and file excludes apply once at the end. Paths are `COLLATE "C"`, like `name`, so ordering and matching don't depend on the locale. ENOENT if `p_root` doesn't exist, ENOTDIR if it is a file.
 
-In Python, `minifs.vfs.glob.glob(conn, root, pattern, excludes=..., hidden=..., limit=...)` compiles the pattern and excludes and calls `vfs_glob`. Excludes of the form `**/<name>/**`, which covers all the defaults, become `p_prune_dirs` instead of regexes, so those directories are never walked. A smoke benchmark finds `src/**/*.py` in a 10k-node tree in about 15 ms. For trees of 100k+ nodes, the literal-prefix and depth hints keep the walk small, and an optional trigram index on `vfs_nodes.name` (`pg_trgm`) speeds up `*foo*` patterns.
+In Python, `minifs.vfs.glob.glob(conn, root, pattern, excludes=..., hidden=..., limit=...)` compiles the pattern and excludes and calls `vfs_glob`. Excludes of the form `**/<name>/**` or `<name>/`, which covers all the defaults, become `p_prune_dirs` instead of regexes, so those directories are never walked. A smoke benchmark finds `src/**/*.py` in a 10k-node tree in about 15 ms. For trees of 100k+ nodes, the literal-prefix and depth hints keep the walk small, and an optional trigram index on `vfs_nodes.name` (`pg_trgm`) speeds up `*foo*` patterns.
 
 The tests compare the translator with `wcmatch.glob` (GLOBSTAR, BRACE and DOTGLOB) on generated patterns and paths, Postgres's matching with Python's on the same regexes in a `C` and a UTF-8 database, and `vfs_glob` with all hints against no hints.
 

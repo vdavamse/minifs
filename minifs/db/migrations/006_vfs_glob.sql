@@ -13,8 +13,9 @@
 -- path), at most p_limit of them (NULL: all). ENOENT if p_root doesn't exist, ENOTDIR if it is a file.
 --
 -- The walk, as in rg: a directory is not walked if its name is in p_prune_dirs or is '.git' (at any depth), if
--- its relative path matches one of p_excludes, or, unless p_hidden, if its name starts with '.'. A file is
--- returned if its path matches p_regex and none of p_excludes; hidden files are returned either way.
+-- its relative path followed by '/' matches one of p_excludes (so an exclude can match only directories), or,
+-- unless p_hidden, if its name starts with '.'. A file is returned if its path matches p_regex and none of
+-- p_excludes; hidden files are returned either way.
 --
 -- Hints:
 -- - p_prefix: the pattern's literal leading directories, relative to p_root. The walk starts in that directory,
@@ -55,7 +56,7 @@ BEGIN
     -- Walk down the prefix, applying the same rules as the walk below would to each directory.
     FOREACH v_seg IN ARRAY coalesce(p_prefix, '{}') LOOP
         v_path := concat_ws('/', v_path, v_seg);
-        IF v_seg = ANY (v_prune) OR (NOT v_hidden AND v_seg LIKE '.%') OR v_path ~ ANY (v_excludes) THEN
+        IF v_seg = ANY (v_prune) OR (NOT v_hidden AND v_seg LIKE '.%') OR (v_path || '/') ~ ANY (v_excludes) THEN
             RETURN;
         END IF;
         IF v_start IS NULL THEN
@@ -79,7 +80,7 @@ BEGIN
          WHERE v_start IS NULL AND n.parent_id IS NULL
            AND CASE n.kind
                WHEN 'file' THEN p_name_like IS NULL OR n.name LIKE p_name_like
-               ELSE NOT (n.name = ANY (v_prune) OR (NOT v_hidden AND n.name LIKE '.%') OR s.path ~ ANY (v_excludes))
+               ELSE NOT (n.name = ANY (v_prune) OR (NOT v_hidden AND n.name LIKE '.%') OR (s.path || '/') ~ ANY (v_excludes))
                END
         UNION ALL
         SELECT n.id, s.path, n.kind, n.size, n.mtime, 1
@@ -87,7 +88,7 @@ BEGIN
          WHERE n.parent_id = v_start
            AND CASE n.kind
                WHEN 'file' THEN p_name_like IS NULL OR n.name LIKE p_name_like
-               ELSE NOT (n.name = ANY (v_prune) OR (NOT v_hidden AND n.name LIKE '.%') OR s.path ~ ANY (v_excludes))
+               ELSE NOT (n.name = ANY (v_prune) OR (NOT v_hidden AND n.name LIKE '.%') OR (s.path || '/') ~ ANY (v_excludes))
                END
         UNION ALL
         SELECT c.id, s.path, c.kind, c.size, c.mtime, t.depth + 1
@@ -97,7 +98,7 @@ BEGIN
            AND (p_max_depth IS NULL OR t.depth < p_max_depth)
            AND CASE c.kind
                WHEN 'file' THEN p_name_like IS NULL OR c.name LIKE p_name_like
-               ELSE NOT (c.name = ANY (v_prune) OR (NOT v_hidden AND c.name LIKE '.%') OR s.path ~ ANY (v_excludes))
+               ELSE NOT (c.name = ANY (v_prune) OR (NOT v_hidden AND c.name LIKE '.%') OR (s.path || '/') ~ ANY (v_excludes))
                END
     )
     SELECT t.id, t.path, t.size, t.mtime
