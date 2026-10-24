@@ -307,6 +307,11 @@ async def test_mkdir_p_errors(conn: AsyncConnection) -> None:
         await mkdir_p(conn, "a", "f")
     with raises_errno("EINVAL"):
         await mkdir_p(conn, "a", "..", "x")
+    await create(conn, None, "root-file")
+    with raises_errno("ENOTDIR"):
+        await mkdir_p(conn, "root-file", "x")
+    with raises_errno("EEXIST"):
+        await mkdir_p(conn, "root-file")
 
 
 async def test_concurrent_mkdir_p_agree(conn: AsyncConnection, db: str) -> None:
@@ -352,6 +357,20 @@ async def test_mkdir_p_racing_a_directory_swap(conn: AsyncConnection, db: str) -
         await other.commit()
     sub = await task
     assert sub is not None and await resolve(conn, "a", "sub") == (sub, "dir")
+
+
+@pytest.mark.parametrize(("path", "errno"), [(("a", "f"), "EEXIST"), (("a", "f", "x"), "ENOTDIR")])
+async def test_mkdir_p_racing_a_file_create(conn: AsyncConnection, db: str, path: tuple[str, ...], errno: str) -> None:
+    # The insert conflicts with the uncommitted file; after the commit, mkdir_p must report it, not loop.
+    a = await mkdir_p(conn, "a")
+    await conn.execute("SET statement_timeout = '10s'")
+    async with await AsyncConnection.connect(db) as other:
+        await create(other, a, "f")
+        task = asyncio.create_task(mkdir_p(conn, *path))
+        await wait_until_blocked(other, conn.info.backend_pid)
+        await other.commit()
+    with raises_errno(errno):
+        await task
 
 
 # vfs_rename
