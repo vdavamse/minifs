@@ -75,19 +75,23 @@ END $$;
 
 
 -- Locks directory p_dir against deletion until commit (FOR KEY SHARE) and returns. NULL is the root.
--- ENOENT if it doesn't exist, ENOTDIR if it is a file.
+-- ENOENT if it doesn't exist, ENOTDIR if it is a file. Files are never locked here, so the error doesn't wait
+-- behind an appender holding the file's inode lock.
 CREATE FUNCTION vfs_lock_dir(p_dir uuid) RETURNS void LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE v_kind text;
 BEGIN
     IF p_dir IS NULL THEN
         RETURN;
     END IF;
-    SELECT kind INTO v_kind FROM vfs_nodes WHERE id = p_dir FOR KEY SHARE;
+    PERFORM FROM vfs_nodes WHERE id = p_dir AND kind = 'dir' FOR KEY SHARE;
+    IF FOUND THEN
+        RETURN;
+    END IF;
+    SELECT kind INTO v_kind FROM vfs_nodes WHERE id = p_dir;
     IF NOT FOUND THEN
         PERFORM vfs_raise('ENOENT', format('directory %s does not exist', p_dir));
-    ELSIF v_kind <> 'dir' THEN
-        PERFORM vfs_raise('ENOTDIR', format('%s is a file', p_dir));
     END IF;
+    PERFORM vfs_raise('ENOTDIR', format('%s is a file', p_dir));
 END $$;
 
 
@@ -170,7 +174,6 @@ CREATE FUNCTION vfs_mkdir_p(p_segments text[]) RETURNS uuid LANGUAGE plpgsql SET
 DECLARE
     v_id uuid;
     v_next uuid;
-    v_kind text;
     v_seg text;
     v_i int := 0;
     v_n int := coalesce(cardinality(p_segments), 0);
@@ -179,26 +182,27 @@ BEGIN
         v_i := v_i + 1;
         PERFORM vfs_check_name(v_seg);
         LOOP
-            -- Lock what we find, so it can't be removed before our child insert or our caller's use.
+            -- Lock the directory we find, so it can't be removed before our child insert or our caller's use.
+            -- Only directories: a file is reported without waiting for its inode lock.
             IF v_id IS NULL THEN
-                SELECT n.id, n.kind INTO v_next, v_kind FROM vfs_nodes n
-                 WHERE n.parent_id IS NULL AND n.name = v_seg FOR KEY SHARE;
+                SELECT n.id INTO v_next FROM vfs_nodes n
+                 WHERE n.parent_id IS NULL AND n.name = v_seg AND n.kind = 'dir' FOR KEY SHARE;
             ELSE
-                SELECT n.id, n.kind INTO v_next, v_kind FROM vfs_nodes n
-                 WHERE n.parent_id = v_id AND n.name = v_seg FOR KEY SHARE;
+                SELECT n.id INTO v_next FROM vfs_nodes n
+                 WHERE n.parent_id = v_id AND n.name = v_seg AND n.kind = 'dir' FOR KEY SHARE;
             END IF;
             EXIT WHEN FOUND;
+            IF (v_id IS NULL AND EXISTS (SELECT FROM vfs_nodes n WHERE n.parent_id IS NULL AND n.name = v_seg))
+               OR EXISTS (SELECT FROM vfs_nodes n WHERE n.parent_id = v_id AND n.name = v_seg) THEN
+                PERFORM vfs_raise(CASE WHEN v_i = v_n THEN 'EEXIST' ELSE 'ENOTDIR' END,
+                                  format('component %s of %L is a file', v_i, p_segments));
+            END IF;
             INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (v_id, v_seg, 'dir')
                 ON CONFLICT ON CONSTRAINT vfs_nodes_parent_name_key DO NOTHING
                 RETURNING vfs_nodes.id INTO v_next;
-            v_kind := 'dir';
             EXIT WHEN v_next IS NOT NULL;
             -- A concurrent transaction created it and has committed: look it up again.
         END LOOP;
-        IF v_kind <> 'dir' THEN
-            PERFORM vfs_raise(CASE WHEN v_i = v_n THEN 'EEXIST' ELSE 'ENOTDIR' END,
-                              format('component %s of %L is a file', v_i, p_segments));
-        END IF;
         v_id := v_next;
     END LOOP;
     RETURN v_id;
@@ -216,7 +220,7 @@ END $$;
 -- concurrent move of one of those ancestors needs FOR UPDATE on it, so the two moves are ordered (or, if they
 -- lock in opposite orders, one gets a deadlock error), and the later one sees the earlier one's result. Under
 -- REPEATABLE READ, locking an ancestor that moved after the snapshot raises a serialization failure instead.
--- Appends take FOR NO KEY UPDATE, which these locks don't block.
+-- The walk locks only directories, so it never waits on a file's inode lock (appends hold it FOR UPDATE).
 CREATE FUNCTION vfs_rename(p_node uuid, p_new_parent uuid, p_new_name text, p_expect_parent uuid DEFAULT NULL)
 RETURNS boolean LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE

@@ -5,7 +5,8 @@ message and the context in DETAIL (see ``vfs_raise`` in migration 003). The code
 platform's errno numbering.
 
 The constraints on ``vfs_nodes`` are the backstop for raw SQL and for the rare races the functions don't
-pre-check; their violations map to errnos too.
+pre-check; their violations map to errnos too, on a best-effort basis: a foreign-key error can't tell a missing
+parent from a parent that is a file, so both map to ENOTDIR. The functions report each case precisely.
 """
 
 from __future__ import annotations

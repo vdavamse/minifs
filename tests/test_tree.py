@@ -401,6 +401,27 @@ async def test_racing_claims_have_one_winner(db: str) -> None:
 
 
 async def test_concurrent_directory_moves_cannot_make_a_cycle(db: str) -> None:
+    # Nested, so that what orders the two moves is the ancestor walk's locks, not the destination lock.
+    async with (
+        await AsyncConnection.connect(db, autocommit=True) as setup,
+        await AsyncConnection.connect(db, autocommit=True) as first,
+        await AsyncConnection.connect(db, autocommit=True) as second,
+    ):
+        a = await mkdir_p(setup, "a")
+        y = await mkdir_p(setup, "a", "y")
+        b = await mkdir_p(setup, "b")
+        x = await mkdir_p(setup, "b", "x")
+        assert a is not None and b is not None
+        async with first.transaction():
+            assert await rename(first, a, x, "a")  # mv /a /b/x/a
+            other = asyncio.create_task(rename(second, b, y, "b"))  # mv /b /a/y/b would close a -> x -> b -> y
+            await wait_until_blocked(setup, second.info.backend_pid)
+        with raises_errno("EINVAL"):
+            await other
+        assert await resolve(setup, "b", "x", "a", "y") == (y, "dir")
+
+
+async def test_opposite_directory_moves_cannot_make_a_cycle(db: str) -> None:
     async with (
         await AsyncConnection.connect(db, autocommit=True) as setup,
         await AsyncConnection.connect(db, autocommit=True) as first,
@@ -494,8 +515,10 @@ async def test_unlink_waits_for_a_concurrent_create(conn: AsyncConnection, db: s
         task = asyncio.create_task(unlink(conn, d))
         await wait_until_blocked(other, conn.info.backend_pid)
         await other.commit()
-    with raises_errno("ENOTEMPTY"):
+    with pytest.raises(psycopg.Error) as info:
         await task
+    # Raised by vfs_unlink's own check, not by the foreign-key backstop.
+    assert info.value.sqlstate == SQLSTATE_BY_ERRNO["ENOTEMPTY"]
 
 
 # Errors
@@ -515,3 +538,21 @@ async def test_unknown_errno_is_a_plain_error(conn: AsyncConnection) -> None:
     with pytest.raises(psycopg.Error) as info:
         await conn.execute("SELECT vfs_raise('EWHAT', 'detail')")
     assert errno_name(info.value) is None
+
+
+async def test_enotdir_does_not_wait_for_a_file_lock(conn: AsyncConnection, db: str) -> None:
+    d = await mkdir_p(conn, "d")
+    assert d is not None
+    file = await create(conn, d, "log.md")
+    async with await AsyncConnection.connect(db) as appender:
+        await appender.execute("SELECT FROM vfs_nodes WHERE id = %s FOR UPDATE", (file,))  # as vfs_append does
+        await conn.execute("SET statement_timeout = '5s'")
+        with raises_errno("ENOTDIR"):
+            await create(conn, file, "x")
+        with raises_errno("ENOTDIR"):
+            await mkdir_p(conn, "d", "log.md", "x")
+        with raises_errno("EEXIST"):
+            await mkdir_p(conn, "d", "log.md")
+        with raises_errno("ENOTDIR"):
+            await rename(conn, d, file, "d")
+        await appender.rollback()
