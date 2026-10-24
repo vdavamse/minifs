@@ -165,11 +165,13 @@ async def _fill_first_page(conn: AsyncConnection, table: str) -> str:
 
 
 async def _page_after_updates(conn: AsyncConnection, table: str, node: str, updates: int) -> set[float]:
-    """Updates ``node``'s size and mtime the way an append does, each in its own transaction; returns the pages
-    its row version was on after each update."""
+    """Updates ``node``'s size, lines and mtime the way an append does, each in its own transaction; returns the
+    pages its row version was on after each update."""
     pages: set[float] = set()
     for size in range(1, updates + 1):
-        await conn.execute(f"UPDATE {table} SET size = %s, mtime = now() WHERE id = %s".encode(), (size, node))
+        await conn.execute(
+            f"UPDATE {table} SET size = %s, lines = %s, mtime = now() WHERE id = %s".encode(), (size, size, node)
+        )
         row = await _one(conn, f"SELECT (ctid::text::point)[0] FROM {table} WHERE id = %s", (node,))
         assert isinstance(row[0], float)
         pages.add(row[0])

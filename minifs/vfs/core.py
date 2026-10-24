@@ -113,6 +113,29 @@ class ReadResult:
     eof: bool
 
 
+@dataclass(frozen=True)
+class LineReadResult:
+    """Lines ``first_line`` onwards of file ``id``: ``content`` is bytes ``[offset, next_offset)``, whole lines
+    with their ``\\n``, except that the last one is cut when the read hit its byte cap (perhaps inside a UTF-8
+    character, so decode with ``errors="replace"``), and the file's last line may have no ``\\n``. ``size``,
+    ``generation`` and ``lines`` (the file's line count; a trailing ``\\n`` adds no empty line) come from the
+    same snapshot.
+
+    A ``first_line`` past the last line returns no content, ``offset == size`` and ``eof``; ``eof`` says the read
+    reached the end of the file.
+    """
+
+    id: UUID
+    content: bytes
+    first_line: int
+    offset: int
+    next_offset: int
+    size: int
+    generation: int
+    lines: int
+    eof: bool
+
+
 def normalize(path: str) -> str:
     """The canonical form of absolute ``path``: no ``.``, ``..``, repeated or trailing slashes.
 

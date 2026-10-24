@@ -98,22 +98,25 @@ async def read_all(conn: AsyncConnection, node: UUID, chunk: int) -> tuple[bytes
 # Schema
 
 
-async def test_extent_storage_is_external(conn: AsyncConnection) -> None:
+async def test_extent_storage_is_compressed(conn: AsyncConnection) -> None:
     row = await _one(
         conn, "SELECT attstorage FROM pg_attribute WHERE attrelid = 'vfs_extents'::regclass AND attname = 'data'"
     )
-    assert row[0] == "e"
+    assert row[0] == "x"  # EXTENDED
 
 
 async def test_extent_on_a_directory_is_rejected(conn: AsyncConnection) -> None:
     d = await mkdir_p(conn, "d")
     with raises_errno("EISDIR"):
         await conn.execute(
-            "INSERT INTO vfs_extents (node_id, generation, byte_offset, data) VALUES (%s, 0, 0, 'x')", (d,)
+            "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
+            " VALUES (%s, 0, 0, 0, 'x', '{0}')",
+            (d,),
         )
     with raises_errno("EISDIR"):
         await conn.execute(
-            "INSERT INTO vfs_extents (node_id, generation, byte_offset, data, node_kind) VALUES (%s, 0, 0, 'x', 'dir')",
+            "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets, node_kind)"
+            " VALUES (%s, 0, 0, 0, 'x', '{0}', 'dir')",
             (d,),
         )
 
@@ -135,6 +138,7 @@ async def test_extents_go_with_their_file(conn: AsyncConnection) -> None:
         "SELECT vfs_append(%s, 'x')",
         "SELECT vfs_write(%s, 'x')",
         "SELECT * FROM vfs_pread(%s, 0, 10)",
+        "SELECT * FROM vfs_pread_lines(%s, 1, 10, 100)",
         "SELECT vfs_compact(%s)",
     ],
 )
@@ -154,6 +158,13 @@ async def test_content_operations_on_a_directory_or_missing_node(conn: AsyncConn
         "SELECT * FROM vfs_pread(%s, NULL, 10)",
         "SELECT * FROM vfs_pread(%s, 0, NULL)",
         "SELECT * FROM vfs_pread(%s, 0, -1)",
+        "SELECT * FROM vfs_pread_lines(%s, NULL, 10, 100)",
+        "SELECT * FROM vfs_pread_lines(%s, 0, 10, 100)",
+        "SELECT * FROM vfs_pread_lines(%s, -1, 10, 100)",
+        "SELECT * FROM vfs_pread_lines(%s, 1, NULL, 100)",
+        "SELECT * FROM vfs_pread_lines(%s, 1, -1, 100)",
+        "SELECT * FROM vfs_pread_lines(%s, 1, 10, NULL)",
+        "SELECT * FROM vfs_pread_lines(%s, 1, 10, -1)",
         "SELECT vfs_compact(%s, 0)",
         "SELECT vfs_compact(%s, NULL)",
         "SELECT vfs_compact(%s, 64 * 1024 * 1024 + 1)",
@@ -208,13 +219,13 @@ async def test_create_directory_with_data_is_einval(conn: AsyncConnection) -> No
 async def test_append_returns_offsets_and_keeps_generation(conn: AsyncConnection) -> None:
     f = await create_file(conn, "log")
     _, _, mtime0 = await stat(conn, f)
-    assert await append(conn, f, b"abc") == 0
+    assert await append(conn, f, b"ab\n") == 0
     assert await append(conn, f, b"de") == 3
     size, gen, mtime = await stat(conn, f)
     assert (size, gen) == (5, 0)
     assert mtime > mtime0
     assert await extents(conn, f) == [(0, 0, 3), (0, 3, 2)]
-    assert await pread(conn, f, 0, 100) == (b"abcde", 5, 0)
+    assert await pread(conn, f, 0, 100) == (b"ab\nde", 5, 0)
 
 
 async def test_empty_append_changes_nothing(conn: AsyncConnection) -> None:
@@ -223,16 +234,17 @@ async def test_empty_append_changes_nothing(conn: AsyncConnection) -> None:
     assert await append(conn, f, b"") == 3
     assert await stat(conn, f) == before
     assert await append(conn, f, b"d") == 3
-    assert await extents(conn, f) == [(0, 0, 3), (0, 3, 1)]
+    assert await extents(conn, f) == [(0, 0, 4)]  # "abc" ended mid-line, so it was cut again with "d"
 
 
-async def test_append_may_split_a_utf8_character(conn: AsyncConnection) -> None:
+async def test_appends_may_split_a_utf8_character_but_extents_do_not(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
     text = "naïve ☃".encode()
     for i in range(len(text)):
         await append(conn, f, text[i : i + 1])
     data, _, _ = await pread(conn, f, 0, 100)
     assert data.decode() == "naïve ☃"
+    assert await extents(conn, f) == [(0, 0, len(text))]  # one line, so each append cut it again
 
 
 async def test_concurrent_appender_waits_and_lands_after_the_first_commit(conn: AsyncConnection, db: str) -> None:
@@ -305,7 +317,7 @@ async def test_append_waiting_on_an_overwrite_lands_in_the_new_generation(conn: 
         assert await task == 3
         await appender.commit()
     assert await pread(conn, f, 0, 100) == (b"new+", 4, 1)
-    assert await extents(conn, f) == [(1, 0, 3), (1, 3, 1)]
+    assert await extents(conn, f) == [(1, 0, 4)]
 
 
 async def test_repeatable_read_append_after_a_concurrent_append_must_retry(conn: AsyncConnection, db: str) -> None:
@@ -321,9 +333,27 @@ async def test_repeatable_read_append_after_a_concurrent_append_must_retry(conn:
         await late.commit()
 
 
+async def test_repeatable_read_append_to_a_partial_line_after_a_concurrent_compaction_must_retry(
+    conn: AsyncConnection, db: str
+) -> None:
+    f = await create_file(conn, "log")
+    for part in [b"a\n", b"b\n", b"c"]:  # ends mid-line, so the next append rewrites the last extent
+        await append(conn, f, part)
+    async with await AsyncConnection.connect(db) as late:
+        await late.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
+        await late.execute("SELECT 1")  # takes the snapshot
+        assert await compact(conn, f) == 2
+        with pytest.raises(psycopg.errors.SerializationFailure):
+            await append(late, f, b"d")  # the inode lock succeeds; the delete of the last extent fails
+        await late.rollback()
+        assert await append(late, f, b"d") == 5  # the retry
+        await late.commit()
+    assert await pread(conn, f, 0, 100) == (b"a\nb\ncd", 6, 0)
+
+
 async def test_repeatable_read_write_after_a_concurrent_compaction_must_retry(conn: AsyncConnection, db: str) -> None:
     f = await create_file(conn, "log")
-    for part in [b"a", b"b", b"c"]:
+    for part in [b"a\n", b"b\n", b"c\n"]:
         await append(conn, f, part)
     async with await AsyncConnection.connect(db) as late:
         await late.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
@@ -419,7 +449,7 @@ async def test_pread_returns_size_and_generation_when_nothing_is_read(conn: Asyn
 
 
 async def test_pread_of_one_extent_larger_than_the_limit(conn: AsyncConnection) -> None:
-    content = bytes(range(256)) * 400  # 100 KB, one extent, TOASTed
+    content = bytes(b for b in range(256) if b != 10) * 400  # 100 KB, one line, so one extent, TOASTed
     f = await create_file(conn, "f", content)
     cur = await conn.execute("SELECT byte_offset, length(data) FROM vfs_pread(%s, 50000, 16000)", (f,))
     assert await cur.fetchall() == [(50000, 16000)]
@@ -429,10 +459,10 @@ async def test_pread_of_one_extent_larger_than_the_limit(conn: AsyncConnection) 
 
 async def test_pread_spanning_extents(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
-    for part in [b"aaaa", b"bbbb", b"cccc", b"dddd"]:
+    for part in [b"aaa\n", b"bbb\n", b"ccc\n", b"dddd"]:
         await append(conn, f, part)
     cur = await conn.execute("SELECT byte_offset, data FROM vfs_pread(%s, 2, 11)", (f,))
-    assert [(o, bytes(d)) for o, d in await cur.fetchall()] == [(2, b"aa"), (4, b"bbbb"), (8, b"cccc"), (12, b"d")]
+    assert [(o, bytes(d)) for o, d in await cur.fetchall()] == [(2, b"a\n"), (4, b"bbb\n"), (8, b"ccc\n"), (12, b"d")]
 
 
 @pytest.mark.parametrize("seed", range(5))
@@ -478,8 +508,9 @@ async def test_pread_chunks_while_another_session_appends(conn: AsyncConnection,
     assert await read_all(conn, f, 333) == (full, len(full))
 
 
-async def _plan_of_pread(conn: AsyncConnection, node: UUID, offset: int, limit: int) -> str:
-    """The EXPLAIN ANALYZE output, with buffers, of the query inside vfs_pread (auto_explain, superuser only)."""
+async def plans_of(conn: AsyncConnection, query: str, params: tuple[object, ...]) -> str:
+    """The EXPLAIN ANALYZE output, with buffers, of the statements inside the function ``query`` calls that read
+    vfs_extents (auto_explain, superuser only), joined."""
     notices: list[str] = []
     conn.add_notice_handler(lambda d: notices.append(d.message_primary or ""))
     for setting in [
@@ -491,11 +522,17 @@ async def _plan_of_pread(conn: AsyncConnection, node: UUID, offset: int, limit: 
         "SET client_min_messages = log",
     ]:
         await conn.execute(setting.encode())
-    await conn.execute("SELECT * FROM vfs_pread(%s, %s, %s)", (node, offset, limit))
+    await conn.execute(query.encode(), params)
     await conn.execute("SET client_min_messages = notice")
-    plans = [n for n in notices if "vfs_extents" in n and "WITH n AS" in n]
-    assert len(plans) == 1, notices
-    return plans[0]
+    plans = [n for n in notices if "vfs_extents" in n and "Query Text: SELECT * FROM" not in n]
+    assert plans, notices
+    return "\n".join(plans)
+
+
+def max_buffer_hits(plan: str) -> int:
+    hits = [int(part.split("=")[1].split()[0]) for part in plan.split() if part.startswith("hit=")]
+    assert hits, plan
+    return max(hits)
 
 
 async def test_pread_near_the_end_of_many_extents_uses_two_index_steps(conn: AsyncConnection) -> None:
@@ -509,15 +546,14 @@ async def test_pread_near_the_end_of_many_extents_uses_two_index_steps(conn: Asy
     content, _ = await read_all(conn, f, 1_000_000)
     assert data == content[-30:-10]
 
-    plan = await _plan_of_pread(conn, f, size - 30, 20)
+    plan = await plans_of(conn, "SELECT * FROM vfs_pread(%s, %s, %s)", (f, size - 30, 20))
     # Step 1: a backward descent to the extent containing the offset.
     assert "Scan Backward using vfs_extents_pkey" in plan, plan
     # Step 2: a forward scan bounded on both sides by the index condition.
     conds = [line for line in plan.splitlines() if "Index Cond:" in line and "byte_offset >= " in line]
     assert len(conds) == 1 and "byte_offset < " in conds[0], plan
     # A few index and heap pages, not the thousands a scan from offset 0 would touch.
-    hits = [int(part.split("=")[1].split()[0]) for part in plan.split() if part.startswith("hit=")]
-    assert hits and max(hits) < 30, plan
+    assert max_buffer_hits(plan) < 30, plan
 
 
 # vfs_compact
@@ -529,16 +565,18 @@ async def test_compact_keeps_bytes_size_generation_and_mtime(conn: AsyncConnecti
     await write(conn, f, b"")  # generation 1
     content = b""
     for _ in range(300):
-        part = rng.randbytes(rng.choice([1, 10, 100, 3000]))
+        part = rng.randbytes(rng.choice([1, 10, 100, 3000]) - 1).replace(b"\n", b" ") + b"\n"  # one extent each
         await append(conn, f, part)
         content += part
     before = await stat(conn, f)
+    lines = await _one(conn, "SELECT lines FROM vfs_nodes WHERE id = %s", (f,))
     xmin = await _one(conn, "SELECT xmin::text FROM vfs_nodes WHERE id = %s", (f,))
     removed = await compact(conn, f, 4096)
     after = await extents(conn, f)
     assert removed == 300 - len(after) > 0
     assert await stat(conn, f) == before
     assert await _one(conn, "SELECT xmin::text FROM vfs_nodes WHERE id = %s", (f,)) == xmin  # not updated
+    assert await _one(conn, "SELECT lines FROM vfs_nodes WHERE id = %s", (f,)) == lines == (300,)
     assert await read_all(conn, f, 1000) == (content, len(content))
     # The pieces tile the file in the same generation, and none exceeds the target (no extent here does).
     assert all(gen == 1 for gen, _, _ in after)
@@ -550,16 +588,18 @@ async def test_compact_keeps_bytes_size_generation_and_mtime(conn: AsyncConnecti
 
 async def test_compact_with_the_default_target(conn: AsyncConnection) -> None:
     f = await create_file(conn, "log")
-    await conn.execute("SELECT vfs_append(%s, decode(repeat('41', 100), 'hex')) FROM generate_series(1, 2000)", (f,))
+    await conn.execute(
+        "SELECT vfs_append(%s, decode(repeat('41', 99) || '0a', 'hex')) FROM generate_series(1, 2000)", (f,)
+    )
     assert len(await extents(conn, f)) == 2000
     await compact(conn, f)
     assert [n for _, _, n in await extents(conn, f)] == [65500, 65500, 65500, 3500]
-    assert (await pread(conn, f, 0, 300_000))[0] == b"A" * 200_000
+    assert (await pread(conn, f, 0, 300_000))[0] == (b"A" * 99 + b"\n") * 2000
 
 
 async def test_compact_leaves_a_large_extent_whole(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
-    for part in [b"a", b"b", b"x" * 100, b"c", b"d", b"e"]:
+    for part in [b"\n", b"\n", b"x" * 99 + b"\n", b"\n", b"\n", b"\n"]:
         await append(conn, f, part)
     assert await compact(conn, f, 10) == 3
     assert [n for _, _, n in await extents(conn, f)] == [2, 100, 3]
@@ -567,10 +607,10 @@ async def test_compact_leaves_a_large_extent_whole(conn: AsyncConnection) -> Non
 
 async def test_compact_starts_pieces_only_at_short_extents(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
-    for part in [b"x" * 6, b"a", b"b", b"y" * 6, b"c"]:  # with target 10, extents of 5 bytes or more are full
+    for part in [b"xxxxx\n", b"\n", b"\n", b"yyyyy\n", b"\n"]:  # with target 10, extents of 5 bytes or more are full
         await append(conn, f, part)
     xs = await _one(conn, "SELECT ctid::text FROM vfs_extents WHERE node_id = %s AND byte_offset = 0", (f,))
-    assert await compact(conn, f, 10) == 3  # a + b + yyyyyy + c; xxxxxx starts no piece
+    assert await compact(conn, f, 10) == 3  # the three short ones and yyyyy\n; xxxxx\n starts no piece
     assert [n for _, _, n in await extents(conn, f)] == [6, 9]
     assert await _one(conn, "SELECT ctid::text FROM vfs_extents WHERE node_id = %s AND byte_offset = 0", (f,)) == xs
 
@@ -579,14 +619,17 @@ async def test_empty_extents_are_rejected(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
     with raises_errno("EINVAL"):
         await conn.execute(
-            "INSERT INTO vfs_extents (node_id, generation, byte_offset, data) VALUES (%s, 0, 0, '')", (f,)
+            "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
+            " VALUES (%s, 0, 0, 0, '', '{0}')",
+            (f,),
         )
 
 
 async def test_compact_refuses_extents_that_do_not_tile(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
     await conn.execute(
-        "INSERT INTO vfs_extents (node_id, generation, byte_offset, data) VALUES (%s, 0, 0, 'ab'), (%s, 0, 5, 'cd')",
+        "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
+        " VALUES (%s, 0, 0, 0, 'ab', '{0}'), (%s, 0, 5, 1, 'cd', '{0}')",
         (f, f),
     )
     with pytest.raises(psycopg.errors.DataCorrupted):
@@ -601,7 +644,7 @@ async def test_compact_of_an_empty_file(conn: AsyncConnection) -> None:
 async def test_appends_wait_for_compaction_and_stay_gap_free(conn: AsyncConnection, db: str) -> None:
     f = await create_file(conn, "log")
     for i in range(50):
-        await append(conn, f, f"{i};".encode())
+        await append(conn, f, f"{i}\n".encode())
     content, size = await read_all(conn, f, 1000)
     async with await AsyncConnection.connect(db) as compactor, await AsyncConnection.connect(db) as appender:
         assert await compact(compactor, f) == 49  # transaction open, inode locked
@@ -618,7 +661,7 @@ async def test_appends_wait_for_compaction_and_stay_gap_free(conn: AsyncConnecti
 
 async def test_concurrent_appends_and_compactions(conn: AsyncConnection, db: str) -> None:
     f = await create_file(conn, "log")
-    parts = [f"[{i}]".encode() for i in range(300)]
+    parts = [f"[{i}]{'' if i % 4 else chr(10)}".encode() for i in range(300)]  # appends that end mid-line too
 
     async def appender() -> list[int]:
         async with await AsyncConnection.connect(db, autocommit=True) as c:
