@@ -72,4 +72,4 @@ dropped afterwards.
 
 `.github/workflows/wheels.yml` builds abi3 wheels (Linux x86_64 and aarch64 manylinux, macOS arm64) and an sdist
 on `v*` tags, on PRs that touch the build, and on demand. Release wheels don't include the `oracle` feature. `uv build` does include it (it reads
-`config-settings-package` from `uv.toml`), so build release artifacts with maturin-action or `maturin build`.
+`[tool.uv] config-settings-package` when run in this checkout), so build release artifacts with maturin-action or `maturin build`.

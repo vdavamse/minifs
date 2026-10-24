@@ -43,7 +43,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install and import the wheel
         run: |
-          # Install from outside the checkout, so uv doesn't apply its uv.toml (the oracle build setting).
+          # Install from outside the checkout, so uv doesn't apply the checkout's [tool.uv] oracle build setting.
           cd "$RUNNER_TEMP"
           uv venv --python 3.12 /tmp/smoke
           uv pip install --python /tmp/smoke/bin/python "$GITHUB_WORKSPACE"/dist/*.whl "psycopg[binary]"

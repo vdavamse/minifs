@@ -130,10 +130,14 @@ async def migrate(conn: AsyncConnection, migrations: list[Migration] | None = No
                     )
                 xid = await _xact_id(conn)
                 await conn.execute(migration.sql.encode())
-                # A COMMIT in the file would commit part of it and release the lock; catch it, including when a
-                # BEGIN after it leaves us in a new transaction.
+                # A COMMIT in the file commits what came before it, and the rest runs outside the lock, so this is
+                # detected only afterwards (including when a BEGIN reopened a transaction). Checking the text
+                # beforehand would misfire on the BEGIN/END of every PL/pgSQL body.
                 if conn.info.transaction_status != TransactionStatus.INTRANS or await _xact_id(conn) != xid:
-                    raise MigrationError(f"{migration.filename} must not contain transaction control statements")
+                    raise MigrationError(
+                        f"{migration.filename} must not contain transaction control statements; it ran partly"
+                        " outside the runner's transaction and was not recorded, so the database needs manual repair"
+                    )
                 await conn.execute(
                     sql.SQL("INSERT INTO {} (version, name, checksum) VALUES (%s, %s, %s)").format(table),
                     (migration.version, migration.name, migration.checksum),

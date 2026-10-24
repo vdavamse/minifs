@@ -39,6 +39,19 @@ module-name = "minifs._regex"
 python-packages = ["minifs"]
 include = [{ path = "minifs/db/migrations/*.sql", format = ["sdist", "wheel"] }]
 
+[tool.uv]
+# The development build (uv sync) enables the regex oracle. uv applies this only to builds it runs in this
+# checkout: not maturin-action's release wheels, and not an sdist installed from anywhere else.
+config-settings-package = { minifs = { build-args = "--features oracle" } }
+# Rebuild the extension on `uv sync` when the Rust sources change.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "crates/**/Cargo.toml" },
+    { file = "crates/**/*.rs" },
+]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
