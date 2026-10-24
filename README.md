@@ -92,23 +92,30 @@ The model has two tables: `vfs_nodes` holds inodes and directory entries, and `v
 
 ```sql
 CREATE TABLE vfs_nodes (                         -- inode + directory entry (no hard links)
-    id         UUID PRIMARY KEY DEFAULT uuidv7(),
-    parent_id  UUID REFERENCES vfs_nodes(id),    -- RESTRICT: rmdir of non-empty dir -> ENOTEMPTY
-    name       TEXT NOT NULL,
-    kind       TEXT NOT NULL CHECK (kind IN ('file','dir')),
-    size       BIGINT NOT NULL DEFAULT 0,        -- exact; maintained under the inode lock
-    generation INT    NOT NULL DEFAULT 0,        -- +1 on overwrite/truncate; appends keep it
-    ctime      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    mtime      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE NULLS NOT DISTINCT (parent_id, name)
-);
+    id          UUID PRIMARY KEY DEFAULT uuidv7(),
+    parent_id   UUID,                            -- NULL for root entries
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL CHECK (kind IN ('file','dir')),   -- never changes after create
+    size        BIGINT NOT NULL DEFAULT 0,       -- exact; maintained under the inode lock; 0 for dirs
+    generation  INT    NOT NULL DEFAULT 0,       -- +1 on overwrite/truncate; appends keep it
+    ctime       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    mtime       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    parent_kind TEXT NOT NULL DEFAULT 'dir' CHECK (parent_kind = 'dir'),
+    UNIQUE NULLS NOT DISTINCT (parent_id, name),
+    UNIQUE (id, kind),                           -- target of the two kind-checking foreign keys
+    FOREIGN KEY (parent_id, parent_kind)         -- parent must be a dir -> ENOTDIR
+        REFERENCES vfs_nodes (id, kind) ON DELETE RESTRICT   -- rmdir of non-empty dir -> ENOTEMPTY
+) WITH (fillfactor = 80);                        -- room for HOT updates of size/mtime on append
 
 CREATE TABLE vfs_extents (                       -- data blocks
-    node_id     UUID   NOT NULL REFERENCES vfs_nodes(id) ON DELETE CASCADE,
+    node_id     UUID   NOT NULL,
     generation  INT    NOT NULL,
     byte_offset BIGINT NOT NULL,
     data        BYTEA  NOT NULL,
-    PRIMARY KEY (node_id, generation, byte_offset)
+    node_kind   TEXT   NOT NULL DEFAULT 'file' CHECK (node_kind = 'file'),
+    PRIMARY KEY (node_id, generation, byte_offset),
+    FOREIGN KEY (node_id, node_kind)             -- only files have extents
+        REFERENCES vfs_nodes (id, kind) ON DELETE CASCADE
 );
 ALTER TABLE vfs_extents ALTER COLUMN data SET STORAGE EXTERNAL;   -- slice reads without decompressing
 ```
@@ -118,7 +125,9 @@ Each column choice, and why:
 | Choice | Why | Alternative rejected |
 | --- | --- | --- |
 | `UNIQUE NULLS NOT DISTINCT (parent_id, name)` | Root entries have `parent_id IS NULL`. A plain `UNIQUE` treats NULLs as distinct, so it would allow two `/docs` entries. Needs PostgreSQL 15+. | Plain `UNIQUE (parent_id, name)` |
-| `parent_id` uses `RESTRICT` | POSIX `rmdir` on a non-empty directory returns `ENOTEMPTY`. `CASCADE` would silently delete a whole subtree. | `ON DELETE CASCADE` |
+| The parent foreign key uses `RESTRICT` | POSIX `rmdir` on a non-empty directory returns `ENOTEMPTY`. `CASCADE` would silently delete a whole subtree. | `ON DELETE CASCADE` |
+| Foreign keys on `(id, kind)` | The schema itself rejects a child under a file and an extent on a directory. The constant columns `parent_kind = 'dir'` and `node_kind = 'file'` make that a plain foreign key. A root's `parent_id` is NULL, so the check skips it. | A trigger, or trusting every SQL function to check |
+| `fillfactor = 80` on `vfs_nodes` | Every append updates `size` and `mtime`, which aren't indexed. With free space in the page, Postgres makes that a HOT update: no new index entries, and the dead version is pruned in place. | The default 100, where a full page forces a non-HOT update |
 | `uuidv7()` ids | Time-ordered: inserts stay local in the B-tree, and the id records creation time. Built in from PostgreSQL 18. On PG 16 or 17, use the pg\_uuidv7 extension where available, or generate the ids in the app. | `gen_random_uuid()` |
 | Variable-length extents | An append is one INSERT and never rewrites earlier bytes. A positional read selects only the overlapping extents. | Inline `body TEXT` (each append rewrites the whole value) or fixed-size chunks (each append rewrites the last block) |
 | `generation` | Lets readers and cursors tell an append (same generation, larger size) from a rewrite (new generation). | Comparing content hashes |
@@ -127,6 +136,21 @@ Each column choice, and why:
 | `STORAGE EXTERNAL` on `data` | TOAST stores values over about 2 KB in roughly 2 KB chunks. Uncompressed, a `substring` fetches only the chunks it covers, so a 16 KB read of a 5 MB extent touches about 8 chunks. | The default `EXTENDED`: text compresses 3 to 4 times, but a slice read may decompress from the start of the value |
 
 **Directory entry and inode in one row.** Without hard links, every inode has exactly one name, so splitting them gains nothing. If hard links are ever needed, split this into `inodes(id, size, generation, nlink, ...)` and `dentries(parent_id, name, inode_id)`.
+
+**Files and directories.** As in ext4, both kinds share one inode format, and `kind` plays the role of the file-type bits in `i_mode`. They differ in what holds their contents.
+
+| | File | Directory |
+| --- | --- | --- |
+| Contents | Extents in `vfs_extents`, keyed by its id | Its children: the `vfs_nodes` rows whose `parent_id` is its id. ext4 stores the entries in the directory's data blocks (linear or HTree); here each entry is stored on the child, and the `(parent_id, name)` index is the directory index. |
+| `size` | Exact byte count | 0 (ext4 reports the size of its entry blocks, which means nothing here) |
+| `generation` | Bumped by overwrite | Unused |
+| `mtime` | Set by append and overwrite | Set at creation only (see below) |
+| Allowed operations | `vfs_append`, `vfs_write`, `vfs_pread` (`EISDIR` on a directory) | `vfs_readdir`, being a parent (`ENOTDIR` on a file), `rmdir` only when empty |
+| Enforced by | The `(node_id, node_kind)` foreign key: no extents on a directory | The `(parent_id, parent_kind)` foreign key: no children under a file |
+
+- **Kind never changes.** A file can't become a directory in place; replacing one with the other is unlink plus create, as in POSIX.
+- **Resolution returns the kind.** `vfs_resolve` returns `(id, kind)`, so the library reports `ENOTDIR` and `EISDIR` before calling an operation, and the directory cache stores the kind with the id. The foreign keys are the backstop.
+- **Directory `mtime` isn't maintained.** POSIX updates it on every create, unlink and rename inside the directory. Here that would lock and update the parent row on every create: a hot spot for shared directories such as `tasks/new/`, and an extra NOTIFY each time. Watchers get those events from NOTIFY by parent id instead.
 
 **Inode numbers and handles.** If a protocol needs a 64-bit inode number, take the low 64 bits of the UUID (the random part in v7). A stateful protocol can use the 16-byte UUID itself as the file handle. Unlike TigerFS's path-encoded NFS handles, it survives renames.
 
@@ -199,7 +223,7 @@ This is how a worker claims a file from `tasks/new/` to `tasks/cur/`. If two wor
 
 ### Path resolution
 
-`vfs_resolve(segments TEXT[])` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. The library caches `(parent_id, name) -> id` and evicts entries when NOTIFY reports a move or delete (see Caching).
+`vfs_resolve(segments TEXT[]) -> (id, kind)` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. The library caches `(parent_id, name) -> id` and evicts entries when NOTIFY reports a move or delete (see Caching).
 
 ### Watch (inotify)
 
@@ -249,23 +273,31 @@ RETURNS TABLE (size BIGINT, generation INT, byte_offset BIGINT, data BYTEA) AS $
         SELECT id, size, generation,
                CASE WHEN p_offset < 0 THEN greatest(size + p_offset, 0) ELSE p_offset END AS off
           FROM vfs_nodes WHERE id = p_node AND kind = 'file'
+    ), s AS (                                       -- step 1: the extent that contains off
+        SELECT n.*, coalesce((SELECT e.byte_offset FROM vfs_extents e
+                               WHERE e.node_id = n.id AND e.generation = n.generation
+                                 AND e.byte_offset <= n.off
+                               ORDER BY e.byte_offset DESC LIMIT 1), 0) AS start
+          FROM n
     )
-    SELECT n.size, n.generation,
-           greatest(e.byte_offset, n.off),
-           substring(e.data
-                     FROM greatest(n.off - e.byte_offset, 0) + 1
-                     FOR  least(e.byte_offset + length(e.data), n.off + p_limit)
-                        - greatest(e.byte_offset, n.off))
-      FROM n
-      LEFT JOIN vfs_extents e
-             ON e.node_id = n.id AND e.generation = n.generation
-            AND e.byte_offset + length(e.data) > n.off
-            AND e.byte_offset < n.off + p_limit
+    SELECT s.size, s.generation,
+           greatest(e.byte_offset, s.off),
+           substring(e.data                         -- substring(bytea) takes int, not bigint
+                     FROM (greatest(s.off - e.byte_offset, 0) + 1)::int
+                     FOR  (least(e.byte_offset + length(e.data), s.off + p_limit)
+                         - greatest(e.byte_offset, s.off))::int)
+      FROM s
+      LEFT JOIN vfs_extents e                       -- step 2: range scan forward from there
+             ON e.node_id = s.id AND e.generation = s.generation
+            AND e.byte_offset >= s.start
+            AND e.byte_offset <  s.off + p_limit
+            AND e.byte_offset + length(e.data) > s.off
      ORDER BY e.byte_offset
 $$ LANGUAGE sql STABLE;
 ```
 
-- **Trimming happens in Postgres.** A 16 KB read of a 5 MB doc sends 16 KB.
+- **Two index steps, like walking ext4's extent tree.** Only `byte_offset < off + limit` can bound a scan of the primary key; the overlap test `byte_offset + length(data) > off` can't. A single range scan would therefore read every extent from the start of the file. Step 1 descends backward to the extent that contains `off`, and step 2 scans forward from it, so a read costs O(log E + extents returned) for a file with E extents. On a 20,000-extent file, a read at the end touches 3 index pages.
+- **Trimming happens in Postgres.** A 16 KB read of a 5 MB doc sends 16 KB. `length(data)` reads the size from the TOAST pointer without fetching the value.
 - **It's one statement, so one MVCC snapshot.** `size` and `generation` describe exactly the bytes returned, even while another client is appending.
 - **The `LEFT JOIN`** returns a single row with NULL data when nothing overlaps, so a read past EOF or of an empty file still returns `size` and `generation`.
 
@@ -302,7 +334,7 @@ PostgreSQL stays the single source of truth: every read through a cache still re
 
 | Cache | Key → value | Kept fresh by | Used by |
 | --- | --- | --- | --- |
-| Directory entries | `(parent_id, name) -> id` | NOTIFY `move` and `delete` evict; a 2 s TTL as a fallback | Every path resolution |
+| Directory entries | `(parent_id, name) -> (id, kind)` | NOTIFY `move` and `delete` evict; a 2 s TTL as a fallback | Every path resolution |
 | File content | `(node_id, generation) -> bytes [0, cached_size)` | The read itself (below) | Agent `read`, line snapping, the line map |
 | Line map | `(node_id, generation) ->` byte offset of every 1,000th line start, and the line count | Extended with the content | Line-numbered reads |
 
@@ -661,6 +693,7 @@ Three things matter most in production: credential handling, LISTEN connections 
 | Reconnect | When the LISTEN connection drops: reconnect, LISTEN again, clear the directory cache, then re-check watched paths so nothing missed is skipped. Saved cursors make this safe. |
 | NOTIFY volume | A transaction that called NOTIFY takes a database-wide lock at commit, so every append commits through that lock. Cache eviction only needs `create`, `move` and `delete`; `modify` exists for watchers. If a hot log makes the lock a bottleneck, stop emitting `modify` for appends to it and have its watchers poll `size`. |
 | TOAST | `SET STORAGE EXTERNAL` on `vfs_extents.data`, so range reads fetch only the chunks they cover |
+| Vacuum | Appends leave a dead `vfs_nodes` row version each; overwrites and compaction leave dead extents. `fillfactor = 80` keeps the inode updates HOT, so they're pruned in place. Watch `n_dead_tup` on both tables, and lower autovacuum's scale factor on `vfs_extents` if overwrites are frequent. |
 | Compaction | A periodic job runs `vfs_compact` on files with more than 1,000 extents. It holds each inode lock only while merging that file. |
 | Postgres version | PG 15+ for `UNIQUE NULLS NOT DISTINCT`. PG 18 has a built-in `uuidv7()`; on older versions use `pg_uuidv7` where available, or generate UUIDv7 in the app. |
 | Extensions | None required. `pg_trgm` only if the optional search index is added, and `vector` (pgvector) for future semantic search. |
@@ -701,6 +734,8 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Append ordering | Two connections appending concurrently produce gap-free offsets, and offset order equals commit order | Concurrency |
 | Read | For random files and random `(offset, limit)` sequences, joining the `pread` chunks equals the full content, including while another task keeps appending | Property |
 | Read edges | Offsets `0`, `size`, `size+1`, `-1`, `-size`, `-(size+1)`; empty file; one extent larger than `limit`; a read spanning extents | Unit |
+| Read plan | On a file with 10,000+ extents, `EXPLAIN` of a read near the end shows a backward index descent and a bounded forward scan, not a scan from offset 0 | Unit |
+| Kinds | Creating a child under a file gives `ENOTDIR`; an extent on a directory is rejected by the foreign key; `read` of a directory gives `EISDIR` | Unit |
 | Line snapping | Offset in the middle of a line or of a multi-byte character; a line longer than `limit`; no trailing newline | Unit |
 | Generations | An overwrite between two cursor reads produces the restart note; an append doesn't | Unit |
 | Tree | `UNIQUE NULLS NOT DISTINCT` rejects duplicate root names; `rmdir` on a non-empty directory gives `ENOTEMPTY`; a move into its own subtree gives `EINVAL` | Unit |
