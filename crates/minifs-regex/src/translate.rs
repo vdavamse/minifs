@@ -97,23 +97,39 @@ pub fn translate(pattern: &str, ignore_case: bool) -> Result<Translation, Error>
         )));
     }
     let hir = parse(pattern, ignore_case)?;
-    let linear = atoms(&hir, false);
+    let line_form = translate_hir(&hir, Subject::Line)?;
+    Ok(Translation { line_form })
+}
+
+/// What a translated pattern is matched against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subject {
+    /// One line of a file, which never contains `\n`: classes drop it and a literal one is
+    /// rejected.
+    Line,
+    /// A path, whose names may contain `\n` like any other character.
+    Path,
+}
+
+/// Emits `hir` as ARE after checking that Postgres can compile it.
+pub fn translate_hir(hir: &Hir, subject: Subject) -> Result<String, Error> {
+    let linear = atoms(hir, false);
     if linear > MAX_ATOMS {
         return Err(Error::unsupported(format!(
             "regex is too large for Postgres to compile ({linear} characters, classes and \
              anchors; the limit is {MAX_ATOMS}); use a shorter pattern"
         )));
     }
-    let extra = atoms(&hir, true).saturating_sub(linear);
+    let extra = atoms(hir, true).saturating_sub(linear);
     if extra > MAX_EXTRA_ATOMS {
         return Err(Error::unsupported(format!(
             "counted repetitions expand to {extra} extra copies, more than Postgres can \
              compile (the limit is {MAX_EXTRA_ATOMS}); use smaller counts or + / *"
         )));
     }
-    let mut line_form = String::new();
-    emit(&hir, &mut line_form)?;
-    Ok(Translation { line_form })
+    let mut out = String::new();
+    emit(hir, subject, &mut out)?;
+    Ok(out)
 }
 
 /// The parser configuration of ripgrep without `-U`, `-P` or `--crlf`: Unicode on, `^`/`$`
@@ -197,8 +213,8 @@ fn atoms(hir: &Hir, expand: bool) -> u64 {
 
 /// Emits `hir`, stopping as soon as the output passes [`MAX_TRANSLATED_LEN`], so a short
 /// pattern of many `\b`s never allocates more than the limit plus one node.
-fn emit(hir: &Hir, out: &mut String) -> Result<(), Error> {
-    emit_node(hir, out)?;
+fn emit(hir: &Hir, subject: Subject, out: &mut String) -> Result<(), Error> {
+    emit_node(hir, subject, out)?;
     if out.len() > MAX_TRANSLATED_LEN {
         return Err(Error::unsupported(format!(
             "regex is too large once translated (over {} KB); \
@@ -209,21 +225,21 @@ fn emit(hir: &Hir, out: &mut String) -> Result<(), Error> {
     Ok(())
 }
 
-fn emit_node(hir: &Hir, out: &mut String) -> Result<(), Error> {
+fn emit_node(hir: &Hir, subject: Subject, out: &mut String) -> Result<(), Error> {
     match hir.kind() {
         HirKind::Empty => out.push_str("(?:)"),
-        HirKind::Literal(lit) => emit_literal(&lit.0, out)?,
-        HirKind::Class(class) => emit_class(&unicode_class(class)?, out),
+        HirKind::Literal(lit) => emit_literal(&lit.0, subject, out)?,
+        HirKind::Class(class) => emit_class(&unicode_class(class)?, subject, out),
         HirKind::Look(look) => emit_look(*look, out)?,
-        HirKind::Repetition(rep) => emit_repetition(rep, out)?,
+        HirKind::Repetition(rep) => emit_repetition(rep, subject, out)?,
         HirKind::Capture(cap) => {
             out.push_str("(?:");
-            emit(&cap.sub, out)?;
+            emit(&cap.sub, subject, out)?;
             out.push(')');
         }
         HirKind::Concat(subs) => {
             for sub in subs {
-                emit(sub, out)?;
+                emit(sub, subject, out)?;
             }
         }
         HirKind::Alternation(subs) => {
@@ -232,7 +248,7 @@ fn emit_node(hir: &Hir, out: &mut String) -> Result<(), Error> {
                 if i > 0 {
                     out.push('|');
                 }
-                emit(sub, out)?;
+                emit(sub, subject, out)?;
             }
             out.push(')');
         }
@@ -240,7 +256,7 @@ fn emit_node(hir: &Hir, out: &mut String) -> Result<(), Error> {
     Ok(())
 }
 
-fn emit_literal(bytes: &[u8], out: &mut String) -> Result<(), Error> {
+fn emit_literal(bytes: &[u8], subject: Subject, out: &mut String) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         Error::unsupported(
             "regex matches bytes that aren't valid UTF-8, which never occur in text; \
@@ -248,7 +264,7 @@ fn emit_literal(bytes: &[u8], out: &mut String) -> Result<(), Error> {
         )
     })?;
     for c in text.chars() {
-        if c == '\n' {
+        if c == '\n' && subject == Subject::Line {
             return Err(newline_error());
         }
         if is_are_meta(c) {
@@ -297,14 +313,14 @@ fn unicode_class(class: &Class) -> Result<ClassUnicode, Error> {
     }
 }
 
-/// A bracket expression listing the class's ranges. `\n` is removed as ripgrep removes it (a
-/// line never contains one), and so is NUL, which Postgres text can't hold.
-fn emit_class(class: &ClassUnicode, out: &mut String) {
+/// A bracket expression listing the class's ranges. NUL is removed, as Postgres text can't hold
+/// it, and so is `\n` when matching lines, as ripgrep removes it (a line never contains one).
+fn emit_class(class: &ClassUnicode, subject: Subject, out: &mut String) {
     let mut class = class.clone();
-    class.difference(&ClassUnicode::new([
-        ClassUnicodeRange::new('\0', '\0'),
-        ClassUnicodeRange::new('\n', '\n'),
-    ]));
+    class.difference(&ClassUnicode::new([ClassUnicodeRange::new('\0', '\0')]));
+    if subject == Subject::Line {
+        class.difference(&ClassUnicode::new([ClassUnicodeRange::new('\n', '\n')]));
+    }
     if class.ranges().is_empty() {
         out.push_str(NEVER);
         return;
@@ -424,6 +440,7 @@ impl WordClass {
             let mut out = String::new();
             emit_class(
                 &unicode_class(class).expect("\\w is ASCII or Unicode"),
+                Subject::Line,
                 &mut out,
             );
             out
@@ -431,7 +448,7 @@ impl WordClass {
     }
 }
 
-fn emit_repetition(rep: &Repetition, out: &mut String) -> Result<(), Error> {
+fn emit_repetition(rep: &Repetition, subject: Subject, out: &mut String) -> Result<(), Error> {
     for count in [Some(rep.min), rep.max].into_iter().flatten() {
         if count > MAX_REPEAT {
             return Err(Error::unsupported(format!(
@@ -448,10 +465,10 @@ fn emit_repetition(rep: &Repetition, out: &mut String) -> Result<(), Error> {
         _ => false,
     };
     if atomic {
-        emit(&rep.sub, out)?;
+        emit(&rep.sub, subject, out)?;
     } else {
         out.push_str("(?:");
-        emit(&rep.sub, out)?;
+        emit(&rep.sub, subject, out)?;
         out.push(')');
     }
     match (rep.min, rep.max) {
@@ -572,6 +589,7 @@ mod tests {
                     greedy: true,
                     sub: Box::new(sub),
                 },
+                Subject::Line,
                 &mut out,
             )
             .unwrap();

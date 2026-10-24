@@ -2,250 +2,445 @@
 
 import random
 import re
+import subprocess
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID
 
-import bracex
 import pytest
 from psycopg import AsyncConnection
-from wcmatch import glob as wcglob
 
-from minifs.vfs.glob import MAX_ALTERNATIVES, GlobError, GlobPlan, compile_excludes, compile_glob, glob, glob_to_regex
+from minifs import _regex
+from minifs.vfs.glob import GlobError, GlobPlan, compile_excludes, compile_glob, glob, glob_to_regex
 from tests.test_tree import create, mkdir_p, raises_errno
+
+# The oracle exists only in development builds; test_regex_extension.py fails without it.
+_needs_oracle = pytest.mark.skipif(not _regex.HAS_ORACLE, reason="minifs._regex was built without the oracle feature")
 
 # Translator
 
-
-@pytest.mark.parametrize(
-    ("pattern", "regex"),
-    [
-        ("*", r"^(?:.*/)?[^/]*$"),
-        ("*.md", r"^(?:.*/)?[^/]*\.md$"),
-        ("?", r"^(?:.*/)?[^/]$"),
-        ("src/*.py", r"^src/[^/]*\.py$"),
-        ("/src/*.py", r"^src/[^/]*\.py$"),
-        ("**/*.py", r"^(?:[^/]+/)*[^/]*\.py$"),
-        ("src/**", r"^src/.*$"),
-        ("a/**/b", r"^a/(?:[^/]+/)*b$"),
-        ("a**b", r"^(?:.*/)?a[^/]*b$"),
-        ("[abc]", r"^(?:.*/)?[a-c]$"),  # ranges are merged
-        ("[ax]", r"^(?:.*/)?[ax]$"),
-        ("[!x]", r"^(?:.*/)?[^x\u002f]$"),
-        ("[^x]", r"^(?:.*/)?[^x\u002f]$"),
-        ("[a-z]", r"^(?:.*/)?[a-z]$"),
-        ("[.-0]", r"^(?:.*/)?[\u002e0]$"),  # the range loses '/'
-        ("[]]", r"^(?:.*/)?[\u005d]$"),
-        ("[[:digit:]]", r"^(?:.*/)?[0-9]$"),
-        ("*.{md,txt}", r"^(?:.*/)?[^/]*\.(?:md|txt)$"),
-        ("{a,{b,c}}", r"^(?:.*/)?(?:a|(?:b|c))$"),
-        ("{a,a}", r"^(?:.*/)?(?:a)$"),
-        ("{a,b}/*", r"^(?:a|b)/[^/]*$"),
-        ("{a/b,c}", r"^(?:a/b|c)$"),  # expanded: the alternatives have different segments
-        ("{a,}**/x", r"^(?:a[^/]*/x|(?:[^/]+/)*x)$"),  # ** is a globstar only in the second
-        ("{{a,},b}**/x", r"^(?:a[^/]*/x|(?:[^/]+/)*x|b[^/]*/x)$"),  # empty alternatives at any depth expand
-        ("{,a}{,b}**/x", r"^(?:(?:[^/]+/)*x|b[^/]*/x|a[^/]*/x|ab[^/]*/x)$"),
-        ("x/*{q/r,{a,}}*/y", r"^(?:x/[^/]*q/r[^/]*/y|x/[^/]*a[^/]*/y|x/(?:[^/]+/)*y)$"),
-        ("{,a/b}/y", r"^(?:/y|a/b/y)$"),  # only a leading '/' of the pattern anchors
-        ("[😀-😂]", r"^(?:.*/)?[\U0001f600-\U0001f602]$"),
-        ("[[:ascii:]]", r"^(?:.*/)?[\u0000-\u002e0-\u007f]$"),
-        (r"\*", r"^(?:.*/)?\*$"),
-        (r"\a", r"^(?:.*/)?a$"),
-        ("a+b(c)$", r"^(?:.*/)?a\+b\(c\)\$$"),
-        ("é", r"^(?:.*/)?é$"),
-    ],
-)
-def test_translation(pattern: str, regex: str) -> None:
-    assert glob_to_regex(pattern) == regex
+# Paths that a pattern must and must not match, with the regex evaluated by Python (see _python_match).
+SEMANTICS: list[tuple[str, list[str], list[str]]] = [
+    ("*", ["a", "a/b", ".x"], []),
+    ("*.md", ["a.md", "x/a.md", "x/y/.md"], ["a.mdx", "a.md/b"]),
+    ("?", ["a", "x/é", "x/😀", "\n"], ["ab", ""]),
+    ("src/*.py", ["src/a.py"], ["x/src/a.py", "src/a/b.py"]),
+    ("/src/*.py", ["src/a.py"], ["x/src/a.py"]),
+    ("/a", ["a"], ["x/a"]),
+    ("**/*.py", ["a.py", "x/y/a.py"], ["a.pyc"]),
+    ("src/**", ["src/a", "src/a/b"], ["src", "x/src/a"]),
+    ("a/**/b", ["a/b", "a/x/y/b"], ["a/xb", "b"]),
+    ("a**b", ["ab", "axxb", "x/ab"], ["a/b"]),
+    ("[abc]", ["a", "x/c"], ["d"]),
+    ("[!x]", ["a", "é"], ["x"]),
+    ("[^x]", ["a"], ["x"]),
+    ("/a[!x]b", ["acb"], ["a/b", "axb"]),  # rg's negated class matches '/', ours never
+    ("/a[.-0]b", ["a.b", "a0b"], ["a/b"]),  # nor does a range across it
+    ("[]]", ["]"], ["a"]),
+    ("[[:alpha:]]", ["[]", ":]", "a]"], ["a"]),  # no POSIX classes in rg: '[' ':' 'a' ... then a ']'
+    ("[é-ö]", ["é", "ö", "ò"], ["e", "😀"]),  # characters, not bytes
+    ("[😀-😂]", ["😁"], ["😃"]),
+    ("*.{md,txt}", ["a.md", "a.txt"], ["a.rs"]),
+    ("{a,{b,c}}", ["a", "c"], ["d"]),  # nested braces (rg 14.1 rejects them, globset 0.4.18 accepts)
+    ("{a/b,c}", ["a/b", "c"], ["x/a/b", "x/c"]),  # a '/' anywhere anchors the pattern
+    ("a{b,}", ["ab"], ["a"]),  # empty alternatives are dropped
+    ("x{**,y}/z", ["x/z", "xq/z", "xy/z"], ["x/q/z"]),  # ** opening an alternative is a *
+    (r"\*", ["*"], ["a"]),
+    (r"\a", ["a"], ["\\a"]),
+    ("a+b(c)$", ["a+b(c)$"], ["aab(c)"]),
+    ("é", ["é"], ["e"]),
+    ("a b ", ["a b"], ["a b "]),  # rg drops trailing whitespace
+    ("a\\ ", ["a "], ["a"]),  # unless escaped
+    ("\\!a", ["!a"], ["a"]),
+    ("\\#a", ["#a"], ["a"]),
+    ("a\nb", ["a\nb"], ["ab"]),  # names may contain newlines
+]
 
 
-@pytest.mark.parametrize(
-    ("pattern", "message"),
-    [
-        ("", "empty pattern"),
-        ("[ab", "unclosed '['"),
-        ("[]", "unclosed '['"),
-        ("[!]", "unclosed '['"),
-        ("{a,b", "unclosed '{'"),
-        ("{a,[}]", "unclosed '{'"),  # [}] is a class
-        ("{a,[b}", "unclosed '['"),
-        ("a\0b", "NUL character"),
-        ("{a,b/c}" * 11, "more than 1024 brace alternatives"),
-        ("{a,b/c}" * 10 + "x" * 16 * 1024, "the translated regex is over 16 KB"),
-        ("{a/" * 1000 + "}" * 1000, "braces nested too deeply"),
-        ("src/", "a pattern ending in '/' matches only directories, and only files are listed"),
-        ("**/", "a pattern ending in '/' matches only directories, and only files are listed"),
-        ("src\\/", "a pattern ending in '/' matches only directories, and only files are listed"),
-    ],
-)
+@pytest.mark.parametrize(("pattern", "matches", "non_matches"), SEMANTICS)
+def test_translation(pattern: str, matches: list[str], non_matches: list[str]) -> None:
+    regex = glob_to_regex(pattern)
+    assert regex.startswith("^") and regex.endswith("$")
+    assert {p: _python_match(regex, p) for p in matches + non_matches} == {
+        **dict.fromkeys(matches, True),
+        **dict.fromkeys(non_matches, False),
+    }
+
+
+def test_regex_text() -> None:
+    any_char = "[\\u0001-\U0010ffff]"
+    not_slash = "[\\u0001-\\u002E0-\U0010ffff]"
+    assert glob_to_regex("*.md") == f"^(?:/?|{any_char}*/){not_slash}*\\.md$"
+    assert glob_to_regex("src/{a,b}/*.py") == f"^src/[ab]/{not_slash}*\\.py$"
+    assert glob_to_regex("/[.-0]") == "^[\\u002E0]$"
+    assert glob_to_regex("/[/]") == "^(?:(?!))$"  # a class without '/' can be empty
+    assert glob_to_regex("/a\nb") == r"^a\u000Ab$"
+    assert glob_to_regex("x/{a,b}{c,dd}") == "^x/[ab](?:c|dd)$"
+    # Braces stay inline, so they cost their length, not the product of their alternatives.
+    assert glob_to_regex("/" + "{a,b}" * 50) == "^" + "[ab]" * 50 + "$"
+
+
+# Rejected by globset, with its message, so by rg too (test_rejections_match_rg).
+SYNTAX_ERRORS = [
+    ("[ab", "unclosed character class; missing ']'"),
+    ("[]", "unclosed character class; missing ']'"),
+    ("[!]", "unclosed character class; missing ']'"),
+    ("{a,b", "unclosed alternate group; missing '}' (maybe escape '{' with '[{]'?)"),
+    ("{a,[}]", "unclosed alternate group; missing '}' (maybe escape '{' with '[{]'?)"),  # [}] is a class
+    ("a}", "unopened alternate group; missing '{' (maybe escape '}' with '[}]'?)"),
+    ("[z-a]", "invalid range; 'z' > 'a'"),
+    ("a\\", "dangling '\\'"),
+]
+
+OTHER_ERRORS = [
+    ("", "empty pattern"),
+    ("  ", "empty pattern"),
+    ("/", "empty pattern"),
+    ("a\0b", "NUL character"),
+    ("!a", "a leading '!' negates the glob in rg; pass it as an exclude, or escape it as '\\!'"),
+    ("#a", "a leading '#' makes the glob a comment, which rg ignores; escape it as '\\#'"),
+    ("x" * 65 * 1024, "glob is too long (65 KB, the limit is 64 KB)"),
+    ("src/", "a pattern ending in '/' matches only directories, and only files are listed"),
+    ("**/", "a pattern ending in '/' matches only directories, and only files are listed"),
+    ("src\\/", "a pattern ending in '/' matches only directories, and only files are listed"),
+]
+
+
+@pytest.mark.parametrize(("pattern", "message"), SYNTAX_ERRORS + OTHER_ERRORS)
 def test_bad_patterns(pattern: str, message: str) -> None:
     with pytest.raises(GlobError) as info:
         compile_glob(pattern)
     assert info.value.message == message
+    assert str(info.value) == f"error parsing glob '{pattern}': {message}"
+
+
+# rg 14.1 (what apt installs) bundles an older globset, which takes a stray '}' literally (README: Divergences).
+@pytest.mark.parametrize(("pattern", "message"), [e for e in SYNTAX_ERRORS if e[0] != "a}"])
+def test_rejections_match_rg(pattern: str, message: str, rg_path: str, tmp_path: Path) -> None:
+    result = subprocess.run([rg_path, "--files", "-g", pattern], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert f"error parsing glob '{pattern}': {message}" in result.stderr
 
 
 @pytest.mark.parametrize(
     ("pattern", "plan"),
     [
-        ("*.md", GlobPlan(r"^(?:.*/)?[^/]*\.md$", name_like="%.md")),
-        ("README.md", GlobPlan(r"^(?:.*/)?README\.md$", name_like="README.md")),
-        ("docs/guides/**/*.md", GlobPlan(r"^docs/guides/(?:[^/]+/)*[^/]*\.md$", ("docs", "guides"), None, "%.md")),
-        ("src/*/*.py", GlobPlan(r"^src/[^/]*/[^/]*\.py$", ("src",), 2, "%.py")),
+        ("*.md", GlobPlan(glob_to_regex("*.md"), name_like="%.md")),
+        ("README.md", GlobPlan(glob_to_regex("README.md"), name_like="README.md")),
+        ("docs/guides/**/*.md", GlobPlan(glob_to_regex("docs/guides/**/*.md"), ("docs", "guides"), None, "%.md")),
+        ("src/*/*.py", GlobPlan(glob_to_regex("src/*/*.py"), ("src",), 2, "%.py")),
         ("src/a.py", GlobPlan(r"^src/a\.py$", ("src",), 1, "a.py")),
-        ("src/**", GlobPlan(r"^src/.*$", ("src",), None, None)),
-        ("src/*.[ch]", GlobPlan(r"^src/[^/]*\.[ch]$", ("src",), 1, "%._")),
-        ("{a,b}", GlobPlan(r"^(?:.*/)?(?:a|b)$")),  # % filters nothing
+        ("src/**", GlobPlan(glob_to_regex("src/**"), ("src",), None, None)),
+        ("src/*.[ch]", GlobPlan(glob_to_regex("src/*.[ch]"), ("src",), 1, "%._")),
+        ("{a,b}", GlobPlan(glob_to_regex("{a,b}"), name_like="_")),  # one character
+        ("{ab,c}", GlobPlan(glob_to_regex("{ab,c}"))),  # % filters nothing
         ("{src,lib}/x_1%.py", GlobPlan(r"^(?:src|lib)/x_1%\.py$", (), 2, r"x\_1\%.py")),
-        ("{src/a,src/b/c}/*.py", GlobPlan(r"^(?:src/a/[^/]*\.py|src/b/c/[^/]*\.py)$", ("src",), 3, "%.py")),
-        ("{src/a,src/b}/c", GlobPlan(r"^(?:src/a/c|src/b/c)$", ("src",), 2, "c")),
-        ("src/*.{md,txt}", GlobPlan(r"^src/[^/]*\.(?:md|txt)$", ("src",), 1, "%.%")),
-        ("a?b**c", GlobPlan(r"^(?:.*/)?a[^/]b[^/]*c$", name_like="a_b%c")),
+        ("{src/a,src/b/c}/*.py", GlobPlan(glob_to_regex("{src/a,src/b/c}/*.py"), ("src",), 3, "%.py")),
+        ("{src/a,src/b}/c", GlobPlan(r"^(?:src/a|src/b)/c$", ("src",), 2, "c")),
+        ("src/*.{md,txt}", GlobPlan(glob_to_regex("src/*.{md,txt}"), ("src",), 1, "%.%")),
+        ("a?b**c", GlobPlan(glob_to_regex("a?b**c"), name_like="a_b%c")),
+        ("a/{b,c/}d", GlobPlan(glob_to_regex("a/{b,c/}d"), ("a",), 2, "%d")),
     ],
 )
 def test_hints(pattern: str, plan: GlobPlan) -> None:
     assert compile_glob(pattern) == plan
 
 
-def test_braces_without_separators_are_not_expanded() -> None:
-    # Expanded, "*{a,b}" * 10 would be 1,024 alternatives of 70 characters each.
-    assert glob_to_regex("*{a,b}" * 10) == "^(?:.*/)?" + "[^/]*(?:a|b)" * 10 + "$"
-
-
 def test_exclude_regexes() -> None:
     excludes = compile_excludes(["**/node_modules/**", "**/.venv/**", "*.log", "**/a*/**", "build/", "a/b/"])
     assert excludes.prune_dirs == ("node_modules", ".venv", "build")
     # Directories are tested as "path/": every exclude also matches them, the ones ending in '/' only them.
-    assert excludes.regexes == (r"^(?:.*/)?[^/]*\.log/?$", r"^(?:[^/]+/)*a[^/]*/.*/?$", r"^a/b/$")
+    log, a_star, a_b = excludes.regexes
+    assert (log, a_b) == (glob_to_regex("*.log")[:-1] + "(?<!/)/?$", "^a/b/$")
+    assert [_python_match(a_star, p) for p in ["x/ab/c", "ab/", "x/ab/c/", "ba/c"]] == [True, False, True, False]
+    # A directory isn't excluded by a match of its path plus '/' (rg never tests that).
+    assert [_python_match(compile_excludes(["{a/,b}"]).regexes[0], p) for p in ["a/", "a", "b/", "b"]] == [
+        False,
+        False,
+        True,
+        True,
+    ]
     unpruned = compile_excludes(["**/node_modules/**", "build/"], prune=False)
     assert unpruned.prune_dirs == ()
-    assert unpruned.regexes == (r"^(?:[^/]+/)*node_modules/.*/?$", r"^(?:.*/)?build/$")
-    assert compile_excludes(["build\\/"]).regexes == (r"^(?:.*/)?build/$",)  # an escaped '/' is one too
-    for doubled in ["build//", "/", "build\\//"]:
+    assert [_python_match(unpruned.regexes[1], p) for p in ["build/", "x/build/", "build", "xbuild/"]] == [
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert compile_excludes(["build\\/"]).regexes == unpruned.regexes[1:]  # an escaped '/' is one too
+    for bad in ["/", "!x/", "[a"]:
         with pytest.raises(GlobError):
-            compile_excludes([doubled])
+            compile_excludes([bad])
     with pytest.raises(TypeError):
         compile_excludes("*.log")
 
 
-# Differential: the translator against wcmatch, on generated patterns and paths.
+# Differential: the translator against ripgrep's own matcher (`ignore`'s overrides, through the extension's
+# oracle), on generated patterns and paths.
 #
-# wcmatch is configured as rg's globs behave: ** spans directories (GLOBSTAR), {a,b} alternates (BRACE), and
-# * matches a leading dot (DOTGLOB; hidden directories are the walker's business). A pattern without '/'
-# matches the name at any depth, so wcmatch gets it with **/ in front. The generator stays inside the syntax
-# both agree on: no '/' in classes, no bash brace sequences ({1..3}), no single-element braces, no
-# unclosed brackets (wcmatch takes those literally, we reject them), no ranges across '/' (wcmatch drops
-# the whole range, we drop only the '/'), and no empty path segments (wcmatch collapses a//b).
+# The oracle matches bytes, the translation characters, and rg's classes can match '/'. So a class goes to the
+# oracle without '/': a negated one with '/' added ([!a] as [!a/], and **/ in front if that adds the pattern's
+# first '/', which would anchor it), a range across '/' split around it. For an ASCII pattern, every non-ASCII
+# character of the path reaches the oracle as a 'z', which no pattern mentions: then one byte is one character.
+# A non-ASCII pattern with '?' or a class that could meet a non-ASCII character is compared on ASCII paths only.
 
-_WC_FLAGS = wcglob.GLOBSTAR | wcglob.BRACE | wcglob.DOTGLOB
+_ASCII_NAME_CHARS = ["a", "b", "c", ".", "-", "*", "?", "[", "]", "{", "}", ",", "\\", "!", "#", " ", "\n"]
+_NAME_CHARS = [*_ASCII_NAME_CHARS, "😁", "é", "ö", "日"]
+_LITERALS = ["a", "b", "c", "é", "日", ".", "-", r"\*", r"\?", r"\[", r"\{", r"\,", "\\\\", "!", "#", " "]
+_TO_ORACLE = {
+    "[!a]": "[!a/]", "[^b]": "[^b/]", "[!é-ö]": "[!é-ö/]", "[!]a]": "[!]a/]", "[+-0]": "[+-.0]", "[!+-0]": "[!+-0/]",
+}  # fmt: skip
+_CLASSES = ["[ab]", "[a-c]", "[é-ö]", "[😀-😂]", "[]a]", "[.-]", "[[:alpha:]]", "[*?]", "[\\]", *_TO_ORACLE]
+_BYTEWISE = ["?", "[é-ö]", "[😀-😂]", "[!", "[^"]  # differ from rg on non-ASCII characters
 
-_NAME_CHARS = ["😁", "a", "b", "c", "é", "ö", "日", ".", "-", "*", "?", "[", "]", "{", "}", ",", "\\"]
-_LITERALS = ["a", "b", "c", "é", "日", ".", "-", r"\*", r"\?", r"\[", r"\{", r"\,", "\\\\"]
-_CLASSES = [
-    "[ab]", "[!a]", "[^b]", "[a-c]", "[é-ö]", "[!é-ö]", "[😀-😂]", "[]a]", "[.-]", "[[:alpha:]]", "[*?]", "[\\]]",
-]  # fmt: skip
 
-
-def _gen_segment(rng: random.Random, depth: int = 0) -> str:
+def _gen_segment(rng: random.Random, depth: int, nested: bool) -> str:
     out: list[str] = []
     for _ in range(rng.randint(1, 4)):
         r = rng.random()
         if r < 0.45:
             out.append(rng.choice(_LITERALS))
         elif r < 0.6:
-            out.append("*")
+            out.append(rng.choice(["*", "**"]))
         elif r < 0.7:
             out.append("?")
         elif r < 0.85:
             out.append(rng.choice(_CLASSES))
-        elif depth < 2:
-            alts = [_gen_segment(rng, depth + 1) for _ in range(rng.randint(2, 3))]
+        elif depth == 0 or (nested and depth < 2):
+            alts = [_gen_segment(rng, depth + 1, nested) for _ in range(rng.randint(1, 3))]
             if rng.random() < 0.2:
-                alts.append("")
+                alts.append(rng.choice(["", "**", "x/y"]))
             out.append("{" + ",".join(alts) + "}")
         else:
             out.append(rng.choice(_LITERALS))
     return "".join(out)
 
 
-def _gen_pattern(rng: random.Random) -> str:
+def _gen_pattern(rng: random.Random, nested: bool = True) -> str:
     segments: list[str] = []
     for i in range(rng.randint(1, 4)):
         globstar = rng.random() < (0.2 if i else 0.15) and (not segments or segments[-1] != "**")
-        segments.append("**" if globstar else _gen_segment(rng))
-    if segments[-1] == "**":
-        segments.append(_gen_segment(rng))
+        segments.append("**" if globstar else _gen_segment(rng, 0, nested))
     pattern = "/".join(segments)
-    if rng.random() < 0.1 and "/" in pattern:
+    if rng.random() < 0.1:
         pattern = "/" + pattern
+    if rng.random() < 0.05:
+        pattern += rng.choice(["/", " ", "\\ ", "\\"])
     return pattern
 
 
-def _gen_path(rng: random.Random) -> str:
-    names = ["".join(rng.choice(_NAME_CHARS) for _ in range(rng.randint(1, 4))) for _ in range(rng.randint(1, 4))]
+def _gen_path(rng: random.Random, chars: Sequence[str]) -> str:
+    names = ["".join(rng.choice(chars) for _ in range(rng.randint(1, 4))) for _ in range(rng.randint(1, 4))]
     return "/".join(n for n in names if n not in (".", "..")) or "a"
-
-
-def _wcmatcher(pattern: str) -> Callable[[str], bool]:
-    if "/" not in pattern:
-        pattern = "**/" + pattern
-    return wcglob.compile(pattern.lstrip("/"), flags=_WC_FLAGS).match
 
 
 def _paths_for(rng: random.Random, pattern: str) -> list[str]:
     """Random paths, plus paths built from the pattern so that matches aren't rare."""
-    paths = [_gen_path(rng) for _ in range(20)]
+    ascii_only = not pattern.isascii() and any(token in pattern for token in _BYTEWISE)
+    chars = _ASCII_NAME_CHARS if ascii_only else _NAME_CHARS
+    paths = [_gen_path(rng, chars) for _ in range(20)]
     for _ in range(20):
         built: list[str] = []
         for segment in pattern.lstrip("/").split("/"):
             if segment == "**":
-                built.extend(_gen_path(rng).split("/")[: rng.randint(0, 2)])
+                built.extend(_gen_path(rng, chars).split("/")[: rng.randint(0, 2)])
                 continue
-            chars = [c for c in segment if c not in "*?[]{},\\!^:"] or ["a"]
-            built.append("".join(rng.choice(chars) for _ in range(rng.randint(1, 4))))
+            pool = [c for c in segment if c not in "*?[]{},\\!^:" and (c.isascii() or not ascii_only)] or ["a"]
+            built.append("".join(rng.choice(pool) for _ in range(rng.randint(1, 4))))
         paths.append("/".join(n for n in built if n not in (".", "..")) or "a")
     return paths
 
 
-def _comparable(pattern: str) -> bool:
-    # An empty alternative can leave an empty segment (x/{,a}/y gives x//y), which wcmatch collapses, or an
-    # empty pattern, which our **/ prefix turns into a different one. (bracex drops an empty alternative at the
-    # pattern's edge, hence the sentinels.) Patterns over the size limits are refused, not compared.
+def _oracle_pattern(pattern: str) -> str:
+    oracle = pattern
+    for ours, theirs in _TO_ORACLE.items():
+        oracle = oracle.replace(ours, theirs)
+    if "/" in oracle and "/" not in pattern:
+        oracle = "**/" + oracle
+    return oracle
+
+
+def _oracle_path(pattern: str, path: str) -> str:
+    return re.sub(r"[^\x00-\x7f]", "z", path) if pattern.isascii() else path
+
+
+def _compiles(pattern: str) -> bool:
     try:
         compile_glob(pattern)
-        wrapped = bracex.expand("<" + pattern.removeprefix("/") + ">", keep_escapes=True, limit=MAX_ALTERNATIVES)
-    except (GlobError, bracex.ExpansionLimitException):
+    except GlobError:
         return False
-    expansions = [e[1:-1] for e in wrapped]
-    return all(e and "//" not in e and not e.startswith("/") and not e.endswith("/") for e in expansions)
+    return True
 
 
-def _cases(seed: int, n: int) -> list[tuple[str, list[str]]]:
+def _cases(seed: int, n: int, *, nested: bool = True) -> list[tuple[str, list[str]]]:
     rng = random.Random(seed)
-    patterns = [p for p in (_gen_pattern(rng) for _ in range(n)) if _comparable(p)]
+    patterns = [p for p in (_gen_pattern(rng, nested) for _ in range(n)) if _compiles(p)]
     return [(p, _paths_for(rng, p)) for p in patterns]
 
 
 def _python_match(regex: str, path: str) -> bool:
-    # ARE's . and [^/] match a newline, Python's . only with DOTALL. The \uXXXX escapes mean the same in both.
-    return re.search(regex, path, re.DOTALL) is not None
+    # ARE's . and [^/] match a newline, Python's . only with DOTALL, and Python's $ also matches before a final
+    # newline, ARE's only at the end (\Z). The \uXXXX escapes mean the same in both.
+    return re.search(regex.removesuffix("$") + r"\Z", path, re.DOTALL) is not None
 
 
-def test_translator_agrees_with_wcmatch() -> None:
+@_needs_oracle
+def test_translator_agrees_with_rg() -> None:
     mismatches: list[tuple[str, str, bool]] = []
-    for pattern, paths in _cases(seed=8, n=1000):
+    for pattern, paths in _cases(seed=27, n=1500):
         regex = glob_to_regex(pattern)
-        matcher = _wcmatcher(pattern)
         for path in paths:
-            expected = matcher(path)
+            expected = _regex.oracle_glob_is_match(_oracle_pattern(pattern), _oracle_path(pattern, path))
             if _python_match(regex, path) != expected:
                 mismatches.append((pattern, path, expected))
     assert mismatches[:20] == []
 
 
+def _ancestors(path: str) -> list[str]:
+    parts = path.split("/")
+    return ["/".join(parts[:i]) for i in range(1, len(parts))]
+
+
+@_needs_oracle
+@pytest.mark.parametrize("prune", [True, False])
+def test_excludes_agree_with_rg(prune: bool) -> None:
+    # rg drops a file when an exclude matches it or one of its directories (which it then doesn't enter). vfs_glob
+    # tests files with the regexes, and directories as "path/" with the regexes and by pruned name.
+    mismatches: list[tuple[str, str, bool]] = []
+    rng = random.Random(32)
+    cases = _cases(seed=33, n=800)
+    extra = ["**/node_modules/**", "build/", "{a/,b}", "b{a,/}", "{node_modules/,dist/}", "a/*", "a**/", "*/"]
+    for pattern, paths in [*cases, *((p, [_gen_path(rng, _ASCII_NAME_CHARS) for _ in range(40)]) for p in extra)]:
+        try:
+            ex = compile_excludes([pattern], prune=prune)
+        except GlobError:
+            continue
+        oracle = _oracle_pattern(pattern)
+        for path in paths:
+            p = _oracle_path(pattern, path)
+            expected = _regex.oracle_glob_is_match(oracle, p) or any(
+                _regex.oracle_glob_is_match(oracle, d, is_dir=True) for d in _ancestors(p)
+            )
+            dirs = _ancestors(path)
+            got = any(_python_match(r, path) for r in ex.regexes) or any(
+                d.rsplit("/", 1)[-1] in ex.prune_dirs or any(_python_match(r, d + "/") for r in ex.regexes)
+                for d in dirs
+            )
+            if got != expected:
+                mismatches.append((pattern, path, expected))
+    assert mismatches[:20] == []
+
+
+@_needs_oracle
+def test_translator_rejects_what_rg_rejects() -> None:
+    rng = random.Random(28)
+    disagreements: list[tuple[str, str]] = []
+    for _ in range(3000):
+        pattern = _gen_pattern(rng).replace("\\]", rng.choice(["]", "[", "{", "}"]))
+        try:
+            compile_glob(pattern)
+            ours = "ok"
+        except GlobError as e:
+            ours = e.message
+        try:
+            _regex.oracle_glob_is_match(pattern, "a")
+            theirs = "ok"
+        except ValueError as e:
+            theirs = str(e)
+        # rg reports the original pattern: "error parsing glob '<pattern>': <message>". We refuse a few more.
+        agree = theirs.endswith(f": {ours}") if theirs != "ok" else ours == "ok"
+        ours_only = ours.startswith("a pattern ending in '/'") or ours == "empty pattern" or pattern[:1] in ("!", "#")
+        if not agree and not ours_only:
+            disagreements.append((pattern, f"{ours} / {theirs}"))
+    assert disagreements[:20] == []
+
+
+@_needs_oracle
+def test_oracle_agrees_with_the_rg_binary(rg_path: str, tmp_path: Path) -> None:
+    # The oracle is rg's matcher as a library; this checks it against the binary on a real tree. The apt rg
+    # (14.1) rejects nested braces, so the patterns have none.
+    rng = random.Random(29)
+    files = {_gen_path(rng, _NAME_CHARS) for _ in range(300)}
+    dirs = {f.rsplit("/", 1)[0] for f in files if "/" in f}
+    dirs = {"/".join(d.split("/")[:i]) for d in dirs for i in range(1, d.count("/") + 2)}
+    files -= dirs
+    for f in files:
+        (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / f).write_text("")
+    mismatches: list[tuple[str, set[str], set[str]]] = []
+    for pattern, _ in _cases(seed=30, n=150, nested=False):
+        if pattern.endswith("/"):
+            continue
+        result = subprocess.run(
+            [rg_path, "--files", "--hidden", "--no-ignore", "--null", "-g", pattern],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        assert result.returncode in (0, 1), (pattern, result.stderr)
+        listed = {p for p in result.stdout.decode().split("\0") if p}
+        expected = {f for f in files if _regex.oracle_glob_is_match(pattern, f)}
+        if listed != expected:
+            mismatches.append((pattern, listed - expected, expected - listed))
+    assert mismatches[:10] == []
+
+
+# Where the translation deliberately differs from rg: checked against the binary, so a change in rg shows up.
+DIVERGENCES = [
+    ("?.md", "é.md", True, False),  # ? is one character; rg's is one byte
+    ("[!a].md", "é.md", True, False),
+    ("/a[!x]b", "a/b", False, True),  # a class never matches '/'; rg's negated classes and ranges do
+    ("a[!x]b", "a/b", False, True),  # even unanchored
+    ("/a[.-0]b", "a/b", False, True),
+]
+
+
+@pytest.mark.parametrize(("pattern", "path", "ours", "rg"), DIVERGENCES)
+def test_divergences_from_rg(pattern: str, path: str, ours: bool, rg: bool, rg_path: str, tmp_path: Path) -> None:
+    assert _python_match(glob_to_regex(pattern), path) == ours
+    (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / path).write_text("")
+    result = subprocess.run([rg_path, "--files", "-g", pattern], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode in (0, 1), result.stderr
+    assert (result.stdout.strip() == path) == rg
+
+
+def _like_regex(like: str) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(like):
+        c = like[i]
+        if c == "\\":
+            out.append(re.escape(like[i + 1]))
+            i += 1
+        else:
+            out.append({"%": ".*", "_": "."}.get(c, re.escape(c)))
+        i += 1
+    return "".join(out)
+
+
+def test_hints_hold_for_every_match() -> None:
+    # The hints are derived from the regex's syntax tree: every path the regex matches must satisfy them.
+    violations: list[tuple[str, str, GlobPlan]] = []
+    for pattern, paths in _cases(seed=31, n=1500):
+        plan = compile_glob(pattern)
+        for path in paths:
+            if not _python_match(plan.regex, path):
+                continue
+            *dirs, name = path.split("/")
+            ok = tuple(dirs[: len(plan.prefix)]) == plan.prefix
+            ok &= plan.max_depth is None or len(dirs) + 1 - len(plan.prefix) <= plan.max_depth
+            ok &= plan.name_like is None or re.fullmatch(_like_regex(plan.name_like), name, re.DOTALL) is not None
+            if not ok:
+                violations.append((pattern, path, plan))
+    assert violations[:20] == []
+
+
 async def test_postgres_agrees_with_the_translator(db_any_locale: str) -> None:
-    # The same regexes evaluated by Postgres, on C-collated text as vfs_glob does, in both locales.
+    # The same regexes evaluated by Postgres, on C-collated text as vfs_glob does, in every locale.
     cases = [(glob_to_regex(p), path) for p, paths in _cases(seed=9, n=300) for path in paths]
     async with await AsyncConnection.connect(db_any_locale, autocommit=True) as conn:
         cur = await conn.execute(
@@ -388,7 +583,7 @@ async def test_classes_on_non_ascii_names(db_any_locale: str) -> None:
         await _tree(conn, None, ["é.md", "E.md", "日本.md", "ö/x.md", "a.md"])
         assert await _paths(conn, None, "[é-ö].md") == {"é.md"}
         assert await _paths(conn, None, "[!a].md") == {"é.md", "E.md", "ö/x.md"}
-        assert await _paths(conn, None, "[[:alpha:]].md") == {"E.md", "a.md", "ö/x.md"}  # POSIX classes are ASCII
+        assert await _paths(conn, None, "[[:alpha:]].md") == set()  # no POSIX classes, as in rg
         assert await _paths(conn, None, "?.md") == {"é.md", "E.md", "a.md", "ö/x.md"}  # ? is one character
         assert await _paths(conn, None, "??.md") == {"日本.md"}
         assert await _paths(conn, None, "[é-ö]/*") == {"ö/x.md"}
