@@ -45,6 +45,10 @@ from tests.test_tree import create, mkdir_p, raises_errno
         ("{a,b}/*", r"^(?:a|b)/[^/]*$"),
         ("{a/b,c}", r"^(?:a/b|c)$"),  # expanded: the alternatives have different segments
         ("{a,}**/x", r"^(?:a[^/]*/x|(?:[^/]+/)*x)$"),  # ** is a globstar only in the second
+        ("{{a,},b}**/x", r"^(?:a[^/]*/x|(?:[^/]+/)*x|b[^/]*/x)$"),  # empty alternatives at any depth expand
+        ("{,a}{,b}**/x", r"^(?:(?:[^/]+/)*x|b[^/]*/x|a[^/]*/x|ab[^/]*/x)$"),
+        ("x/*{q/r,{a,}}*/y", r"^(?:x/[^/]*q/r[^/]*/y|x/[^/]*a[^/]*/y|x/(?:[^/]+/)*y)$"),
+        ("{,a/b}/y", r"^(?:/y|a/b/y)$"),  # only a leading '/' of the pattern anchors
         ("[😀-😂]", r"^(?:.*/)?[\U0001f600-\U0001f602]$"),
         ("[[:ascii:]]", r"^(?:.*/)?[\u0000-\u002e0-\u007f]$"),
         (r"\*", r"^(?:.*/)?\*$"),
@@ -73,6 +77,7 @@ def test_translation(pattern: str, regex: str) -> None:
         ("{a/" * 1000 + "}" * 1000, "braces nested too deeply"),
         ("src/", "a pattern ending in '/' matches only directories, and only files are listed"),
         ("**/", "a pattern ending in '/' matches only directories, and only files are listed"),
+        ("src\\/", "a pattern ending in '/' matches only directories, and only files are listed"),
     ],
 )
 def test_bad_patterns(pattern: str, message: str) -> None:
@@ -90,11 +95,12 @@ def test_bad_patterns(pattern: str, message: str) -> None:
         ("src/*/*.py", GlobPlan(r"^src/[^/]*/[^/]*\.py$", ("src",), 2, "%.py")),
         ("src/a.py", GlobPlan(r"^src/a\.py$", ("src",), 1, "a.py")),
         ("src/**", GlobPlan(r"^src/.*$", ("src",), None, None)),
-        ("src/*.[ch]", GlobPlan(r"^src/[^/]*\.[ch]$", ("src",), 1, None)),
+        ("src/*.[ch]", GlobPlan(r"^src/[^/]*\.[ch]$", ("src",), 1, "%._")),
+        ("{a,b}", GlobPlan(r"^(?:.*/)?(?:a|b)$")),  # % filters nothing
         ("{src,lib}/x_1%.py", GlobPlan(r"^(?:src|lib)/x_1%\.py$", (), 2, r"x\_1\%.py")),
         ("{src/a,src/b/c}/*.py", GlobPlan(r"^(?:src/a/[^/]*\.py|src/b/c/[^/]*\.py)$", ("src",), 3, "%.py")),
         ("{src/a,src/b}/c", GlobPlan(r"^(?:src/a/c|src/b/c)$", ("src",), 2, "c")),
-        ("src/*.{md,txt}", GlobPlan(r"^src/[^/]*\.(?:md|txt)$", ("src",), 1, None)),
+        ("src/*.{md,txt}", GlobPlan(r"^src/[^/]*\.(?:md|txt)$", ("src",), 1, "%.%")),
         ("a?b**c", GlobPlan(r"^(?:.*/)?a[^/]b[^/]*c$", name_like="a_b%c")),
     ],
 )
@@ -115,6 +121,10 @@ def test_exclude_regexes() -> None:
     unpruned = compile_excludes(["**/node_modules/**", "build/"], prune=False)
     assert unpruned.prune_dirs == ()
     assert unpruned.regexes == (r"^(?:[^/]+/)*node_modules/.*/?$", r"^(?:.*/)?build/$")
+    assert compile_excludes(["build\\/"]).regexes == (r"^(?:.*/)?build/$",)  # an escaped '/' is one too
+    for doubled in ["build//", "/", "build\\//"]:
+        with pytest.raises(GlobError):
+            compile_excludes([doubled])
     with pytest.raises(TypeError):
         compile_excludes("*.log")
 
@@ -361,6 +371,8 @@ async def test_newest_first_and_limit(conn: AsyncConnection) -> None:
     assert [m.path for m in matches] == ["a", "d/e", "b", "c"]
     assert matches[0].id == ids["a"] and matches[0].size == 0 and matches[0].mtime == base + timedelta(days=2)
     assert [m.path for m in await glob(conn, None, "**", limit=2)] == ["a", "d/e"]
+    with pytest.raises(ValueError):
+        await glob(conn, None, "**", limit=-1)
 
 
 async def test_bad_root(conn: AsyncConnection) -> None:
@@ -412,6 +424,7 @@ async def test_hints_do_not_change_results(conn: AsyncConnection) -> None:
         "*.py", "src/**/*.py", "src/*/*.md", "{src,lib}/**/x.py", "a/b/*", "a/**", "**/b/*.txt", "src/a/b/x.py",
         "src/{a,b}/*", "*/*/*", "node_modules/**", "*.{py,md}", "[ab]/*.py", "**/é.py", "docs/a/*.t?t",
         ".hidden/*", "src/.hidden/**", "a/node_modules/x.py", "{src/a,src/b/c}/*.py", "{a,b/a}/**/{x,y}.*",
+        "{{a,},b}**/x.py", "*.[mt]?", "src/{a,b}*/{x,y}.py",
     ]  # fmt: skip
     excludes_options = [[], ["**/node_modules/**"], ["**/node_modules/**", "*.md", "b"], ["a/", "src/b/"]]
     for pattern in patterns:

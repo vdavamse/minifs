@@ -441,7 +441,7 @@ The defaults follow rg. Only files are returned (directories are walked, not lis
 
 `minifs/vfs/glob.py` translates in three steps:
 
-1. **Expand braces that need it** into alternatives (at most 1,024): those whose alternatives contain `/` or `*`, or an empty alternative next to a `*`, because they can change the segments or whether a segment is a globstar (`**` is one only as a whole segment, so in `{a,}**/x` it is for the empty alternative only). Other braces, like `*.{md,txt}`, stay inline as `(?:md|txt)`, so `*{a,b}` repeated ten times is a short regex, not 1,024 alternatives.
+1. **Expand braces that need it** into alternatives (at most 1,024): those whose alternatives contain `/`, `*` or an empty alternative (at any depth), because they can change the segments or whether a segment is a globstar (`**` is one only as a whole segment, so in `{a,}**/x` it is for the empty alternative only). Other braces, like `*.{md,txt}`, stay inline as `(?:md|txt)`, so `*{a,b}` repeated ten times is a short regex, not 1,024 alternatives.
 2. **Tokenize each alternative and split it into segments.** A segment that is exactly `**` is a globstar; `**` anywhere else is a `*`. A backslash makes the next character literal.
 3. **Emit** each alternative and join them as `(?:alt1|alt2)`. Literals escape only ARE's special characters: a backslash before a letter is a meaningful ARE escape (`\y`, `\m`), so letters stay bare.
 
@@ -455,7 +455,7 @@ An unclosed `[` or `{` raises `GlobError`, as do an empty pattern, a pattern end
 | --- | --- | --- |
 | Literal prefix | `docs/guides/**/*.md` gives `docs/guides` | `vfs_glob` resolves that directory and walks only its subtree. If it doesn't exist or is a file, the result is empty, not an error. A prefix through a hidden directory (for `Glob`) or an excluded one also gives an empty result, as in rg. Paths stay relative to the search root, so results don't depend on the hint. For alternatives, the prefix they share. |
 | Max depth | `src/*/*.py` gives 2 below `src` | Stop the recursion at that depth. Only when no alternative has a globstar. |
-| Name filter | Last segment `*.md` gives `LIKE '%.md'` | A cheap filter on the name before the full regex. Only when the last segment has no class and is the same in every alternative. |
+| Name filter | Last segment `*.md` gives `LIKE '%.md'`, `*.{py,md}` gives `'%.%'` | A cheap filter on the name before the full regex: a class becomes `_` and an inline group `%`. Only when the last segment translates to the same filter in every alternative. |
 
 ### The SQL
 

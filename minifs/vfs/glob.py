@@ -22,7 +22,7 @@ from uuid import UUID
 from psycopg import AsyncConnection
 
 # Braces whose alternatives can change the segments or the globstars ('/' or '*' inside, or an empty
-# alternative next to a '*') are expanded before translation, so `{a/b,c}/{d,e/f}` costs four; this caps the
+# alternative at any depth) are expanded before translation, so `{a/b,c}/{d,e/f}` costs four; this caps the
 # product. Other braces become an inline group.
 MAX_ALTERNATIVES = 1024
 # A longer regex is slow to match against every path: refused.
@@ -118,7 +118,7 @@ def _compile(pattern: str) -> GlobPlan:
 def _compile_alternatives(pattern: str) -> GlobPlan:
     alternatives = [_segments(_tokenize(pattern, alt)) for alt in _expand_braces(pattern)]
     anchored = any(len(segments) > 1 for segments in alternatives)
-    if anchored:  # a leading '/' only anchors
+    if pattern.startswith("/"):  # a leading '/' only anchors
         alternatives = [s[1:] if len(s) > 1 and not s[0] else s for s in alternatives]
     bodies = list(dict.fromkeys(_emit(segments) for segments in alternatives))
     body = bodies[0] if len(bodies) == 1 else "(?:" + "|".join(bodies) + ")"
@@ -150,7 +150,12 @@ def compile_excludes(patterns: Iterable[str], *, prune: bool = True) -> Excludes
             prune_dirs.append(name)
         elif _ends_with_separator(pattern):
             # Directories are tested as "path/", files never end in '/'.
-            regexes.append(_compile(pattern[:-1]).regex.removesuffix("$") + "/$")
+            body = pattern[:-1]
+            if (len(body) - len(body.rstrip("\\"))) % 2:
+                body = body[:-1]  # it was an escaped '/'
+            if not body or _ends_with_separator(body):
+                raise GlobError(pattern, "empty path segment")
+            regexes.append(_compile(body).regex.removesuffix("$") + "/$")
         else:
             regexes.append(_compile(pattern).regex.removesuffix("$") + "/?$")
     return Excludes(tuple(regexes), tuple(prune_dirs))
@@ -171,8 +176,10 @@ async def glob(
 
     Raises GlobError for a bad pattern, and ENOENT / ENOTDIR (see ``minifs.db.errors``) for a bad ``root``.
     """
+    if limit is not None and limit < 0:
+        raise ValueError(f"limit must not be negative, got {limit}")
     plan = compile_glob(pattern)
-    ex = compile_excludes(excludes, prune=hints)  # first, so that a str is refused
+    ex = compile_excludes(excludes, prune=hints)  # before the query, so that a str is refused
     if not hints:
         plan = GlobPlan(plan.regex)
     cur = await conn.execute(
@@ -259,11 +266,12 @@ def _expand(pattern: str, p: str) -> list[str]:
             i = _class_end(pattern, p, i) + 1
         elif c == "{":
             j, parts = _brace_parts(pattern, p, i)
-            # Inline unless an alternative can change the segments ('/') or whether a segment is a globstar:
-            # one with a '*', or an empty one next to a '*' ({a,}** is ** for the empty alternative).
-            maybe_empty = any(all(c in "{}," for c in part) for part in parts)
-            next_to_star = p[i - 1 : i] == "*" or p[j + 1 : j + 2] == "*"
-            if not any("/" in part or "*" in part for part in parts) and not (maybe_empty and next_to_star):
+            # Inline only if no alternative can change the segments ('/') or whether a segment is a globstar
+            # ('*', or an empty alternative at any depth: {a,}** is ** for the empty one). Such a group always
+            # adds at least one character within a segment. (An escaped ',' may expand needlessly: harmless.)
+            region = p[i + 1 : j]
+            maybe_empty = "" in parts or any(e in region for e in ("{,", ",,", ",}", "{}"))
+            if not maybe_empty and "/" not in region and "*" not in region:
                 i = j + 1  # left for _tokenize, as a _Group
                 continue
             heads = [alt for part in parts for alt in _expand(pattern, part)]
@@ -498,26 +506,26 @@ def _name_like(alternatives: list[list[_Segment]]) -> str | None:
 
 
 def _segment_like(segment: _Segment) -> str | None:
+    """A LIKE pattern every name matching ``segment`` satisfies: a class is one character (_), a group any
+    run of them (%). None when it would filter nothing, or for a globstar."""
     if _is_globstar(segment):
         return None
     out: list[str] = []
     for token in segment:
-        if isinstance(token, _Star):
+        if isinstance(token, _Star | _Group):
             if not out or out[-1] != "%":
                 out.append("%")
-        elif isinstance(token, _Any):
+        elif isinstance(token, _Any | _Class):
             out.append("_")
-        elif isinstance(token, _Class | _Group):
-            return None
         else:
             out.append("\\" + token.char if token.char in "\\%_" else token.char)
-    return "".join(out)
+    like = "".join(out)
+    return None if like == "%" else like
 
 
 def _ends_with_separator(pattern: str) -> bool:
-    """Whether ``pattern`` ends in an unescaped '/'."""
-    body = pattern.removesuffix("/")
-    return body != pattern and (len(body) - len(body.rstrip("\\"))) % 2 == 0
+    """Whether ``pattern`` ends in a '/', escaped or not (an escaped '/' is a separator too)."""
+    return pattern.endswith("/")
 
 
 def _pruned_dir_name(pattern: str) -> str | None:
