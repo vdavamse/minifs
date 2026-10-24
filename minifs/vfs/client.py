@@ -28,6 +28,7 @@ from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import retry_serializable
+from minifs.vfs import glob as globbing
 from minifs.vfs.core import Entry, FileVersion, Kind, ReadResult, VFSError, join, normalize, split
 
 DEFAULT_READ_LIMIT = 16_000
@@ -73,7 +74,7 @@ _ROOT = _Ref("%s::uuid", [None])
 class VFSClient:
     """Path-based filesystem operations over the minifs SQL functions.
 
-    ``pool`` serves every operation; ``search_pool`` (default: ``pool``) is for scans (glob and grep, #8 and #10).
+    ``pool`` serves every operation; ``search_pool`` (default: ``pool``) serves the scans (glob; grep with #10).
     Both come from ``minifs.db.pool``. ``cache`` is an optional ``DirCache``.
     """
 
@@ -150,6 +151,29 @@ class VFSClient:
         content = b"".join(row[4] for row in rows if row[4] is not None)
         end = start + len(content)
         return ReadResult(node, content, start, end, size, generation, end >= size)
+
+    async def glob(
+        self,
+        pattern: str,
+        path: str = "/",
+        *,
+        excludes: Sequence[str] = (),
+        hidden: bool = False,
+        limit: int | None = None,
+    ) -> list[Entry]:
+        """The files below directory ``path`` that match glob ``pattern`` (``minifs.vfs.glob``), newest first, at
+        most ``limit``. Runs on the search pool. ``GlobError`` for a bad pattern; ENOENT, ENOTDIR for ``path``."""
+        segments = split(path)
+        root = await self.stat(path)
+        if not root.is_dir:
+            raise VFSError("ENOTDIR", join(*segments))
+
+        async def attempt() -> list[globbing.GlobMatch]:
+            async with self.search_pool.connection() as conn, conn.transaction():
+                return await globbing.glob(conn, root.id, pattern, excludes=excludes, hidden=hidden, limit=limit)
+
+        matches = await _mapped(path, attempt)
+        return [Entry(join(*segments, *m.path.split("/")), m.id, "file", m.size, m.mtime) for m in matches]
 
     # Writes
 

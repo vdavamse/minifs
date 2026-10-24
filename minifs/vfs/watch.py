@@ -26,7 +26,7 @@ import json
 import logging
 import random
 from collections import deque
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Literal, Self, cast
@@ -35,14 +35,13 @@ from uuid import UUID
 from psycopg import AsyncConnection, sql
 from psycopg_pool import AsyncConnectionPool
 
+from minifs.db.pool import ConnectionFactory
+
 logger = logging.getLogger(__name__)
 
 CHANNEL = "vfs"  # the trigger in migration 005 notifies on this channel
 
 Op = Literal["create", "modify", "move", "delete", "rescan"]
-
-ConnectionFactory = Callable[[], Awaitable[AsyncConnection[Any]]]
-"""Returns a new connection, with fresh credentials. The watcher closes the connections it gets."""
 
 
 @dataclass(frozen=True, slots=True)

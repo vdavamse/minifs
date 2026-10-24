@@ -16,6 +16,7 @@ from minifs.db.errors import SQLSTATE_BY_ERRNO
 from minifs.db.pool import Connector, Pools, open_pool, retry_serializable
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import FileVersion, Kind, VFSError
+from minifs.vfs.glob import GlobError
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
 
@@ -553,3 +554,20 @@ async def test_no_await_after_commit(pool: Pool, monkeypatch: pytest.MonkeyPatch
     release.set()
     await vfs.settle()
     assert all(v[0] != old.id for v in cache.entries.values())
+
+
+async def test_glob(pool: Pool) -> None:
+    vfs = VFSClient(pool, search_pool=pool)
+    await vfs.create("/w/src/a.py", b"1", parents=True)
+    await vfs.create("/w/src/b.txt", parents=True)
+    await vfs.create("/w/.hidden/c.py", parents=True)
+    await vfs.create("/other/d.py", parents=True)
+    assert [e.path for e in await vfs.glob("**/*.py", "/w")] == ["/w/src/a.py"]
+    assert sorted(e.path for e in await vfs.glob("*.py", "/w/", hidden=True)) == ["/w/.hidden/c.py", "/w/src/a.py"]
+    assert len(await vfs.glob("*.py")) == 2
+    entry = (await vfs.glob("a.py", "/w"))[0]
+    assert (entry.kind, entry.size, entry.id) == ("file", 1, (await vfs.stat("/w/src/a.py")).id)
+    await raises("ENOENT", vfs.glob("*", "/nope"), "/nope")
+    await raises("ENOTDIR", vfs.glob("*", "/w/src/a.py"), "/w/src/a.py")
+    with pytest.raises(GlobError):
+        await vfs.glob("src/", "/w")

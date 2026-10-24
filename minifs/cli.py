@@ -1,5 +1,5 @@
-"""``minifs`` command line: ``db migrate`` / ``db status``, and ``ls``, ``cat``, ``put``, ``rm``, ``mv`` for humans
-debugging the tree."""
+"""``minifs`` command line: ``db migrate`` / ``db status``, and ``ls``, ``cat``, ``put``, ``rm``, ``mv``, ``glob`` for
+humans debugging the tree."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from minifs.db.migrate import MigrationError, applied_versions, load_migrations,
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import VFSError
+from minifs.vfs.glob import GlobError
 
 _CAT_CHUNK = 1 << 20
 
@@ -41,6 +42,10 @@ def main(argv: list[str] | None = None) -> int:
     put.add_argument("-p", "--parents", action="store_true", help="create missing parent directories")
     rm = _add_dsn(commands.add_parser("rm", help="remove files or empty directories"))
     rm.add_argument("paths", nargs="+", metavar="path")
+    glob = _add_dsn(commands.add_parser("glob", help="list the files matching a glob pattern, newest first"))
+    glob.add_argument("pattern")
+    glob.add_argument("path", nargs="?", default="/", help="directory to search (default: /)")
+    glob.add_argument("--hidden", action="store_true", help="include hidden files and directories")
     mv = _add_dsn(commands.add_parser("mv", help="move or rename (fails if the destination exists)"))
     mv.add_argument("src")
     mv.add_argument("dst")
@@ -51,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "db":
             return asyncio.run(_migrate(args.dsn) if args.db_command == "migrate" else _status(args.dsn))
         return asyncio.run(_with_client(args.dsn, _VFS_COMMANDS[args.command], args))
-    except (MigrationError, VFSError, psycopg.Error, OSError) as e:
+    except (MigrationError, VFSError, GlobError, psycopg.Error, OSError) as e:
         detail = f" ({e.detail})" if isinstance(e, VFSError) and e.detail else ""
         print(f"minifs {label}: {e}{detail}", file=sys.stderr)
         return 1
@@ -125,6 +130,12 @@ async def _rm(vfs: VFSClient, args: argparse.Namespace) -> int:
     return 0
 
 
+async def _glob(vfs: VFSClient, args: argparse.Namespace) -> int:
+    for entry in await vfs.glob(args.pattern, args.path, hidden=args.hidden):
+        print(entry.path)
+    return 0
+
+
 async def _mv(vfs: VFSClient, args: argparse.Namespace) -> int:
     await vfs.rename(args.src, args.dst)
     return 0
@@ -136,6 +147,7 @@ _VFS_COMMANDS: dict[str, Callable[[VFSClient, argparse.Namespace], Awaitable[int
     "put": _put,
     "rm": _rm,
     "mv": _mv,
+    "glob": _glob,
 }
 
 

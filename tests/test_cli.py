@@ -114,3 +114,12 @@ def test_cat_refuses_a_file_replaced_midway(db: str, monkeypatch: pytest.MonkeyP
     captured = capsysbinary.readouterr()
     assert captured.out == b"AAAA"
     assert b"ESTALE: /f" in captured.err
+
+
+def test_glob(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    monkeypatch.setattr(sys, "stdin", _Stdin(b"x"))
+    assert run(db, "put", "-p", "/w/a.md") == 0
+    assert run(db, "glob", "*.md") == 0
+    assert capsysbinary.readouterr().out == b"/w/a.md\n"
+    assert run(db, "glob", "[", "/w") == 1
+    assert capsysbinary.readouterr().err.startswith(b"minifs glob: ")
