@@ -9,8 +9,10 @@ exception is cost: a pattern too expensive for Postgres to compile is the model'
 from __future__ import annotations
 
 import logging
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import NoReturn
 
 from psycopg import AsyncConnection, errors
 
@@ -29,7 +31,9 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# Translations are cached up to a total size: one line form can be up to 256 KB, and each \b is about 23 KB.
+# Translations are cached up to a total size in memory. One line form can be up to 256 K characters, and the
+# Unicode \w holds characters outside the BMP, so CPython stores these strings at 4 bytes per character: a \b is
+# about 23 K characters, or 90 KB.
 _CACHE_BYTES = 32 * 1024 * 1024
 
 # Inputs whose translation Postgres has compiled. Keys are small, so this is bounded by count.
@@ -47,6 +51,9 @@ _translations_bytes = 0
 # (pattern, ignore_case) of translations Postgres has compiled, most recently validated last. Compilation doesn't
 # depend on the database, as long as it's UTF8, which validate() checks.
 _validated: OrderedDict[tuple[str, bool], None] = OrderedDict()
+
+# (pattern, ignore_case) Postgres found too expensive, with the message to repeat, most recent last.
+_too_expensive: OrderedDict[tuple[str, bool], str] = OrderedDict()
 
 
 class RegexTranslationBug(RuntimeError):
@@ -93,7 +100,7 @@ def translate(pattern: str, ignore_case: bool = False) -> Translation:
 
 
 def _size(translation: Translation) -> int:
-    return len(translation.pattern) + len(translation.line_form)
+    return sys.getsizeof(translation.pattern) + sys.getsizeof(translation.line_form)
 
 
 def translate_fixed(text: str, ignore_case: bool = False) -> Translation:
@@ -117,33 +124,47 @@ async def validate(conn: AsyncConnection, translation: Translation) -> None:
     if key in _validated:
         _validated.move_to_end(key)
         return
+    if (message := _too_expensive.get(key)) is not None:
+        _too_expensive.move_to_end(key)
+        raise RegexTooExpensive(message)
     try:
         async with conn.transaction(force_rollback=True):
             await conn.execute(f"SET LOCAL statement_timeout = '{_VALIDATE_TIMEOUT}'")
             await conn.execute("SELECT '' ~ %s, '' ~ %s", (translation.line_form, translation.file_form))
+    except errors.InvalidRegularExpression as e:
+        if "too complex" not in (e.diag.message_primary or ""):
+            logger.error(
+                "regex translator bug: Postgres rejected the translation of %r (ignore_case=%s): %s; line form: %r",
+                translation.pattern,
+                translation.ignore_case,
+                e,
+                translation.line_form,
+            )
+            raise RegexTranslationBug(
+                f"internal error: the search pattern {translation.pattern!r} was translated into a regex Postgres "
+                f"rejects ({e})"
+            ) from e
+        _reject_as_too_expensive(key, "regex is too complex for Postgres to compile", e)
     except errors.QueryCanceled as e:
         if "statement timeout" not in (e.diag.message_primary or ""):
             raise  # cancelled by the client or an administrator, not by the pattern
-        raise RegexTooExpensive(
-            f"regex is too expensive for Postgres to compile (over {_VALIDATE_TIMEOUT}); "
-            "use fewer or smaller counted repetitions"
-        ) from e
-    except errors.InvalidRegularExpression as e:
-        if "too complex" in (e.diag.message_primary or ""):
-            raise RegexTooExpensive(
-                "regex is too complex for Postgres to compile; use fewer or smaller counted repetitions"
-            ) from e
-        logger.error(
-            "regex translator bug: Postgres rejected the translation of %r (ignore_case=%s): %s; line form: %r",
-            translation.pattern,
-            translation.ignore_case,
-            e,
-            translation.line_form,
-        )
-        raise RegexTranslationBug(
-            f"internal error: the search pattern {translation.pattern!r} was translated into a regex Postgres "
-            f"rejects ({e})"
-        ) from e
+        _reject_as_too_expensive(key, f"regex is too expensive for Postgres to compile (over {_VALIDATE_TIMEOUT})", e)
+    except (errors.ProgramLimitExceeded, errors.InsufficientResources) as e:
+        _reject_as_too_expensive(key, "regex is too large for Postgres to compile", e)
+    except errors.InternalError_ as e:
+        # A huge NFA makes Postgres refuse an allocation ("invalid memory alloc request size").
+        if "memory" not in (e.diag.message_primary or ""):
+            raise
+        _reject_as_too_expensive(key, "regex is too large for Postgres to compile", e)
     _validated[key] = None
     if len(_validated) > _VALIDATED_SIZE:
         _validated.popitem(last=False)
+
+
+def _reject_as_too_expensive(key: tuple[str, bool], reason: str, cause: Exception) -> NoReturn:
+    """Remember the rejection, so retries of the same pattern don't cost the server another compile."""
+    message = f"{reason}; use a shorter pattern or fewer, smaller counted repetitions"
+    _too_expensive[key] = message
+    if len(_too_expensive) > _VALIDATED_SIZE:
+        _too_expensive.popitem(last=False)
+    raise RegexTooExpensive(message) from cause

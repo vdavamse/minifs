@@ -10,7 +10,8 @@ pub fn oracle_is_match(
     haystack: &str,
     ignore_case: bool,
 ) -> Result<bool, regex::Error> {
-    Ok(regex::RegexBuilder::new(pattern)
+    // Wrapped as ripgrep, and so the translator, wrap it.
+    Ok(regex::RegexBuilder::new(&format!("(?:{pattern})"))
         .case_insensitive(ignore_case)
         .build()?
         .is_match(haystack))
@@ -196,6 +197,8 @@ mod tests {
         assert!(!oracle_is_match(r"^\d+$", "12a", false).unwrap());
         assert!(oracle_is_match("ERROR", "an error", true).unwrap());
         assert!(oracle_is_match(r"(", "", false).is_err());
+        assert!(oracle_is_match("a)(b", "ab", false).unwrap());
+        assert!(oracle_is_match("(?x)a#c", "a", false).is_err());
     }
 
     #[test]

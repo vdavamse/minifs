@@ -63,8 +63,13 @@ UNSUPPORTED = {
     r"\b\w\b" * 20: "too large",
     r"(?:a{255}){255}": "expand to",
     r"(?:a{0,100}){100}": "expand to",
+    "|".join(f"w{i}" for i in range(16000)): "too large",
     r"(?-u:\B)": "use \\B",
 }
+
+
+def _short_id(pattern: str) -> str:
+    return pattern if len(pattern) <= 40 else f"{pattern[:30]}...({len(pattern)} chars)"
 
 
 def _matches(conn: psycopg.Connection, are: str, haystacks: list[str]) -> list[bool]:
@@ -185,7 +190,7 @@ def test_syntax_error_span_counts_characters() -> None:
     assert "look-around" in info.value.message
 
 
-@pytest.mark.parametrize("pattern", NEWLINE_ERRORS + list(UNSUPPORTED))
+@pytest.mark.parametrize("pattern", NEWLINE_ERRORS + list(UNSUPPORTED), ids=_short_id)
 def test_unsupported_patterns_are_rejected_with_a_hint(pattern: str) -> None:
     with pytest.raises(RegexError) as info:
         regex.translate(pattern)
@@ -264,6 +269,19 @@ async def test_validate_reports_expensive_patterns_to_the_model(
     assert "translator bug" not in caplog.text
 
 
+async def test_validate_remembers_expensive_patterns(conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch) -> None:
+    slow = Translation("(?:[a-z]{0,255}){40}", False, "(?:[a-z]{0,255}){40}")
+    monkeypatch.setattr(regex, "_VALIDATE_TIMEOUT", "1ms")
+    with pytest.raises(RegexTooExpensive) as first:
+        await regex.validate(conn, slow)
+    # Retried, the pattern is refused without compiling again: with time to spare, a compile would succeed.
+    monkeypatch.setattr(regex, "_VALIDATE_TIMEOUT", "10s")
+    with pytest.raises(RegexTooExpensive) as second:
+        await regex.validate(conn, slow)
+    assert second.value.message == first.value.message
+    assert "shorter pattern" in first.value.message
+
+
 async def test_validate_refuses_a_non_utf8_database(pg_server: PgServer) -> None:
     name = f"test_{uuid.uuid4().hex}"
     with psycopg.connect(pg_server.conninfo, autocommit=True) as admin:
@@ -281,7 +299,7 @@ async def test_validate_refuses_a_non_utf8_database(pg_server: PgServer) -> None
             admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
 
 
-@pytest.mark.parametrize("pattern", list(UNSUPPORTED))
+@pytest.mark.parametrize("pattern", list(UNSUPPORTED), ids=_short_id)
 def test_unsupported_patterns_are_accepted_by_rg(pattern: str, rg_path: str, tmp_path: Path) -> None:
     haystack = tmp_path / "haystack.txt"
     haystack.write_text("a\n")

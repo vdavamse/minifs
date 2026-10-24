@@ -25,6 +25,11 @@ pub const MAX_TRANSLATED_LEN: usize = 256 * 1024;
 /// Plain length isn't counted here; [`MAX_TRANSLATED_LEN`] bounds it.
 pub const MAX_EXTRA_ATOMS: u64 = 8192;
 
+/// Largest number of atoms before expansion. Bounds wide patterns: a 12,000-way alternation of
+/// short words (about 70,000 atoms) compiles in 0.08 s, but 16,000 ways makes Postgres fail an
+/// allocation.
+pub const MAX_ATOMS: u64 = 50_000;
+
 /// ARE's newline-sensitive mode: `^` and `$` also match at line breaks.
 pub const FILE_FORM_PREFIX: &str = "(?n)";
 
@@ -80,7 +85,14 @@ impl std::error::Error for Error {}
 /// Parses `pattern` as ripgrep does and translates it into ARE.
 pub fn translate(pattern: &str, ignore_case: bool) -> Result<Translation, Error> {
     let hir = parse(pattern, ignore_case)?;
-    let extra = atoms(&hir, true).saturating_sub(atoms(&hir, false));
+    let linear = atoms(&hir, false);
+    if linear > MAX_ATOMS {
+        return Err(Error::unsupported(format!(
+            "regex is too large for Postgres to compile ({linear} characters, classes and \
+             anchors; the limit is {MAX_ATOMS}); use a shorter pattern"
+        )));
+    }
+    let extra = atoms(&hir, true).saturating_sub(linear);
     if extra > MAX_EXTRA_ATOMS {
         return Err(Error::unsupported(format!(
             "counted repetitions expand to {extra} extra copies, more than Postgres can \
@@ -125,7 +137,9 @@ fn parse(pattern: &str, ignore_case: bool) -> Result<Hir, Error> {
             regex_syntax::Error::Translate(e) => Some(e.span()),
             _ => None,
         }
-        .map(|s| (unwrap(s.start.offset), unwrap(s.end.offset)));
+        .map(|s| (unwrap(s.start.offset), unwrap(s.end.offset)))
+        // An error at the wrapper's own parens has no position in the pattern as given.
+        .filter(|(start, end)| start < end);
         Error {
             message: err.to_string(),
             span,
@@ -587,8 +601,10 @@ mod tests {
             err.syntax && err.message.contains("unclosed group"),
             "{err}"
         );
-        // The error points at the wrapper's opening paren, clamped to the pattern.
-        assert_eq!(err.span, Some((0, 0)));
+        // The error is at the wrapper's paren, which isn't part of the pattern.
+        assert_eq!(err.span, None);
+        assert_eq!(rejected("a)").span, None);
+        assert_eq!(rejected("a))").span, Some((2, 3)));
     }
 
     #[test]
@@ -641,6 +657,15 @@ mod tests {
         assert_eq!(line(&"a".repeat(5000)), "a".repeat(5000));
         assert_eq!(line(&"語".repeat(2000)), "語".repeat(2000));
         assert!(translate("(?:abcdefghijklmnopq){0,255}", false).is_ok());
+        // Wide patterns are bounded before expansion.
+        let words = |n: usize| {
+            (0..n)
+                .map(|i| format!("w{i}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        assert!(translate(&words(5000), false).is_ok());
+        assert!(rejected(&words(16_000)).message.contains("too large"));
         assert_eq!(
             line(r"\w{255}").len(),
             WordClass::Unicode.bracket().len() + 5
