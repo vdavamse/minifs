@@ -10,8 +10,9 @@ reconnects with backoff, listens again, and then sends every subscription a ``re
 been lost in the gap, so callers re-check whatever they watch (saved cursors make that cheap) and caches clear.
 
 A connection can also die without the socket closing. Every ``keepalive`` seconds the watcher runs ``SELECT 1``,
-and treats no answer within ``probe_timeout`` as a lost connection. The probe keeps a Lakebase compute awake
-while a watcher runs; that is the price of noticing a dead connection.
+and treats no answer within ``probe_timeout`` as a lost connection, which it closes without waiting for the
+server. The probe keeps a Lakebase compute awake while a watcher runs; that is the price of noticing a dead
+connection.
 
 Events are hints, not facts: anyone who can connect can NOTIFY on the channel, and PostgreSQL folds identical
 payloads within one transaction. React to an event by reading the database, never by trusting its fields alone.
@@ -133,6 +134,8 @@ class Subscription:
         if len(self._events) >= self._maxsize:
             self._events.clear()
             event = RESCAN
+        if event is RESCAN and self._events and self._events[-1] is RESCAN:
+            return  # one rescan covers both
         self._events.append(event)
         self._wakeup.set()
 
@@ -171,9 +174,10 @@ class PathWatch(Subscription):
     """The events for the node a path named when the watch started, like an inotify watch.
 
     A file is matched by node id. A directory is matched by its id and by parent id, so a move into or out of it
-    is seen from both sides. The watch follows its node, not the path: it keeps watching a node that is renamed,
-    and ends (after delivering the event) when the node is deleted, or when a ``rescan`` finds it gone. Watch the
-    path again to follow whatever it names now.
+    is seen from both sides. The watch follows its node, not the path: it keeps watching a node that is renamed.
+    After a ``rescan``, or a ``delete`` of the node itself, it checks the database, and ends (after delivering
+    that event) if the node is gone or the check fails: a watch is never left on a node it can't vouch for. Watch
+    the path again to follow whatever it names now.
     """
 
     def __init__(self, watcher: Watcher, segments: list[str], maxsize: int) -> None:
@@ -208,7 +212,8 @@ class PathWatch(Subscription):
         self._resolved = True
         self._events = deque(e for e in self._events if self.matches(e))
 
-    async def _exists(self) -> bool:
+    async def _still_there(self) -> bool:
+        """Whether the node still exists. False if the check fails: the caller re-watches, which is safe."""
         if self.node is None:
             return True
         try:
@@ -216,9 +221,10 @@ class PathWatch(Subscription):
                 cur = await conn.execute("SELECT FROM vfs_nodes WHERE id = %s", (self.node,))
                 return await cur.fetchone() is not None
         except Exception as error:
-            # The rescan is delivered regardless; the caller re-checks, and a deleted node still ends the watch.
-            logger.warning("minifs watch: could not check that %s still exists (%r)", self.node, error)
-            return True
+            logger.warning(
+                "minifs watch: could not check that %s still exists (%r), ending the watch", self.node, error
+            )
+            return False
 
     def _finish(self) -> None:
         self._gone = True
@@ -229,14 +235,20 @@ class PathWatch(Subscription):
             if self._gone:
                 raise StopAsyncIteration
             event = await super().get()
-            if event.op == "rescan":
-                if not await self._exists():
+            if not self.matches(event):
+                continue
+            # Events are hints: a rescan or the node's own delete is confirmed against the database.
+            if event.op == "rescan" or (event.op == "delete" and event.id == self.node):
+                try:
+                    there = await self._still_there()
+                except BaseException:
+                    # Cancelled while checking: keep the event for the next get(), so a rescan is never lost.
+                    self._events.appendleft(event)
+                    self._wakeup.set()
+                    raise
+                if not there:
                     self._finish()
-                return event
-            if self.matches(event):
-                if event.op == "delete" and event.id == self.node:
-                    self._finish()
-                return event
+            return event
 
 
 class Watcher:
@@ -247,8 +259,9 @@ class Watcher:
     are retried forever, with jittered exponential backoff from ``retry_min`` to ``retry_max`` seconds that resets
     only once a connection has answered a keepalive probe, so a connection that keeps dropping at once backs off.
 
-    ``watch()`` runs a query when it starts and on each ``rescan``: on a connection from ``pool`` if given, else on
-    a short-lived one from ``connect``. Each is bounded by ``connect_timeout``.
+    ``watch()`` runs a query when it starts, on each ``rescan`` and on its node's ``delete``: on a connection from
+    ``pool`` if given, else on a short-lived one from ``connect``. Each is bounded by ``connect_timeout``. With many
+    watches per process, pass a pool, so a reconnect doesn't open one connection per watch at once.
     """
 
     def __init__(
@@ -295,8 +308,7 @@ class Watcher:
         self._closed = True
         if self._task is not None:
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
+            await asyncio.wait({self._task})  # unlike awaiting the task, never swallows a cancel aimed at the caller
         await self._discard()
         for subscription in list(self._subscriptions):
             subscription._end()  # pyright: ignore[reportPrivateUsage]
@@ -319,9 +331,9 @@ class Watcher:
     async def watch(self, path: str) -> AsyncGenerator[PathWatch]:
         """Events for the node at ``path`` ("/"-separated, from the root), until the block exits (see PathWatch).
 
-        Subscribes before resolving the path, so a change committed after this returns is always delivered. A
-        change committed just before the call may be delivered too, if its notification was still on its way:
-        events err towards repeating a change the caller already sees, never towards missing one.
+        Subscribes before resolving the path, so a change committed after this returns is delivered, or covered by
+        a later ``rescan`` if the connection drops. A change committed just before the call may be delivered too,
+        if its notification was still on its way: events err towards repeating a change, never towards missing one.
         Raises the psycopg error from ``vfs_resolve`` (``errno_name`` gives ENOENT or ENOTDIR) if the path
         doesn't resolve.
         """
@@ -415,6 +427,21 @@ class Watcher:
                     continue
                 self._broadcast(event)
             # Notifications that arrive during the probe are kept by psycopg for the next notifies().
-            async with asyncio.timeout(self._probe_timeout):
-                await conn.execute("SELECT 1")
+            await self._probe(conn)
             self._healthy = True
+
+    async def _probe(self, conn: AsyncConnection[Any]) -> None:
+        """SELECT 1, or TimeoutError after probe_timeout.
+
+        On a timeout the connection is closed here rather than by cancelling the query: psycopg's cancel waits for
+        the server, and how long depends on the psycopg and libpq versions.
+        """
+        probe = asyncio.ensure_future(conn.execute("SELECT 1"))
+        done, _ = await asyncio.wait({probe}, timeout=self._probe_timeout)
+        if probe in done:
+            probe.result()
+            return
+        probe.add_done_callback(lambda task: task.cancelled() or task.exception())  # abandoned: don't log its fate
+        await self._discard()
+        probe.cancel()
+        raise TimeoutError(f"no answer to the keepalive probe within {self._probe_timeout}s")

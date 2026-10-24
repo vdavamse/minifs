@@ -273,11 +273,11 @@ async with Watcher(connect) as watcher:
                 ...                     # events may have been lost: re-check the directory
 ```
 
-- `watch(path)` filters the single channel by node id (a file) or by parent id (a directory, plus the directory's own events). It subscribes before resolving the path, so nothing committed after it returns is missed; a change committed just before may be delivered too.
-- Like inotify, a watch follows the node the path named when it started: through renames, until the node is deleted. The `delete` is its last event, and the watch ends. To follow whatever a path names now, watch it again.
-- When the connection drops, the watcher reconnects with jittered backoff, listens again, and only then sends every subscriber a `rescan` event. A watch then checks that its node still exists, and ends after the `rescan` if it doesn't. A subscriber that falls more than `maxsize` events behind, or whose predicate raises, also gets a `rescan`.
-- Every `keepalive` seconds (30 by default) the watcher probes the connection with `SELECT 1`, so a connection that died silently is noticed within about `keepalive + probe_timeout` plus psycopg's 10-second cancel wait.
-- A watch's own queries (resolving the path, the check after a `rescan`) go through `pool` if one is given, else through a short-lived connection from the factory.
+- `watch(path)` filters the single channel by node id (a file) or by parent id (a directory, plus the directory's own events). It subscribes before resolving the path, so a change committed after it returns is delivered, or covered by a later `rescan`; a change committed just before may be delivered too.
+- Like inotify, a watch follows the node the path named when it started: through renames, until the node is deleted. The `delete` (confirmed against the database, since events are hints) is its last event, and the watch ends. To follow whatever a path names now, watch it again.
+- When the connection drops, the watcher reconnects with jittered backoff, listens again, and only then sends every subscriber a `rescan` event. A watch then checks that its node still exists, and ends after the `rescan` if it doesn't, or if the check fails: it is never left on a node it can't vouch for. Consecutive `rescan`s are folded into one. A subscriber that falls more than `maxsize` events behind, or whose predicate raises, also gets a `rescan`.
+- Every `keepalive` seconds (30 by default) the watcher probes the connection with `SELECT 1`, so a connection that died silently is noticed within `keepalive + probe_timeout`. A probe that times out closes the connection without waiting for the server.
+- A watch's own queries (resolving the path, the check after a `rescan`) go through `pool` if one is given, else through a short-lived connection from the factory. With many watches per process, pass a pool, so a reconnect doesn't open one connection per watch at once.
 - `watcher.subscribe(predicate)` is the raw feed. The library's directory cache uses it on the same connection (see Caching).
 
 ## Read contract

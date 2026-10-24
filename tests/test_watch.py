@@ -29,6 +29,15 @@ async def next_event(events: Subscription) -> Event:
     return await asyncio.wait_for(events.get(), 10)
 
 
+async def drain(events: Subscription) -> list[Event]:
+    """Every event until the subscription ends, failing instead of hanging if it doesn't."""
+
+    async def collect() -> list[Event]:
+        return [e async for e in events]
+
+    return await asyncio.wait_for(collect(), 10)
+
+
 async def catch_up(watcher: Watcher, conn: AsyncConnection) -> None:
     """Waits until the watcher has received every notification committed so far.
 
@@ -208,7 +217,7 @@ async def test_watch_ends_when_its_node_is_deleted(conn: AsyncConnection, watche
     async with watcher.watch("d") as events:
         await unlink(conn, d)
         await mkdir_p(conn, "d")  # a new node at the same path: not this watch's
-        assert [e async for e in events] == [Event("delete", id=d, parent=None, name="d", kind="dir")]
+        assert await drain(events) == [Event("delete", id=d, parent=None, name="d", kind="dir")]
 
 
 async def test_watch_follows_its_node_through_a_rename(conn: AsyncConnection, watcher: Watcher) -> None:
@@ -291,7 +300,7 @@ async def test_rescan_ends_a_watch_whose_node_is_gone(conn: AsyncConnection, db:
         await unlink(conn, old)
         await mkdir_p(conn, "inbox")
         allow.set()
-        assert [e async for e in events] == [RESCAN]
+        assert await drain(events) == [RESCAN]
 
 
 async def test_rescan_keeps_a_watch_whose_node_exists(conn: AsyncConnection, db: str) -> None:
@@ -303,7 +312,8 @@ async def test_rescan_keeps_a_watch_whose_node_exists(conn: AsyncConnection, db:
         assert (await next_event(events)).id == f
 
 
-async def test_rescan_is_delivered_when_the_check_fails(conn: AsyncConnection, db: str) -> None:
+async def test_failed_check_after_rescan_ends_the_watch(conn: AsyncConnection, db: str) -> None:
+    """The rescan is delivered, and a watch whose node can't be vouched for ends rather than going stale."""
     calls = 0
     connect = factory(db)
 
@@ -314,13 +324,65 @@ async def test_rescan_is_delivered_when_the_check_fails(conn: AsyncConnection, d
             raise OSError("token endpoint unavailable")
         return await connect()
 
-    d = await mkdir_p(conn, "d")
+    await mkdir_p(conn, "d")
     async with Watcher(flaky, retry_min=0.01) as watcher, watcher.watch("d") as events:
         await terminate(conn, watcher.backend_pid)
-        assert await next_event(events) == RESCAN
+        assert await drain(events) == [RESCAN]
         assert calls == 4
+
+
+async def test_cancelled_check_keeps_the_rescan(conn: AsyncConnection, db: str) -> None:
+    slow = asyncio.Event()
+    connect = factory(db)
+
+    async def gated() -> AsyncConnection[Any]:
+        if slow.is_set():
+            await asyncio.sleep(3600)
+        return await connect()
+
+    d = await mkdir_p(conn, "d")
+    async with Watcher(gated, retry_min=0.01) as watcher, watcher.watch("d") as events:
+        await terminate(conn, watcher.backend_pid)
+        while watcher.backend_pid is None:  # reconnected: the rescan is queued
+            await asyncio.sleep(0.01)
+        slow.set()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(events.get(), 0.5)  # cancelled during the check
+        slow.clear()
+        assert await next_event(events) == RESCAN
         f = await create(conn, d, "f")
         assert (await next_event(events)).id == f
+
+
+async def test_forged_delete_does_not_end_the_watch(conn: AsyncConnection, watcher: Watcher) -> None:
+    d = await mkdir_p(conn, "d")
+    assert d is not None
+    await catch_up(watcher, conn)
+    async with watcher.watch("d") as events:
+        forged = {"op": "delete", "id": str(d), "parent": None, "name": "d", "kind": "dir"}
+        await conn.execute("SELECT pg_notify('vfs', %s)", (json.dumps(forged),))
+        assert (await next_event(events)).op == "delete"
+        f = await create(conn, d, "f")
+        assert (await next_event(events)).id == f
+
+
+async def test_consecutive_rescans_are_folded(db: str) -> None:
+    async with Watcher(factory(db)) as watcher:
+        events = watcher.subscribe()
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+    assert await drain(events) == [RESCAN]
+
+
+async def test_aclose_keeps_the_callers_cancellation(db: str) -> None:
+    watcher = Watcher(factory(db))
+    await watcher.start()
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await watcher.aclose()
+    task.uncancel()
 
 
 async def test_watch_queries_use_the_pool(conn: AsyncConnection, db: str) -> None:
@@ -391,7 +453,7 @@ async def test_keepalive_keeps_events(conn: AsyncConnection, db: str) -> None:
 async def test_close_ends_subscriptions(db: str) -> None:
     async with Watcher(factory(db)) as watcher:
         events = watcher.subscribe()
-    assert [e async for e in events] == []
+    assert await drain(events) == []
     with pytest.raises(RuntimeError):
         watcher.subscribe()
 
@@ -400,7 +462,7 @@ async def test_closed_subscription_stops_receiving(conn: AsyncConnection, watche
     with watcher.subscribe() as events:
         pass
     await create(conn, None, "f")
-    assert [e async for e in events] == []
+    assert await drain(events) == []
 
 
 async def test_truncate_is_a_rescan(conn: AsyncConnection, watcher: Watcher) -> None:
