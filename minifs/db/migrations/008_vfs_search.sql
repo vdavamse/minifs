@@ -9,8 +9,8 @@
 -- holds whole lines and never splits a UTF-8 character: each one is decoded and tested on its own.
 
 
--- p_data decoded as UTF-8, or NULL if it isn't valid UTF-8 (or holds a NUL, which text can't), so a search skips
--- such content instead of failing.
+-- p_data decoded as UTF-8, or NULL if it isn't valid UTF-8 (or holds a NUL, which text can't): a decode that
+-- never fails a query. One subtransaction per call, so vfs_search checks whole files itself instead.
 CREATE FUNCTION vfs_utf8(p_data bytea) RETURNS text
 LANGUAGE plpgsql IMMUTABLE STRICT SET search_path FROM CURRENT AS $$
 BEGIN
@@ -26,9 +26,9 @@ END $$;
 -- currency), the line without its \n, cut to p_max_chars characters (NULL: whole), and whether it was cut (a
 -- final \r doesn't count, since the Grep tool drops it).
 --
--- Files are searched one at a time in path order (bytewise, COLLATE "C"), and the search stops once it has
--- p_limit hits, so a common pattern costs the files up to its first p_limit hits, not the whole scope. In each
--- file, two passes per extent of the current generation:
+-- Files are searched one at a time in path order (bytewise, COLLATE "C"), each file's extents in line order, and
+-- the search stops once it has p_limit hits: a common pattern costs the extents up to its first p_limit hits, not
+-- the whole scope or the whole file. For each extent of a file's current generation:
 -- 1. Extent filter: the decoded extent, without its final \n, is tested once against p_file_pattern, the
 --    translated pattern in newline-sensitive mode ('(?n)', minifs.vfs.regex.Translation.file_form), where ^ and
 --    $ match at line breaks and . and [^...] don't cross them. The translator keeps \n out of every class, so
@@ -41,8 +41,9 @@ END $$;
 -- search is in the translated pattern, so the regexes are always tested with ~, never ~* (which depends on the
 -- database's locale).
 --
--- A file with any extent that isn't UTF-8 (vfs_utf8) is skipped whole, so results don't depend on how the file's
--- bytes happen to be cut into extents. Each file's extents are decoded once (the MATERIALIZED CTE).
+-- A file with any content that isn't UTF-8 is skipped whole, so results don't depend on how its bytes happen to
+-- be cut into extents. That is checked first, in one subtransaction per file (vfs_utf8 would cost one per
+-- extent). As in rg, a UTF-8 byte order mark at the start of a file isn't part of line 1, whose offset is then 3.
 CREATE FUNCTION vfs_search(
     p_ids uuid[],
     p_paths text[],
@@ -54,44 +55,57 @@ CREATE FUNCTION vfs_search(
 ) RETURNS TABLE (path text, line_no bigint, byte_offset bigint, line text, cut boolean)
 LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $$
 DECLARE
+    c_bom constant text := chr(65279);
     v_left bigint := p_limit;               -- hits still wanted; NULL: no limit
     v_rows bigint;
     f record;
+    x record;
 BEGIN
     IF v_left IS NOT NULL AND v_left <= 0 THEN
         RETURN;
     END IF;
+    <<files>>
     FOR f IN SELECT g.path, n.id, n.generation
                FROM unnest(p_ids, p_paths) AS g(id, path)
                JOIN vfs_nodes n ON n.id = g.id AND n.kind = 'file'
               ORDER BY g.path COLLATE "C"
     LOOP
-        RETURN QUERY
-        WITH extents AS MATERIALIZED (
-            SELECT e.byte_offset, e.line_start, e.line_offsets, vfs_utf8(e.data) AS body
-              FROM vfs_extents e
-             WHERE e.node_id = f.id AND e.generation = f.generation
-        ), hits AS (
-            SELECT x.* FROM extents x
-             WHERE NOT EXISTS (SELECT FROM extents b WHERE b.body IS NULL)
-               AND CASE WHEN p_fixed THEN strpos(x.body, p_file_pattern) > 0
-                        ELSE (CASE WHEN right(x.body, 1) = E'\n' THEN left(x.body, -1) ELSE x.body END)
-                             ~ p_file_pattern
-                   END
-        )
-        SELECT f.path, h.line_start + l.k, h.byte_offset + h.line_offsets[l.k::int],
-               CASE WHEN p_max_chars IS NULL THEN l.text ELSE left(l.text, p_max_chars) END,
-               p_max_chars IS NOT NULL
-                   AND char_length(l.text) - (right(l.text, 1) = E'\r')::int > p_max_chars
-          FROM hits h, string_to_table(h.body, E'\n') WITH ORDINALITY AS l(text, k)
-         WHERE l.k <= cardinality(h.line_offsets)
-           AND CASE WHEN p_fixed THEN strpos(l.text, p_line_pattern) > 0 ELSE l.text ~ p_line_pattern END
-         ORDER BY h.line_start + l.k
-         LIMIT v_left;
-        IF v_left IS NOT NULL THEN
-            GET DIAGNOSTICS v_rows = ROW_COUNT;
-            v_left := v_left - v_rows;
-            EXIT WHEN v_left <= 0;
-        END IF;
+        BEGIN
+            PERFORM convert_from(e.data, 'UTF8') FROM vfs_extents e
+              WHERE e.node_id = f.id AND e.generation = f.generation;
+        EXCEPTION WHEN character_not_in_repertoire OR untranslatable_character THEN
+            CONTINUE files;
+        END;
+        -- Fetched as the loop goes, so extents after the last one needed are neither decoded nor tested.
+        FOR x IN SELECT e.byte_offset, e.line_start, e.line_offsets, m.bom, b.body
+                   FROM vfs_extents e
+                        CROSS JOIN LATERAL (SELECT convert_from(e.data, 'UTF8') AS raw OFFSET 0) d
+                        CROSS JOIN LATERAL (SELECT e.line_start = 0 AND left(d.raw, 1) = c_bom AS bom) m
+                        CROSS JOIN LATERAL (SELECT CASE WHEN m.bom THEN substr(d.raw, 2) ELSE d.raw END AS body
+                                            OFFSET 0) b
+                  WHERE e.node_id = f.id AND e.generation = f.generation
+                    AND CASE WHEN p_fixed THEN strpos(b.body, p_file_pattern) > 0
+                             ELSE (CASE WHEN right(b.body, 1) = E'\n' THEN left(b.body, -1) ELSE b.body END)
+                                  ~ p_file_pattern
+                        END
+                  ORDER BY e.line_start
+        LOOP
+            RETURN QUERY
+            SELECT f.path, x.line_start + l.k,
+                   x.byte_offset + x.line_offsets[l.k::int] + CASE WHEN x.bom AND l.k = 1 THEN 3 ELSE 0 END,
+                   CASE WHEN p_max_chars IS NULL THEN l.text ELSE left(l.text, p_max_chars) END,
+                   p_max_chars IS NOT NULL
+                       AND char_length(l.text) - (right(l.text, 1) = E'\r')::int > p_max_chars
+              FROM string_to_table(x.body, E'\n') WITH ORDINALITY AS l(text, k)
+             WHERE l.k <= cardinality(x.line_offsets)
+               AND CASE WHEN p_fixed THEN strpos(l.text, p_line_pattern) > 0 ELSE l.text ~ p_line_pattern END
+             ORDER BY l.k
+             LIMIT v_left;
+            IF v_left IS NOT NULL THEN
+                GET DIAGNOSTICS v_rows = ROW_COUNT;
+                v_left := v_left - v_rows;
+                EXIT files WHEN v_left <= 0;
+            END IF;
+        END LOOP;
     END LOOP;
 END $$;

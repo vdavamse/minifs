@@ -84,7 +84,7 @@ class GrepHit:
 @dataclass(frozen=True)
 class GrepResult:
     """The hits in order of path, then line; ``truncated`` if there were more than the limit. ``files`` and
-    ``bytes`` describe the scope that was scanned."""
+    ``bytes`` are the scope's totals (from ``vfs_nodes``); the search may stop before reading all of it."""
 
     hits: list[GrepHit]
     truncated: bool
@@ -97,7 +97,7 @@ def compile_pattern(pattern: str, *, ignore_case: bool = False, fixed: bool = Fa
     ripgrep's message for a pattern it rejects, such as one with a literal newline."""
     if fixed:
         translation = regex.translate_fixed(pattern, ignore_case)  # rejects what rg -F does
-        if not ignore_case:
+        if not ignore_case and "\0" not in pattern:  # a text parameter can't hold NUL; the regex spells it
             return Matcher(pattern, pattern, True, None)  # strpos is cheaper than a regex
     else:
         translation = regex.translate(pattern, ignore_case)
@@ -163,11 +163,13 @@ async def search(
     *,
     limit: int = DEFAULT_LIMIT,
     max_line_chars: int | None = MAX_LINE_CHARS,
+    timeout: float | None = None,
 ) -> GrepResult:
     """The lines of ``scope``'s files that match, at most ``limit`` (``vfs_search``). Validates the translated
-    pattern in Postgres first (see ``minifs.vfs.regex.validate``)."""
+    pattern in Postgres first (see ``minifs.vfs.regex.validate``), within ``timeout`` seconds if given (the
+    transaction's statement timeout, which validation would otherwise lengthen to its own)."""
     if matcher.translation is not None:
-        await regex.validate(conn, matcher.translation)
+        await regex.validate(conn, matcher.translation, timeout)
     if not scope.ids:
         return GrepResult([], False, 0, 0)
     cur = await conn.execute(

@@ -596,10 +596,10 @@ The `Grep` tool takes only ladderframe's parameters: `pattern`, `path` (a direct
 
 ### Cost and limits
 
-- Work grows with the bytes scanned, not with the number of matches. The extent filter costs one regex pass over the bytes, and only matching extents (about 64 KB each at most) are split into lines. Files are searched in path order and the scan stops once it has the hits it needs, so a common pattern reads only the first files, while one with few hits reads the whole scope (about 0.7 s for 45 MB on a laptop).
+- Work grows with the bytes scanned, not with the number of matches. The extent filter costs one regex pass over the bytes, and only matching extents (about 64 KB each, or one longer line) are split into lines. Files are searched in path order, each in line order, and the scan stops once it has the hits it needs, so a common pattern reads only the first extents, while one with few hits reads the whole scope (about 0.7 s for 45 MB on a laptop).
 - The total size of the scope comes from `vfs_nodes` before any content is read. A search over more than a configured cap (for example 50 MB) is refused with `ModelRetry: Search scope is 120 MB; narrow the path or include pattern`.
 - Every search runs under `SET LOCAL statement_timeout`.
-- A file with content that isn't valid UTF-8 is skipped whole, so the result doesn't depend on how its bytes are cut into extents. It's still readable with `vfs.pread`, and with `Read` unless it looks binary.
+- A file with content that isn't valid UTF-8 is skipped whole, so the result doesn't depend on how its bytes are cut into extents. Each file is checked once before its extents are searched, which costs one pass over its bytes. As in rg, a UTF-8 byte order mark at the start of a file isn't part of its first line (that line's byte offset is then 3). It's still readable with `vfs.pread`, and with `Read` unless it looks binary.
 
 ### Output format for the agent
 

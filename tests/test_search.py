@@ -382,16 +382,39 @@ async def test_stops_at_the_limit(vfs: VFSClient, conn: AsyncConnection) -> None
     lines = [(h.path, h.line) for h in result.hits]
     assert lines[998:1002] == [("/w/00", 999), ("/w/00", 1000), ("/w/01", 1), ("/w/01", 2)]
     assert (len(result.hits), result.truncated) == (1500, True)
-    # Only the files up to the limit are decoded: each file is one extent, and 1501 hits take two files.
-    async with conn.transaction():
-        await conn.execute("SET LOCAL track_functions = 'pl'")
-        cur = await conn.execute(
-            "SELECT count(*) FROM vfs_search((SELECT array_agg(id) FROM vfs_nodes WHERE kind = 'file'),"
-            " (SELECT array_agg(name) FROM vfs_nodes WHERE kind = 'file'), 'foo', 'foo', true, 1501)"
-        )
-        assert (await cur.fetchone()) == (1501,)
-        cur = await conn.execute("SELECT pg_stat_get_xact_function_calls('vfs_utf8'::regproc)")
-        assert (await cur.fetchone()) == (2,)
+
+
+async def test_stops_inside_a_file(vfs: VFSClient) -> None:
+    # One large file of matching lines, in many extents: the first hits come from its first extents.
+    await put(vfs, "/app.log", b"".join(f"INFO request {i}\n".encode() for i in range(600_000)))
+    start = time.monotonic()
+    result = await vfs.grep("INFO")
+    limited = time.monotonic() - start
+    assert [h.line for h in result.hits] == list(range(1, 101))
+    assert result.truncated
+    start = time.monotonic()
+    everything = await vfs.grep("INFO", limit=1_000_000, timeout=60)
+    full = time.monotonic() - start
+    assert len(everything.hits) == 600_000
+    assert limited * 3 < full, (limited, full)
+
+
+async def test_byte_order_mark(vfs: VFSClient, rg_path: str, tmp_path: Path) -> None:
+    content = b"\xef\xbb\xbffoo\nfoo \xef\xbb\xbf\n"
+    await put(vfs, "/bom", content)
+    await put(vfs, "/bom-only", b"\xef\xbb\xbf\n")
+    assert hits((await vfs.grep("^foo")).hits) == [("/bom", 1, 3, "foo"), ("/bom", 2, 7, "foo \ufeff")]
+    assert hits((await vfs.grep("^$")).hits) == [("/bom-only", 1, 3, "")]
+    (tmp_path / "bom").write_bytes(content)
+    rg = subprocess.run([rg_path, "--json", "--no-config", "-e", "^foo", "bom"], cwd=tmp_path, capture_output=True)
+    matches = [m["data"] for m in map(json.loads, rg.stdout.splitlines()) if m["type"] == "match"]
+    assert [(m["line_number"], m["lines"]["text"]) for m in matches] == [(1, "foo\n"), (2, "foo \ufeff\n")]
+
+
+async def test_fixed_string_with_nul(vfs: VFSClient) -> None:
+    await put(vfs, "/f", b"a b\n")
+    assert (await vfs.grep("a\0b", fixed=True)).hits == []
+    assert (await vfs.grep("a\0b", fixed=True, ignore_case=True)).hits == []
 
 
 async def test_excludes(vfs: VFSClient) -> None:

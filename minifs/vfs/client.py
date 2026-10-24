@@ -314,7 +314,9 @@ class VFSClient:
                             max_files=max_files,
                         )
                     searching.check_scope(scope, max_files=max_files, max_bytes=max_bytes)
-                    result = await searching.search(conn, scope, matcher, limit=limit, max_line_chars=max_line_chars)
+                    result = await searching.search(
+                        conn, scope, matcher, limit=limit, max_line_chars=max_line_chars, timeout=timeout
+                    )
                 except psycopg.errors.QueryCanceled:
                     raise searching.timed_out() from None
                 return node, result
