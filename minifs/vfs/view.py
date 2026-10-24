@@ -40,12 +40,15 @@ from minifs.vfs.core import Entry, FileVersion, ReadResult, VFSError, join, spli
 from minifs.vfs.policy import Action, Policy
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
+_REFETCH_FACTOR = 8
+_BRACED_STAR = re.compile(r"\{[^}]*\*")
 _log = logging.getLogger(__name__)
 
 
 def workspace_mounts(workspace_id: UUID | str) -> dict[str, str]:
-    """The agent's mounts: its workspace at ``/workspace``, and the shared ``/docs``."""
-    return {"/workspace": f"/workspaces/{workspace_id}", "/docs": "/docs"}
+    """The agent's mounts: its workspace at ``/workspace``, and the shared ``/docs``. ValueError if
+    ``workspace_id`` isn't a UUID (``""`` or ``..`` would mount other workspaces)."""
+    return {"/workspace": f"/workspaces/{UUID(str(workspace_id))}", "/docs": "/docs"}
 
 
 class _Mount:
@@ -73,8 +76,9 @@ class _Target:
 
 class VFSView:
     """``client``'s tree as ``actor`` sees it through ``mounts`` (visible prefix -> real prefix), under
-    ``policy``. The operations are ``VFSClient``'s, in visible paths. ValueError for nested mounts or an actor
-    the policy has no rules for."""
+    ``policy``. The operations are ``VFSClient``'s, in visible paths. ValueError for an actor the policy has no
+    rules for, or for mounts that nest, visibly or in the real tree (two visible names for one node would let
+    the policy on one name be bypassed through the other)."""
 
     def __init__(self, client: VFSClient, mounts: Mapping[str, str], policy: Policy, actor: str) -> None:
         if actor not in policy.actors:
@@ -83,8 +87,12 @@ class VFSView:
         self._mounts = [_Mount(split(v), split(r)) for v, r in mounts.items()]
         for a in self._mounts:
             for b in self._mounts:
-                if a is not b and b.visible[: len(a.visible)] == a.visible:
+                if a is b:
+                    continue
+                if b.visible[: len(a.visible)] == a.visible:
                     raise ValueError(f"mount {join(*b.visible)} is inside mount {join(*a.visible)}")
+                if b.real[: len(a.real)] == a.real:
+                    raise ValueError(f"mount {join(*b.visible)} reaches into mount {join(*a.visible)}'s tree")
         self.policy = policy
         self.actor = actor
 
@@ -126,18 +134,25 @@ class VFSView:
     ) -> list[Entry]:
         """``VFSClient.glob`` below directory ``path``: the first ``limit`` files the actor may read.
 
+        Mounts the actor can't read anything in are not searched. When the policy hides some of the first
+        ``limit`` matches, the glob looks further, up to ``_REFETCH_FACTOR`` times as many, so a policy that hides
+        most of the matches can return fewer than ``limit``.
+
         Below a virtual directory, the glob runs in each mount and the results are merged, newest first. The
-        pattern and excludes still match paths relative to ``path``, restated relative to each mount point. That
-        is exact unless a ``**`` segment is followed by one that can match a directory above or at a mount point
-        (``**/workspace/*.md`` from ``/``), which is EINVAL: glob from inside a mount instead."""
+        pattern and excludes still match paths relative to ``path``, restated relative to each mount point. Where
+        that can't be done exactly, the glob is EINVAL (glob from inside a mount instead): a ``**`` segment
+        followed by one that can match a directory above or at a mount point (``**/workspace/*.md`` from ``/``),
+        an escaped ``/``, a brace with a ``*`` in a segment that reaches a mount point (``{a,**}/x.md``), and a
+        brace or class with a ``/`` in it."""
         target = self._target(path, "read")
         if limit is not None and not 0 <= limit <= _MAX_LIMIT:
             raise VFSError("EINVAL", target.visible, f"invalid limit {limit}")
         entries = await self._glob(target, pattern, excludes, hidden, limit)
         readable = [e for e in entries if self.policy.allows(self.actor, "read", e.path)]
         if limit is not None and len(entries) == limit and len(readable) < limit:
-            # The policy hid some of the first `limit`: look past them.
-            entries = await self._glob(target, pattern, excludes, hidden, None)
+            # The policy hid some of the first `limit`: look past them, a bounded distance.
+            wider = min(limit * _REFETCH_FACTOR, _MAX_LIMIT)
+            entries = await self._glob(target, pattern, excludes, hidden, wider)
             readable = [e for e in entries if self.policy.allows(self.actor, "read", e.path)][:limit]
         return readable
 
@@ -145,6 +160,8 @@ class VFSView:
         self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
     ) -> list[Entry]:
         if target.real is not None:
+            if not self.policy.allows_any(self.actor, "read", target.visible):
+                return []
             matches = await self._mapped(
                 self._client.glob(pattern, target.real, excludes=excludes, hidden=hidden, limit=limit), target
             )
@@ -157,12 +174,12 @@ class VFSView:
 
     async def create(self, path: str, data: bytes | None = None, *, parents: bool = False) -> FileVersion:
         """``VFSClient.create`` of ``path``."""
-        target = self._creatable(path)
+        target = self._creatable(path, parents)
         return await self._mapped(self._client.create(_real(target), data, parents=parents), target)
 
     async def mkdir(self, path: str, *, parents: bool = False) -> UUID:
         """``VFSClient.mkdir`` of ``path``."""
-        target = self._creatable(path)
+        target = self._creatable(path, parents)
         return await self._mapped(self._client.mkdir(_real(target), parents=parents), target)
 
     async def mkdir_p(self, path: str) -> UUID | None:
@@ -170,6 +187,7 @@ class VFSView:
         target = self._target(path)
         if target.real is None:
             return None
+        self._check_parents(target)
         self.policy.check(self.actor, "write", target.visible)
         return await self._mapped(self._client.mkdir_p(_real(target)), target)
 
@@ -189,12 +207,12 @@ class VFSView:
 
     async def rename(self, src: str, dst: str) -> None:
         """``VFSClient.rename``; both paths may be in different mounts."""
-        source, dest = self._movable(src), self._movable(dst)
+        source, dest = self._moved(src), self._movable(dst)
         await self._mapped(self._client.rename(_real(source), _real(dest)), source, dest)
 
     async def claim(self, src: str, dst: str) -> bool:
         """``VFSClient.claim``: whether this caller moved ``src`` to ``dst``."""
-        source, dest = self._movable(src), self._movable(dst)
+        source, dest = self._moved(src), self._movable(dst)
         return await self._mapped(self._client.claim(_real(source), _real(dest)), source, dest)
 
     async def unlink(self, path: str) -> None:
@@ -219,12 +237,22 @@ class VFSView:
             self.policy.check(self.actor, action, target.visible)
         return target
 
-    def _creatable(self, path: str) -> _Target:
-        """``path``, to be created; EEXIST for a virtual directory."""
-        target = self._target(path, "write")
+    def _creatable(self, path: str, parents: bool) -> _Target:
+        """``path``, to be created (with its missing parents); EEXIST for a virtual directory."""
+        target = self._target(path)
         if target.real is None:
             raise VFSError("EEXIST", target.visible)
+        if parents:
+            self._check_parents(target)
+        self.policy.check(self.actor, "write", target.visible)
         return target
+
+    def _check_parents(self, target: _Target) -> None:
+        """Checks ``write`` on every directory between the mount point and ``target``, which creating
+        ``target``'s missing parents may create. Conservative: it doesn't look which are missing."""
+        assert target.mount is not None
+        for end in range(len(target.mount.visible) + 1, len(target.path)):
+            self.policy.check(self.actor, "write", join(*target.path[:end]))
 
     def _movable(self, path: str) -> _Target:
         """``path``, to be moved or removed (or replaced by a move). What is below it moves too, so the actor must
@@ -234,6 +262,13 @@ class VFSView:
             raise VFSError("EBUSY", target.visible, "a mount point")
         self.policy.check(self.actor, "write", target.visible, subtree=True)
         return target
+
+    def _moved(self, src: str) -> _Target:
+        """The source of a move: as ``_movable``, and readable throughout, since a move can land files where
+        the actor may read them."""
+        source = self._movable(src)
+        self.policy.check(self.actor, "read", source.visible, subtree=True)
+        return source
 
     def _entry(self, entry: Entry, target: _Target) -> Entry:
         return Entry(self._visible(entry.path, target), entry.id, entry.kind, entry.size, entry.mtime, entry.generation)
@@ -299,6 +334,8 @@ class VFSView:
                 continue
             if not hidden and any(name.startswith(".") for name in prefix):
                 continue
+            if not self.policy.allows_any(self.actor, "read", join(*mount.visible)):
+                continue
             mount_pattern = _below(pattern, prefix, dirs=False, path=target.visible)
             if mount_pattern is None or mount_pattern is True:
                 continue
@@ -342,7 +379,9 @@ def _below(pattern: str, prefix: tuple[str, ...], *, dirs: bool, path: str) -> s
     """Glob ``pattern``, relative to virtual directory ``path``, restated relative to the mount point ``prefix``
     below it: None if it matches nothing in the mount, True if it matches the mount point or a directory above it
     (only for ``dirs``, an exclude, which can match directories). EINVAL when it can't be restated exactly."""
-    body = pattern[:-1] if dirs and pattern.endswith("/") and not pattern.endswith("\\/") else pattern
+    if "\\/" in pattern:  # an escaped / is still a separator to glob.py: don't guess where segments are
+        raise _unrestatable(pattern, path)
+    body = pattern[:-1] if dirs and pattern.endswith("/") else pattern
     suffix = pattern[len(body) :]
     if "/" not in body:  # a name at any depth
         if not dirs:
@@ -372,7 +411,8 @@ def _below(pattern: str, prefix: tuple[str, ...], *, dirs: bool, path: str) -> s
 
 def _matches_any(segment: str, names: Sequence[str], pattern: str, path: str) -> bool:
     """Whether the glob path segment ``segment`` (of ``pattern``) matches one of ``names``."""
-    if segment in ("", ".", ".."):
+    if segment in ("", ".", "..") or _BRACED_STAR.search(segment):
+        # A brace with a `*` in it is expanded before translation and may turn into a `**` segment.
         raise _unrestatable(pattern, path)
     try:
         regex = globbing.compile_glob(segment).regex  # literals and explicit ranges only: Python reads it the same

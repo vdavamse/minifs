@@ -160,6 +160,13 @@ async def test_a_missing_mount_root(vfs: VFSClient, policy: Policy) -> None:
 def test_bad_configuration(vfs: VFSClient, policy: Policy) -> None:
     with pytest.raises(ValueError, match="inside mount"):
         VFSView(vfs, {"/w": "/a", "/w/x": "/b"}, policy, "agent")
+    with pytest.raises(ValueError, match="reaches into"):
+        VFSView(vfs, {"/rw": "/data", "/ro": "/data/ro"}, policy, "agent")
+    with pytest.raises(ValueError, match="reaches into"):
+        VFSView(vfs, {"/a": "/data", "/b": "/data"}, policy, "agent")
+    for bad in ("", "..", f"{W1}/.."):
+        with pytest.raises(ValueError):
+            workspace_mounts(bad)
     with pytest.raises(ValueError, match="no rules"):
         VFSView(vfs, workspace_mounts(W1), policy, "intruder")
 
@@ -221,6 +228,38 @@ async def test_a_move_carries_its_subtree(vfs: VFSClient) -> None:
     await raises("EACCES", agent.rename("/workspace/notes.md", "/workspace/keep"), "/workspace/keep")
     await agent.rename("/workspace/notes.md", "/workspace/keep2.md")
     assert (await vfs.pread(f"/workspaces/{W1}/keep/f.md")).content == b"kept"
+
+
+async def test_creating_parents_needs_write_on_them(vfs: VFSClient, policy: Policy) -> None:
+    agent = view(vfs, policy)
+    await vfs.unlink(f"/workspaces/{W1}/log.md")
+    for call in (
+        agent.mkdir_p("/workspace/log.md/x"),
+        agent.create("/workspace/log.md/x", b"junk", parents=True),
+        agent.mkdir("/workspace/log.md/x", parents=True),
+    ):
+        await raises("EACCES", call, "/workspace/log.md")
+    await raises("ENOENT", vfs.stat(f"/workspaces/{W1}/log.md"))
+    await agent.create("/workspace/new/deep/x.md", b"x", parents=True)
+    await raises("EACCES", agent.create("/workspace/log.md", b""), "/workspace/log.md")  # creating is a write
+
+
+async def test_a_move_needs_read_on_its_source(vfs: VFSClient) -> None:
+    drop = Policy({"agent": [Rule("/workspace/drop/**", "write"), Rule("/workspace/**", "read", "write")]})
+    agent = view(vfs, drop)
+    await vfs.create(f"/workspaces/{W1}/drop/secret.md", b"s", parents=True)
+    await raises("EACCES", agent.pread("/workspace/drop/secret.md"))
+    await raises("EACCES", agent.rename("/workspace/drop/secret.md", "/workspace/s.md"), "/workspace/drop/secret.md")
+    await raises("EACCES", agent.claim("/workspace/drop/secret.md", "/workspace/s.md"))
+    await agent.rename("/workspace/notes.md", "/workspace/drop/notes.md")  # into the drop box is fine
+
+
+async def test_glob_skips_mounts_it_cannot_read(vfs: VFSClient) -> None:
+    hidden = view(vfs, Policy({"agent": [Rule("/workspace/**"), Rule("/**", "read")]}))
+    assert [e.path for e in await hidden.glob("**", "/")] == ["/docs/guide.md"]
+    assert not hidden.policy.allows_any("agent", "read", "/workspace")
+    assert hidden.policy.allows_any("agent", "read", "/")
+    assert Policy({"a": [Rule("/w/x.md", "read"), Rule("/w/**")]}).allows_any("a", "read", "/w")
 
 
 async def test_glob_limit_counts_only_readable_files(vfs: VFSClient) -> None:

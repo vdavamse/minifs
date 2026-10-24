@@ -56,8 +56,10 @@ class Rule:
 
 
 class Policy:
-    """Ordered rules per actor. ``denials`` counts the refused operations by ``(actor, action)``, for the
-    write-policy denials metric."""
+    """Ordered rules per actor. ``denials`` counts the refused operations (``check``) by ``(actor, action)``, for
+    the write-policy denials metric; entries a view leaves out of a listing aren't refusals and aren't counted.
+    The counter belongs to the policy object, so ``DEFAULT_POLICY``'s is process-wide: build a ``Policy`` of its
+    ``rules`` for a counter of your own."""
 
     def __init__(self, rules: Mapping[str, Sequence[Rule]]) -> None:
         self.rules: dict[str, tuple[Rule, ...]] = {actor: tuple(r) for actor, r in rules.items()}
@@ -83,6 +85,20 @@ class Policy:
                     return False
                 if any(rest and _only_globstars(rest) for rest in rests):  # ends in **: covers the subtree
                     return True
+        return action == "read"
+
+    def allows_any(self, actor: str, action: Action, path: str) -> bool:
+        """Whether ``actor`` may ``action`` at ``path`` or at some path below it. Conservative the other way: True
+        unless a rule that doesn't grant ``action`` covers the whole subtree before any rule that could grant it."""
+        segments = split(path)
+        for rule in self.rules[actor]:
+            rests = _rests(rule.segments, segments)
+            if not rests:
+                continue
+            if rule.grants(action):
+                return True
+            if any(rest and _only_globstars(rest) for rest in rests):
+                return False
         return action == "read"
 
     def check(self, actor: str, action: Action, path: str, *, subtree: bool = False) -> None:
