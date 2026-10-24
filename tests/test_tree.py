@@ -108,28 +108,28 @@ async def test_duplicate_root_names_are_rejected(conn: AsyncConnection) -> None:
     await create(conn, None, "docs", "dir")
     with raises_errno("EEXIST"):
         await create(conn, None, "docs", "dir")
-    with pytest.raises(psycopg.errors.UniqueViolation):
+    with raises_errno("EEXIST"):
         await conn.execute("INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (NULL, 'docs', 'file')")
 
 
 async def test_raw_insert_under_a_file_violates_the_foreign_key(conn: AsyncConnection) -> None:
     file = await create(conn, None, "f")
-    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+    with raises_errno("ENOTDIR"):
         await conn.execute("INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (%s, 'x', 'file')", (file,))
 
 
 async def test_raw_move_under_a_file_violates_the_foreign_key(conn: AsyncConnection) -> None:
     file = await create(conn, None, "f")
     other = await create(conn, None, "g")
-    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+    with raises_errno("ENOTDIR"):
         await conn.execute("UPDATE vfs_nodes SET parent_id = %s WHERE id = %s", (file, other))
 
 
 async def test_raw_delete_of_non_empty_directory_is_restricted(conn: AsyncConnection) -> None:
     directory = await create(conn, None, "d", "dir")
     await create(conn, directory, "f")
-    # PostgreSQL 18 reports RESTRICT as restrict_violation (23001); earlier versions as foreign_key_violation.
-    with pytest.raises((psycopg.errors.RestrictViolation, psycopg.errors.ForeignKeyViolation)):
+    # PostgreSQL 18 reports RESTRICT as restrict_violation (23001), earlier versions as foreign_key_violation.
+    with raises_errno("ENOTEMPTY"):
         await conn.execute("DELETE FROM vfs_nodes WHERE id = %s", (directory,))
 
 
@@ -141,29 +141,53 @@ async def test_kind_cannot_change(conn: AsyncConnection) -> None:
 
 @pytest.mark.parametrize("name", ["", ".", "..", "a/b", "x" * 256])
 async def test_invalid_names_are_rejected(conn: AsyncConnection, name: str) -> None:
-    with raises_errno("EINVAL"):
+    with raises_errno("ENAMETOOLONG" if len(name) > 255 else "EINVAL"):
         await create(conn, None, name)
-    with pytest.raises(psycopg.errors.CheckViolation):
+    with raises_errno("EINVAL"):
         await conn.execute("INSERT INTO vfs_nodes (name, kind) VALUES (%s, 'file')", (name,))
 
 
 async def test_longest_name_is_255_bytes(conn: AsyncConnection) -> None:
     await create(conn, None, "é" * 127 + "x")  # 255 bytes
-    with raises_errno("EINVAL"):
+    with raises_errno("ENAMETOOLONG"):
         await create(conn, None, "é" * 128)  # 256 bytes
 
 
-async def test_append_style_update_is_hot(conn: AsyncConnection) -> None:
+async def _fill_first_page(conn: AsyncConnection, table: str) -> str:
+    """Inserts files into ``table`` until its first page is full; returns the ctid of a row on that page."""
+    for i in range(1000):
+        await conn.execute(f"INSERT INTO {table} (name, kind) VALUES ('file-{i:04d}', 'file')".encode())
+        row = await _one(conn, f"SELECT max((ctid::text::point)[0]) FROM {table}")
+        if row[0] == 1:
+            break
+    row = await _one(conn, f"SELECT id FROM {table} WHERE (ctid::text::point)[0] = 0 LIMIT 1")
+    return str(row[0])
+
+
+async def _page_after_updates(conn: AsyncConnection, table: str, node: str, updates: int) -> set[float]:
+    """Updates ``node``'s size and mtime the way an append does, each in its own transaction; returns the pages
+    its row version was on after each update."""
+    pages: set[float] = set()
+    for size in range(1, updates + 1):
+        await conn.execute(f"UPDATE {table} SET size = %s, mtime = now() WHERE id = %s".encode(), (size, node))
+        row = await _one(conn, f"SELECT (ctid::text::point)[0] FROM {table} WHERE id = %s", (node,))
+        assert isinstance(row[0], float)
+        pages.add(row[0])
+    return pages
+
+
+async def test_append_style_updates_are_hot(conn: AsyncConnection) -> None:
+    # A HOT update keeps the new row version on the same page (no index changes). With fillfactor 80 a full page
+    # still has room, and pruning reclaims the dead versions between transactions.
     row = await _one(conn, "SELECT reloptions FROM pg_class WHERE oid = 'vfs_nodes'::regclass")
     assert row[0] == ["fillfactor=80"]
-    file = await create(conn, None, "log.md")
-    async with conn.transaction():
-        for size in range(1, 51):
-            await conn.execute("UPDATE vfs_nodes SET size = %s, mtime = now() WHERE id = %s", (size, file))
-        row = await _one(
-            conn, "SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_xact_user_tables WHERE relname = 'vfs_nodes'"
-        )
-    assert row == (50, 50)
+    node = await _fill_first_page(conn, "vfs_nodes")
+    assert await _page_after_updates(conn, "vfs_nodes", node, 50) == {0.0}
+
+    # The control: the same table at the default fillfactor 100 moves the first update off the full page.
+    await conn.execute("CREATE TABLE nodes_ff100 (LIKE vfs_nodes INCLUDING DEFAULTS INCLUDING INDEXES)")
+    node = await _fill_first_page(conn, "nodes_ff100")
+    assert 0.0 not in await _page_after_updates(conn, "nodes_ff100", node, 1)
 
 
 # vfs_resolve
@@ -285,7 +309,17 @@ async def test_mkdir_p_errors(conn: AsyncConnection) -> None:
         await mkdir_p(conn, "a", "..", "x")
 
 
-async def test_concurrent_mkdir_p_agree(db: str) -> None:
+async def test_concurrent_mkdir_p_agree(conn: AsyncConnection, db: str) -> None:
+    async with await AsyncConnection.connect(db) as first:
+        created = await mkdir_p(first, "tasks", "new")  # uncommitted
+        # The second one's insert of "tasks" waits on the first's; after the commit it finds the rows instead.
+        second = asyncio.create_task(mkdir_p(conn, "tasks", "new"))
+        await wait_until_blocked(first, conn.info.backend_pid)
+        await first.commit()
+    assert await second == created
+
+
+async def test_many_concurrent_mkdir_p_agree(db: str) -> None:
     async def run() -> UUID | None:
         async with await AsyncConnection.connect(db, autocommit=True) as conn:
             return await mkdir_p(conn, "tasks", "new")
@@ -382,6 +416,46 @@ async def test_concurrent_directory_moves_cannot_make_a_cycle(db: str) -> None:
         with raises_errno("EINVAL"):
             await other
         assert await resolve(setup, "b", "a") == (a, "dir")
+
+
+async def test_repeatable_read_moves_cannot_make_a_cycle(db: str) -> None:
+    # A REPEATABLE READ snapshot taken before a concurrent move must not pass the cycle check on stale parents.
+    async with (
+        await AsyncConnection.connect(db, autocommit=True) as setup,
+        await AsyncConnection.connect(db, autocommit=True) as mover,
+        await AsyncConnection.connect(db) as stale,
+    ):
+        a = await mkdir_p(setup, "a")
+        y = await mkdir_p(setup, "a", "y")
+        b = await mkdir_p(setup, "b")
+        x = await mkdir_p(setup, "b", "x")
+        assert a is not None and b is not None
+        await stale.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
+        await stale.execute("SELECT 1")  # takes the snapshot
+        assert await rename(mover, a, x, "a")  # mv /a /b/x/a, committed after the snapshot
+        with pytest.raises(psycopg.errors.SerializationFailure):
+            await rename(stale, b, y, "b")  # mv /b /a/y/b would close the cycle a -> x -> b -> y -> a
+        await stale.rollback()
+        assert await resolve(setup, "b", "x", "a", "y") == (y, "dir")
+
+
+async def test_open_transaction_in_one_directory_does_not_block_other_moves(db: str) -> None:
+    async with (
+        await AsyncConnection.connect(db, autocommit=True) as setup,
+        await AsyncConnection.connect(db) as writer,
+        await AsyncConnection.connect(db, autocommit=True) as blocked,
+        await AsyncConnection.connect(db, autocommit=True) as mover,
+    ):
+        d = await mkdir_p(setup, "d")
+        e = await mkdir_p(setup, "e")
+        assert d is not None and e is not None
+        await create(writer, d, "x")  # left uncommitted: holds FOR KEY SHARE on d
+        moving_d = asyncio.create_task(rename(blocked, d, None, "d2"))  # waits for the writer
+        await wait_until_blocked(setup, blocked.info.backend_pid)
+        await mover.execute("SET statement_timeout = '5s'")
+        assert await rename(mover, e, None, "e2")  # an unrelated directory move doesn't queue behind d's
+        await writer.rollback()
+        assert await moving_d
 
 
 async def test_rename_racing_a_create_of_the_same_name(conn: AsyncConnection, db: str) -> None:

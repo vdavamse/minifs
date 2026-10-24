@@ -1,11 +1,13 @@
 import asyncio
 import uuid
 from pathlib import Path
+from typing import cast
 
 import psycopg
 import pytest
 from psycopg import AsyncConnection, sql
 from psycopg.conninfo import make_conninfo
+from psycopg.pq import TransactionStatus
 
 from minifs.cli import main
 from minifs.db.migrate import Migration, MigrationError, applied_versions, load_migrations, migrate
@@ -205,3 +207,16 @@ def test_migrations_need_no_superuser(pg_server: PgServer) -> None:
         finally:
             admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
             admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+async def test_refuses_servers_older_than_15() -> None:
+    class Info:
+        server_version = 140011
+        transaction_status = TransactionStatus.IDLE
+
+    class OldServer:
+        autocommit = True
+        info = Info()
+
+    with pytest.raises(MigrationError, match="PostgreSQL 15"):
+        await migrate(cast(AsyncConnection, OldServer()), [])
