@@ -187,7 +187,7 @@ fn char_offset(text: &str, byte_offset: usize) -> usize {
 /// Atoms in the NFA Postgres builds: characters, classes and anchors, with a word boundary
 /// counting as its four lookarounds. With `expand`, each counted repetition's operand counts as
 /// many times as its largest count, as ARE copies it.
-fn atoms(hir: &Hir, expand: bool) -> u64 {
+pub(crate) fn atoms(hir: &Hir, expand: bool) -> u64 {
     match hir.kind() {
         HirKind::Empty => 0,
         HirKind::Literal(lit) => String::from_utf8_lossy(&lit.0).chars().count() as u64,

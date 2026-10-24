@@ -15,6 +15,19 @@ use regex_syntax::hir::{Hir, HirKind};
 
 use crate::translate::{self, Error, Subject};
 
+/// Deepest brace nesting accepted. globset turns braces into a regex recursively, so an
+/// unbounded depth could overflow the stack of a thread with a small one (512 KB on macOS).
+pub const MAX_BRACE_DEPTH: usize = 64;
+
+/// Why a pattern ending in `/` can't list files.
+pub const ONLY_DIR: &str =
+    "a pattern ending in '/' matches only directories, and only files are listed";
+
+/// Largest glob, in characters, classes and anchors of its regex. `vfs_glob` matches the regex
+/// against every path it walks, and a real glob has a few dozen; this still admits a literal
+/// path of a few thousand characters.
+pub const MAX_ATOMS: u64 = 4096;
+
 /// What `vfs_glob` needs for one pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobPlan {
@@ -39,9 +52,10 @@ fn error(message: impl Into<String>, syntax: bool) -> Error {
 }
 
 /// Compiles `pattern` as `rg -g` does. Errors carry globset's message (as rg prints it after
-/// `error parsing glob '<pattern>': `), with `syntax` set, or a reason of our own for patterns
-/// rg accepts but means something else by (a leading `!` or `#`).
-pub fn compile(pattern: &str) -> Result<GlobPlan, Error> {
+/// `error parsing glob '<pattern>': `), with `syntax` set, or a reason of our own. An include
+/// with a leading `!` or `#` is refused, since rg would read a negation or a comment. An
+/// `exclude` is the part after rg's `-g '!'`, where both are ordinary characters.
+pub fn compile(pattern: &str, exclude: bool) -> Result<GlobPlan, Error> {
     if pattern.contains('\0') {
         return Err(error("NUL character", false));
     }
@@ -49,13 +63,16 @@ pub fn compile(pattern: &str) -> Result<GlobPlan, Error> {
         return Err(error(
             format!(
                 "glob is too long ({} KB, the limit is {} KB)",
-                pattern.len() / 1024,
+                pattern.len().div_ceil(1024),
                 translate::MAX_PATTERN_LEN / 1024
             ),
             false,
         ));
     }
-    let (actual, only_dir) = gitignore_glob(pattern)?;
+    let (actual, only_dir) = gitignore_glob(pattern, exclude)?;
+    if brace_depth(&actual) > MAX_BRACE_DEPTH {
+        return Err(error("braces nested too deeply", false));
+    }
     let glob = GlobBuilder::new(&actual)
         .literal_separator(true)
         .backslash_escape(true)
@@ -66,15 +83,18 @@ pub fn compile(pattern: &str) -> Result<GlobPlan, Error> {
         .dot_matches_new_line(true)
         .build()
         .parse(&unicode_regex(glob.regex()))
-        .map_err(|e| match e {
-            regex_syntax::Error::Parse(e)
-                if matches!(e.kind(), regex_syntax::ast::ErrorKind::NestLimitExceeded(_)) =>
-            {
-                error("braces nested too deeply", false)
-            }
-            // globset writes valid regexes; never echo one, it can be as long as the pattern.
-            _ => error("internal error: globset's regex doesn't parse", false),
-        })?;
+        // globset writes valid regexes; never echo one, it can be as long as the pattern.
+        .map_err(|_| error("internal error: globset's regex doesn't parse", false))?;
+    let atoms = translate::atoms(&hir, false);
+    if atoms > MAX_ATOMS {
+        return Err(error(
+            format!(
+                "glob is too large ({atoms} characters and classes once translated, the limit \
+                 is {MAX_ATOMS}); use a shorter pattern"
+            ),
+            false,
+        ));
+    }
     let regex = translate::translate_hir(&hir, Subject::Path)?;
     let prefix = literal_prefix(&hir);
     let max_depth = max_slashes(&hir)
@@ -89,17 +109,52 @@ pub fn compile(pattern: &str) -> Result<GlobPlan, Error> {
     })
 }
 
+/// The deepest brace nesting of a glob, scanned as globset's parser reads it: a backslash
+/// escapes the next character and braces inside a class are literal. An unclosed class ends
+/// the scan; globset rejects it.
+fn brace_depth(glob: &str) -> usize {
+    let (mut depth, mut max) = (0usize, 0usize);
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '[' => {
+                // `[!` / `[^` negate, and a `]` right after the opening is literal.
+                if matches!(chars.peek(), Some('!' | '^')) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&']') {
+                    chars.next();
+                }
+                if !chars.by_ref().any(|c| c == ']') {
+                    break;
+                }
+            }
+            '{' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
 /// The glob globset gets, and whether it is for directories only: what
-/// `ignore::gitignore::GitignoreBuilder::add_line` does to each `-g` pattern.
-fn gitignore_glob(pattern: &str) -> Result<(String, bool), Error> {
-    // rg would take these as a comment (ignoring the glob) and as a negation (an exclude).
-    if pattern.starts_with('#') {
+/// `ignore::gitignore::GitignoreBuilder::add_line` does to each `-g` pattern (for an exclude,
+/// to what follows its `!`).
+fn gitignore_glob(pattern: &str, exclude: bool) -> Result<(String, bool), Error> {
+    // In an include, rg would take these as a comment (ignoring the glob) and as a negation.
+    if !exclude && pattern.starts_with('#') {
         return Err(error(
             "a leading '#' makes the glob a comment, which rg ignores; escape it as '\\#'",
             false,
         ));
     }
-    if pattern.starts_with('!') {
+    if !exclude && pattern.starts_with('!') {
         return Err(error(
             "a leading '!' negates the glob in rg; pass it as an exclude, or escape it as '\\!'",
             false,
@@ -112,7 +167,7 @@ fn gitignore_glob(pattern: &str) -> Result<(String, bool), Error> {
         pattern.trim_end()
     };
     let mut absolute = false;
-    if line.starts_with("\\!") || line.starts_with("\\#") {
+    if !exclude && (line.starts_with("\\!") || line.starts_with("\\#")) {
         line = &line[1..];
     } else if let Some(rest) = line.strip_prefix('/') {
         // A leading '/' only anchors.
@@ -342,11 +397,11 @@ mod tests {
     use super::*;
 
     fn regex(pattern: &str) -> String {
-        compile(pattern).unwrap().regex
+        compile(pattern, false).unwrap().regex
     }
 
     fn rejected(pattern: &str) -> Error {
-        compile(pattern).unwrap_err()
+        compile(pattern, false).unwrap_err()
     }
 
     fn plan(
@@ -409,25 +464,46 @@ mod tests {
 
     #[test]
     fn gitignore_rules() {
-        assert_eq!(gitignore_glob("*.md").unwrap(), ("**/*.md".into(), false));
-        assert_eq!(gitignore_glob("**/x").unwrap(), ("**/x".into(), false));
-        assert_eq!(gitignore_glob("**").unwrap(), ("**".into(), false));
-        assert_eq!(gitignore_glob("/x").unwrap(), ("x".into(), false));
-        assert_eq!(gitignore_glob("a/b").unwrap(), ("a/b".into(), false));
         assert_eq!(
-            gitignore_glob("src/**").unwrap(),
+            gitignore_glob("*.md", false).unwrap(),
+            ("**/*.md".into(), false)
+        );
+        assert_eq!(
+            gitignore_glob("**/x", false).unwrap(),
+            ("**/x".into(), false)
+        );
+        assert_eq!(gitignore_glob("**", false).unwrap(), ("**".into(), false));
+        assert_eq!(gitignore_glob("/x", false).unwrap(), ("x".into(), false));
+        assert_eq!(gitignore_glob("a/b", false).unwrap(), ("a/b".into(), false));
+        assert_eq!(
+            gitignore_glob("src/**", false).unwrap(),
             ("src/**/*".into(), false)
         );
-        assert_eq!(gitignore_glob("build/").unwrap(), ("**/build".into(), true));
         assert_eq!(
-            gitignore_glob("build\\/").unwrap(),
+            gitignore_glob("build/", false).unwrap(),
             ("**/build".into(), true)
         );
-        assert_eq!(gitignore_glob("a/b/").unwrap(), ("a/b".into(), true));
-        assert_eq!(gitignore_glob("x.md  ").unwrap(), ("**/x.md".into(), false));
-        assert_eq!(gitignore_glob("x\\ ").unwrap(), ("**/x\\ ".into(), false));
-        assert_eq!(gitignore_glob("\\!x").unwrap(), ("**/!x".into(), false));
-        assert_eq!(gitignore_glob("\\#x").unwrap(), ("**/#x".into(), false));
+        assert_eq!(
+            gitignore_glob("build\\/", false).unwrap(),
+            ("**/build".into(), true)
+        );
+        assert_eq!(gitignore_glob("a/b/", false).unwrap(), ("a/b".into(), true));
+        assert_eq!(
+            gitignore_glob("x.md  ", false).unwrap(),
+            ("**/x.md".into(), false)
+        );
+        assert_eq!(
+            gitignore_glob("x\\ ", false).unwrap(),
+            ("**/x\\ ".into(), false)
+        );
+        assert_eq!(
+            gitignore_glob("\\!x", false).unwrap(),
+            ("**/!x".into(), false)
+        );
+        assert_eq!(
+            gitignore_glob("\\#x", false).unwrap(),
+            ("**/#x".into(), false)
+        );
     }
 
     #[test]
@@ -459,15 +535,43 @@ mod tests {
                 "{pattern:?}: {err}"
             );
         }
-        assert!(compile("src/").unwrap().only_dir);
-        let deep = format!("{}a{}", "{".repeat(300), "}".repeat(300));
-        assert_eq!(rejected(&deep).message, "braces nested too deeply");
+        assert!(compile("src/", false).unwrap().only_dir);
+        // Refused before globset recurses: this used to overflow a 512 KB stack.
+        let deep = format!("{}a{}", "{".repeat(5000), "}".repeat(5000));
+        let message = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || compile(&deep, false).unwrap_err().message)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(message, "braces nested too deeply");
+        let ok = format!(
+            "{}a{}",
+            "{".repeat(MAX_BRACE_DEPTH),
+            "}".repeat(MAX_BRACE_DEPTH)
+        );
+        assert!(compile(&ok, false).is_ok());
+        // Braces in classes and escaped ones don't count.
+        assert_eq!(brace_depth(r"{a,[{{]\{{b}}"), 2);
+        assert_eq!(brace_depth("[]{]{"), 1);
+        assert!(
+            rejected(&"?".repeat(5000))
+                .message
+                .starts_with("glob is too large (")
+        );
+        // In an exclude (what follows rg's `-g '!'`), a leading '!' or '#' is a character.
+        assert_eq!(gitignore_glob("#x", true).unwrap(), ("**/#x".into(), false));
+        assert_eq!(gitignore_glob("!x", true).unwrap(), ("**/!x".into(), false));
+        assert_eq!(
+            gitignore_glob("\\!x", true).unwrap(),
+            ("**/\\!x".into(), false)
+        );
     }
 
     #[test]
     fn hints() {
         let p = |pattern: &str| {
-            let mut plan = compile(pattern).unwrap();
+            let mut plan = compile(pattern, false).unwrap();
             plan.regex.clear();
             plan
         };

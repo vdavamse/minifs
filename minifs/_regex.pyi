@@ -23,8 +23,9 @@ def translate(pattern: str, ignore_case: bool = False) -> str:
     Raises ``RegexError`` for a pattern ripgrep rejects or that has no ARE equivalent.
     """
 
-def compile_glob(pattern: str) -> tuple[str, list[str], int | None, str | None, bool]:
-    """Compile a glob as ``rg -g`` takes it: ``(regex, prefix, max_depth, name_like, only_dir)``.
+def compile_glob(pattern: str, exclude: bool = False) -> tuple[str, list[str], int | None, str | None, bool]:
+    """Compile a glob as ``rg -g`` takes it (with ``exclude``, as what follows ``rg -g '!'``):
+    ``(regex, prefix, max_depth, name_like, only_dir)``.
 
     ``regex`` is an anchored ARE over paths relative to the search root, where ``?`` and classes match one
     character and never ``/``. ``prefix`` holds the literal leading directories, ``max_depth`` the deepest level
@@ -32,11 +33,13 @@ def compile_glob(pattern: str) -> tuple[str, list[str], int | None, str | None, 
     (None: it would filter nothing), and ``only_dir`` is true for a pattern ending in ``/``.
 
     Raises ``RegexError`` with globset's message (``syntax`` true) for a glob rg rejects, and for an empty pattern,
-    a NUL, a leading ``!`` or ``#`` (rg reads them as a negation and a comment) or a translation too large.
+    a NUL, braces nested over 64 deep, a glob over 4,096 characters and classes once translated, and, unless
+    ``exclude``, a leading ``!`` or ``#`` (rg reads them as a negation and a comment).
     """
 
 def glob_to_are(pattern: str) -> str:
-    """The ``regex`` of ``compile_glob(pattern)``."""
+    """The ``regex`` of ``compile_glob(pattern)``; also raises ``RegexError`` for a pattern ending in ``/``, which
+    matches only directories."""
 
 def escape(text: str) -> str:
     """Escape regex metacharacters, so the result matches ``text`` literally."""
@@ -46,6 +49,6 @@ ORACLE_CHARS: str
 
 def oracle_is_match(pattern: str, haystack: str, ignore_case: bool = False) -> bool: ...
 def oracle_random_pattern(seed: int) -> str: ...
-def oracle_glob_is_match(pattern: str, path: str, is_dir: bool = False) -> bool:
-    """Whether ``rg -g pattern`` matches ``path`` (a directory when ``is_dir``), by ripgrep's own matcher (bytes, not
-    characters)."""
+def oracle_glob_is_match(pattern: str, path: str, is_dir: bool = False, exclude: bool = False) -> bool:
+    """Whether ``rg -g pattern`` (with ``exclude``, ``rg -g '!pattern'``) matches ``path`` (a directory when
+    ``is_dir``), by ripgrep's own matcher (bytes, not characters)."""

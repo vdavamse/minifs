@@ -103,6 +103,12 @@ OTHER_ERRORS = [
     ("!a", "a leading '!' negates the glob in rg; pass it as an exclude, or escape it as '\\!'"),
     ("#a", "a leading '#' makes the glob a comment, which rg ignores; escape it as '\\#'"),
     ("x" * 65 * 1024, "glob is too long (65 KB, the limit is 64 KB)"),
+    ("{" * 65 + "a" + "}" * 65, "braces nested too deeply"),
+    ("{" * 20_000 + "a" + "}" * 20_000, "braces nested too deeply"),  # refused before globset recurses
+    (
+        "?" * 5000,
+        "glob is too large (5005 characters and classes once translated, the limit is 4096); use a shorter pattern",
+    ),
     ("src/", "a pattern ending in '/' matches only directories, and only files are listed"),
     ("**/", "a pattern ending in '/' matches only directories, and only files are listed"),
     ("src\\/", "a pattern ending in '/' matches only directories, and only files are listed"),
@@ -117,7 +123,7 @@ def test_bad_patterns(pattern: str, message: str) -> None:
     assert str(info.value) == f"error parsing glob '{pattern}': {message}"
 
 
-# rg 14.1 (what apt installs) bundles an older globset, which takes a stray '}' literally (README: Divergences).
+# rg 14.1 (what apt installs) bundles an older globset, which drops a stray '}' (README: Divergences).
 @pytest.mark.parametrize(("pattern", "message"), [e for e in SYNTAX_ERRORS if e[0] != "a}"])
 def test_rejections_match_rg(pattern: str, message: str, rg_path: str, tmp_path: Path) -> None:
     result = subprocess.run([rg_path, "--files", "-g", pattern], cwd=tmp_path, capture_output=True, text=True)
@@ -172,7 +178,13 @@ def test_exclude_regexes() -> None:
         False,
     ]
     assert compile_excludes(["build\\/"]).regexes == unpruned.regexes[1:]  # an escaped '/' is one too
-    for bad in ["/", "!x/", "[a"]:
+    # What follows rg's -g '!': a leading '!' or '#' is a character.
+    assert [_python_match(compile_excludes(["#x", "!y"]).regexes[i], p) for i, p in [(0, "a/#x"), (1, "!y")]] == [
+        True,
+        True,
+    ]
+    assert compile_excludes(["!x/"]).prune_dirs == ("!x",)
+    for bad in ["/", "[a", "{a"]:
         with pytest.raises(GlobError):
             compile_excludes([bad])
     with pytest.raises(TypeError):
@@ -313,7 +325,10 @@ def test_excludes_agree_with_rg(prune: bool) -> None:
     mismatches: list[tuple[str, str, bool]] = []
     rng = random.Random(32)
     cases = _cases(seed=33, n=800)
-    extra = ["**/node_modules/**", "build/", "{a/,b}", "b{a,/}", "{node_modules/,dist/}", "a/*", "a**/", "*/"]
+    extra = [
+        "**/node_modules/**", "build/", "{a/,b}", "b{a,/}", "{node_modules/,dist/}", "a/*", "a**/", "*/", "#a", "!a",
+        "\\!a", "#*/", "!",
+    ]  # fmt: skip
     for pattern, paths in [*cases, *((p, [_gen_path(rng, _ASCII_NAME_CHARS) for _ in range(40)]) for p in extra)]:
         try:
             ex = compile_excludes([pattern], prune=prune)
@@ -322,8 +337,8 @@ def test_excludes_agree_with_rg(prune: bool) -> None:
         oracle = _oracle_pattern(pattern)
         for path in paths:
             p = _oracle_path(pattern, path)
-            expected = _regex.oracle_glob_is_match(oracle, p) or any(
-                _regex.oracle_glob_is_match(oracle, d, is_dir=True) for d in _ancestors(p)
+            expected = _regex.oracle_glob_is_match(oracle, p, exclude=True) or any(
+                _regex.oracle_glob_is_match(oracle, d, is_dir=True, exclude=True) for d in _ancestors(p)
             )
             dirs = _ancestors(path)
             got = any(_python_match(r, path) for r in ex.regexes) or any(
@@ -394,6 +409,8 @@ DIVERGENCES = [
     ("[!a].md", "é.md", True, False),
     ("/a[!x]b", "a/b", False, True),  # a class never matches '/'; rg's negated classes and ranges do
     ("a[!x]b", "a/b", False, True),  # even unanchored
+    ("/a[/]b", "a/b", False, True),  # nor an explicit '/'
+    ("/a[x/]b", "a/b", False, True),
     ("/a[.-0]b", "a/b", False, True),
 ]
 
@@ -406,6 +423,28 @@ def test_divergences_from_rg(pattern: str, path: str, ours: bool, rg: bool, rg_p
     result = subprocess.run([rg_path, "--files", "-g", pattern], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode in (0, 1), result.stderr
     assert (result.stdout.strip() == path) == rg
+
+
+def test_globset_version_skew_with_rg(rg_path: str, tmp_path: Path) -> None:
+    # rg 14's bundled globset drops a stray '}' and rejects nested braces; ours (0.4.18+) does the reverse.
+    version = subprocess.run([rg_path, "--version"], capture_output=True, text=True).stdout.split()[1]
+    if not version.startswith("14."):
+        pytest.skip(f"checks rg 14's globset, this is rg {version}")
+    for name in ["a", "a}", "b"]:
+        (tmp_path / name).write_text("")
+    stray = subprocess.run([rg_path, "--files", "-g", "a}"], cwd=tmp_path, capture_output=True, text=True)
+    assert stray.stdout.split() == ["a"]
+    nested = subprocess.run([rg_path, "--files", "-g", "{a,{b}}"], cwd=tmp_path, capture_output=True, text=True)
+    assert nested.returncode == 2 and "nested alternate groups are not allowed" in nested.stderr
+    with pytest.raises(GlobError):
+        compile_glob("a}")
+    assert _python_match(glob_to_regex("{a,{b}}"), "b")
+
+
+def test_glob_to_are() -> None:
+    assert _regex.glob_to_are("src/*.py") == glob_to_regex("src/*.py")
+    with pytest.raises(_regex.RegexError, match="matches only directories"):
+        _regex.glob_to_are("src/")
 
 
 def _like_regex(like: str) -> str:

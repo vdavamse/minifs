@@ -17,18 +17,24 @@ pub fn oracle_is_match(
         .is_match(haystack))
 }
 
-/// Reports whether `rg -g <pattern>` matches `path` (relative to the search root), a directory
-/// when `is_dir`, using ripgrep's own override matcher from the `ignore` crate. It matches
-/// bytes, so `?` and classes match one byte of a non-ASCII character where the translation
-/// matches the whole character.
+/// Reports whether `rg -g <pattern>` (with `exclude`, `rg -g '!<pattern>'`) matches `path`
+/// (relative to the search root), a directory when `is_dir`, using ripgrep's own override
+/// matcher from the `ignore` crate. It matches bytes, so `?` and classes match one byte of a
+/// non-ASCII character where the translation matches the whole character.
 pub fn oracle_glob_is_match(
     pattern: &str,
     path: &str,
     is_dir: bool,
+    exclude: bool,
 ) -> Result<bool, ignore::Error> {
     let mut builder = ignore::overrides::OverrideBuilder::new(".");
-    builder.add(pattern)?;
-    Ok(builder.build()?.matched(path, is_dir).is_whitelist())
+    if exclude {
+        builder.add(&format!("!{pattern}"))?;
+        Ok(builder.build()?.matched(path, is_dir).is_ignore())
+    } else {
+        builder.add(pattern)?;
+        Ok(builder.build()?.matched(path, is_dir).is_whitelist())
+    }
 }
 
 /// A random pattern, printed from a random HIR with regex-syntax's printer. The same seed

@@ -51,10 +51,11 @@ fn py_translate(py: Python<'_>, pattern: &str, ignore_case: bool) -> PyResult<St
 /// `(regex, prefix, max_depth, name_like, only_dir)`: a [`glob::GlobPlan`] for Python.
 type PyGlobPlan = (String, Vec<String>, Option<u32>, Option<String>, bool);
 
-/// The regex and pruning hints for a glob.
+/// The regex and pruning hints for a glob; with `exclude`, for what follows rg's `-g '!'`.
 #[pyfunction(name = "compile_glob")]
-fn py_compile_glob(py: Python<'_>, pattern: &str) -> PyResult<PyGlobPlan> {
-    let plan = glob::compile(pattern).map_err(|e| regex_error(py, e))?;
+#[pyo3(signature = (pattern, exclude = false))]
+fn py_compile_glob(py: Python<'_>, pattern: &str, exclude: bool) -> PyResult<PyGlobPlan> {
+    let plan = glob::compile(pattern, exclude).map_err(|e| regex_error(py, e))?;
     Ok((
         plan.regex,
         plan.prefix,
@@ -64,12 +65,22 @@ fn py_compile_glob(py: Python<'_>, pattern: &str) -> PyResult<PyGlobPlan> {
     ))
 }
 
-/// Translates a glob, as `rg -g` takes it, into an anchored ARE over relative paths.
+/// Translates a glob, as `rg -g` takes it, into an anchored ARE over relative file paths. A
+/// pattern ending in `/` matches only directories, so it is rejected.
 #[pyfunction(name = "glob_to_are")]
 fn py_glob_to_are(py: Python<'_>, pattern: &str) -> PyResult<String> {
-    glob::compile(pattern)
-        .map(|plan| plan.regex)
-        .map_err(|e| regex_error(py, e))
+    let plan = glob::compile(pattern, false).map_err(|e| regex_error(py, e))?;
+    if plan.only_dir {
+        return Err(regex_error(
+            py,
+            translate::Error {
+                message: glob::ONLY_DIR.to_string(),
+                span: None,
+                syntax: false,
+            },
+        ));
+    }
+    Ok(plan.regex)
 }
 
 /// Escapes regex metacharacters, so the result matches `text` literally.
@@ -88,9 +99,14 @@ fn py_oracle_is_match(pattern: &str, haystack: &str, ignore_case: bool) -> PyRes
 
 #[cfg(feature = "oracle")]
 #[pyfunction(name = "oracle_glob_is_match")]
-#[pyo3(signature = (pattern, path, is_dir = false))]
-fn py_oracle_glob_is_match(pattern: &str, path: &str, is_dir: bool) -> PyResult<bool> {
-    oracle::oracle_glob_is_match(pattern, path, is_dir)
+#[pyo3(signature = (pattern, path, is_dir = false, exclude = false))]
+fn py_oracle_glob_is_match(
+    pattern: &str,
+    path: &str,
+    is_dir: bool,
+    exclude: bool,
+) -> PyResult<bool> {
+    oracle::oracle_glob_is_match(pattern, path, is_dir, exclude)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 

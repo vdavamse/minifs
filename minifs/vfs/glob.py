@@ -71,15 +71,15 @@ def glob_to_regex(pattern: str) -> str:
 @lru_cache(maxsize=1024)
 def compile_glob(pattern: str) -> GlobPlan:
     """The regex and the pruning hints for ``pattern``. Raises GlobError."""
-    regex, prefix, max_depth, name_like, only_dir = _compile(pattern)
+    regex, prefix, max_depth, name_like, only_dir = _compile(pattern, exclude=False)
     if only_dir:
         raise GlobError(pattern, "a pattern ending in '/' matches only directories, and only files are listed")
     return GlobPlan(regex, tuple(prefix), max_depth, name_like)
 
 
-def _compile(pattern: str) -> tuple[str, list[str], int | None, str | None, bool]:
+def _compile(pattern: str, *, exclude: bool) -> tuple[str, list[str], int | None, str | None, bool]:
     try:
-        return _regex.compile_glob(pattern)
+        return _regex.compile_glob(pattern, exclude)
     except _regex.RegexError as e:
         raise GlobError(pattern, e.message) from None
 
@@ -88,7 +88,8 @@ def compile_excludes(patterns: Iterable[str], *, prune: bool = True) -> Excludes
     """The regexes and pruned directory names for exclude patterns (rg's ``-g '!...'``). Raises GlobError.
 
     As in gitignore, a trailing ``/`` limits a pattern to directories and doesn't anchor it: ``build/`` skips
-    every directory named build. With ``prune``, ``**/<name>/**`` and ``<name>/`` with a literal name become
+    every directory named build. A pattern is what follows rg's ``-g '!'``, so a leading ``!`` or ``#`` is an
+    ordinary character. With ``prune``, ``**/<name>/**`` and ``<name>/`` with a literal name become
     pruned directory names instead of regexes, so the walk never enters those directories. The result is the
     same either way.
     """
@@ -101,7 +102,7 @@ def compile_excludes(patterns: Iterable[str], *, prune: bool = True) -> Excludes
         if name is not None:
             prune_dirs.append(name)
             continue
-        regex, _, _, _, only_dir = _compile(pattern)
+        regex, _, _, _, only_dir = _compile(pattern, exclude=True)
         # Directories are tested as "path/", and files never end in '/'. The lookbehind keeps a match of "path/"
         # itself (from an alternative ending in '/', like {a/,b}) from excluding the directory "path".
         regexes.append(regex.removesuffix("$") + ("/$" if only_dir else "(?<!/)/?$"))
@@ -154,6 +155,6 @@ def _pruned_dir_name(pattern: str) -> str | None:
         name = pattern[:-1]
     else:
         return None
-    if not name or any(c in name for c in "/\\*?[]{}") or name in (".", "..") or name[0] in "!#":
+    if not name or any(c in name for c in "/\\*?[]{}") or name in (".", ".."):
         return None
     return name
