@@ -21,7 +21,7 @@ An agent sees one filesystem tree, stored entirely in Postgres, and works on it 
 - Full POSIX: no hard links, permission bits, xattrs or random-offset writes in v1.
 - Large binary files. The design targets text (source code, markdown, logs) from kilobytes to a few megabytes per file.
 
-**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly extents in `vfs_extents`. SQL functions implement append, overwrite, positional read, rename and watch (via NOTIFY). A trigger keeps a line index (`vfs_lines`, with a trigram index) in step with every write, which powers `rg`. A recursive walk over the parent pointers powers `glob`. A Python VFS library wraps these functions, and agent tools (for example PydanticAI tools) wrap the library.
+**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly extents in `vfs_extents`. SQL functions implement append, overwrite, positional read, rename, compaction and watch (via NOTIFY). `rg` scans the current bytes of the files in scope inside Postgres, the way ripgrep scans a disk, so there is no line table or search index to keep in step with writes. A recursive walk over the parent pointers powers `glob`. A Python VFS library wraps these functions and caches what can't go stale: directory entries, and file bytes keyed by generation. Agent tools (for example PydanticAI tools) wrap the library.
 
 ## Context
 
@@ -29,7 +29,7 @@ An agent sees one filesystem tree, stored entirely in Postgres, and works on it 
 
 **Why not a real filesystem?** Many places agents run don't allow one. Managed platforms run apps as a non-privileged user with no system packages and no FUSE ([Databricks Apps best practices](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/best-practices)), and AWS Fargate allows only `SYS_PTRACE` to be added ([ECS KernelCapabilities](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_KernelCapabilities.html)). Every kernel-mount approach needs `CAP_SYS_ADMIN` or `/dev/fuse`, so the filesystem lives in the tool layer, not the kernel. Postgres also gives durability, transactions, concurrent access from many agents and change notifications for free.
 
-**What we take from TigerFS.** TigerFS exposes PostgreSQL as a mountable filesystem. Its file-first workspaces already use a parent-pointer directory model (ADR-017: `parent_id`, `filename`, `UNIQUE NULLS NOT DISTINCT`, a one-round-trip `resolve_path`, and a 2-second path cache). Its consistency rule is: never cache content, cache only metadata. This design adopts all of that. It adds extent-based content for appends and offset reads, and replaces kernel mounts with tools.
+**What we take from TigerFS.** TigerFS exposes PostgreSQL as a mountable filesystem. Its file-first workspaces already use a parent-pointer directory model (ADR-017: `parent_id`, `filename`, `UNIQUE NULLS NOT DISTINCT`, a one-round-trip `resolve_path`, and a 2-second path cache). Its consistency rule is: never cache content, cache only metadata. This design adopts the directory model and refines that rule: content may be cached because bytes never change within a generation, and every read still checks the database (see Caching). It adds extent-based content for appends and offset reads, and replaces kernel mounts with tools.
 
 ## Architecture
 
@@ -46,15 +46,15 @@ Any number of clients share one VFS library and one set of SQL functions. Postgr
                     SQL functions
                            |
                       PostgreSQL
-        vfs_nodes · vfs_extents · vfs_lines · NOTIFY vfs
+        vfs_nodes · vfs_extents · NOTIFY vfs
 ```
 
 | Component | Role |
 | --- | --- |
 | Agent tools | `ls`, `read`, `write`, `glob`, `rg` exposed to the model, with shell-style errors |
-| VFS library | Path resolution, the chroot view, write policy, glob and regex translation, and watch |
-| SQL functions | Append, overwrite, positional read, resolve, readdir, create, rename, unlink |
-| PostgreSQL | Tables, triggers for the line index and NOTIFY |
+| VFS library | Path resolution, the chroot view, write policy, glob and regex translation, caching, and watch |
+| SQL functions | Append, overwrite, positional read, resolve, readdir, create, rename, unlink, search, compact |
+| PostgreSQL | Tables, the NOTIFY trigger, and routine compaction |
 
 ## Filesystem tree and conventions
 
@@ -110,6 +110,7 @@ CREATE TABLE vfs_extents (                       -- data blocks
     data        BYTEA  NOT NULL,
     PRIMARY KEY (node_id, generation, byte_offset)
 );
+ALTER TABLE vfs_extents ALTER COLUMN data SET STORAGE EXTERNAL;   -- slice reads without decompressing
 ```
 
 Each column choice, and why:
@@ -123,6 +124,7 @@ Each column choice, and why:
 | `generation` | Lets readers and cursors tell an append (same generation, larger size) from a rewrite (new generation). | Comparing content hashes |
 | `size` stored on the inode | `stat` without scanning extents. It's always updated in the same transaction as the extent, so it can't drift. | Computing `sum(length(data))` on every stat |
 | `BYTEA` content | True byte offsets, and safe for binary content. Python decodes UTF-8. | `TEXT` (offsets would be in characters) |
+| `STORAGE EXTERNAL` on `data` | TOAST stores values over about 2 KB in roughly 2 KB chunks. Uncompressed, a `substring` fetches only the chunks it covers, so a 16 KB read of a 5 MB extent touches about 8 chunks. | The default `EXTENDED`: text compresses 3 to 4 times, but a slice read may decompress from the start of the value |
 
 **Directory entry and inode in one row.** Without hard links, every inode has exactly one name, so splitting them gains nothing. If hard links are ever needed, split this into `inodes(id, size, generation, nlink, ...)` and `dentries(parent_id, name, inode_id)`.
 
@@ -130,7 +132,11 @@ Each column choice, and why:
 
 **Moves must not create cycles.** `rename` of a directory checks that the destination isn't inside the source. A recursive CTE walks up from the destination's parent within the same transaction, so a move like `mv /a /a/b/c` returns `EINVAL`.
 
-**Extent count.** A log appended one line at a time gains one extent per append. A few thousand extents still read in a single indexed range scan. If it ever matters, an optional compaction job can merge extents into about 64 KB pieces under the inode lock, without changing the bytes or the generation.
+**Compaction.** Extent size isn't a tuning knob: an extent is exactly as big as the write that made it, and TOAST already splits large values into chunks. What grows is the extent count: a log appended one line at a time gains one extent per append. `vfs_compact(node)` merges a file's extents into pieces of about 64 KB under the inode lock.
+
+- It changes none of the bytes, `size`, `generation` or `mtime`, so readers, cursors and caches never notice. It doesn't update `vfs_nodes`, so it emits no NOTIFY.
+- It runs as routine maintenance: a periodic job compacts files with more than 1,000 extents. `vfs_append` can also compact opportunistically when a file crosses that threshold.
+- The target size is forgiving. Anything from 16 KB to 1 MB behaves about the same, so it is set once, not tuned.
 
 ## Core operations
 
@@ -174,7 +180,6 @@ BEGIN
     SELECT generation INTO v_gen FROM vfs_nodes WHERE id = p_node AND kind = 'file' FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'ENOENT' USING ERRCODE = 'P0002'; END IF;
     DELETE FROM vfs_extents WHERE node_id = p_node;
-    DELETE FROM vfs_lines   WHERE node_id = p_node;      -- search index, see Search
     INSERT INTO vfs_extents VALUES (p_node, v_gen + 1, 0, p_data);
     UPDATE vfs_nodes SET generation = v_gen + 1, size = length(p_data), mtime = now()
      WHERE id = p_node;
@@ -194,7 +199,7 @@ This is how a worker claims a file from `tasks/new/` to `tasks/cur/`. If two wor
 
 ### Path resolution
 
-`vfs_resolve(segments TEXT[])` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. The library caches `(parent_id, name) -> id` for 2 seconds, which is metadata only. Renames and unlinks clear the affected entries.
+`vfs_resolve(segments TEXT[])` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. The library caches `(parent_id, name) -> id` and evicts entries when NOTIFY reports a move or delete (see Caching).
 
 ### Watch (inotify)
 
@@ -217,6 +222,7 @@ CREATE TRIGGER trg_vfs_notify AFTER INSERT OR UPDATE OR DELETE ON vfs_nodes
 - An append updates `size`, so it emits `modify`. A Maildir-style claim emits `move`.
 - Notifications are delivered **at commit**, so a watcher is never woken for data it can't read yet.
 - In Python, `vfs.watch(path)` is an async iterator that filters the single `vfs` channel by node id (a file) or parent id (a directory).
+- The library's directory cache listens on the same channel and connection (see Caching).
 
 ## Read contract
 
@@ -286,6 +292,45 @@ The tool keeps `path -> (generation, next_offset)` in the agent's run state and 
 
 - `rg` hits carry byte offsets (`style.md @18234`), so the agent can follow up with `read(path, offset=18234 - 500, limit=2000)`.
 - A cursor is just a saved `next_offset`, so tailing a log is a `read` with no offset.
+
+## Caching
+
+PostgreSQL stays the single source of truth: every read through a cache still reflects the latest committed write. Two properties make that cheap.
+
+- **File bytes never change in place.** An append adds bytes after the end, an overwrite starts a new generation, and compaction changes neither. Bytes cached under `(node_id, generation)` are valid forever. The only question is whether the file has grown or been rewritten.
+- **Directory entries are keyed by parent id, not by path.** Renaming `/a` to `/b` changes only the `(root, "a")` entry. Every entry below it is keyed by its parent's id, which didn't change, so it stays valid.
+
+| Cache | Key → value | Kept fresh by | Used by |
+| --- | --- | --- | --- |
+| Directory entries | `(parent_id, name) -> id` | NOTIFY `move` and `delete` evict; a 2 s TTL as a fallback | Every path resolution |
+| File content | `(node_id, generation) -> bytes [0, cached_size)` | The read itself (below) | Agent `read`, line snapping, the line map |
+| Line map | `(node_id, generation) ->` byte offset of every 1,000th line start, and the line count | Extended with the content | Line-numbered reads |
+
+The caches live in each process's memory and are never shared between processes. Search and glob results aren't cached, because they depend on the whole tree. Saved cursors aren't a cache: they're per-agent state.
+
+### Directory entries
+
+- Only positive entries are cached. A missing name is never cached, so a file another client creates is visible at once.
+- The cache also keeps `id -> (parent_id, name)`. A `move` or `delete` notification carries the node id, so it evicts the right entry without knowing the old name.
+- The TTL only covers notifications lost while the LISTEN connection reconnects. After a reconnect, the whole cache is cleared.
+
+### File content
+
+A cached read is one statement, the same as an uncached one:
+
+1. Call `vfs_pread(node, cached_size, limit)`. It returns the file's current `size` and `generation`, along with any bytes past the cached end.
+2. If the generation is unchanged, add the returned bytes (often none) to the entry and serve the request from memory.
+3. If the generation changed, drop the entry and read again from offset 0.
+
+The saving is bytes on the wire and the work of re-splitting lines, not round trips. Tailing a growing log fetches only the new tail on each read. Entries are evicted least-recently-used under a per-process byte budget. Files above a size cap keep only their line map, and their bytes are read by range as before.
+
+### Line map
+
+Line numbers are derived on the client and never stored in Postgres.
+
+- The map holds the byte offset where every 1,000th line starts, plus the total line count. Reading lines N to N+k jumps to the nearest checkpoint at or before N, reads forward from that byte offset and splits on `\n`.
+- It is built from the content on first use and extended on append by scanning only the new bytes. A cold start on a large file reads that file once.
+- Lines split on `\n` only, as in ripgrep, so line numbers agree with `rg` hits.
 
 ## Glob
 
@@ -386,107 +431,87 @@ CREATE FUNCTION vfs_glob(
 $$ LANGUAGE sql STABLE;
 ```
 
-Each directory level is an index lookup on `UNIQUE (parent_id, name)`. A few thousand nodes take milliseconds. For trees of 100k+ nodes, the literal-prefix and depth hints keep the walk small, and a trigram index on `vfs_nodes.name` speeds up `*foo*` patterns.
+Each directory level is an index lookup on `UNIQUE (parent_id, name)`. A few thousand nodes take milliseconds. For trees of 100k+ nodes, the literal-prefix and depth hints keep the walk small, and an optional trigram index on `vfs_nodes.name` (`pg_trgm`) speeds up `*foo*` patterns.
 
 ## Search (rg in Postgres)
 
-`rg` runs entirely in Postgres. A line index (`vfs_lines`) is kept in step with every write by a trigger, and a `pg_trgm` GIN index speeds up regex matching on it. There's no local mirror, no sync and no `rg` binary, and a search sees every committed write, even one from a millisecond ago.
+`rg` runs entirely in Postgres and scans the current bytes of the files in scope, the way ripgrep scans a disk. Nothing is derived at write time, so an append stays one INSERT, there's no index to keep in step, and a search sees every committed write, even one from a millisecond ago. There's no local mirror, no sync and no `rg` binary.
 
-### Why not search the extents directly
+### Why there's no line index
 
-Extents are append fragments: a match can cross an extent boundary, extents have no line numbers, and a trigram index on fragments would miss matches. ripgrep works on lines, so the index stores lines. It's derived data, like a filesystem's search index, never a second source of truth.
+An earlier draft kept every line in a `vfs_lines` table with a trigram index. It paid for that on every write: storage of 2 to 4 times the text, a trigger on each append, a full re-index on each overwrite, and a rule that writers never split a UTF-8 character across appends. The only gain was index lookups, which matter once the bytes in scope get large. The target is workspaces of files from kilobytes to a few megabytes, where a scan is enough. If measurements say otherwise, an index can be added without changing the storage model (see Open decisions).
 
-```sql
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+### Lines exist only inside the query
 
-CREATE TABLE vfs_lines (
-    node_id     UUID    NOT NULL REFERENCES vfs_nodes(id) ON DELETE CASCADE,
-    generation  INT     NOT NULL,
-    line_no     INT     NOT NULL,                  -- 1-based, like rg -n
-    byte_offset BIGINT  NOT NULL,                  -- same currency as read(offset=...)
-    text        TEXT    NOT NULL,                  -- without the trailing \n
-    complete    BOOLEAN NOT NULL,                  -- false = last line, no \n yet
-    PRIMARY KEY (node_id, generation, line_no)
-);
-CREATE INDEX vfs_lines_trgm ON vfs_lines USING gin (text gin_trgm_ops);
-```
+ripgrep matches line by line, and models write patterns that assume it: `^def `, `foo$`, `.*`. The search keeps those semantics without storing lines.
 
-### The indexing trigger
+1. **Scope.** `vfs_glob` picks the files (see Glob) and reads their sizes from `vfs_nodes`, before any content is touched.
+2. **File filter.** Each file's current bytes are joined in offset order, decoded as UTF-8 and tested once against the pattern in newline-sensitive mode (`(?n)`). In that mode `^` and `$` match at line breaks, and `.` and `[^...]` don't cross them. Every file with a matching line passes, plus the occasional file without one (for example when `\s` matches a newline).
+3. **Line check.** Only the files that pass are split on `\n`, and each line is tested on its own. This step is exact and decides the results.
 
 ```sql
--- AFTER INSERT ON vfs_extents: split the new bytes into lines, merging a trailing partial line.
-CREATE FUNCTION vfs_index_extent() RETURNS trigger AS $$
-DECLARE
-    v_prev vfs_lines; v_text TEXT; v_parts TEXT[]; v_no INT; v_off BIGINT; n INT;
+CREATE FUNCTION vfs_text(p_node UUID) RETURNS TEXT AS $$
 BEGIN
-    BEGIN
-        v_text := convert_from(NEW.data, 'UTF8');
-    EXCEPTION WHEN character_not_in_repertoire THEN
-        RETURN NULL;                                -- binary content: readable, not searchable
-    END;
-
-    SELECT * INTO v_prev FROM vfs_lines
-     WHERE node_id = NEW.node_id AND generation = NEW.generation
-     ORDER BY line_no DESC LIMIT 1;
-
-    IF FOUND AND NOT v_prev.complete THEN           -- previous append ended mid-line
-        DELETE FROM vfs_lines
-         WHERE node_id = NEW.node_id AND generation = NEW.generation AND line_no = v_prev.line_no;
-        v_text := v_prev.text || v_text;
-        v_no := v_prev.line_no;  v_off := v_prev.byte_offset;
-    ELSE
-        v_no := coalesce(v_prev.line_no, 0) + 1;  v_off := NEW.byte_offset;
-    END IF;
-
-    v_parts := string_to_array(v_text, E'\n');
-    n := array_length(v_parts, 1);
-    FOR i IN 1 .. n LOOP
-        EXIT WHEN i = n AND v_parts[i] = '';        -- text ended with \n
-        INSERT INTO vfs_lines VALUES (NEW.node_id, NEW.generation, v_no, v_off, v_parts[i], i < n);
-        v_off := v_off + octet_length(v_parts[i]) + 1;
-        v_no  := v_no + 1;
-    END LOOP;
-    RETURN NULL;
-END $$ LANGUAGE plpgsql;
-
-CREATE TRIGGER trg_vfs_index AFTER INSERT ON vfs_extents
-    FOR EACH ROW EXECUTE FUNCTION vfs_index_extent();
+    RETURN (SELECT convert_from(string_agg(e.data, ''::bytea ORDER BY e.byte_offset), 'UTF8')
+              FROM vfs_nodes n
+              JOIN vfs_extents e ON e.node_id = n.id AND e.generation = n.generation
+             WHERE n.id = p_node);
+EXCEPTION WHEN character_not_in_repertoire THEN
+    RETURN NULL;                                    -- binary content: readable, not searchable
+END $$ LANGUAGE plpgsql STABLE;
 ```
 
-- **Appends are cheap.** An append of one whole line adds one index row and touches nothing earlier.
-- **Overwrites re-index.** `vfs_write` deletes the node's lines, and the new generation's single extent indexes it again.
-- **Writers must append whole UTF-8 strings.** A multi-byte character split across two extents would make `convert_from` fail on both halves. The library guarantees this, and a test enforces it.
+The bytes are decoded only after they're joined, so a UTF-8 character split across two appends decodes correctly, and writers need no rule about where an append ends.
 
 ### The search query
-
-The file scope comes from `vfs_glob` (see Glob), so `rg` has ripgrep's structure: walk and filter by glob, then search the matching files.
 
 ```sql
 -- in one transaction:
 SET LOCAL statement_timeout = '2s';
 
-SELECT g.path, l.line_no, l.byte_offset, l.text
-  FROM vfs_glob($root, $glob_regex, $name_like, $depth, $excludes, false, 10000) g
-  JOIN vfs_nodes n ON n.id = g.id
-  JOIN vfs_lines l ON l.node_id = n.id AND l.generation = n.generation
- WHERE l.text ~ $pattern                 -- or ~* for ignore_case; built in Python, never a CASE
- ORDER BY g.path, l.line_no
+WITH files AS (
+    SELECT g.id, g.path, vfs_text(g.id) AS body
+      FROM vfs_glob($root, $glob_regex, $name_like, $depth, $excludes, false, 10000) g
+), hits AS (                                        -- step 2: one regex test per file
+    SELECT id, path,
+           CASE WHEN right(body, 1) = E'\n' THEN left(body, -1) ELSE body END AS body
+      FROM files
+     WHERE body ~ $file_pattern                     -- '(?n)' plus the translated pattern
+), lines AS (                                       -- step 3: lines exist only here
+    SELECT h.path, l.line_no, l.text,
+           coalesce(sum(octet_length(l.text) + 1) OVER (
+               PARTITION BY h.id ORDER BY l.line_no
+               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS byte_offset
+      FROM hits h,
+           regexp_split_to_table(h.body, E'\n') WITH ORDINALITY AS l(text, line_no)
+)
+SELECT path, line_no, byte_offset, text
+  FROM lines
+ WHERE text ~ $line_pattern                         -- or ~* for ignore_case; built in Python
+ ORDER BY path, line_no
  LIMIT $max_plus_one;
 ```
 
+- **Trailing newline.** The final `\n` is dropped before splitting, so a file ending in a newline doesn't gain an empty phantom line that `^$` would match.
+- **Byte offsets.** Each hit's offset is the running byte length of the lines before it, in the same currency as `read(offset=...)`.
+- **One snapshot.** `vfs_text` is `STABLE`, so it reads with the query's snapshot, and every file is searched as of the same moment.
+
 | rg feature | Implementation |
 | --- | --- |
-| `-i` | `~*` instead of `~`. Build one predicate form in Python, because a `CASE` around the operators stops the planner from using the trigram index. |
-| `-F` (fixed strings) | `strpos(l.text, $s) > 0`, or `LIKE` with `%` and `_` escaped. Models search literal words most often, and trigrams speed those up the most. |
-| `-C n` (context) | A second query for `line_no BETWEEN hit - n AND hit + n` on the files that matched |
+| `-i` | `~*` instead of `~` in both steps. Build each predicate in Python rather than with a `CASE` around the operators. |
+| `-F` (fixed strings) | `strpos(body, $s) > 0` for the file filter and `strpos(text, $s) > 0` for lines |
+| `-C n` (context) | Keep the lines `line_no BETWEEN hit - n AND hit + n` from the same split of the matching files |
 | `-g` / `--glob` | Through the `vfs_glob` scope |
-| `--max-count` | `row_number() OVER (PARTITION BY node_id)` plus a filter |
-| Byte offset per hit | `l.byte_offset`, the line's start, which `read(offset=...)` accepts directly |
-| `-U` (multiline) | Not supported in v1. Lines are rows, as in rg's default mode. |
+| `--max-count` | `row_number() OVER (PARTITION BY path)` plus a filter |
+| Byte offset per hit | The running sum above, which `read(offset=...)` accepts directly |
+| `-U` (multiline) | Not supported in v1. A literal `\n` in the pattern is rejected, as rg does without `-U`. |
 
-### Index behavior
+### Cost and limits
 
-The `pg_trgm` GIN and GiST indexes support `~` and `~*`. They extract trigrams from the regex, and "a pattern with no extractable trigrams will degenerate to a full-index scan" ([pg\_trgm docs](https://www.postgresql.org/docs/current/pgtrgm.html)). Patterns with a literal run of 3+ characters (`import`, `parse.*config`) are fast. For patterns like `\d+` or `.`, require a `path` or `glob` scope.
+- Work grows with the bytes in scope, not with the number of matches. The file filter costs one regex pass per file, and only matching files are split into lines.
+- The total size of the scope comes from `vfs_nodes` before any content is read. A search over more than a configured cap (for example 50 MB) is refused with `rg: search scope is 120 MB; narrow the path or glob`.
+- Every search runs under `SET LOCAL statement_timeout`.
+- Files that aren't valid UTF-8 are skipped. They're still readable with `read`.
 
 ### Output format for the agent
 
@@ -509,8 +534,9 @@ Postgres documents these incompatibilities with Perl: "\\b, \\B, the lack of spe
 | `\b` | Word boundary | Backspace | Rewrite to `\y` |
 | `\B` | Not a word boundary | Different meaning | Rewrite to `\Y` |
 | `\<`, `\>` (GNU grep) | Word start or end | Not supported | Rewrite to `\m`, `\M` |
-| `\z` | End of text | Not documented | Rewrite to `$`. Each line is its own row. |
-| `\A`, `\Z` | Start or end of text | Supported | Pass through |
+| `\z` | End of text | Not documented | Rewrite to `$`. rg's text is the line, and `$` ends the line in both forms (below). |
+| `\A`, `\Z` | Start or end of text | Start or end of the whole string | Rewrite to `^`, `$`. Passed through, they would match only at the start or end of the file in the file filter. |
+| A literal `\n` | Newline | Supported | Reject, as rg does without `-U`. No single line contains one. |
 | `(?P<n>...)`, `(?<n>...)` | Named group | Not documented | Remove the name, keep the group |
 | `\p{L}`, `\pL`, `\P{...}` | Unicode property class | Not supported | Reject, with the hint: use `[[:alpha:]]` |
 | `(?i)` at the start | Ignore case | Supported only at the start | Pass through |
@@ -529,28 +555,30 @@ Postgres documents these incompatibilities with Perl: "\\b, \\B, the lack of spe
 | Project | What it is | Usable here? |
 | --- | --- | --- |
 | [pgpcre](https://github.com/petere/pgpcre) | Postgres extension that adds PCRE as a `pcre` type with `~` and `=~` operators | Rarely: not offered by most managed services, and it has no index support for pattern matching. |
-| [re2 (PGXN)](https://api.pgxn.org/src/re2/re2-0.4.0/doc/re2.md) | Postgres extension with ClickHouse-compatible RE2 functions; an `@~` operator with a `gin_re2_ops` trigram prefilter | Rarely available, but the best design reference: RE2 syntax is close to Rust's, and its GIN trigram prefilter is the same strategy we use with `pg_trgm`. |
+| [re2 (PGXN)](https://api.pgxn.org/src/re2/re2-0.4.0/doc/re2.md) | Postgres extension with ClickHouse-compatible RE2 functions; an `@~` operator with a `gin_re2_ops` trigram prefilter | Rarely available, but the best design reference: RE2 syntax is close to Rust's, and its GIN trigram prefilter is the model for an optional index (see Open decisions). |
 | [omni\_regex (Omnigres)](https://docs.omnigres.org/omni_regex/regex/) | PCRE2-based match and capture functions | Rarely available |
 | [PL/Rust](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.Using.PL_Rust.html) | Postgres functions written in Rust, with the `regex` crate allowed | RDS only |
 | [PCRE2 `pcre2_convert`](https://git.stg.centos.org/source-git/pcre2/blob/c8s/f/src/pcre2_convert.c) | Converts POSIX patterns and globs into PCRE2 | Wrong direction. Useful as a reference for edge cases only. |
 | [RegexBuddy](https://www.regexbuddy.com/postgresql.html) | Commercial GUI that converts between regex flavors, including PostgreSQL | No: a GUI tool, not a library |
 | Python `re._parser` (formerly `sre_parse`) | CPython's internal regex parser, which produces an AST | It's a possible base for a translator, but it's an internal API that can change between Python versions. |
 
-`pg_trgm` ships with Postgres and is available almost everywhere, including managed services such as Databricks Lakebase ([Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions)). So we translate to ARE and use `pg_trgm`.
+Postgres's built-in ARE engine is the only regex engine available everywhere, so we translate to ARE. `pg_trgm`, which ships with Postgres and is offered on most managed services such as Databricks Lakebase ([Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions)), stays in reserve for an index if scans prove too slow.
 
 ### Translator design
 
 1. **Accepted dialect:** Rust regex syntax (what `rg` uses by default), plus lookaround and backreferences, since ARE supports both. The tool description says "Rust-style regex".
 2. **Tokenizer, then emitter.** Write a small hand-written tokenizer that understands escapes, classes, groups, quantifiers and flags, rather than depending on `re._parser`. Then emit ARE tokens using the table above. The amount of code is small; correctness comes from the tests.
-3. **Reject, don't guess.** Unsupported constructs return a shell-style error with a hint, such as `rg: \p{..} is not supported; use [[:alpha:]]`. An error is always better than a silent zero-match.
-4. **Validate in Postgres.** Compile the translated pattern once with `SELECT '' ~ $1` under a 100 ms timeout, so syntax errors come back as `rg: regex parse error: ...` before the real search runs. Cache translations per pattern.
-5. **Safety.** Postgres warns that "regular expressions can be contrived that take arbitrary amounts of time and memory" and advises a statement timeout for untrusted patterns. Every search runs under `SET LOCAL statement_timeout`.
+3. **Two forms.** The emitter returns the line form for the line check, and the file form for the file filter: the same pattern with `(?n)` in front, merged with a leading `(?i)` into `(?in)` where present.
+4. **Reject, don't guess.** Unsupported constructs return a shell-style error with a hint, such as `rg: \p{..} is not supported; use [[:alpha:]]`. An error is always better than a silent zero-match.
+5. **Validate in Postgres.** Compile the translated pattern once with `SELECT '' ~ $1` under a 100 ms timeout, so syntax errors come back as `rg: regex parse error: ...` before the real search runs. Cache translations per pattern.
+6. **Safety.** Postgres warns that "regular expressions can be contrived that take arbitrary amounts of time and memory" and advises a statement timeout for untrusted patterns. Every search runs under `SET LOCAL statement_timeout`.
 
 ### Differential testing (how we know it's right)
 
 - **A corpus of real patterns:** start with 200+ patterns collected from model transcripts (`\bparse\b`, `TODO|FIXME`, `(?i)error`, `\d{2}:\d{2}`, and so on), and add every new pattern seen in production logs.
 - **An oracle:** for each pattern and each test line, compare Python `re.search(original)` with Postgres `line ~ translated`, for the subset where Python and Rust semantics agree. Every disagreement is either a translator bug or a construct that should be rejected.
 - **Property tests:** generate random patterns from the supported grammar and random lines, then compare the same way.
+- **The file filter never drops a match:** for random patterns and files, whenever some line matches the line form, the whole file matches the file form. A failure here would be a silent missed hit, so it gets its own property test.
 
 ## Agent integration
 
@@ -558,9 +586,9 @@ Agents get Claude Code's file toolset with the same semantics, so models apply w
 
 | Claude Code tool | VFS tool | Backed by |
 | --- | --- | --- |
-| Read (`offset`, `limit`) | `read(path, offset, limit)` | `vfs_pread` over `vfs_extents` |
+| Read (`offset`, `limit`) | `read(path, offset, limit)` | `vfs_pread` over `vfs_extents`, through the content cache |
 | Glob | `glob(pattern, path, exclude)` | `vfs_glob` over `vfs_nodes` |
-| Grep (ripgrep) | `rg(pattern, path, glob, ignore_case, fixed_strings, context)` | `vfs_glob` and `vfs_lines` |
+| Grep (ripgrep) | `rg(pattern, path, glob, ignore_case, fixed_strings, context)` | `vfs_glob` and a scan of `vfs_extents` |
 | LS | `ls(path)` | `vfs_readdir` |
 | Write | `write(path, content)` | `vfs_write` or `vfs_create`, subject to the write policy |
 
@@ -575,6 +603,7 @@ minifs/
     glob.py      glob translator and pruning hints
     regex.py     rg-pattern to ARE translator
     watch.py     LISTEN vfs and async iterators per path
+    cache.py     directory-entry cache, content and line-map cache, NOTIFY eviction
   tools/
     tools.py     ls / read / write / glob / rg
   db/
@@ -629,15 +658,18 @@ Three things matter most in production: credential handling, LISTEN connections 
 | --- | --- |
 | Credentials | Managed services often use short-lived tokens as the Postgres password. Give the psycopg pool a connection factory that fetches a fresh credential, not a fixed DSN. |
 | LISTEN | Use a direct, dedicated connection for LISTEN, never one through a transaction-mode pooler. |
-| Reconnect | When the LISTEN connection drops: reconnect, LISTEN again, then re-check watched paths so nothing missed is skipped. Saved cursors make this safe. |
+| Reconnect | When the LISTEN connection drops: reconnect, LISTEN again, clear the directory cache, then re-check watched paths so nothing missed is skipped. Saved cursors make this safe. |
+| NOTIFY volume | A transaction that called NOTIFY takes a database-wide lock at commit, so every append commits through that lock. Cache eviction only needs `create`, `move` and `delete`; `modify` exists for watchers. If a hot log makes the lock a bottleneck, stop emitting `modify` for appends to it and have its watchers poll `size`. |
+| TOAST | `SET STORAGE EXTERNAL` on `vfs_extents.data`, so range reads fetch only the chunks they cover |
+| Compaction | A periodic job runs `vfs_compact` on files with more than 1,000 extents. It holds each inode lock only while merging that file. |
 | Postgres version | PG 15+ for `UNIQUE NULLS NOT DISTINCT`. PG 18 has a built-in `uuidv7()`; on older versions use `pg_uuidv7` where available, or generate UUIDv7 in the app. |
-| Extensions | `pg_trgm` (required). `vector` (pgvector) is an option for future semantic search over `vfs_lines`. |
-| Pools | Per process: one LISTEN connection, and a small pool (about 5) for the tools. |
+| Extensions | None required. `pg_trgm` only if the optional search index is added, and `vector` (pgvector) for future semantic search. |
+| Pools | Per process: one LISTEN connection (shared by watch and the cache), and a small pool (about 5) for the tools. |
 
 ### Protecting the database
 
 - **Every search runs under `SET LOCAL statement_timeout = '2s'`.** On timeout, return `rg: search timed out; narrow the pattern or path`.
-- **Guide patterns toward the index.** Require a `path` or `glob` scope when the pattern has no literal run of 3+ characters.
+- **Cap the bytes scanned.** Refuse a search whose scope is larger than the configured cap, with a hint to narrow the `path` or `glob`. The size comes from `vfs_nodes`, so the check reads no content.
 - **Cap output:** at most 50 matches by default, and `glob` at most 100 results, each with a "narrow it" hint.
 - **Separate pools for search and writes.** If CPU contention appears at scale, consider sending search to a read replica. That gives up read-your-latest-write consistency, so only do it if you need to.
 
@@ -645,8 +677,9 @@ Three things matter most in production: credential handling, LISTEN connections 
 
 | Item | Estimate |
 | --- | --- |
-| Append cost | One inode row lock, one extent insert, one or two line-index rows, one NOTIFY |
-| Line index plus trigram GIN | Very roughly 2 to 4 times the text size |
+| Append cost | One inode row lock, one extent insert, one NOTIFY |
+| Storage | The text itself, uncompressed (`STORAGE EXTERNAL`), plus about 30 bytes of row overhead per extent |
+| Search cost | One regex pass over the bytes in scope, plus a line split of the files that match |
 | `glob` over a few thousand nodes | Milliseconds |
 
 ### Observability
@@ -654,12 +687,14 @@ Three things matter most in production: credential handling, LISTEN connections 
 Metrics to track:
 
 - Tool call latency per operation, and tool calls per agent run.
-- Search duration, timeouts, and translator rejections by construct. Rejections show which constructs are worth supporting next.
+- Search duration, bytes scanned, timeouts, scope-cap refusals, and translator rejections by construct. Rejections show which constructs are worth supporting next. Bytes scanned per search shows when an index starts to pay off.
+- Cache hit rate and bytes fetched per read.
+- Extents per file, which shows whether compaction keeps up.
 - Write-policy denials, which show whether agents try to write outside their allowed paths.
 
 ## Testing strategy
 
-Most of the correctness rests on three properties, and each gets a test that compares two independent answers: joined chunked reads equal the full file, pruned globs equal full walks, and translated regexes agree with an oracle. Everything runs against real Postgres in testcontainers; there are no SQL mocks.
+Most of the correctness rests on four properties, and each gets a test that compares two independent answers: joined chunked reads equal the full file, cached reads equal uncached ones, pruned globs equal full walks, and translated regexes agree with an oracle. Everything runs against real Postgres in testcontainers; there are no SQL mocks.
 
 | Area | Test | Kind |
 | --- | --- | --- |
@@ -671,7 +706,12 @@ Most of the correctness rests on three properties, and each gets a test that com
 | Tree | `UNIQUE NULLS NOT DISTINCT` rejects duplicate root names; `rmdir` on a non-empty directory gives `ENOTEMPTY`; a move into its own subtree gives `EINVAL` | Unit |
 | Claim | Two claimers racing for the same file: exactly one wins | Concurrency |
 | Watch | Events arrive only after commit; `move` versus `modify` is classified correctly | Integration |
-| Line index | Partial-line merges across appends; overwrite re-indexes; non-UTF-8 content is skipped | Unit |
+| Search | Hits match a per-line search in Python over the same files; a trailing newline adds no phantom line; a UTF-8 character split across two appends still matches; non-UTF-8 files are skipped; the scope cap refuses before reading content | Integration |
+| File filter | Whenever a line matches the line form, the file matches the file form | Property |
+| Compaction | Bytes, `size`, `generation` and `mtime` are unchanged; appends running during compaction keep gap-free offsets | Concurrency |
+| Content cache | Reads through the cache equal uncached `pread` while another client appends, overwrites and compacts | Property |
+| Directory cache | A rename or delete by another client is seen once its NOTIFY arrives; a dropped LISTEN connection clears the cache; a missing name is never cached | Integration |
+| Line map | Line N read through the map equals line N from splitting the whole file, across appends that end mid-line | Property |
 | Glob translator | Compared with `PurePath.full_match` (Python 3.13+) or `wcmatch` (GLOBSTAR and BRACE flags) on generated patterns and paths | Differential |
 | Glob pruning | Results with all hints enabled equal results with none | Differential |
 | Regex translator | A corpus of real model patterns plus generated ones, compared with Python `re` on the shared subset | Differential |
@@ -700,13 +740,14 @@ The payoff is that the same tree mounts through FUSE on a laptop or NFS on Kuber
 | Client access | Through the VFS library, or direct SQL | The VFS library, for one model end to end. Revisit only if profiling shows overhead. |
 | Workspaces per process | One, or many | Many, with one LISTEN connection filtered by payload |
 | Postgres version | PG 15–17 (UUIDv7 from an extension or the app), or PG 18 (built-in `uuidv7()`) | PG 18 where available |
-| Line-based addressing | Add `read(path, line=, lines=)` | Not in v1. Byte offsets are the only addressing scheme, since `rg` hits already carry offsets. |
-| Semantic search | pgvector over windows of `vfs_lines` | After the core tools are stable |
+| Line-numbered reads | A stored line table, or derived on the client | Derived, from the line map (see Caching). If cold reads of large logs prove slow, store each extent's count of preceding newlines: one integer per extent, set by `vfs_append` and kept by compaction. |
+| Search index | None (scan), or a trigram GIN index | Scan in v1. If bytes scanned per search grow too large, index whole-file text refreshed by compaction, and keep scanning the newer appends. An index on raw extents would be unsound, because a match can cross an extent boundary. |
+| Semantic search | pgvector over windows of file text | After the core tools are stable |
 
 ## Sources
 
 - [PostgreSQL 9.7 Pattern Matching](https://www.postgresql.org/docs/current/functions-matching.html): ARE syntax, Perl incompatibilities, and the statement-timeout advice
-- [PostgreSQL pg\_trgm](https://www.postgresql.org/docs/current/pgtrgm.html): regex index support and how it degrades
+- [PostgreSQL pg\_trgm](https://www.postgresql.org/docs/current/pgtrgm.html): regex index support, for the optional search index
 - [Databricks Apps best practices](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/best-practices) and [ECS KernelCapabilities](https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_KernelCapabilities.html): examples of platforms without FUSE or root
 - [Lakebase extensions](https://docs.databricks.com/gcp/en/oltp/projects/extensions): an example of a managed Postgres extension list
 - [pgpcre](https://github.com/petere/pgpcre), [re2 for PostgreSQL (PGXN)](https://api.pgxn.org/src/re2/re2-0.4.0/doc/re2.md), [omni\_regex](https://docs.omnigres.org/omni_regex/regex/), [PL/Rust on RDS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.Using.PL_Rust.html), [PCRE2 pcre2\_convert](https://git.stg.centos.org/source-git/pcre2/blob/c8s/f/src/pcre2_convert.c), [RegexBuddy PostgreSQL](https://www.regexbuddy.com/postgresql.html): the translator survey
