@@ -1,0 +1,2 @@
+-- Baseline: intentionally empty. It records that minifs manages this database;
+-- the schema itself starts in 002.
