@@ -10,8 +10,10 @@
 -- ESTALE). Every function pins search_path to the one this migration ran with.
 --
 -- The writers lock the inode FOR UPDATE until commit. Under REPEATABLE READ, locking a file that another
--- transaction changed after the snapshot raises a serialization failure (40001), as any row lock does, and so
--- does compacting extents a concurrent compaction replaced: retry the transaction.
+-- transaction changed after the snapshot raises a serialization failure (40001), as any row lock does. So does
+-- deleting extents (vfs_write, vfs_compact, the cascade of vfs_unlink) that a compaction committed after the
+-- snapshot replaced: compaction only locks the inode, so the lock succeeds and the delete fails. Retry the
+-- transaction.
 
 CREATE TABLE vfs_extents (                       -- data blocks
     node_id     uuid   NOT NULL,
@@ -172,8 +174,8 @@ END $$;
 
 -- Merges the extents of file p_node into pieces of about p_target bytes (64 KB by default) under the inode lock,
 -- and returns how many extents it removed. A piece starts at an extent shorter than half the target and takes
--- the extents after it that end within p_target bytes of its start. Longer extents count as full: they start
--- no piece and are never copied, so a compacted file is walked by one index scan and isn't rewritten again.
+-- the extents after it that end within p_target bytes of its start. Extents of at least half the target never
+-- start a piece, extents longer than p_target are never copied, and a compacted file isn't rewritten again.
 -- Bytes, size, generation and mtime are unchanged and vfs_nodes isn't updated (no NOTIFY), so readers,
 -- cursors and caches don't notice. Appends wait for it. ENOENT, EISDIR; EINVAL for a p_target outside
 -- [1, 64 MB]. Extents that don't tile the file (only raw SQL can make them) raise data_corrupted.

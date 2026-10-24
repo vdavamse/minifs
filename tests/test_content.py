@@ -321,6 +321,21 @@ async def test_repeatable_read_append_after_a_concurrent_append_must_retry(conn:
         await late.commit()
 
 
+async def test_repeatable_read_write_after_a_concurrent_compaction_must_retry(conn: AsyncConnection, db: str) -> None:
+    f = await create_file(conn, "log")
+    for part in [b"a", b"b", b"c"]:
+        await append(conn, f, part)
+    async with await AsyncConnection.connect(db) as late:
+        await late.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
+        await late.execute("SELECT 1")  # takes the snapshot
+        assert await compact(conn, f) == 2
+        with pytest.raises(psycopg.errors.SerializationFailure):
+            await write(late, f, b"new")  # the inode lock succeeds; the delete of the old extents fails
+        await late.rollback()
+        assert await write(late, f, b"new") == (1, 3)  # the retry
+        await late.commit()
+
+
 async def test_mtime_never_goes_back(conn: AsyncConnection, db: str) -> None:
     f = await create_file(conn, "log")
     async with await AsyncConnection.connect(db) as early:

@@ -188,9 +188,12 @@ DECLARE v_size BIGINT; v_gen INT;
 BEGIN
     SELECT size, generation INTO v_size, v_gen
       FROM vfs_nodes WHERE id = p_node AND kind = 'file' FOR UPDATE;
-    IF NOT FOUND THEN RAISE EXCEPTION 'ENOENT' USING ERRCODE = 'P0002'; END IF;
+    IF NOT FOUND THEN PERFORM vfs_raise('ENOENT', p_node::text); END IF;   -- or EISDIR
+    IF length(p_data) = 0 THEN RETURN v_size; END IF;   -- extents are never empty
     INSERT INTO vfs_extents VALUES (p_node, v_gen, v_size, p_data);
-    UPDATE vfs_nodes SET size = v_size + length(p_data), mtime = now() WHERE id = p_node;
+    UPDATE vfs_nodes SET size = v_size + length(p_data),
+                         mtime = greatest(mtime, clock_timestamp())   -- never backwards
+     WHERE id = p_node;
     RETURN v_size;                       -- the offset the data landed at
 END $$ LANGUAGE plpgsql;
 ```
@@ -208,19 +211,22 @@ DECLARE v_gen INT; v_size BIGINT; v_parent UUID; v_name TEXT;
 BEGIN
     SELECT n.generation, n.size, n.parent_id, n.name INTO v_gen, v_size, v_parent, v_name
       FROM vfs_nodes n WHERE n.id = p_node AND n.kind = 'file' FOR UPDATE;
-    IF NOT FOUND THEN RAISE EXCEPTION 'ENOENT' USING ERRCODE = 'P0002'; END IF;
+    IF NOT FOUND THEN PERFORM vfs_raise('ENOENT', p_node::text); END IF;   -- or EISDIR
     IF num_nulls(p_expect_gen, p_expect_size, p_expect_name) NOT IN (0, 3)
        OR (p_expect_gen IS NULL AND p_expect_parent IS NOT NULL) THEN
-        RAISE EXCEPTION 'EINVAL';                   -- a compare-and-swap is all or nothing
+        PERFORM vfs_raise('EINVAL', 'partial expectation');   -- a compare-and-swap is all or nothing
     END IF;
     IF p_expect_gen IS NOT NULL                     -- compare-and-swap for the Write tool
        AND ((v_gen, v_size, v_name) IS DISTINCT FROM (p_expect_gen, p_expect_size, p_expect_name)
             OR v_parent IS DISTINCT FROM p_expect_parent) THEN
-        RAISE EXCEPTION 'ESTALE';                   -- P0001; the client maps the message
+        PERFORM vfs_raise('ESTALE', p_node::text);  -- SQLSTATE MF116
     END IF;
     DELETE FROM vfs_extents WHERE node_id = p_node;
-    INSERT INTO vfs_extents VALUES (p_node, v_gen + 1, 0, p_data);
-    UPDATE vfs_nodes SET generation = v_gen + 1, size = length(p_data), mtime = now()
+    IF length(p_data) > 0 THEN
+        INSERT INTO vfs_extents VALUES (p_node, v_gen + 1, 0, p_data);
+    END IF;
+    UPDATE vfs_nodes SET generation = v_gen + 1, size = length(p_data),
+                         mtime = greatest(mtime, clock_timestamp())
      WHERE id = p_node;
     RETURN QUERY SELECT v_gen + 1, length(p_data)::BIGINT;
 END $$ LANGUAGE plpgsql;
@@ -321,7 +327,7 @@ $$ LANGUAGE sql STABLE;
 - **Trimming happens in Postgres.** A 16 KB read of a 5 MB doc sends 16 KB. `length(data)` reads the size from the TOAST pointer without fetching the value.
 - **It's one statement, so one MVCC snapshot.** `size` and `generation` describe exactly the bytes returned, even while another client is appending.
 - **The `LEFT JOIN`** returns a single row with NULL data when nothing overlaps, so a read past EOF or of an empty file still returns `size` and `generation`, and `byte_offset` is the resolved start offset.
-- **The real function** (migration 004) is this query inside a PL/pgSQL `STABLE` function, still one snapshot, which raises `ENOENT` or `EISDIR` when the query returns no row.
+- **The real function** (migration 004, like the real `vfs_append` and `vfs_write`) is this query inside a PL/pgSQL `STABLE` function, still one snapshot, which raises `ENOENT` or `EISDIR` when the query returns no row.
 
 ### Per-path cursors and generations
 
