@@ -1,7 +1,8 @@
 """Test fixtures: a real PostgreSQL in testcontainers, and a clean database per test.
 
-The server starts once per session (image from ``MINIFS_TEST_PG_IMAGE``, default ``postgres:18``). Two template
-databases are migrated once: one with the image's UTF-8 locale and one with ``LOCALE 'C'``. Each test then gets
+The server starts once per session (image from ``MINIFS_TEST_PG_IMAGE``, default ``postgres:18``). Three template
+databases are migrated once: one with the image's UTF-8 locale, one with ``LOCALE 'C'`` and one with
+``LOCALE 'C.UTF-8'``, the default on Databricks Lakebase. Each test then gets
 its own database cloned from a template, which is much cheaper than migrating, and dropped afterwards.
 
 Clones isolate everything inside a database, not cluster-wide objects such as roles: migrations that create
@@ -27,7 +28,7 @@ from minifs.db.migrate import migrate
 
 PG_IMAGE = os.environ.get("MINIFS_TEST_PG_IMAGE", "postgres:18")
 
-TEMPLATES = {"utf8": "minifs_template_utf8", "c": "minifs_template_c"}
+TEMPLATES = {"utf8": "minifs_template_utf8", "c": "minifs_template_c", "c_utf8": "minifs_template_c_utf8"}
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ def pg_server() -> Iterator[PgServer]:
             assert row is not None
             utf8_locale: str = row[0]
             for locale, template in TEMPLATES.items():
-                _create_database(conn, template, "C" if locale == "c" else utf8_locale)
+                _create_database(conn, template, {"c": "C", "c_utf8": "C.UTF-8"}.get(locale, utf8_locale))
                 asyncio.run(_migrate(server.database(template)))
                 conn.execute(sql.SQL("ALTER DATABASE {} IS_TEMPLATE true").format(sql.Identifier(template)))
         yield server
@@ -78,7 +79,7 @@ def db_c(pg_server: PgServer) -> Iterator[str]:
 
 @pytest.fixture(params=sorted(TEMPLATES))
 def db_any_locale(request: pytest.FixtureRequest, pg_server: PgServer) -> Iterator[str]:
-    """A fresh, migrated database; the test runs once per locale (``c`` and ``utf8``)."""
+    """A fresh, migrated database; the test runs once per locale (``c``, ``c_utf8`` and ``utf8``)."""
     yield from _clone(pg_server, TEMPLATES[request.param])
 
 
