@@ -178,7 +178,7 @@ class DirEntryCache:
         """Keeps the cache fresh from ``watcher``'s events until the block exits.
 
         Clears the cache first, since entries stored before may have missed events. RuntimeError if the watcher was
-        not started. If the watcher closes while the block runs, eviction falls back to the TTL alone.
+        not started or is closed. If the watcher closes while the block runs, eviction falls back to the TTL alone.
         """
         if not watcher.started:
             raise RuntimeError("follow() needs a started Watcher: no events would arrive")

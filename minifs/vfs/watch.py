@@ -326,7 +326,8 @@ class Watcher:
 
     @property
     def started(self) -> bool:
-        """Whether ``start()`` ran (entering the watcher runs it), so events are delivered. Stays True after close."""
+        """Whether ``start()`` ran (entering the watcher runs it). Stays True after ``aclose()``, when events no longer
+        arrive."""
         return self._task is not None
 
     @property

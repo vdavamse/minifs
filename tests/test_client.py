@@ -677,23 +677,33 @@ async def test_error_path_callers_keep_their_error_whatever_the_eviction_does(
     vfs = VFSClient(pool, cache=cache)
     old = await vfs.create("/f")
     await VFSClient(pool).unlink("/f")
-    entered, release = asyncio.Event(), asyncio.Event()
+    release = asyncio.Event()
+    waiting = 0
+    await_eviction = VFSClient.__dict__["_await_eviction"]
 
     async def broken(self: VFSClient, refs: Any, started: Any = None) -> None:
-        entered.set()
         await release.wait()
         raise RuntimeError("evict failed")
 
+    async def counted_wait(self: VFSClient, refs: Any) -> None:
+        nonlocal waiting
+        waiting += 1
+        await await_eviction(self, refs)  # reaches asyncio.wait() without suspending before it
+
     monkeypatch.setattr(VFSClient, "_evict_stale", broken)
+    monkeypatch.setattr(VFSClient, "_await_eviction", counted_wait)
     stats = [asyncio.create_task(vfs.stat("/f")) for _ in range(2)]
-    await asyncio.wait_for(entered.wait(), 10)
-    (shared,) = vfs._evicting.values()  # pyright: ignore[reportPrivateUsage]
-    await until(lambda: all(not s.done() for s in stats) and len(vfs._background) == 1, "no shared eviction")  # pyright: ignore[reportPrivateUsage]
-    if outcome == "cancelled":
-        shared.cancel()
-    else:
-        release.set()
-    errors = await asyncio.wait_for(asyncio.gather(*stats, return_exceptions=True), 10)
+    try:
+        await until(lambda: waiting == 2, "both reads never reached the eviction")
+        (shared,) = vfs._evicting.values()  # pyright: ignore[reportPrivateUsage]
+        assert len(vfs._background) == 1  # pyright: ignore[reportPrivateUsage]  # both wait for the one task
+        if outcome == "cancelled":
+            shared.cancel()
+        else:
+            release.set()
+        errors = await asyncio.wait_for(asyncio.gather(*stats, return_exceptions=True), 10)
+    finally:
+        release.set()  # never leave an eviction hanging
     assert all(isinstance(e, VFSError) and e.errno == "ENOENT" for e in errors), errors
     await vfs.settle()
     assert not vfs._evicting  # pyright: ignore[reportPrivateUsage]
