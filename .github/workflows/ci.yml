@@ -46,8 +46,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 18 has a built-in uuidv7(); 16 exercises the fallback.
-        postgres: ["16", "18"]
+        # The versions Databricks Lakebase offers (17 is its default). 18 has a built-in uuidv7(); 16 and 17
+        # use the SQL fallback, since Lakebase has no pg_uuidv7.
+        postgres: ["16", "17", "18"]
     env:
       MINIFS_TEST_PG_IMAGE: postgres:${{ matrix.postgres }}
     steps:
