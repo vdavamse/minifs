@@ -21,12 +21,23 @@ async def test_db_is_utf8_and_migrated(conn: AsyncConnection) -> None:
     assert row is not None and row[0] >= 1
 
 
+async def _e_acute_is_alpha(conninfo: str) -> bool:
+    async with await AsyncConnection.connect(conninfo) as conn:
+        cur = await conn.execute("SELECT 'é' ~ '^[[:alpha:]]$'")
+        row = await cur.fetchone()
+        assert row is not None
+        return row[0]
+
+
 async def test_db_c_uses_c_locale(db_c: str) -> None:
     assert await _collate(db_c) == "C"
+    assert not await _e_acute_is_alpha(db_c)
 
 
 async def test_db_has_utf8_locale(db: str) -> None:
-    assert (await _collate(db)).lower().endswith("utf8")
+    # Behavioural, not just the name: a musl (alpine) image accepts any locale name and acts like C.
+    assert await _collate(db) != "C"
+    assert await _e_acute_is_alpha(db)
 
 
 async def test_each_test_gets_a_clean_database(conn: AsyncConnection) -> None:

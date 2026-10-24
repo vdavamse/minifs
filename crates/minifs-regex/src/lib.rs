@@ -32,16 +32,10 @@ fn _regex(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "oracle"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn version_matches_manifest() {
-        assert_eq!(VERSION, "0.1.0");
-    }
-
-    #[cfg(feature = "oracle")]
     #[test]
     fn oracle_matches_and_rejects() {
         assert!(oracle_is_match(r"fn \w+\(", "pub fn main() {").unwrap());

@@ -42,7 +42,15 @@ cross-check against it; without it they skip, while in CI they fail.
 Add a file `minifs/db/migrations/NNN_lower_snake.sql` with the next free number. Each file runs in one
 transaction with its row in `vfs_schema_version`, so don't use statements that can't run in a transaction
 (`CREATE INDEX CONCURRENTLY`). Never edit a migration once it's merged: the runner stores a checksum and refuses
-a changed file. Add a new migration instead.
+a changed file. Add a new migration instead. A pending migration numbered below one already applied is refused
+too, so renumber a branch's migration after the latest one on `main` before merging.
+
+The version table and the objects go in the connection's `current_schema()`. Each migration starts with the
+caller's `search_path`, so prefer `SET LOCAL` inside one. Cluster-wide objects (roles) outlive a test database,
+so create them idempotently (`DO $$ ... IF NOT EXISTS ...`).
+
+`minifs db status` prints each migration as `applied`, `pending` or `modified` (changed since it was applied),
+and versions the database has but this checkout doesn't as `unknown`.
 
 ## Database fixtures
 
@@ -62,4 +70,5 @@ dropped afterwards.
 ## Wheels
 
 `.github/workflows/wheels.yml` builds abi3 wheels (Linux x86_64 and aarch64 manylinux, macOS arm64) and an sdist
-on `v*` tags, on PRs that touch the build, and on demand. Release wheels don't include the `oracle` feature.
+on `v*` tags, on PRs that touch the build, and on demand. Release wheels don't include the `oracle` feature. `uv build` does include it (it reads
+`config-settings-package` from `[tool.uv]`), so build release artifacts with maturin-action or `maturin build`.

@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -28,6 +28,8 @@ jobs:
       - run: uv run ruff format --check .
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The release configuration, without `oracle`.
+      - run: cargo clippy --all-targets -- -D warnings
       - run: uv run pyright
 
   rust:

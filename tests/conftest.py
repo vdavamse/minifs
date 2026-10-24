@@ -2,7 +2,10 @@
 
 The server starts once per session (image from ``MINIFS_TEST_PG_IMAGE``, default ``postgres:18``). Two template
 databases are migrated once: one with the image's UTF-8 locale and one with ``LOCALE 'C'``. Each test then gets
-its own database cloned from a template (a file copy, so it's cheap) and dropped afterwards.
+its own database cloned from a template, which is much cheaper than migrating, and dropped afterwards.
+
+Clones isolate everything inside a database, not cluster-wide objects such as roles: migrations that create
+those must be idempotent.
 """
 
 from __future__ import annotations
@@ -24,8 +27,6 @@ from minifs.db.migrate import migrate
 
 PG_IMAGE = os.environ.get("MINIFS_TEST_PG_IMAGE", "postgres:18")
 
-# Locale of the official Debian-based postgres images.
-UTF8_LOCALE = "en_US.utf8"
 TEMPLATES = {"utf8": "minifs_template_utf8", "c": "minifs_template_c"}
 
 
@@ -46,8 +47,12 @@ def pg_server() -> Iterator[PgServer]:
             row = conn.execute("SELECT current_setting('server_version_num')::int").fetchone()
             assert row is not None
             server = PgServer(conninfo, row[0])
+            # The image's own locale (en_US.utf8 in the official images) for the UTF-8 template.
+            row = conn.execute("SELECT datcollate FROM pg_database WHERE datname = 'template0'").fetchone()
+            assert row is not None
+            utf8_locale: str = row[0]
             for locale, template in TEMPLATES.items():
-                _create_database(conn, template, "C" if locale == "c" else UTF8_LOCALE)
+                _create_database(conn, template, "C" if locale == "c" else utf8_locale)
                 asyncio.run(_migrate(server.database(template)))
                 conn.execute(sql.SQL("ALTER DATABASE {} IS_TEMPLATE true").format(sql.Identifier(template)))
         yield server

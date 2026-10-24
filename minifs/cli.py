@@ -48,8 +48,18 @@ async def _migrate(dsn: str) -> int:
 async def _status(dsn: str) -> int:
     async with await AsyncConnection.connect(dsn, autocommit=True) as conn:
         recorded = await applied_versions(conn)
-    for migration in load_migrations():
-        print(f"{'applied' if migration.version in recorded else 'pending'} {migration.filename}")
+    migrations = load_migrations()
+    for migration in migrations:
+        if migration.version not in recorded:
+            state = "pending"
+        elif recorded[migration.version] != migration.checksum:
+            state = "modified"
+        else:
+            state = "applied"
+        print(f"{state} {migration.filename}")
+    known = {m.version for m in migrations}
+    for version in sorted(set(recorded) - known):
+        print(f"unknown {version:03d} (applied, but not in this minifs version)")
     return 0
 
 

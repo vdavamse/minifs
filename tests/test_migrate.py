@@ -95,3 +95,59 @@ def test_cli_migrate_and_status(empty_db: str, capsys: pytest.CaptureFixture[str
     assert "up to date" in capsys.readouterr().out
     assert main(["db", "status", "--dsn", empty_db]) == 0
     assert "applied 001_baseline.sql" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("body", ["-- nothing\n", "/* nothing */", "", "-- x\n;"])
+async def test_statement_free_migrations_apply(empty_db: str, body: str) -> None:
+    async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
+        assert len(await migrate(conn, [Migration(1, "empty", body)])) == 1
+
+
+async def test_migration_changing_search_path_does_not_leak(empty_db: str) -> None:
+    # pg_dump output starts with set_config('search_path', '', false); a plain SET outlives its transaction.
+    migrations = [
+        Migration(1, "dump", "SELECT pg_catalog.set_config('search_path', '', false); SET search_path = pg_catalog;"),
+        Migration(2, "table", "CREATE TABLE lands_in_public ();"),
+    ]
+    async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
+        await conn.execute("SET search_path = public")
+        assert await migrate(conn, migrations) == migrations
+        cur = await conn.execute("SELECT current_setting('search_path'), to_regclass('public.lands_in_public')::text")
+        assert await cur.fetchone() == ("public", "lands_in_public")
+        assert set(await applied_versions(conn)) == {1, 2}
+
+
+async def test_version_table_goes_in_current_schema(empty_db: str) -> None:
+    async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
+        await conn.execute("CREATE SCHEMA app; SET search_path = app, public")
+        await migrate(conn, [Migration(1, "a", "CREATE TABLE t ();")])
+        cur = await conn.execute("SELECT to_regclass('app.vfs_schema_version')::text, to_regclass('app.t')::text")
+        assert await cur.fetchone() == ("vfs_schema_version", "t")
+
+
+async def test_refuses_connection_inside_transaction(empty_db: str) -> None:
+    async with await AsyncConnection.connect(empty_db) as conn:
+        await conn.execute("SELECT 1")
+        with pytest.raises(MigrationError, match="inside a transaction"):
+            await migrate(conn, [Migration(1, "a", "")])
+
+
+async def test_refuses_pending_migration_older_than_applied(empty_db: str) -> None:
+    async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
+        await migrate(conn, [Migration(3, "c", "")])
+        with pytest.raises(MigrationError, match="003 is already applied"):
+            await migrate(conn, [Migration(1, "a", ""), Migration(3, "c", "")])
+
+
+def test_cli_status_reports_modified_and_unknown(empty_db: str, capsys: pytest.CaptureFixture[str]) -> None:
+    async def record() -> None:
+        async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
+            await migrate(conn, [Migration(1, "baseline", "-- edited"), Migration(99, "future", "")])
+
+    asyncio.run(record())
+    assert main(["db", "status", "--dsn", empty_db]) == 0
+    out = capsys.readouterr().out
+    assert "modified 001_baseline.sql" in out
+    assert "unknown 099" in out
+    assert main(["db", "migrate", "--dsn", empty_db]) == 1
+    assert "checksum mismatch" in capsys.readouterr().err

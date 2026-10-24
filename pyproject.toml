@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "minifs"
-version = "0.1.0"
+dynamic = ["version"]  # from crates/minifs-regex/Cargo.toml
 description = "Postgres based VFS for agents"
 readme = "README.md"
 license = "MIT"
@@ -40,12 +40,14 @@ python-packages = ["minifs"]
 include = [{ path = "minifs/db/migrations/*.sql", format = ["sdist", "wheel"] }]
 
 [tool.uv]
-# The development build (uv sync) enables the regex oracle; release wheels don't.
-config-settings = { build-args = "--features oracle" }
+# The development build (uv sync) enables the regex oracle. Release wheels come from maturin-action, which
+# doesn't read this; `uv build` does, so don't publish what it builds.
+config-settings-package = { minifs = { build-args = "--features oracle" } }
 # Rebuild the extension when the Rust sources change.
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
     { file = "crates/**/Cargo.toml" },
     { file = "crates/**/*.rs" },
 ]

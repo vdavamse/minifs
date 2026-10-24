@@ -8,6 +8,8 @@ on:
       - "crates/**"
       - "Cargo.*"
       - "pyproject.toml"
+      - "uv.lock"
+      - "minifs/**"
       - ".github/workflows/wheels.yml"
   workflow_dispatch:
 
@@ -16,7 +18,7 @@ permissions:
 
 concurrency:
   group: wheels-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   wheel:
@@ -34,6 +36,7 @@ jobs:
       # Release wheels are built without the `oracle` feature.
       - uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.15.0
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist
@@ -56,8 +59,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
         with:
+          maturin-version: v1.15.0
           command: sdist
           args: --out dist
+      # The sdist builds the extension from source, so this also checks it needs only a Rust toolchain.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+      - name: Install and import the sdist
+        run: |
+          uv venv --python 3.12 /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.tar.gz "psycopg[binary]"
+          cd /tmp
+          /tmp/smoke/bin/python -c "import minifs._regex as r; assert not r.HAS_ORACLE; from minifs.db.migrate import load_migrations; assert load_migrations()"
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
