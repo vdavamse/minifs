@@ -79,7 +79,7 @@ that.
 | --- | --- |
 | `db` | conninfo of a fresh, migrated database (UTF-8 locale) |
 | `db_c` | the same with `LOCALE 'C'` |
-| `db_any_locale` | parametrised over both; use for tests that must hold in either locale |
+| `db_any_locale` | parametrised over `C`, `C.UTF-8` (Lakebase's default) and the UTF-8 locale; use for tests that must hold in every locale |
 | `empty_db` | a fresh database with no migrations |
 | `conn` | an autocommit `AsyncConnection` to `db` |
 | `pg_version` | `server_version_num` (e.g. `160004`), for version-dependent tests |

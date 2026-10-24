@@ -2,7 +2,7 @@
 
 from psycopg import AsyncConnection
 
-from tests.conftest import PG_IMAGE
+from tests.conftest import PG_IMAGE, TEMPLATES, PgServer
 
 
 async def _collate(conninfo: str) -> str:
@@ -38,6 +38,13 @@ async def test_db_has_utf8_locale(db: str) -> None:
     # Behavioural, not just the name: a musl (alpine) image accepts any locale name and acts like C.
     assert await _collate(db) != "C"
     assert await _e_acute_is_alpha(db)
+
+
+async def test_templates_cover_c_c_utf8_and_utf8(pg_server: PgServer) -> None:
+    collations = {key: await _collate(pg_server.database(name)) for key, name in TEMPLATES.items()}
+    assert collations["c"] == "C"
+    assert collations["c_utf8"] == "C.UTF-8"  # Databricks Lakebase's default
+    assert collations["utf8"] not in {"C", "C.UTF-8"}
 
 
 async def test_each_test_gets_a_clean_database(conn: AsyncConnection) -> None:
