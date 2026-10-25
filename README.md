@@ -186,12 +186,14 @@ Expected outcomes (`ENOENT`, `ENOTDIR`, `EISDIR`, `EEXIST`, `ESTALE`, `ENOTEMPTY
 | Overwrite | `vfs_write(node, data, expect_gen, expect_size, expect_parent, expect_name) -> (generation, size)` | `open` with `O_TRUNC`, then `write` | Inode `FOR UPDATE`; optional compare-and-swap |
 | Positional read | `vfs_pread(node, offset, limit)` | `pread` | None (MVCC snapshot) |
 | Line read | `vfs_pread_lines(node, first_line, max_lines, max_bytes)` | — | None (MVCC snapshot) |
-| Resolve path | `vfs_lookup(path) -> (id, kind)` | `namei` | None |
+| Resolve path | `vfs_lookup(path) -> (id, kind, err, err_detail)` | `namei` | None |
 | List directory | `vfs_readdir(dir)` | `readdir` | None |
 | Create, mkdir | `vfs_create(parent, name, kind, data DEFAULT NULL) -> (id, generation, size)` | `open` with `O_CREAT\|O_EXCL`, `mkdir` | Unique constraint |
 | Rename, move | `vfs_rename(node, new_parent, new_name, expect_parent)` | `rename` | Row lock; checks for cycles |
 | Unlink, rmdir | `vfs_unlink(node)` | `unlink`, `rmdir` | Child check plus FK |
 | Watch | `LISTEN vfs` | `inotify` | — |
+
+Every function in the table that can produce an outcome also returns `err, err_detail` after the columns shown (migration 009).
 
 ### Append
 

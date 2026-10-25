@@ -128,7 +128,7 @@ class VFSClient:
         rows = await self._run(
             path,
             f"SELECT r.id, r.err, r.err_detail, n.kind, n.size, n.mtime, n.generation"
-            f" FROM {ref.sql} r LEFT JOIN vfs_nodes n ON n.id = r.id",
+            f" FROM {ref.sql} r LEFT JOIN LATERAL (SELECT * FROM vfs_nodes n WHERE n.id = r.id) n ON true",
             ref.params,
             [ref],
         )
@@ -684,7 +684,10 @@ def _lookup_errors(row: Sequence[Any], count: int) -> list[_Error]:
 
 async def _lookup(conn: AsyncConnection[Any], ref: _Ref) -> tuple[UUID | None, _Error, Kind | None, int | None]:
     """The id, lookup error, kind and size of the node ``ref`` names, on ``conn``."""
-    query = f"SELECT r.id, r.err, r.err_detail, n.kind, n.size FROM {ref.sql} r LEFT JOIN vfs_nodes n ON n.id = r.id"
+    query = (
+        f"SELECT r.id, r.err, r.err_detail, n.kind, n.size"
+        f" FROM {ref.sql} r LEFT JOIN LATERAL (SELECT * FROM vfs_nodes n WHERE n.id = r.id) n ON true"
+    )
     cur = await conn.execute(cast(Any, query), ref.params)
     row = await cur.fetchone()
     assert row is not None

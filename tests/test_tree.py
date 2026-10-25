@@ -721,3 +721,23 @@ async def test_an_outcome_returns_one_row_and_runs_nothing_else(conn: AsyncConne
     rows = await cur.fetchall()
     assert len(rows) == 1 and rows[0][:3] == (None,) * 3 and rows[0][3] == "ENOTDIR"
     assert await _one(conn, "SELECT count(*) FROM vfs_nodes") == (1,)
+
+
+async def test_a_lookup_joins_as_an_index_lookup(conn: AsyncConnection) -> None:
+    # vfs_lookup is declared ROWS 1: with the default estimate of 1000 rows, a join on its id hashes vfs_nodes.
+    d = await create(conn, None, "d", "dir")
+    await conn.execute(
+        "INSERT INTO vfs_nodes (parent_id, name, kind) SELECT %s, 'f' || i, 'file' FROM generate_series(1, 5000) i",
+        (d,),
+    )
+    await conn.execute("ANALYZE vfs_nodes")
+    for lookup in ("vfs_lookup(ARRAY['d', 'f7'])", "vfs_mkdir_p(ARRAY['d'])"):
+        cur = await conn.execute(f"EXPLAIN SELECT n.size FROM {lookup} r LEFT JOIN vfs_nodes n ON n.id = r.id".encode())
+        plan = "\n".join(line for (line,) in await cur.fetchall())
+        assert "Seq Scan on vfs_nodes" not in plan and "Hash" not in plan, plan
+    # The control: at the default estimate, the same join hashes the table.
+    await conn.execute("ALTER FUNCTION vfs_lookup(text[]) ROWS 1000")
+    cur = await conn.execute(
+        "EXPLAIN SELECT n.size FROM vfs_lookup(ARRAY['d', 'f7']) r LEFT JOIN vfs_nodes n ON n.id = r.id"
+    )
+    assert "Seq Scan on vfs_nodes" in "\n".join(line for (line,) in await cur.fetchall())

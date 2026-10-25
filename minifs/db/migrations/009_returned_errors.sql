@@ -50,7 +50,7 @@ DROP FUNCTION vfs_glob(uuid, text, text, int, text[], boolean, int, text[], text
 
 -- p_id, or EINVAL if p_err is set: wraps a looked-up id passed on to an operation, so even a directory argument
 -- (where NULL is the root) fails loudly if the caller didn't check the lookup's err.
-CREATE FUNCTION vfs_gate(p_id uuid, p_err text) RETURNS uuid LANGUAGE plpgsql IMMUTABLE SET search_path FROM CURRENT AS $$
+CREATE FUNCTION vfs_gate(p_id uuid, p_err text) RETURNS uuid LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $$
 BEGIN
     IF p_err IS NOT NULL THEN
         PERFORM vfs_raise('EINVAL', format('the lookup failed with %s', p_err));
@@ -70,9 +70,10 @@ END $$;
 
 -- Walks p_segments from the root in one round trip. Returns one row: (NULL, 'dir') for the root (empty array),
 -- else the node's id and kind; or err ENOENT if a component is missing, ENOTDIR if a non-final component is a
--- file, with id and kind NULL.
+-- file, with id and kind NULL. ROWS 1, so a join on its id plans as an index lookup (the default estimate of 1000
+-- rows makes the planner hash all of vfs_nodes instead).
 CREATE FUNCTION vfs_lookup(p_segments text[]) RETURNS TABLE (id uuid, kind text, err text, err_detail text)
-LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $$
+LANGUAGE plpgsql STABLE ROWS 1 SET search_path FROM CURRENT AS $$
 DECLARE
     v_id uuid;
     v_kind text := 'dir';
@@ -255,7 +256,7 @@ END $$;
 -- component is a file, EEXIST if the final one is; nothing has been created then, since every directory after
 -- one this call created is new too. EINVAL / ENAMETOOLONG for a bad component.
 CREATE FUNCTION vfs_mkdir_p(p_segments text[]) RETURNS TABLE (id uuid, err text, err_detail text)
-LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+LANGUAGE plpgsql ROWS 1 SET search_path FROM CURRENT AS $$
 DECLARE
     v_id uuid;
     v_next uuid;

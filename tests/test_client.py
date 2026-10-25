@@ -796,7 +796,14 @@ async def test_outcomes_raise_nothing_on_the_server(conn: AsyncConnection, tmp_p
             await outcome("ENOENT", call)
         await outcome("ENOTDIR", vfs.stat("/d/f/x"))
         await outcome("ENOTDIR", vfs.create("/d/f/x", parents=True))
-        await outcome("EISDIR", vfs.pread("/d"))
+        for call in (
+            vfs.pread("/d"),
+            vfs.pread_lines("/d"),
+            vfs.append("/d", b"x"),
+            vfs.write("/d", b"x"),
+            vfs.compact("/d"),
+        ):
+            await outcome("EISDIR", call)
         await outcome("EEXIST", vfs.create("/d/f"))
         await outcome("EEXIST", vfs.rename("/tasks/new/t1", "/d/f"))
         version = await vfs.stat("/d/f")
@@ -851,14 +858,25 @@ async def test_grep_and_glob_of_a_missing_path_return_the_error(vfs: VFSClient) 
         assert error.db_error is None
 
 
-async def test_a_failed_lookup_never_reaches_the_root(vfs: VFSClient) -> None:
+@pytest.mark.parametrize("cached", [False, True])
+async def test_a_failed_lookup_never_reaches_the_root(pool: Pool, cached: bool) -> None:
     # A NULL directory id is the root: an operation called with a failed lookup's id would act there.
-    await vfs.create("/a")
-    await raises("ENOENT", vfs.create("/nope/f"), "/nope/f")
-    await raises("ENOENT", vfs.mkdir("/nope/d"), "/nope/d")
-    await raises("ENOENT", vfs.rename("/a", "/nope/a"), "/nope/a")
-    await raises("ENOENT", vfs.readdir("/nope"), "/nope")
+    cache = DictCache()
+    vfs = VFSClient(pool, cache=cache if cached else None)
+    await vfs.mkdir_p("/gone")
+    a = await vfs.create("/a", b"root a")
+    await vfs.readdir("/")  # caches /gone
+    await VFSClient(pool).unlink("/gone")  # so its cached link is stale
+    for parent in ("/nope", "/gone"):
+        await raises("ENOENT", vfs.create(f"{parent}/f"), f"{parent}/f")
+        await raises("ENOENT", vfs.mkdir(f"{parent}/d"), f"{parent}/d")
+        await raises("ENOENT", vfs.rename("/a", f"{parent}/a"), f"{parent}/a")
+        await raises("ENOENT", vfs.readdir(parent), parent)
+        # expect_parent NULL would also mean the root, where /a is: the compare-and-swap must not pass.
+        await raises("ENOENT", vfs.write(f"{parent}/a", b"CLOBBER", expect=a), f"{parent}/a")
+        await raises("ENOENT", vfs.claim(f"{parent}/a", "/b"), parent)
     assert [e.path for e in await vfs.readdir("/")] == ["/a"]
+    assert (await vfs.pread("/a")).content == b"root a"
 
 
 async def test_rename_racing_a_create_reports_the_destination(vfs: VFSClient, db: str) -> None:
@@ -878,3 +896,33 @@ async def test_rename_racing_a_create_reports_the_destination(vfs: VFSClient, db
         await other.commit()
     error = await raises("EEXIST", task, "/d/b")
     assert error.db_error is not None  # raised, by the constraint
+
+
+async def test_a_claim_lost_inside_vfs_rename_raises_nothing(conn: AsyncConnection, db: str) -> None:
+    # The lookup finds the task in tasks/new, then vfs_rename waits for a concurrent claim's lock and finds it moved:
+    # ESTALE, returned, and the claim is False with the caller's transaction intact.
+    vfs = VFSClient(cast(Any, _OneTransaction(conn)))
+    await vfs.mkdir_p("/tasks/new")
+    await vfs.mkdir_p("/tasks/cur")
+    await vfs.create("/tasks/new/t1")
+    async with await AsyncConnection.connect(db) as other:
+        await other.execute(
+            "SELECT * FROM vfs_rename((SELECT id FROM vfs_lookup(ARRAY['tasks', 'new', 't1'])),"
+            " (SELECT id FROM vfs_lookup(ARRAY['tasks', 'cur'])), 't1-other',"
+            " (SELECT id FROM vfs_lookup(ARRAY['tasks', 'new'])))"
+        )  # uncommitted: holds t1 FOR UPDATE
+        async with conn.transaction():
+            task = asyncio.create_task(vfs.claim("/tasks/new/t1", "/tasks/cur/t1-mine"))
+            for _ in range(200):
+                cur = await other.execute(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (conn.info.backend_pid,)
+                )
+                if await cur.fetchone() == ("Lock",):
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("the claim never waited for the other one's lock")
+            await other.commit()
+            assert await task is False
+            assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+    assert [e.name for e in await vfs.readdir("/tasks/cur")] == ["t1-other"]

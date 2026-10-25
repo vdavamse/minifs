@@ -124,7 +124,8 @@ async def _cat(vfs: VFSClient, args: argparse.Namespace) -> int:
 
 async def _put(vfs: VFSClient, args: argparse.Namespace) -> int:
     data = Path(args.source).read_bytes() if args.source else sys.stdin.buffer.read()
-    # Look first, so a new file costs no failed write (the server returns ENOENT rather than raising it).
+    # Look the path up, then create or write (#35). Both cost two statements for a new file; neither raises on the
+    # server, which returns ENOENT. The fallback below only covers a file removed since the stat.
     try:
         await vfs.stat(args.path)
     except VFSError as e:
