@@ -13,8 +13,10 @@ saves the walk: when every component of a path is cached, the statement checks t
 ``(parent, name) -> id`` link in one index lookup each, and falls back to ``vfs_lookup`` when any link no longer
 holds. So a stale cache costs a slower resolution, never the wrong node. Each statement returns the id it
 resolved, and a ``vfs_lookup`` the chain of ids it walked, in the same row: the client stores what it learns (every
-component of a walk, listings, creates), evicts what it renames or removes, and evicts a cached id that turned out
-stale. Keeping the cache fresh against other clients (NOTIFY, TTL) is the cache's job.
+component of a walk, listings, creates, a rename's destination), evicts what it renames or removes, and evicts a
+cached id that turned out stale. A path whose first components are cached is walked on the server from the deepest
+of them, after checking them in the same statement. Keeping the cache fresh against other clients (NOTIFY, TTL)
+is the cache's job.
 Without a cache, every path is resolved on the server.
 """
 
@@ -54,25 +56,30 @@ MAX_TIMEOUT = _MAX_INT / 1000  # seconds: statement_timeout is an int of millise
 _log = logging.getLogger(__name__)
 _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache links
 
-# A node argument is a FROM item of one row (id, kind, chain, err, err_detail): the node's id, or the errno of a
-# failed lookup. chain is what the server walked (vfs_lookup), for the cache to store; NULL when nothing was walked.
+# A node argument is a FROM item of one row (id, kind, chain, err, err_detail): the node's id and kind, or the errno
+# of a failed lookup. chain is what the server walked (vfs_lookup), for the cache to store; NULL when nothing was
+# walked. kind, when not NULL, is also the kind of chain's last element.
 _LOOKUP = "(SELECT id, kind, chain, err, err_detail FROM vfs_lookup(%s))"
-# The last cached id if every cached link (id, parent, name) still holds, else the server's lookup. Either way it
-# stores nothing (chain NULL): every link was cached already, and after a stale one the client only evicts; the
-# next lookup of the path walks it and stores it.
-_LOOKUP_CACHED = """(SELECT l.id, NULL::text AS kind, NULL::uuid[] AS chain, l.err, l.err_detail
-   FROM (SELECT bool_and(n.id IS NOT NULL) AS ok, (array_agg(c.id ORDER BY c.i DESC))[1] AS last
+# A path whose first components are cached: the server checks them and walks the rest (migration 014).
+_LOOKUP_BELOW = "(SELECT id, kind, chain, err, err_detail FROM vfs_lookup(%s, %s::uuid[]))"
+# The last cached id if every cached link (id, parent, name) still holds, else the server's lookup. The first stores
+# nothing (chain NULL): every link was cached already. The fallback's chain replaces the stale links.
+_LOOKUP_CACHED = """(SELECT l.id, l.kind, l.chain, l.err, l.err_detail
+   FROM (SELECT bool_and(n.id IS NOT NULL) AS ok, (array_agg(c.id ORDER BY c.i DESC))[1] AS last,
+                (array_agg(n.kind ORDER BY c.i DESC))[1] AS last_kind
            FROM unnest(%s::uuid[], %s::uuid[], %s::text[]) WITH ORDINALITY AS c(id, parent, name, i)
            LEFT JOIN vfs_nodes n
                   ON n.id = c.id AND n.parent_id IS NOT DISTINCT FROM c.parent AND n.name = c.name) v
-  CROSS JOIN LATERAL (SELECT v.last AS id, NULL::text AS err, NULL::text AS err_detail WHERE v.ok
+  CROSS JOIN LATERAL (SELECT v.last AS id, v.last_kind AS kind, NULL::uuid[] AS chain, NULL::text AS err,
+                             NULL::text AS err_detail
+                       WHERE v.ok
                       UNION ALL
-                      SELECT r.id, r.err, r.err_detail FROM vfs_lookup(%s) r WHERE NOT v.ok) l)"""
+                      SELECT r.id, r.kind, r.chain, r.err, r.err_detail FROM vfs_lookup(%s) r WHERE NOT v.ok) l)"""
 _NULL = (
     "(SELECT NULL::uuid AS id, NULL::text AS kind, NULL::uuid[] AS chain, NULL::text AS err, NULL::text AS err_detail)"
 )
-# The parent of a create with parents: the directories vfs_mkdir_p found or made. It reports no chain.
-_MKDIR_P = "(SELECT id, NULL::text AS kind, NULL::uuid[] AS chain, err, err_detail FROM vfs_mkdir_p(%s))"
+# The parent of a create with parents, and mkdir_p: the directories vfs_mkdir_p found or made, every one in chain.
+_MKDIR_P = "(SELECT id, 'dir'::text AS kind, chain, err, err_detail FROM vfs_mkdir_p(%s))"
 
 
 class DirCache(Protocol):
@@ -93,9 +100,10 @@ type _Walk = tuple[list[UUID] | None, Kind | None, str | None]  # a lookup's (ch
 class _Ref:
     """A node argument of a statement: a FROM item that yields the node's id (NULL for the root) or a lookup error
     (``_LOOKUP``), and its parameters.
-    ``links`` is the cached ``(id, parent id, name)`` of every component, if the cache held the whole path;
-    ``cached`` the last id. ``segments`` is the path a server lookup walks, and ``walk`` what that lookup returned
-    once the statement ran (``_run``, ``_lookup``), for ``VFSClient._learn``."""
+    ``segments`` is the path. ``links`` is the cached ``(id, parent id, name)`` of its first components: all of
+    them if the cache held the whole path (``_LOOKUP_CACHED``), ``cached`` then being the last id, else a prefix
+    (``_LOOKUP_BELOW``) and ``cached`` None. ``walk`` is what a server lookup returned once the statement ran
+    (``_run``, ``_lookup``), for ``VFSClient._learn``, and ``kind`` the kind of the node it resolved, if any."""
 
     def __init__(
         self, sql: str, params: Sequence[object], links: Sequence[_Link] = (), segments: Sequence[str] = ()
@@ -103,9 +111,10 @@ class _Ref:
         self.sql = sql
         self.params = list(params)
         self.links = list(links)
-        self.cached = self.links[-1][0] if self.links else None
         self.segments = tuple(segments)
+        self.cached = self.links[-1][0] if self.links and len(self.links) == len(self.segments) else None
         self.walk: _Walk | None = None
+        self.kind: Kind | None = None
 
 
 def _root() -> _Ref:
@@ -236,7 +245,7 @@ class VFSClient:
         """``pread(path, offset, limit)`` of each ``(path, offset, limit)`` in ``reads``, in one statement, so one
         round trip and one snapshot. A read that fails with an outcome (ENOENT, ENOTDIR, EISDIR) gives its
         ``VFSError`` in its place; EINVAL for a bad offset or limit fails the whole call. Paths are resolved on the
-        server, without the cache.
+        server, without the cache, which then stores each walk.
 
         With ``groups``, a group id per read: of the reads with the same id, in order, only up to the first file is
         read; the later ones are looked up but read with limit 0 (``AGENTS.md``, else ``CLAUDE.md``)."""
@@ -256,13 +265,14 @@ class VFSClient:
         # A path is "/" and names joined by "/", which no name contains, so the server splits it back.
         rows = await self._run(
             paths[asked[0]],
-            "WITH q AS (SELECT q.i, q.off, q.lim, q.grp, l.id, l.kind, l.err, l.err_detail"
+            "WITH q AS (SELECT q.i, q.off, q.lim, q.grp, l.id, l.kind, l.chain, l.err, l.err_detail"
             "             FROM unnest(%s::text[], %s::bigint[], %s::int[], %s::bigint[])"
             "                  WITH ORDINALITY AS q(path, off, lim, grp, i)"
             "            CROSS JOIN LATERAL vfs_lookup(string_to_array(substr(q.path, 2), '/')) l),"
             " w AS (SELECT q.*, coalesce(bool_or(q.kind = 'file') OVER (PARTITION BY q.grp ORDER BY q.i"
             "                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), false) AS shadowed FROM q)"
-            " SELECT w.i, w.id, w.err, w.err_detail, p.size, p.generation, p.byte_offset, p.data, p.err, p.err_detail"
+            " SELECT w.i, w.id, w.err, w.err_detail, p.size, p.generation, p.byte_offset, p.data, p.err, p.err_detail,"
+            "        CASE WHEN row_number() OVER (PARTITION BY w.i ORDER BY p.byte_offset) = 1 THEN w.chain END, w.kind"
             " FROM w LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(w.id, w.err), w.off,"
             "                                                   CASE WHEN w.shadowed THEN 0 ELSE w.lim END)"
             "                           WHERE w.err IS NULL OFFSET 0) p ON true"
@@ -272,8 +282,14 @@ class VFSClient:
         by_read: dict[int, list[tuple[Any, ...]]] = {}
         for row in rows:
             by_read.setdefault(row[0], []).append(row)
+        walked: list[_Ref] = []
         for n, i in enumerate(asked, 1):
-            node, lookup_err, lookup_detail, size, generation, start, _, err, detail = by_read[n][0][1:]
+            ref = _Ref(_LOOKUP, [], segments=split(paths[i]))
+            ref.walk = (by_read[n][0][10], by_read[n][0][11], by_read[n][0][2])
+            walked.append(ref)
+        self._learn(walked)
+        for n, i in enumerate(asked, 1):
+            node, lookup_err, lookup_detail, size, generation, start, _, err, detail = by_read[n][0][1:10]
             if lookup_err is not None or err is not None:
                 failed = lookup_err or err
                 results[i] = VFSError(failed, paths[i], detail=(lookup_detail if lookup_err else detail) or "")
@@ -439,7 +455,10 @@ class VFSClient:
         """Like ``mkdir -p``: creates every missing directory of ``path`` and returns the last one's id (None for
         the root). ENOTDIR if a non-final component is a file, EEXIST if the final one is."""
         segments = split(path)
-        rows = await self._run(path, "SELECT id, err, err_detail FROM vfs_mkdir_p(%s)", [list(segments)])
+        ref = _Ref(_MKDIR_P, [list(segments)], segments=segments)
+        rows = await self._run(
+            path, f"SELECT {_walks([ref])}r0.id, r0.err, r0.err_detail FROM {ref.sql} r0", ref.params, [ref]
+        )
         node, err, detail = rows[0]
         await self._outcome(path, [], (err, detail))
         return node
@@ -521,7 +540,9 @@ class VFSClient:
         segments = split(path)
         if not segments:
             raise VFSError("EEXIST", "/")
-        parent = _Ref(_MKDIR_P, [list(segments[:-1])]) if parents else self._dir_ref(segments[:-1])
+        parent = (
+            _Ref(_MKDIR_P, [list(segments[:-1])], segments=segments[:-1]) if parents else self._dir_ref(segments[:-1])
+        )
         try:
             rows = await self._call(path, [parent], "vfs_create({0}, %s, %s, %s)", [segments[-1], kind, data])
         except VFSError as e:
@@ -567,6 +588,7 @@ class VFSClient:
                 refs,
             )
             if rows[0][-2] == "ESTALE":  # lost the compare-and-swap: someone else moved it first
+                self._checked_dirs(parent, expect_parent, rows[0])
                 self._evict(node, rows[0][0])
                 if claim:
                     return False
@@ -575,6 +597,7 @@ class VFSClient:
             self._vanished(rows[0], lookups, rows[0][-2])
             if expect is not None and all(err is None for err, _ in lookups) and rows[0][0] != expect:
                 # `src` is a node other than `expect`, so the gate kept vfs_rename from running: nothing moved.
+                self._checked_dirs(parent, expect_parent, rows[0])
                 self._checked(node, rows[0][0])
                 if claim:
                     return False  # the claimed node is gone from `src`
@@ -596,8 +619,16 @@ class VFSClient:
                     return False
                 raise src_error from None
             raise e.at(join(*dst_segments)) from None
+        self._checked_dirs(parent, expect_parent, rows[0])
         self._evict(node, rows[0][0])
+        if self.cache is not None and node.kind is not None:
+            self.cache.store(rows[0][3], dst_segments[-1], rows[0][0], node.kind)  # where it is now
         return True
+
+    def _checked_dirs(self, parent: _Ref, expect_parent: _Ref, row: Sequence[Any]) -> None:
+        """``_checked`` for the directory refs of a ``_rename`` whose lookups all succeeded (``row``, of ``_gated``)."""
+        self._checked(parent, row[3])
+        self._checked(expect_parent, row[6])
 
     async def _check_destination(self, segments: tuple[str, ...]) -> None:
         """Raises what a move to ``segments`` would: a missing or file parent directory, an invalid name."""
@@ -613,44 +644,59 @@ class VFSClient:
             raise VFSError("ENAMETOOLONG", path, "name over 255 bytes")
 
     def _ref(self, segments: tuple[str, ...]) -> _Ref:
-        chain = self._cached_chain(segments)
-        if chain is None:
+        links = self._cached_links(segments)
+        if not links:
             return _Ref(_LOOKUP, [list(segments)], segments=segments)
-        ids = [node for node, _ in chain]
-        parents = [parent for _, parent in chain]
-        links = list(zip(ids, parents, segments, strict=True))
-        return _Ref(_LOOKUP_CACHED, [ids, parents, list(segments), list(segments)], links)
+        ids = [node for node, _, _ in links]
+        if len(links) < len(segments):  # the server walks on from the deepest cached directory
+            return _Ref(_LOOKUP_BELOW, [list(segments), ids], links, segments)
+        parents = [parent for _, parent, _ in links]
+        return _Ref(_LOOKUP_CACHED, [ids, parents, list(segments), list(segments)], links, segments)
 
     def _dir_ref(self, segments: tuple[str, ...]) -> _Ref:
         """Like ``_ref``, for a directory argument, where the root is NULL (and needs no subquery)."""
         return self._ref(segments) if segments else _root()
 
-    def _cached_chain(self, segments: tuple[str, ...]) -> list[tuple[UUID, UUID | None]] | None:
-        """``(id, parent id)`` of every component of ``segments`` if the cache holds them all, else None."""
-        if self.cache is None or not segments:
-            return None
-        chain: list[tuple[UUID, UUID | None]] = []
+    def _cached_links(self, segments: tuple[str, ...]) -> list[_Link]:
+        """The cached ``(id, parent id, name)`` of every component of ``segments`` up to the first the cache lacks:
+        all of them, or a prefix of directories."""
+        links: list[_Link] = []
+        if self.cache is None:
+            return links
         parent: UUID | None = None
         for name in segments:
             hit = self.cache.lookup(parent, name)
             if hit is None:
-                return None
-            chain.append((hit[0], parent))
+                break
+            if hit[1] != "dir" and len(links) < len(segments) - 1:
+                break  # a file before the end: the server walks to it and reports ENOTDIR
+            links.append((hit[0], parent, name))
             parent = hit[0]
-        return chain
+        return links
 
     def _learn(self, refs: Sequence[_Ref]) -> None:
         """Stores every link the server walked for ``refs``, as the kernel adds a dentry for each component of a
         path walk: each component's ``(parent, name) -> id``, a directory but for the last, which has the kind the
-        lookup returned (a file on ENOTDIR, a directory on ENOENT). A failed lookup stores the prefix it resolved,
-        never the missing name. This runs after the statement, so the entries race a concurrent move as a listing's
-        do; the in-statement check of cached chains, NOTIFY and the TTL cover it (``minifs.vfs.cache``)."""
+        lookup returned (a file on ENOTDIR, a directory on ENOENT; ``vfs_mkdir_p``'s are all directories). A failed
+        lookup stores the prefix it resolved, never the missing name. This runs after the statement, so the entries
+        race a concurrent move as a listing's do; the in-statement check of cached chains, NOTIFY and the TTL cover
+        it (``minifs.vfs.cache``).
+
+        A walk below a cached prefix (``links`` of a partial path) that didn't hold started from the root instead,
+        and the first id where the two differ is the stale link: it is evicted with no query. The links below it are
+        keyed by its id, so they may still hold, and are kept, as ``_evict_stale`` keeps them."""
         for ref in refs:
             chain, kind, err = ref.walk or (None, None, None)
             ref.walk = None  # learned once
-            if self.cache is None or not chain:
+            if self.cache is None or chain is None:
                 continue
-            last: Kind = (kind or "dir") if err is None else "file" if err == "ENOTDIR" else "dir"
+            prefix = [] if ref.cached is not None else [node for node, _, _ in ref.links]
+            stale = next((node for i, node in enumerate(prefix) if i >= len(chain) or chain[i] != node), None)
+            if stale is not None:
+                self.cache.evict(stale)
+            if not chain:
+                continue
+            last: Kind = kind or ("file" if err == "ENOTDIR" else "dir")
             parent: UUID | None = None
             for i, (node, name) in enumerate(zip(chain, ref.segments, strict=False)):
                 self.cache.store(parent, name, node, last if i == len(chain) - 1 else "dir")
@@ -766,11 +812,12 @@ class VFSClient:
         """Raises the first of ``errors``, the ``(err, err_detail)`` pairs a statement returned, as a ``VFSError``
         for ``path``: the one place a returned outcome becomes an exception, with the same errno and detail a raised
         one had (and no ``db_error``). ENOENT and ENOTDIR first evict the links of ``refs`` that went stale, as
-        ``_run`` does for raised errors, so a retry doesn't reuse them."""
+        ``_run`` does for raised errors, so a retry doesn't reuse them. A partly cached path's walk has shown that
+        already (``_learn``), so only fully cached ones are checked."""
         for err, detail in errors:
             if err is not None:
                 if err in ("ENOENT", "ENOTDIR"):
-                    await self._await_eviction(refs)
+                    await self._await_eviction([ref for ref in refs if ref.cached is not None])
                 raise VFSError(err, normalize(path), detail=detail or "")
 
     async def _run(
@@ -801,6 +848,7 @@ class VFSClient:
             return rows
         for i, ref in enumerate(refs):
             ref.walk = cast(_Walk, tuple(rows[0][3 * i : 3 * i + 3]))
+            ref.kind = ref.walk[1]
         self._learn(refs)
         return [row[3 * len(refs) :] for row in rows]
 
@@ -862,6 +910,7 @@ async def _lookup(conn: AsyncConnection[Any], ref: _Ref) -> tuple[UUID | None, _
     row = await cur.fetchone()
     assert row is not None
     ref.walk = (row[5], row[6], row[1])
+    ref.kind = row[6]
     return row[0], (row[1], row[2]), row[3], row[4]
 
 

@@ -398,9 +398,11 @@ async def test_stale_cache_never_reaches_the_wrong_node(pool: Pool) -> None:
     await other.mkdir("/d")
     await other.create("/d/x", b"other")
     assert (await vfs.pread("/d/x")).content == b"other"
-    # The stale chain is gone; nothing cached points at the moved directory under its old name.
+    # The stale chain is gone: the fallback's walk replaced it, and nothing cached points at the moved directory
+    # under its old name.
     await vfs.settle()
-    assert all(name != "d" for _, name in cache.entries)
+    d = (await other.stat("/d")).id
+    assert all(node == d for (_, name), (node, _) in cache.entries.items() if name == "d")
     assert (await vfs.claim("/d/x", "/e/z")) is True
     assert (await other.pread("/e/z")).content == b"other"
 
@@ -410,8 +412,9 @@ async def test_eviction_without_a_fully_cached_path(pool: Pool) -> None:
     vfs = VFSClient(pool, cache=cache)
     d = await vfs.mkdir("/d")
     f = await vfs.create("/d/f")
-    await vfs.rename("/d", "/e")  # evicts d only
-    assert cache.entries == {(d, "f"): (f.id, "file")}
+    await vfs.rename("/d", "/e")  # d is cached under its new name only; its entries are keyed by its id, so kept
+    assert cache.entries == {(d, "f"): (f.id, "file"), (None, "e"): (d, "dir")}
+    cache.entries.pop((None, "e"))
     await vfs.unlink("/e/f")  # resolved on the server, still evicted; the walk taught the cache /e
     assert cache.entries == {(None, "e"): (d, "dir")}
 

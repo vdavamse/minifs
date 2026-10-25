@@ -25,6 +25,7 @@ from psycopg.conninfo import make_conninfo
 from testcontainers.community.postgres import PostgresContainer
 
 from minifs.db.migrate import migrate
+from minifs.vfs import regex
 
 PG_IMAGE = os.environ.get("MINIFS_TEST_PG_IMAGE", "postgres:18")
 
@@ -57,6 +58,14 @@ def pg_server() -> Iterator[PgServer]:
                 asyncio.run(_migrate(server.database(template)))
                 conn.execute(sql.SQL("ALTER DATABASE {} IS_TEMPLATE true").format(sql.Identifier(template)))
         yield server
+
+
+@pytest.fixture(autouse=True)
+def _fresh_regex_verdicts() -> None:
+    """Forgets which patterns Postgres compiled or refused (per process), so no test depends on another's patterns:
+    a test that hands ``regex.validate`` a broken translation of a pattern another test grepped for would pass."""
+    regex._validated.clear()  # pyright: ignore[reportPrivateUsage]
+    regex._too_expensive.clear()  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.fixture

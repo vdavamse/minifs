@@ -349,11 +349,11 @@ async def test_a_rename_after_the_store_still_resolves(
             await catch_up(watcher, conn)  # with follow, the move's notification has evicted b by now
             # The race the notification can't cover: a walk whose snapshot predates the move, stored after it.
             cache.store(a, "b", old_b, "dir")
-            evictions = cache.stats().evictions
             assert (await vfs.pread("/a/b/f")).content == b"new"  # the stale chain is caught in the statement
             await vfs.settle()
-            assert cache.stats().evictions > evictions  # and its stale link evicted
-            assert cache.lookup(a, "b") != (old_b, "dir")
+            new_b = (await other.stat("/a/b")).id
+            assert new_b is not None and cache.lookup(a, "b") == (new_b, "dir")  # the fallback's walk replaced it
+            assert cache.lookup(new_b, "f") == (new.id, "file")
             assert (await vfs.stat("/a/b/f")).id == new.id
             assert (await vfs.stat("/a/moved/f")).id == old.id
             assert (await vfs.pread("/a/b/f")).content == b"new"
@@ -378,10 +378,11 @@ async def test_mutations_learn_their_paths(pool: Pool) -> None:
     f = await other.create("/src/x/f")
     cache = DirEntryCache(ttl=60)
     vfs = VFSClient(pool, cache=cache)
-    await vfs.rename("/src/x/f", "/dst/y/g")  # both sides walked; the moved node isn't kept under its old name
+    await vfs.rename("/src/x/f", "/dst/y/g")  # both sides walked; the moved node is kept under its new name only
     src, dst = (await other.stat("/src/x")).id, (await other.stat("/dst/y")).id
-    assert cached_ids(cache) == {(await other.stat("/src")).id, src, (await other.stat("/dst")).id, dst}
+    assert cached_ids(cache) == {(await other.stat("/src")).id, src, (await other.stat("/dst")).id, dst, f.id}
     assert cache.lookup(src, "f") is None
+    assert cache.lookup(dst, "g") == (f.id, "file")
     created = await vfs.create("/dst/y/h")  # its parent hits every component
     assert cache.lookup(dst, "h") == (created.id, "file")
     await vfs.unlink("/dst/y/g")
@@ -468,3 +469,158 @@ async def test_each_operation_is_one_statement(pool: Pool, monkeypatch: pytest.M
     with pytest.raises(VFSError):
         await vfs.stat("/a/b/missing")
     assert len(statements) == 1
+
+
+# More walks (#55)
+
+
+def capture(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Any]]:
+    """Every statement sent from now on, with its parameters."""
+    statements: list[tuple[str, Any]] = []
+    execute = AsyncConnection.execute
+
+    async def capturing(self: AsyncConnection[Any], query: Any, params: Any = None, *args: Any, **kwargs: Any) -> Any:
+        if str(query).strip():  # the pool's check at checkout is an empty query
+            statements.append((str(query), params))
+        return await execute(self, query, params, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", capturing)
+    return statements
+
+
+async def test_a_cold_create_with_parents_caches_every_directory(pool: Pool) -> None:
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    f = await vfs.create("/w/a/b/f", b"f", parents=True)
+    w, a, b = [await VFSClient(pool).stat(path) for path in ("/w", "/w/a", "/w/a/b")]
+    assert cache.lookup(None, "w") == (w.id, "dir") and cache.lookup(w.id, "a") == (a.id, "dir")
+    assert cache.lookup(a.id, "b") == (b.id, "dir") and cache.lookup(b.id, "f") == (f.id, "file")
+    lookups, hits, stores = walk_stats(cache)
+    assert (await vfs.stat("/w/a/b/f")).id == f.id
+    assert walk_stats(cache) == (lookups + 4, hits + 4, stores)  # every component hit
+    y = await vfs.mkdir_p("/w/x/y")  # w found, x and y made: all three stored
+    x = (await VFSClient(pool).stat("/w/x")).id
+    assert cache.lookup(w.id, "x") == (x, "dir") and y is not None and cache.lookup(x, "y") == (y, "dir")
+    cache.clear()
+    with pytest.raises(VFSError) as error:
+        await vfs.mkdir_p("/w/a/b/f/z")
+    assert error.value.errno == "ENOTDIR"
+    assert cached_ids(cache) == {w.id, a.id, b.id}  # the directories before the file, all as directories
+    assert cache.lookup(a.id, "b") == (b.id, "dir")
+
+
+async def test_a_partly_cached_path_walks_below_its_prefix(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    other = VFSClient(pool)
+    await other.create("/a/b/c/f", b"f", parents=True)
+    g = await other.create("/a/b/c/g", b"g")
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    await vfs.stat("/a/b/c/f")  # stores a, b, c and f
+    ids = [(await other.stat(path)).id for path in ("/a", "/a/b", "/a/b/c")]
+    statements = capture(monkeypatch)
+    lookups, hits, stores = walk_stats(cache)
+    assert (await vfs.stat("/a/b/c/g")).id == g.id
+    # One statement, whose lookup starts below c: the server checks a, b and c, then looks up g alone.
+    assert len(statements) == 1 and "vfs_lookup(%s, %s::uuid[])" in statements[0][0]
+    assert statements[0][1][:2] == [["a", "b", "c", "g"], ids]
+    assert walk_stats(cache) == (lookups + 4, hits + 3, stores + 4)  # g missed; the walk stored all four
+    assert cache.lookup(ids[2], "g") == (g.id, "file")
+
+
+async def test_a_stale_prefix_is_evicted_without_a_query(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    other = VFSClient(pool)
+    await other.create("/a/b/f", b"f", parents=True)
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    await vfs.stat("/a/b/f")
+    a, b = (await other.stat("/a")).id, (await other.stat("/a/b")).id
+    await other.rename("/a/b", "/moved")  # no notifications here: the cache still has a/b
+    statements = capture(monkeypatch)
+    with pytest.raises(VFSError) as error:
+        await vfs.stat("/a/b/g")  # the prefix a, b no longer holds: walked from the root, ENOENT at b
+    assert error.value.errno == "ENOENT" and error.value.path == "/a/b/g"
+    assert len(statements) == 1
+    assert cache.lookup(a, "b") is None and cache.lookup(None, "a") == (a, "dir")
+    assert b is not None and cache.lookup(b, "f") is not None  # keyed by b's id, which still holds
+    assert (await vfs.stat("/moved/f")).path == "/moved/f"
+
+
+async def test_a_rename_destination_hits_next_time(pool: Pool) -> None:
+    other = VFSClient(pool)
+    await other.mkdir("/dst")
+    await other.create("/src/f", b"f", parents=True)
+    d = await other.mkdir("/src/d")
+    await other.create("/src/d/inner", b"i")
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    await vfs.stat("/src/d/inner")
+    await vfs.rename("/src/f", "/dst/g")
+    lookups, hits, stores = walk_stats(cache)
+    assert (await vfs.stat("/dst/g")).kind == "file"
+    assert walk_stats(cache) == (lookups + 2, hits + 2, stores)
+    await vfs.rename("/src/d", "/dst/e")  # a cached chain (kind from the statement) moving a directory
+    lookups, hits, stores = walk_stats(cache)
+    assert (await vfs.stat("/dst/e/inner")).path == "/dst/e/inner"
+    assert walk_stats(cache) == (lookups + 3, hits + 3, stores)  # its entries were kept: keyed by its id
+    assert cache.lookup((await other.stat("/dst")).id, "e") == (d, "dir")
+
+
+async def test_a_rename_evicts_a_stale_destination_link(pool: Pool) -> None:
+    other = VFSClient(pool)
+    await other.create("/x/f", b"f", parents=True)
+    old_c = await other.mkdir("/a/b/c", parents=True)
+    old_b = (await other.stat("/a/b")).id
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    await vfs.stat("/a/b/c")
+    # No notifications here: the cache still has a/b/c. b and c both move, and new ones take their names.
+    await other.rename("/a/b", "/a/moved")
+    await other.rename("/a/moved/c", "/c")
+    new_c = await other.mkdir("/a/b/c", parents=True)
+    await vfs.rename("/x/f", "/a/b/c/f")  # the destination's cached chain no longer holds
+    # The fallback's walk replaced (a, b) and stored (new b, c). (old b, c) -> old c is a stale link it can't reach,
+    # under a directory that still exists: only checking the destination's links evicts it.
+    await vfs.settle()
+    assert old_b is not None and cache.lookup(old_b, "c") is None and old_c not in cached_ids(cache)
+    assert (await vfs.stat("/a/b/c/f")).path == "/a/b/c/f"
+    assert new_c in cached_ids(cache)
+
+
+async def test_a_stale_chain_to_the_same_node_is_replaced(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    other = VFSClient(pool)
+    f = await other.create("/a/b/f", b"f", parents=True)
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    await vfs.stat("/a/b/f")
+    # b is replaced, and f moved into the new b: the cached chain is stale but still ends at f.
+    await other.rename("/a/b", "/a/c")
+    await other.mkdir("/a/b")
+    await other.rename("/a/c/f", "/a/b/f")
+    assert (await vfs.stat("/a/b/f")).id == f.id  # the fallback walk, which stores the chain it walked
+    statements = capture(monkeypatch)
+    lookups, hits, stores = walk_stats(cache)
+    assert (await vfs.stat("/a/b/f")).id == f.id
+    assert walk_stats(cache) == (lookups + 3, hits + 3, stores)  # all cached, and every link holds
+    assert len(statements) == 1 and "unnest(%s::uuid[], %s::uuid[], %s::text[])" in statements[0][0]  # the chain
+    new_b = (await other.stat("/a/b")).id
+    assert new_b is not None and cache.lookup(new_b, "f") == (f.id, "file")
+
+
+async def test_pread_many_learns_its_walks(pool: Pool) -> None:
+    other = VFSClient(pool)
+    agents = await other.create("/w/AGENTS.md", b"rules", parents=True)
+    await other.create("/w/sub/f", b"f", parents=True)
+    w = (await other.stat("/w")).id
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    reads = [("/w/AGENTS.md", 0, 100), ("/w/CLAUDE.md", 0, 100), ("/w/sub/f/x", 0, 100)]
+    results = await vfs.pread_many(reads, groups=[0, 0, 1])
+    assert [r.errno if isinstance(r, VFSError) else r.content for r in results] == [b"rules", "ENOENT", "ENOTDIR"]
+    f = (await other.stat("/w/sub/f")).id
+    assert cache.lookup(None, "w") == (w, "dir") and cache.lookup(w, "AGENTS.md") == (agents.id, "file")
+    sub = cache.lookup(w, "sub")
+    assert sub is not None and cache.lookup(sub[0], "f") == (f, "file")  # up to the file, as a file
+    assert cache.lookup(w, "CLAUDE.md") is None
+    lookups, hits, stores = walk_stats(cache)
+    assert (await vfs.pread("/w/AGENTS.md")).content == b"rules"
+    assert walk_stats(cache) == (lookups + 2, hits + 2, stores)
