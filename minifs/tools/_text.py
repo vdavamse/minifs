@@ -10,7 +10,7 @@ import re
 from minifs.vfs.core import FileVersion, VFSError
 from minifs.vfs.view import VFSView
 
-BOM = "﻿"
+BOM = "\ufeff"
 
 PAGE = 1024 * 1024
 """Bytes per ``pread`` when reading a whole file."""

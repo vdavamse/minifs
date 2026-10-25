@@ -17,9 +17,9 @@ from ladderframe.tools.write import Write
 CASES = [
     ("new", None, "a\nb\n"),
     ("overwrite", b"a\nb\n", "a\nc\n"),
-    ("bom_kept", "﻿old".encode(), "new"),
-    ("bom_in_content", None, "﻿x\n"),
-    ("bom_both", "﻿old\n".encode(), "﻿new\n"),
+    ("bom_kept", "\ufeffold".encode(), "new"),
+    ("bom_in_content", None, "\ufeffx\n"),
+    ("bom_both", "\ufeffold\n".encode(), "\ufeffnew\n"),
     ("no_final_newline", b"x", "y"),
     ("add_final_newline", b"x", "x\n"),
     ("indented", b"    a = 1\n    b = 2\n", "    a = 1\n    b = 3\n"),

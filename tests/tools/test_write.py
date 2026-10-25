@@ -70,9 +70,9 @@ async def test_creates_and_overwrites(deps: Deps, client: VFSClient) -> None:
 
 
 async def test_keeps_the_bom(deps: Deps, client: VFSClient) -> None:
-    await client.create(f"/workspaces/{W1}/bom.txt", "﻿old".encode())
+    await client.create(f"/workspaces/{W1}/bom.txt", "\ufeffold".encode())
     await write(deps, "bom.txt", "new")
-    assert await content(client, "bom.txt") == "﻿new".encode()
+    assert await content(client, "bom.txt") == "\ufeffnew".encode()
 
 
 async def test_write_over_a_non_utf8_file(deps: Deps, client: VFSClient) -> None:
@@ -115,7 +115,7 @@ async def test_overwrite_is_a_new_generation(deps: Deps, client: VFSClient) -> N
     [
         ("/docs/guide.md", "/docs/guide.md"),
         ("/docs/new.md", "/docs/new.md"),
-        ("/docs/sub/new.md", "/docs/sub"),  # the first directory the create would make
+        ("/docs/sub/new.md", "/docs/sub/new.md"),
         ("log.md", "/workspace/log.md"),
     ],
 )
@@ -169,7 +169,7 @@ class Racing(VFSView):
     def __init__(
         self, view: VFSView, client: VFSClient, before_write: Sequence[Step] = (), before_create: Sequence[Step] = ()
     ) -> None:
-        super().__init__(client, {"/workspace": f"/workspaces/{W1}", "/docs": "/docs"}, view.policy, view.actor)
+        super().__init__(client, workspace_mounts(W1), view.policy, view.actor)
         self.before_write, self.before_create = list(before_write), list(before_create)
         self.writes = self.creates = 0
 
@@ -237,6 +237,52 @@ async def test_a_file_removed_twice_is_a_retry(view: VFSView, client: VFSClient)
     unlink = lambda: client.unlink(f"/workspaces/{W1}/notes.md")  # noqa: E731
     racing = Racing(view, client, [unlink], [create(client, "notes.md", b"theirs\n")])
     assert await retry_message(Write, Deps(racing), content="mine\n", filePath="notes.md") == STALE
+
+
+async def test_a_parent_removed_before_the_create_is_made_again(view: VFSView, client: VFSClient) -> None:
+    await client.mkdir(f"/workspaces/{W1}/d")
+    racing = Racing(view, client, before_create=[lambda: client.unlink(f"/workspaces/{W1}/d")])
+    _, meta = await write(Deps(racing), "d/x.txt", "mine\n")
+    assert (racing.creates, meta["exists"]) == (2, False)  # the second with parents
+    assert await content(client, "d/x.txt") == b"mine\n"
+
+
+async def test_a_file_replaced_by_a_directory_is_a_directory(view: VFSView, client: VFSClient) -> None:
+    async def replace() -> None:
+        await client.unlink(f"/workspaces/{W1}/notes.md")
+        await client.mkdir(f"/workspaces/{W1}/notes.md")
+
+    racing = Racing(view, client, [replace])
+    message = await retry_message(Write, Deps(racing), content="mine\n", filePath="notes.md")
+    assert message == "Path is a directory, not a file: /workspace/notes.md"
+
+
+async def test_write_only_rules(client: VFSClient) -> None:
+    """A rule granting ``write`` without ``read`` lets ``Write`` create files, but not overwrite them (the diff needs
+    the old text); a rule granting nothing refuses the write, not the read, as ladderframe checks the write."""
+    policy = Policy(
+        {
+            "agent": [
+                Rule("/workspace/out/**", "write"),
+                Rule("/workspace/none/**"),
+                Rule("/workspace/**", "read", "write"),
+            ]
+        }
+    )
+    deps = Deps(VFSView(client, workspace_mounts(W1), policy, "agent"))
+    await client.mkdir(f"/workspaces/{W1}/out")
+    assert await run_tool(Write, deps, content="x", filePath="out/new.txt") == "Wrote file successfully."
+    assert await content(client, "out/new.txt") == b"x"
+    assert (
+        await run_tool(Write, deps, content="y", filePath="out/new.txt")
+        == "Permission denied: read /workspace/out/new.txt"
+    )
+    assert await content(client, "out/new.txt") == b"x"
+    assert (
+        await run_tool(Write, deps, content="x", filePath="none/a.txt")
+        == "Permission denied: write /workspace/none/a.txt"
+    )
+    assert policy.denials == {("agent", "read"): 1, ("agent", "write"): 1}  # only the refusals
 
 
 async def test_parents_only_for_a_missing_parent(client: VFSClient) -> None:

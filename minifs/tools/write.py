@@ -2,14 +2,12 @@
 ``Write`` (``ladderframe.tools.write``, which follows opencode's write tool), over a ``VFSView``.
 
 ladderframe serialises writers of a path with a thread lock; here an overwrite is a compare-and-swap on the
-version read for the diff, so a concurrent writer anywhere is detected. A lost race (``ESTALE``, or a create that
-finds the file created, or a file gone before its overwrite) is tried once more from the start, which is safe since
-``Write`` replaces the whole file; a second loss is the ``ModelRetry`` of ``tool_error``.
+version read for the diff, so a concurrent writer anywhere is detected. A lost race (``ESTALE``, a create that finds
+the file created, a file gone or replaced by a directory before its overwrite) is tried once more from the start,
+which is safe since ``Write`` replaces the whole file; a second loss is the ``ModelRetry`` of ``tool_error``.
 """
 
 from __future__ import annotations
-
-import posixpath
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ToolReturn
@@ -18,7 +16,7 @@ from minifs.tools._text import diff_metadata, encode_text, read_file, split_bom
 from minifs.tools.base import vfs_tool
 from minifs.tools.deps import HasVFS, resolve
 from minifs.tools.errors import tool_error
-from minifs.vfs.core import Entry, VFSError
+from minifs.vfs.core import VFSError
 from minifs.vfs.view import VFSView
 
 DESCRIPTION = """Writes a file to the filesystem.
@@ -44,13 +42,14 @@ async def write(ctx: RunContext[HasVFS], content: str, filePath: str) -> str | T
     """
     path = resolve(ctx, filePath)
     try:
-        try:
-            exists, content_old, content_new = await _write(ctx.deps.vfs, path, content)
-        except _Lost:
+        for _ in range(2):
             try:
                 exists, content_old, content_new = await _write(ctx.deps.vfs, path, content)
+                break
             except _Lost:
-                raise VFSError("ESTALE", path) from None
+                continue
+        else:
+            raise VFSError("ESTALE", path)
     except VFSError as e:
         return tool_error(e, "write")
     return ToolReturn(
@@ -61,19 +60,30 @@ async def write(ctx: RunContext[HasVFS], content: str, filePath: str) -> str | T
 
 async def _write(vfs: VFSView, path: str, content: str) -> tuple[bool, str, str]:
     """Writes ``content`` to ``path``: ``(the file existed, its old text, the new text)``, without BOMs. ``_Lost``
-    where another writer got in between: a create beaten to the file, a file changed or removed after its stat."""
+    where another writer got in between: a create beaten to the file, a file changed, removed or replaced by a
+    directory after its stat."""
     next_bom, content_new = split_bom(content)
+    if not vfs.policy.allows(vfs.actor, "read", path):
+        # ladderframe checks the write permission first. Allowed to write but not read: a new file needs no old
+        # text, but an existing one can't be diffed. (Asked with ``allows``, so only the refusal that decides
+        # counts as a denial.)
+        vfs.policy.check(vfs.actor, "write", path)
+        try:
+            await _create(vfs, path, encode_text(content_new, next_bom))
+        except VFSError as e:
+            if e.errno == "EEXIST":
+                vfs.policy.check(vfs.actor, "read", path)
+            raise
+        return False, "", content_new
     try:
         entry = await vfs.stat(path)
     except VFSError as e:
         if e.errno != "ENOENT":
             raise
-        parent = await _parent(vfs, path)
         try:
-            await vfs.create(path, encode_text(content_new, next_bom), parents=parent is None)
-        except VFSError as e:
-            # created meanwhile, or its parent removed (a virtual directory never is: outside the mounts below it)
-            if e.errno == "EEXIST" or (e.errno == "ENOENT" and parent is not None and parent.id is not None):
+            await _create(vfs, path, encode_text(content_new, next_bom))
+        except VFSError as c:
+            if c.errno == "EEXIST":  # created meanwhile
                 raise _Lost from None
             raise
         return False, "", content_new
@@ -94,15 +104,16 @@ async def _write(vfs: VFSView, path: str, content: str) -> tuple[bool, str, str]
     return True, content_old, content_new
 
 
-async def _parent(vfs: VFSView, path: str) -> Entry | None:
-    """``path``'s parent directory, None if it is missing. ``create`` gets ``parents`` only then, since the view
-    checks ``write`` on every directory a ``parents`` create could make, existing or not."""
+async def _create(vfs: VFSView, path: str, data: bytes) -> None:
+    """Creates file ``path``, with its missing parent directories. ``parents`` only when the parent is missing (the
+    create without it is ENOENT), since the view checks ``write`` on every directory a ``parents`` create could
+    make, existing or not."""
     try:
-        return await vfs.stat(posixpath.dirname(path))
+        await vfs.create(path, data)
     except VFSError as e:
         if e.errno != "ENOENT":
             raise
-        return None
+        await vfs.create(path, data, parents=True)
 
 
 Write = vfs_tool(write, "Write", DESCRIPTION, sequential=True)
