@@ -486,6 +486,8 @@ async def test_pread_many(vfs: VFSClient, policy: Policy) -> None:
     denied, guide = await ingestion.pread_many([("/workspace/notes.md", 0, 1), ("/docs/guide.md", 0, 100)])
     assert isinstance(denied, VFSError) and (denied.errno, denied.path) == ("EACCES", "/workspace/notes.md")
     assert isinstance(guide, ReadResult)
+    with pytest.raises(ValueError):
+        await agent.pread_many(reads, groups=[0])
     (only,) = await agent.pread_many([("/", 0, 1)])  # nothing to send
     assert isinstance(only, VFSError) and only.errno == "EISDIR"
 

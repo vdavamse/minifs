@@ -165,6 +165,8 @@ class VFSView:
         """``VFSClient.pread_many`` of ``reads``: each read's error in its place, a policy denial (EACCES), a path
         outside every mount (ENOENT) and a virtual directory (EISDIR) among them. Those aren't sent, so in a group
         they never stand in for a file."""
+        if groups is not None and len(groups) != len(reads):
+            raise ValueError(f"{len(groups)} groups for {len(reads)} reads")
         results: list[ReadResult | VFSError] = []
         asked: list[tuple[int, _Target, int, int, int]] = []  # (index in results, target, offset, limit, group)
         for n, (path, offset, limit) in enumerate(reads):
