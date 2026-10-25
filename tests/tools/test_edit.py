@@ -5,12 +5,15 @@ policy, the chroot, the size cap and lost races."""
 import asyncio
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import minifs.tools._text as text
+import minifs.tools.edit as edit_module
 from minifs.tools import TOOLS, Edit
 from minifs.tools.deps import EditSettings, ToolSettings
 from minifs.tools.edit import (
@@ -21,6 +24,7 @@ from minifs.tools.edit import (
     trimmed_boundary_replacer,
 )
 from minifs.vfs.client import VFSClient
+from minifs.vfs.core import ReadResult
 from minifs.vfs.policy import Policy, Rule
 from minifs.vfs.view import VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
@@ -126,7 +130,8 @@ async def test_a_file_as_a_parent_is_not_found(deps: Deps) -> None:
 
 async def test_concurrent_edits_of_one_file_keep_every_change(view: VFSView, client: VFSClient) -> None:
     """ladderframe locks the path, so all 20 edits apply. Here each is a compare-and-swap redone once, so an edit
-    that loses twice is a retry; but no edit's change is lost, and none applies twice."""
+    that loses twice is a retry; but no edit's change is lost, and none applies twice. This checks for lost updates
+    only: whether the edits actually race depends on timing, so the redo itself is the ``Racing`` tests' job."""
     await put(client, "many.txt", "".join(f"line {i}\n" for i in range(20)).encode())
 
     async def one(i: int) -> bool:
@@ -287,6 +292,41 @@ async def test_size_cap(deps: Deps, client: VFSClient) -> None:
         EditSettings(max_bytes=-1)
     with pytest.raises(TypeError):
         EditSettings(max_bytes=1.5)  # pyright: ignore[reportArgumentType]
+
+
+async def test_a_file_grown_past_the_cap_is_refused_after_one_page(
+    view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cap protects memory, so a file that grew past it after the stat isn't read in full first."""
+    monkeypatch.setattr(text, "PAGE", 10)
+    reads = 0
+
+    class Growing(VFSView):
+        async def pread(self, path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                await client.write(f"/workspaces/{W1}/notes.md", b"mine\n" * 100)
+            return await super().pread(path, offset, limit)
+
+    growing = Growing(client, workspace_mounts(W1), view.policy, view.actor)
+    small = Deps(growing, vfs_settings=ToolSettings(edit=EditSettings(max_bytes=100)))
+    message = await edit_retry(small, "notes.md", "mine", "ours", True)
+    assert message.startswith("Cannot edit /workspace/notes.md: it is 500 bytes, over the 100-byte limit")
+    assert reads == 1
+
+
+async def test_replace_runs_off_the_event_loop(deps: Deps, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The replacers are CPU-bound (seconds for a miss in a few MB), so they run in a worker thread."""
+    threads: list[threading.Thread] = []
+
+    def recording(*args: Any) -> str:
+        threads.append(threading.current_thread())
+        return replace(*args)
+
+    monkeypatch.setattr(edit_module, "replace", recording)
+    await edit(deps, "notes.md", "mine", "ours")
+    assert threads and threads[0] is not threading.main_thread()
 
 
 async def test_write_only_rules(client: VFSClient) -> None:

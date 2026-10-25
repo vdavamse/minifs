@@ -16,6 +16,7 @@ https://github.com/cline/cline/blob/main/evals/diff-edits/diff-apply/diff-06-26-
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Callable, Iterator
 
@@ -23,6 +24,7 @@ from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ToolReturn
 
 from minifs.tools._text import (
+    TooLarge,
     convert_to_line_ending,
     create_file,
     detect_line_ending,
@@ -90,13 +92,10 @@ async def edit(
             raise VFSError("ESTALE", path)
     except VFSError as e:
         return tool_error(e, "write", ENOENT="File {path} not found", ENOTDIR="File {path} not found")
-    return ToolReturn(
-        "Edit applied successfully.",
-        metadata={
-            "filepath": path,
-            **diff_metadata(path, normalize_line_endings(content_old), normalize_line_endings(content_new)),
-        },
+    diff = await asyncio.to_thread(
+        diff_metadata, path, normalize_line_endings(content_old), normalize_line_endings(content_new)
     )
+    return ToolReturn("Edit applied successfully.", metadata={"filepath": path, **diff})
 
 
 async def _edit(
@@ -139,9 +138,10 @@ async def _edit(
     if entry.size > max_bytes:
         raise ModelRetry(_too_large(path, entry.size, max_bytes))
     try:
-        data, version = await read_file(vfs, path)
-        if len(data) > max_bytes:  # grew since the stat
-            raise ModelRetry(_too_large(path, len(data), max_bytes))
+        try:
+            data, version = await read_file(vfs, path, max_bytes)
+        except TooLarge as e:  # grew since the stat
+            raise ModelRetry(_too_large(path, e.size, max_bytes)) from None
         try:
             source_bom, content_old = split_bom(data.decode("utf-8"))
         except UnicodeDecodeError:
@@ -150,7 +150,9 @@ async def _edit(
         old = convert_to_line_ending(normalize_line_endings(old_string), ending)
         replacement = convert_to_line_ending(normalize_line_endings(new_string), ending)
         try:
-            replaced = replace(content_old, old, replacement, replace_all)
+            # In a thread, as pydantic-ai runs ladderframe's sync Edit: the fallback replacers scan the whole file
+            # (seconds for a miss in a few MB), which would stall every other coroutine on the loop.
+            replaced = await asyncio.to_thread(replace, content_old, old, replacement, replace_all)
         except ValueError as exc:
             raise ModelRetry(str(exc)) from None
         next_bom, content_new = split_bom(replaced)

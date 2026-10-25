@@ -17,10 +17,21 @@ PAGE = 1024 * 1024
 """Bytes per ``pread`` when reading a whole file."""
 
 
-async def read_file(vfs: VFSView, path: str) -> tuple[bytes, FileVersion]:
+class TooLarge(Exception):
+    """The file is over ``read_file``'s ``max_size``: ``size`` bytes."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__(size)
+        self.size = size
+
+
+async def read_file(vfs: VFSView, path: str, max_size: int | None = None) -> tuple[bytes, FileVersion]:
     """The whole content of file ``path`` and the version it is, read in pages: what a compare-and-swap write
-    expects. ESTALE if the file changed between pages (the content would mix two versions)."""
+    expects. ESTALE if the file changed between pages (the content would mix two versions). ``TooLarge``, after
+    the first page, for a file over ``max_size`` bytes."""
     first = await vfs.pread(path, 0, PAGE)
+    if max_size is not None and first.size > max_size:
+        raise TooLarge(first.size)
     version = FileVersion(first.id, first.generation, first.size)
     chunks = [first.content]
     page = first
