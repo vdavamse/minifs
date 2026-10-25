@@ -48,6 +48,8 @@ _PAGE_ATTEMPTS = 3
 batches) before it settles for what the last attempt read."""
 _INSTRUCTION_CALLS = 2
 """Instruction-file lookups in flight at once, so a Read holds at most three pool connections."""
+_RACES = frozenset({"ENOENT", "ENOTDIR", "EISDIR"})
+"""Errors of a later call that mean the path changed since the sample: the read starts again."""
 _MAX_LINES = 2**31 - 1  # pread_lines' max_lines and max_bytes, and pread's limit, are int
 _MAX_LINE = 2**63 - 1  # and first_line a bigint; no file has that many lines
 
@@ -109,12 +111,14 @@ async def read(
             if _is_binary(path, sample.content):
                 raise ModelRetry(f"Cannot read binary file: {path}")
 
-            if isinstance(first, VFSError) and not settle:
+            if isinstance(first, VFSError) and first.errno in _RACES and not settle:
                 continue  # gone, or replaced by a directory, since the sample
             if isinstance(first, BaseException):
                 raise first
             if (first.id, first.generation) != version and not settle:
                 continue  # the page isn't the sampled file's
+            if first.lines < start and not (first.lines == 0 and start == 1):
+                raise ModelRetry(f"Offset {start} is out of range for this file ({first.lines} lines)")
             # A text file: its instruction files are looked up while the rest of the page is read.
             page, instructions = await asyncio.gather(
                 _read_lines(ctx, path, start, count, config, first, None if settle else version),
@@ -231,7 +235,7 @@ async def _read_lines(
     The page comes in batches of ``pread_lines``, each capped at raw bytes. A line the cap cut is decoded as is when
     it's the first of its batch: the batch holds more than ``max_line_length`` characters of it, so it's truncated
     to the same text as the whole line would be. Otherwise it's left to the next batch. None when a batch isn't
-    from file version ``version`` (a new generation, or another file moved to the path); with no ``version`` the
+    from file version ``version`` (a new generation, or another file moved to the path), or the path is gone; with no ``version`` the
     page is taken as it comes. A ``limit`` or ``start`` beyond what ``pread_lines`` takes is clamped, as no file
     has that many lines."""
     fetch = _fetch(config)
@@ -255,7 +259,14 @@ async def _read_lines(
             line += 1
         if batch.eof or len(lines) >= limit or not batch.content:
             return lines, total, start + len(lines) <= total, False
-        batch = await ctx.deps.vfs.pread_lines(path, min(line, _MAX_LINE), min(limit - len(lines), _MAX_LINES), fetch)
+        try:
+            batch = await ctx.deps.vfs.pread_lines(
+                path, min(line, _MAX_LINE), min(limit - len(lines), _MAX_LINES), fetch
+            )
+        except VFSError as e:
+            if version is not None and e.errno in _RACES:
+                return None  # gone, or replaced by a directory, mid-page
+            raise
 
 
 def _fetch(config: ReadSettings) -> int:

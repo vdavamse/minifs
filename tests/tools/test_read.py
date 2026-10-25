@@ -24,7 +24,7 @@ from minifs.tools import TOOLS, Read
 from minifs.tools.deps import ReadSettings, ToolSettings
 from minifs.tools.read import DESCRIPTION, MAX_ATTACHMENT_BYTES, SAMPLE_BYTES
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import Entry, LineReadResult, ReadResult
+from minifs.vfs.core import Entry, LineReadResult, ReadResult, VFSError
 from minifs.vfs.policy import Policy, Rule
 from minifs.vfs.view import VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
@@ -624,3 +624,45 @@ async def test_a_read_holds_at_most_three_connections(
     out = await run_tool(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="a/b/c/d/e/f.txt")
     assert "Instructions from: /workspace/a/b/c/CLAUDE.md" in out and "Instructions from: /workspace/a/CLAUDE.md" in out
     assert 2 <= peak <= 3  # the sample and the first batch; the instruction lookups, two at a time
+
+
+async def test_instruction_lookups_that_fail_or_find_a_directory(
+    client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An AGENTS.md lookup that fails (EIO) skips its directory; an AGENTS.md directory falls through to
+    CLAUDE.md, as ladderframe's ``is_file``."""
+    await put(client, "/workspace/a/CLAUDE.md", b"from a")
+    await client.mkdir(f"{WS}/a/b/AGENTS.md", parents=True)
+    await put(client, "/workspace/a/b/CLAUDE.md", b"from b")
+    await put(client, "/workspace/a/b/f.txt", b"x\n")
+    stat = view.stat
+
+    async def failing(path: str) -> Entry:
+        if path == "/workspace/a/AGENTS.md":
+            raise VFSError("EIO", path, "database error")
+        return await stat(path)
+
+    monkeypatch.setattr(view, "stat", failing)
+    out = await run_tool(Read, Deps(view), filePath="a/b/f.txt")
+    assert "Instructions from: /workspace/a/b/CLAUDE.md\nfrom b" in out
+    assert "from a" not in out
+
+
+async def test_a_file_deleted_mid_page(client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The read starts again, and finds the path gone: not found, with suggestions."""
+    settings = ReadSettings(max_line_length=100, max_bytes=1024)  # one long line per batch
+    await put(client, "/workspace/f.txt", b"".join(b"a" * 1000 + b"\n" for _ in range(10)))
+    await put(client, "/workspace/f.txt.bak", b"old\n")
+    pread_lines = view.pread_lines
+    calls = 0
+
+    async def deleting(*args: Any) -> LineReadResult:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            await view.unlink("/workspace/f.txt")
+        return await pread_lines(*args)
+
+    monkeypatch.setattr(view, "pread_lines", deleting)
+    message = await retry_message(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="f.txt")
+    assert message == "File not found: /workspace/f.txt\n\nDid you mean one of these?\n/workspace/f.txt.bak"
