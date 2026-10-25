@@ -2,7 +2,7 @@
 
 import pytest
 
-from minifs.tools import Grep
+from minifs.tools import Grep, Read
 from minifs.tools.deps import GrepSettings, ToolSettings
 from minifs.tools.grep import DESCRIPTION
 from minifs.vfs.client import MAX_TIMEOUT, VFSClient
@@ -54,12 +54,11 @@ async def test_grep_at_exactly_the_limit_is_not_truncated(client: VFSClient, dep
     assert "truncated" not in out and "more matches" not in out
 
 
-async def test_read_line_numbers_agree_with_grep(client: VFSClient, deps: Deps, view: VFSView) -> None:
-    # A lone \r doesn't end a line, for Grep or Read. Cross-checked against the view's line read until Read lands.
+async def test_read_line_numbers_agree_with_grep(client: VFSClient, deps: Deps) -> None:
+    # A lone \r doesn't end a line, for Grep or Read.
     await make(client, {"log.txt": b"progress 10%\rprogress 100%\nNEEDLE\n"})
     assert "Line 2: NEEDLE" in await run_tool(Grep, deps, pattern="NEEDLE")
-    read = await view.pread_lines("/workspace/log.txt", first_line=2, max_lines=1)
-    assert read.content == b"NEEDLE\n"
+    assert "2: NEEDLE" in await run_tool(Read, deps, filePath="log.txt")
 
 
 # Output
