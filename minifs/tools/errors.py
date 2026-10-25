@@ -17,7 +17,7 @@ from __future__ import annotations
 from pydantic_ai import ModelRetry
 
 from minifs.vfs.core import VFSError
-from minifs.vfs.policy import Action
+from minifs.vfs.policy import Action, PolicyDenied
 from minifs.vfs.search import SearchRefused
 
 MESSAGES: dict[str, str] = {
@@ -31,7 +31,10 @@ MESSAGES: dict[str, str] = {
     "ENAMETOOLONG": "File name too long: {path}",
     "EIO": "Internal error reading {path}",
 }
-"""The ``ModelRetry`` message for each errno; any other errno (EINVAL) gets ``<path>: <the error's message>``."""
+"""The ``ModelRetry`` message for each errno. EINVAL, and any errno not here, gets ``<path>: <the error's message>``
+(the view's messages name no real paths), or ``<errno>: <path>`` without one."""
+
+_OVERRIDABLE = frozenset(MESSAGES) | {"EINVAL"}
 
 
 def denied(action: Action, path: str) -> str:
@@ -40,14 +43,16 @@ def denied(action: Action, path: str) -> str:
 
 
 def tool_error(error: VFSError | SearchRefused, action: Action, **messages: str) -> str:
-    """What the tool returns for ``error``, from a call that needs ``action``: the denial for EACCES; otherwise
-    raises ``ModelRetry``. ``messages`` override ``MESSAGES`` by errno. A ``SearchRefused``'s text is already
-    written for the model."""
+    """What the tool returns for ``error``: the denial for EACCES, naming the action the policy refused (``action``,
+    what the call needs, for an EACCES that doesn't say); otherwise raises ``ModelRetry``. ``messages`` override
+    ``MESSAGES`` by errno. A ``SearchRefused``'s text is already written for the model."""
+    unknown = messages.keys() - _OVERRIDABLE
+    assert not unknown, f"no such errno to override: {sorted(unknown)}"
     if isinstance(error, SearchRefused):
         raise ModelRetry(str(error)) from None
     if error.errno == "EACCES":
-        return denied(action, error.path)
+        return denied(error.action if isinstance(error, PolicyDenied) else action, error.path)
     template = messages.get(error.errno) or MESSAGES.get(error.errno)
-    if template is None:
-        raise ModelRetry(f"{error.path}: {error.message}" if error.message else f"Invalid path: {error.path}") from None
-    raise ModelRetry(template.format(path=error.path)) from None
+    if template is not None:
+        raise ModelRetry(template.format(path=error.path)) from None
+    raise ModelRetry(f"{error.path}: {error.message}" if error.message else f"{error.errno}: {error.path}") from None

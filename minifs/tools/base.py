@@ -17,14 +17,16 @@ the parameter descriptions, wrapped in a ``pydantic_ai.Tool`` with ladderframe's
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Concatenate
 
-from pydantic_ai import Tool
+from pydantic_ai import RunContext, Tool
 
 from minifs.tools.deps import HasVFS
 
 
-def vfs_tool(function: Callable[..., Awaitable[Any]], name: str, description: str) -> Tool[HasVFS]:
+def vfs_tool(
+    function: Callable[Concatenate[RunContext[HasVFS], ...], Awaitable[Any]], name: str, description: str
+) -> Tool[HasVFS]:
     """``function`` as the tool ``name``. Every parameter must be described in its docstring."""
     tool: Tool[HasVFS] = Tool(
         function,

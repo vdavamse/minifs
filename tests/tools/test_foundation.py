@@ -7,7 +7,7 @@ import textwrap
 from dataclasses import dataclass
 
 import pytest
-from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.usage import RunUsage
@@ -17,9 +17,10 @@ from minifs.tools.base import vfs_tool
 from minifs.tools.deps import DEFAULT_SETTINGS, GrepSettings, HasVFS, ToolSettings, resolve, settings
 from minifs.tools.errors import tool_error
 from minifs.vfs.core import FileVersion, VFSError
+from minifs.vfs.policy import PolicyDenied
 from minifs.vfs.search import SearchRefused
 from minifs.vfs.view import VFSView
-from tests.tools.conftest import Deps, call_tool, retry_message, run_tool
+from tests.tools.conftest import W2, Deps, call_tool, retry_message, run_tool
 
 DESCRIPTION = "Shows a file's content, or replaces it."
 
@@ -89,8 +90,16 @@ async def test_invalid_arguments_are_a_retry(deps: Deps) -> None:
 
 
 def test_toolset_holds_every_tool() -> None:
-    assert isinstance(toolset(), FunctionToolset)
-    assert set(toolset().tools) == {t.name for t in TOOLS}
+    tools = toolset()
+    assert isinstance(tools, FunctionToolset)
+    assert list(tools.tools.values()) == list(TOOLS)  # empty until #11, #12, #13, #39 and #40 add theirs
+
+
+def test_agents_accept_the_tools_for_their_own_deps() -> None:
+    """Checked by pyright: ``Tool[HasVFS]`` fits an agent over any deps with a ``vfs``."""
+    agent: Agent[OnlyVFS, str] = Agent(TestModel(), deps_type=OnlyVFS, tools=[Peek])
+    with_toolset: Agent[Deps, str] = Agent(TestModel(), deps_type=Deps, toolsets=[toolset()])
+    assert agent.deps_type is OnlyVFS and with_toolset.deps_type is Deps
 
 
 # Deps
@@ -119,6 +128,15 @@ def test_settings_from_deps(deps: Deps) -> None:
 # Paths
 
 
+def test_workdir_that_isnt_a_string_is_the_default(deps: Deps) -> None:
+    @dataclass
+    class Broken:
+        vfs: VFSView
+        vfs_workdir: object = None
+
+    assert resolve(context(Broken(deps.vfs)), "a") == "/workspace/a"
+
+
 @pytest.mark.parametrize(
     ("workdir", "path", "resolved"),
     [
@@ -130,6 +148,7 @@ def test_settings_from_deps(deps: Deps) -> None:
         ("/workspace", "", "/workspace"),
         ("/workspace", "~/x", "/workspace/~/x"),
         ("/docs", "guide.md", "/docs/guide.md"),
+        ("workspace", "a", "/workspace/a"),  # a relative workdir is anchored at /
     ],
 )
 def test_resolve(deps: Deps, workdir: str, path: str, resolved: str) -> None:
@@ -143,9 +162,13 @@ async def test_relative_path_resolves_against_workdir(deps: Deps) -> None:
     assert await run_tool(Peek, docs, filePath="guide.md") == "/docs/guide.md: guide\n"
 
 
-async def test_dotdot_cannot_leave_the_view(deps: Deps) -> None:
-    message = await retry_message(Peek, deps, filePath="../workspaces/x/secret.md")
-    assert message == "File not found: /workspaces/x/secret.md"
+@pytest.mark.parametrize("workspace", [W2, "nope"])
+@pytest.mark.parametrize("prefix", ["../", "/"])
+@pytest.mark.parametrize("content", [None, "x"])
+async def test_other_workspaces_look_missing(deps: Deps, workspace: str, prefix: str, content: str | None) -> None:
+    """Another workspace's file, read or written, looks exactly like a file that doesn't exist."""
+    message = await retry_message(Peek, deps, filePath=f"{prefix}workspaces/{workspace}/secret.md", content=content)
+    assert message == f"File not found: /workspaces/{workspace}/secret.md"
 
 
 # Errors
@@ -176,7 +199,8 @@ async def test_estale_is_a_retry(deps: Deps) -> None:
         (VFSError("EIO", "/workspace/a", "database error"), "Internal error reading /workspace/a"),
         (VFSError("ENOTDIR", "/workspace/a/b"), "File not found: /workspace/a/b"),
         (VFSError("EINVAL", "/", "'**' spans mount points here"), "/: '**' spans mount points here"),
-        (VFSError("EINVAL", "/x"), "Invalid path: /x"),
+        (VFSError("EINVAL", "/x"), "EINVAL: /x"),
+        (VFSError("EXDEV", "/x"), "EXDEV: /x"),
         (SearchRefused("timeout", "The search timed out. Narrow it."), "The search timed out. Narrow it."),
     ],
 )
@@ -190,7 +214,14 @@ def test_retry_messages(error: VFSError | SearchRefused, message: str) -> None:
 def test_message_override() -> None:
     with pytest.raises(ModelRetry, match=r"^No such directory: /workspace/x$"):
         tool_error(VFSError("ENOENT", "/workspace/x"), "read", ENOENT="No such directory: {path}")
-    assert tool_error(VFSError("EACCES", "/docs", "agent may not read here"), "read") == "Permission denied: read /docs"
+    with pytest.raises(AssertionError, match="ENOENTT"):
+        tool_error(VFSError("ENOENT", "/workspace/x"), "read", ENOENTT="No such directory: {path}")
+
+
+def test_denial_names_the_refused_action() -> None:
+    """The policy's action wins over the one the tool passed: a write tool's refused read says read."""
+    assert tool_error(PolicyDenied("/docs/a", "agent", "read"), "write") == "Permission denied: read /docs/a"
+    assert tool_error(VFSError("EACCES", "/docs/a"), "write") == "Permission denied: write /docs/a"
 
 
 # Packaging

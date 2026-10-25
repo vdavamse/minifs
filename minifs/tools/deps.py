@@ -68,8 +68,9 @@ DEFAULT_SETTINGS = ToolSettings()
 
 
 def workdir(ctx: RunContext[HasVFS]) -> str:
-    """The deps' ``vfs_workdir``, ``/workspace`` by default."""
-    return getattr(ctx.deps, "vfs_workdir", DEFAULT_WORKDIR)
+    """The deps' ``vfs_workdir``, ``/workspace`` by default (or if it isn't a string), anchored at ``/``."""
+    value = getattr(ctx.deps, "vfs_workdir", DEFAULT_WORKDIR)
+    return "/" + value.lstrip("/") if isinstance(value, str) else DEFAULT_WORKDIR
 
 
 def settings(ctx: RunContext[HasVFS]) -> ToolSettings:

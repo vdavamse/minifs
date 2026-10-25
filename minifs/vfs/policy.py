@@ -30,6 +30,18 @@ _ACTIONS: frozenset[str] = frozenset(get_args(Action))
 _log = logging.getLogger(__name__)
 
 
+class PolicyDenied(VFSError):
+    """EACCES from the policy: ``actor`` may not ``action`` at ``path``."""
+
+    def __init__(self, path: str, actor: str, action: Action) -> None:
+        super().__init__("EACCES", path, f"{actor} may not {action} here")
+        self.actor = actor
+        self.action: Action = action
+
+    def __reduce__(self) -> tuple[type[PolicyDenied], tuple[str, str, Action]]:  # pyright: ignore[reportIncompatibleMethodOverride]
+        return (PolicyDenied, (self.path, self.actor, self.action))
+
+
 @dataclass(frozen=True, init=False)
 class Rule:
     """``actions`` granted on the paths ``pattern`` matches: ``Rule("/docs/**", "read")``."""
@@ -113,11 +125,12 @@ class Policy:
         return action == "read"
 
     def check(self, actor: str, action: Action, path: str, *, subtree: bool = False) -> None:
-        """Raises EACCES for ``path`` unless ``actor`` may ``action`` there (``allows``), and counts the denial."""
+        """Raises EACCES (``PolicyDenied``) for ``path`` unless ``actor`` may ``action`` there (``allows``), and
+        counts the denial."""
         if not self.allows(actor, action, path, subtree=subtree):
             self.denials[actor, action] += 1
             _log.info("write policy denied %s %s on %s", actor, action, path)
-            raise VFSError("EACCES", path, f"{actor} may not {action} here")
+            raise PolicyDenied(path, actor, action)
 
 
 def _bad_class(segment: str) -> bool:
