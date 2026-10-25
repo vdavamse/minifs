@@ -18,7 +18,7 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 from minifs import cli
 from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO
 from minifs.db.pool import Connector, Pools, open_pool, retry_serializable
-from minifs.vfs.client import VFSClient
+from minifs.vfs.client import VFSClient, _gated  # pyright: ignore[reportPrivateUsage]
 from minifs.vfs.core import FileVersion, Kind, VFSError
 from minifs.vfs.glob import GlobError
 from tests.test_tree import wait_until_blocked
@@ -371,6 +371,18 @@ async def test_uncached_readdir_fills_the_cache(pool: Pool) -> None:
     await vfs.readdir("/a/b")
     assert [name for _, name in cache.entries] == ["a", "b", "c"]
     assert (await vfs.stat("/a/b/c")).kind == "file"
+
+
+async def test_a_listing_returns_the_walk_once(pool: Pool) -> None:
+    for name in "abc":
+        await VFSClient(pool).create(f"/d/{name}", parents=True)
+    vfs = VFSClient(pool, cache=DictCache())
+    ref = vfs._ref(("d",))  # pyright: ignore[reportPrivateUsage]
+    async with pool.connection() as conn:
+        cur = await conn.execute(_gated([ref], "vfs_readdir({0})"), ref.params)  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+        rows = await cur.fetchall()
+    assert len(rows) == 3 and rows[0][0] is not None
+    assert all(row[:3] == (None, None, None) for row in rows[1:])  # chain, kind and err only on the first row
 
 
 async def test_stale_cached_node_is_enoent(pool: Pool) -> None:

@@ -59,7 +59,8 @@ class CacheStats:
     ``follow``); entries dropped by the TTL or the size cap count as neither.
 
     ``hit_rate`` counts path components, not paths: a path resolves from the cache only if all its components hit.
-    A path is cached once this process looked it up, listed its directory or created it: the first use of a path is a
+    A path is cached once this process looked it up, listed its directory or created it (``mkdir_p`` and a create
+    with ``parents`` store only the created node): the first use of a path is a
     miss (one per path, as the walk stops at the first missing component), and later ones hit. So a low rate with
     few ``expired`` means paths used once, and with many, the TTL is short for the access pattern."""
 

@@ -327,10 +327,13 @@ async def test_enotdir_stores_the_file(pool: Pool) -> None:
 
 
 @pytest.mark.parametrize("follow", [True, False], ids=["follow", "no-notify"])
-async def test_a_rename_after_the_store_still_resolves(pool: Pool, db: str, follow: bool) -> None:
+async def test_a_rename_after_the_store_still_resolves(
+    pool: Pool, db: str, conn: AsyncConnection, follow: bool
+) -> None:
     other = VFSClient(pool)
     old = await other.create("/a/b/f", b"old", parents=True)
     a, old_b = (await other.stat("/a")).id, (await other.stat("/a/b")).id
+    assert old_b is not None
     async with Watcher(factory(db)) as watcher:
         cache = DirEntryCache(ttl=60)
         async with contextlib.AsyncExitStack() as stack:
@@ -343,9 +346,14 @@ async def test_a_rename_after_the_store_still_resolves(pool: Pool, db: str, foll
             await other.rename("/a/b", "/a/moved")
             await other.mkdir("/a/b")
             new = await other.create("/a/b/f", b"new")
+            await catch_up(watcher, conn)  # with follow, the move's notification has evicted b by now
+            # The race the notification can't cover: a walk whose snapshot predates the move, stored after it.
+            cache.store(a, "b", old_b, "dir")
+            evictions = cache.stats().evictions
             assert (await vfs.pread("/a/b/f")).content == b"new"  # the stale chain is caught in the statement
             await vfs.settle()
-            assert cache.lookup(a, "b") != (old_b, "dir")  # evicted: found stale, or by the move's notification
+            assert cache.stats().evictions > evictions  # and its stale link evicted
+            assert cache.lookup(a, "b") != (old_b, "dir")
             assert (await vfs.stat("/a/b/f")).id == new.id
             assert (await vfs.stat("/a/moved/f")).id == old.id
             assert (await vfs.pread("/a/b/f")).content == b"new"

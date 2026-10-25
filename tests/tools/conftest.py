@@ -46,7 +46,7 @@ async def client(db: str, request: pytest.FixtureRequest) -> AsyncIterator[VFSCl
     ``/docs/guide.md``. Every tool test runs twice: without a directory cache and with one, warmed by a stat of each
     seeded file, so the cached run resolves those paths from the cache."""
     async with open_pool(Connector(db), max_size=3) as pool:
-        client = VFSClient(pool, cache=DirEntryCache() if request.param else None)
+        client = VFSClient(pool, cache=DirEntryCache(ttl=60) if request.param else None)
         await client.create(f"/workspaces/{W1}/notes.md", b"mine\n", parents=True)
         await client.create(f"/workspaces/{W2}/secret.md", b"theirs\n", parents=True)
         await client.create("/docs/guide.md", b"guide\n", parents=True)

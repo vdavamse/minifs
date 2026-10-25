@@ -755,18 +755,26 @@ def _gated(refs: Sequence[_Ref], call: str, condition: str = "") -> str:
     ``condition`` (`` AND ...`` over the lookups, with parameters after the call's) gates the call further."""
     call = call.format(*(f"vfs_gate(r{i}.id, r{i}.err)" for i in range(len(refs))))
     lookups = " CROSS JOIN ".join(f"{ref.sql} r{i}" for i, ref in enumerate(refs))
-    columns = _walks(refs) + "".join(f"r{i}.id, r{i}.err, r{i}.err_detail, " for i in range(len(refs)))
+    columns = _walks(refs, first_row=True) + "".join(f"r{i}.id, r{i}.err, r{i}.err_detail, " for i in range(len(refs)))
     gate = " AND ".join(f"r{i}.err IS NULL" for i in range(len(refs))) + condition
     return (
         f"SELECT {columns}f.* FROM {lookups} LEFT JOIN LATERAL (SELECT * FROM {call} WHERE {gate} OFFSET 0) f ON true"
     )
 
 
-def _walks(refs: Sequence[_Ref]) -> str:
+def _walks(refs: Sequence[_Ref], *, first_row: bool = False) -> str:
     """The leading columns of a query over ``refs`` (as ``r0``, ``r1``, ...): each one's chain, kind and err, which
     ``_run`` stores in the cache. They come back in the statement's own rows, so learning a walk costs no round
-    trip."""
-    return "".join(f"r{i}.chain, r{i}.kind, r{i}.err, " for i in range(len(refs)))
+    trip. ``first_row``: NULL past the first row (``_run`` reads only that one), so a long listing doesn't repeat
+    the chain on every row. ``row_number() OVER ()`` numbers the rows in the order they are returned."""
+    if not first_row:
+        return "".join(f"r{i}.chain, r{i}.kind, r{i}.err, " for i in range(len(refs)))
+    first = "row_number() OVER () = 1"
+    return "".join(
+        f"CASE WHEN {first} THEN r{i}.chain END AS chain, CASE WHEN {first} THEN r{i}.kind END AS kind,"
+        f" CASE WHEN {first} THEN r{i}.err END AS err, "
+        for i in range(len(refs))
+    )
 
 
 def _lookup_errors(row: Sequence[Any], count: int) -> list[_Error]:
