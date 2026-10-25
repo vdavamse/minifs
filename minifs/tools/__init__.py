@@ -22,10 +22,11 @@ except ImportError as e:  # pragma: no cover - exercised by test_import_without_
 
 from minifs.tools.deps import HasVFS, ToolSettings
 from minifs.tools.glob import Glob
+from minifs.tools.grep import Grep
 from minifs.tools.read import Read
 from minifs.tools.write import Write
 
-TOOLS: tuple[Tool[HasVFS], ...] = (Read, Write, Glob)
+TOOLS: tuple[Tool[HasVFS], ...] = (Read, Write, Glob, Grep)
 """Every tool, in the order the model sees them."""
 
 
@@ -34,4 +35,4 @@ def toolset() -> FunctionToolset[HasVFS]:
     return FunctionToolset(list(TOOLS))
 
 
-__all__ = ["TOOLS", "Glob", "HasVFS", "Read", "ToolSettings", "Write", "toolset"]
+__all__ = ["TOOLS", "Glob", "Grep", "HasVFS", "Read", "ToolSettings", "Write", "toolset"]

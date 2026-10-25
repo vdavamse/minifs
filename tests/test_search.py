@@ -474,6 +474,22 @@ async def test_excludes(vfs: VFSClient) -> None:
         await vfs.grep("foo", excludes="build/")
 
 
+async def test_keep_filters_the_scope_before_the_caps(vfs: VFSClient) -> None:
+    await put(vfs, "/w/a.md", b"foo\n")  # 4 bytes
+    await put(vfs, "/w/b/secret.md", b"foo foo\n")  # 8 bytes
+    await put(vfs, "/w/c.md", b"foo\n")
+
+    def keep(path: str) -> bool:
+        return "secret" not in path
+
+    result = await vfs.grep("foo", "/w", keep=keep, max_bytes=8)  # over the byte cap only with secret.md
+    assert ([h.path for h in result.hits], result.files, result.bytes) == (["/w/a.md", "/w/c.md"], 2, 8)
+    with pytest.raises(SearchRefused):  # the file cap counts every file listed, kept or not
+        await vfs.grep("foo", "/w", keep=keep, max_files=2)
+    assert (await vfs.grep("foo", "/w/b/secret.md", keep=keep)).hits == []  # a file path is filtered too
+    assert (await vfs.grep("foo", "/w/a.md", keep=keep)).files == 1
+
+
 async def test_cut_ignores_a_final_cr(vfs: VFSClient) -> None:
     await put(vfs, "/f", b"a" * 10 + b"\r\n" + b"b" * 11 + b"\r\n")
     result = await vfs.grep(".", max_line_chars=10)

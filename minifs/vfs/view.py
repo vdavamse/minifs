@@ -13,7 +13,7 @@ in ``policy.denials``), then runs as the ``VFSClient`` operation on the real pat
 transaction of its own: it depends on the path alone, and the operation resolves that same path in its one
 statement. Results and errors come back in visible paths: a ``VFSError`` keeps its errno and message, gets the
 visible path, and drops ``detail`` and ``db_error``, which name real paths and node ids. Entries the actor may
-not read are left out of listings and glob results; a grep needs ``read`` on everything it searches.
+not read are left out of listings, glob results and the files a grep searches.
 
 What each operation needs:
 
@@ -30,11 +30,13 @@ What each operation needs:
 An actor may learn a little it can't read: ``append`` returns the new size of a file it may append to, and
 ``create`` is EEXIST if something is there; a glob with a ``limit`` that returns fewer than ``limit`` entries, or
 is not ``truncated``, while a glob without a limit finds more readable files, tells that unreadable newer files
-fill its refetch window; and an ``expect`` naming some node id outside the path tells whether that id exists (ids
-are random, and the view hands out only ids inside the mounts). Moving or removing a mount point or a virtual
-directory is EBUSY. A mount point is a directory: a file can't be created there, and creating one with ``parents``
-(or by ``mkdir_p``) also creates the real directories above it. A database error other than a ``VFSError`` comes
-back as EIO, since its text may name real paths.
+fill its refetch window; a grep refused over the file cap, which counts unreadable files, or timed out while
+its walk lists them (or, from a virtual directory, ``truncated`` set by a later mount refused either way), tells
+that unreadable files are there; and an ``expect`` naming some node id outside the path tells whether that id
+exists (ids are random, and the view hands out only ids inside the mounts). Moving or removing a mount point or a
+virtual directory is EBUSY. A mount point is a directory: a file can't be created there, and creating one with
+``parents`` (or by ``mkdir_p``) also creates the real directories above it. A database error other than a
+``VFSError`` comes back as EIO, since its text may name real paths.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -233,10 +235,10 @@ class VFSView:
     ) -> searching.GrepResult:
         """``VFSClient.grep`` of ``path``, with hits in visible paths.
 
-        The actor must be allowed to read everything it searches, or the grep is EACCES (grep a narrower path):
-        filtering hits afterwards would let unreadable files count against ``limit`` and the caps, and show in
-        ``files`` and ``bytes``. A file ``path`` needs ``read`` on the file only. Mounts the actor can read
-        nothing in are not searched.
+        Files the actor may not read are left out of the scope before it is searched, so they never match, count
+        toward ``limit`` or the byte cap, or show in ``files`` and ``bytes``; they do count toward the file cap and
+        the walk's timeout.
+        A ``path`` the actor may not read is EACCES. Mounts the actor can read nothing in are not searched.
 
         Below a virtual directory, the grep runs in each mount in turn, in path order, until ``limit`` hits, with
         ``include`` and ``excludes`` restated as for ``glob`` (EINVAL in the same cases). Each mount is its own
@@ -277,10 +279,7 @@ class VFSView:
         hits: list[searching.GrepHit] = []
         files = size = 0
         truncated = False
-        mounts = self._restated(target, include, excludes, hidden)
-        for mount_target, _, _ in mounts:  # all before any search
-            self.policy.check(self.actor, "read", mount_target.visible, subtree=True)
-        for mount_target, mount_include, mount_excludes in mounts:
+        for mount_target, mount_include, mount_excludes in self._restated(target, include, excludes, hidden):
             try:
                 result = await self._mapped(
                     self._client.grep(
@@ -296,6 +295,7 @@ class VFSView:
                         max_bytes=max_bytes,
                         max_line_chars=max_line_chars,
                         timeout=timeout,
+                        keep=self._grep_keep(mount_target),
                     ),
                     mount_target,
                 )
@@ -325,13 +325,6 @@ class VFSView:
         limit: int,
         **options: Any,
     ) -> searching.GrepResult:
-        expect: UUID | None = None
-        if not self.policy.allows(self.actor, "read", target.visible, subtree=True):
-            # Only a file may be searched, since nothing is below it: pin it, in case a directory takes its place.
-            entry = await self._mapped(self._client.stat(_real(target)), target)
-            if entry.is_dir:
-                self.policy.check(self.actor, "read", target.visible, subtree=True)  # EACCES
-            expect = entry.id
         result = await self._mapped(
             self._client.grep(
                 pattern,
@@ -340,7 +333,7 @@ class VFSView:
                 excludes=excludes,
                 hidden=hidden,
                 limit=limit,
-                expect=expect,
+                keep=self._grep_keep(target),
                 **options,
             ),
             target,
@@ -348,6 +341,24 @@ class VFSView:
         return searching.GrepResult(
             [self._hit(hit, target) for hit in result.hits], result.truncated, result.files, result.bytes
         )
+
+    def _grep_keep(self, target: _Target) -> Callable[[str], bool] | None:
+        """The files at or below ``target`` a grep may search, by real path: None for all, when the actor may read
+        the whole subtree. The client filters a file ``target`` too: a mount searched from a virtual directory
+        isn't checked on its own. A path outside the mount is refused, not guessed at."""
+        if self.policy.allows(self.actor, "read", target.visible, subtree=True):
+            return None
+        mount = target.mount
+        assert mount is not None
+
+        def keep(real: str) -> bool:
+            segments = split(real)
+            if segments[: len(mount.real)] != mount.real:
+                return False
+            visible = join(*mount.visible, *segments[len(mount.real) :])
+            return self.policy.allows(self.actor, "read", visible)
+
+        return keep
 
     # Writes
 

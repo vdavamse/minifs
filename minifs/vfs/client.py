@@ -259,19 +259,21 @@ class VFSClient:
         max_bytes: int = searching.MAX_BYTES,
         max_line_chars: int | None = searching.MAX_LINE_CHARS,
         timeout: float = searching.TIMEOUT,
-        expect: UUID | None = None,
+        keep: Callable[[str], bool] | None = None,
     ) -> searching.GrepResult:
         """The lines matching ripgrep ``pattern`` (``fixed``: a literal string) in the files below directory
         ``path`` that match glob ``include`` (None: all) and none of ``excludes`` (as in ``glob``), or in file ``path``
         alone (``include``, ``excludes`` and ``hidden`` don't apply, as for a path given to rg), in order of path
         (bytewise), then line, at most ``limit`` (``minifs.vfs.search``). Unlike ``glob``, hidden files are searched
-        unless ``hidden`` is false, as ladderframe's Grep does; ``.git`` never is. Files that aren't UTF-8 are skipped.
+        unless ``hidden`` is false, as ladderframe's Grep does; ``.git`` never is. Files that aren't UTF-8 are
+        skipped. ``keep`` (a view's policy), given each file's path, a file ``path`` too, leaves out the files it
+        rejects: they count toward the file cap (the walk stops past it, before they can be filtered) but not the
+        byte cap, the hits or the result's totals.
 
         One snapshot on a search-pool connection, each statement under ``timeout`` seconds: the scope is read from
         the tree first, and refused over ``max_files`` files or ``max_bytes`` bytes before any content is read.
         ``SearchRefused`` for a refused or timed-out search; ``RegexError`` for a bad pattern, ``GlobError`` for a
-        bad ``include`` or exclude; ENOENT, ENOTDIR for ``path``; EINVAL for a bad limit or timeout. With
-        ``expect``, ESTALE unless ``path`` is that file, checked in the search's snapshot."""
+        bad ``include`` or exclude; ENOENT, ENOTDIR for ``path``; EINVAL for a bad limit or timeout."""
         segments = split(path)
         if not 0 <= limit < _MAX_INT:  # limit + 1 is asked for
             raise VFSError("EINVAL", join(*segments), f"invalid limit {limit}")
@@ -281,8 +283,6 @@ class VFSClient:
             raise VFSError("EINVAL", join(*segments), f"invalid line length {max_line_chars}")
         if not 0 < timeout <= MAX_TIMEOUT:
             raise VFSError("EINVAL", join(*segments), f"invalid timeout {timeout}")
-        if expect is not None and not segments:
-            raise VFSError("ESTALE", "/", "not the expected file")
         # Bad patterns are reported before anything about the path.
         matcher = searching.compile_pattern(pattern, ignore_case=ignore_case, fixed=fixed)
         if include is not None:
@@ -301,11 +301,11 @@ class VFSClient:
                         node, error, kind, size = await _lookup(conn, ref)
                         if error[0] is not None:
                             return error, None, None  # committed, not rolled back: nothing failed on the server
-                        if expect is not None and (node != expect or kind != "file"):
-                            return ("ESTALE", "not the expected file"), node, None
                         if kind == "file":
                             assert node is not None and size is not None
-                            scope = searching.Scope((node,), (join(*segments),), size)
+                            scope = searching.Scope((node,), (join(*segments),), (size,))
+                            if keep is not None:
+                                scope = scope.only(keep)
                     if scope is None:
                         scope = await searching.find_scope(
                             conn,
@@ -315,6 +315,7 @@ class VFSClient:
                             excludes=excludes,
                             hidden=hidden,
                             max_files=max_files,
+                            keep=keep,
                         )
                     searching.check_scope(scope, max_files=max_files, max_bytes=max_bytes)
                     result = await searching.search(
@@ -330,8 +331,6 @@ class VFSClient:
             if e.errno in ("ENOENT", "ENOTDIR"):
                 await self._await_eviction([ref])
             raise
-        if error[0] == "ESTALE":
-            self._checked(ref, node)  # the path resolved, to another node: drop a stale cached link
         await self._outcome(path, [ref], error)
         assert result is not None
         self._checked(ref, node)

@@ -629,7 +629,7 @@ Found 100 matches (more matches available)
 (Results truncated. Consider using a more specific path or pattern.)
 ```
 
-The example is a `Grep` with `path="/"`; the default path is `/workspace`. A search with no hits returns `No files found`. A trailing `\r` is dropped from each hit line, as in ladderframe, and lines longer than 2,000 characters are cut, with `...` appended.
+The example is a `Grep` with `path="/"`; the default path is `/workspace`. A search with no hits returns `No files found`. A trailing `\r` is dropped from each hit line, as in ladderframe, and lines longer than 2,000 characters are cut, with `...` appended. Files the agent's policy doesn't let it read (a `/workspace/**/.env` rule without `read`, say) are left out of the search before it runs, so they never match and count toward neither the limit nor the byte cap; they still count toward the file cap and the walk's time, so a search refused over the cap, or timed out while listing, can tell that unreadable files exist. A `path` the agent may not read returns `Permission denied: read <path>`; a rule on a directory alone (`/workspace/secret`, no `/**`) doesn't cover the files below it, as for `Glob` and `Read`.
 
 `Glob` output is ladderframe's too: one absolute path per line, `No files found` when nothing matches, and `(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)` past the limit.
 

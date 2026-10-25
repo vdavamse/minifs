@@ -16,6 +16,7 @@ from typing import Protocol
 
 from pydantic_ai import RunContext
 
+from minifs.vfs.client import MAX_TIMEOUT
 from minifs.vfs.glob import compile_excludes
 from minifs.vfs.view import MAX_GLOB_LIMIT, VFSView
 
@@ -75,6 +76,23 @@ class GrepSettings:
     """Characters kept of each hit line; longer lines are cut."""
     timeout: float = 2.0
     """Seconds each of a search's statements may run."""
+    excludes: tuple[str, ...] = DEFAULT_EXCLUDES
+    """Skipped as well as ``ALWAYS_EXCLUDED``, which a caller can't turn off. A grep from a virtual directory
+    (``/``) restates each exclude in every mount, as a glob does, so avoid the forms ``GlobSettings.excludes``
+    lists (``**/workspace/**``, say): they make every such grep EINVAL, which the model sees as a retry naming a
+    pattern it never wrote."""
+
+    def __post_init__(self) -> None:
+        """A bad setting is the caller's mistake, so it fails here, not as a retry the model can't fix."""
+        for name in ("limit", "max_line_chars"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"grep {name} must be an int, not {value!r}")
+            if not 0 <= value <= MAX_GLOB_LIMIT:
+                raise ValueError(f"grep {name} must be 0 to {MAX_GLOB_LIMIT}, not {value}")
+        if isinstance(self.timeout, bool) or not 0 < self.timeout <= MAX_TIMEOUT:
+            raise ValueError(f"grep timeout must be over 0 and at most {MAX_TIMEOUT} seconds, not {self.timeout!r}")
+        compile_excludes(self.excludes)  # GlobError
 
 
 @dataclass(frozen=True)

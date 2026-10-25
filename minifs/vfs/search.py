@@ -3,7 +3,7 @@
 A search runs in one REPEATABLE READ transaction under ``SET LOCAL statement_timeout``, which applies to each of
 its statements (resolving the path, the scope, the search; ``regex.validate`` uses its own, shorter one):
 
-1. ``find_scope``: the files from ``vfs_glob``, with their total size, read from ``vfs_nodes`` only. ``check_scope``
+1. ``find_scope``: the files from ``vfs_glob``, with their sizes, read from ``vfs_nodes`` only. ``check_scope``
    refuses a scope over the file or byte cap, so an oversized search costs no content read.
 2. ``search``: ``vfs_search`` goes through the files in path order, filters each extent with the pattern's file
    form, checks the lines of the extents that pass with its line form, and stops at the limit.
@@ -14,7 +14,7 @@ its statements (resolving the path, the scope, the search; ``regex.validate`` us
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
@@ -58,15 +58,26 @@ class Matcher:
 
 @dataclass(frozen=True)
 class Scope:
-    """The files to search: their ids and the paths to report them by, in the same order, and their total size."""
+    """The files to search: their ids, the paths to report them by and their sizes, in the same order."""
 
     ids: tuple[UUID, ...]
     paths: tuple[str, ...]
-    bytes: int
+    sizes: tuple[int, ...]
 
     @property
     def files(self) -> int:
         return len(self.ids)
+
+    @property
+    def bytes(self) -> int:
+        return sum(self.sizes)
+
+    def only(self, keep: Callable[[str], bool]) -> Scope:
+        """The files whose path ``keep`` accepts."""
+        kept = [i for i, path in enumerate(self.paths) if keep(path)]
+        return Scope(
+            tuple(self.ids[i] for i in kept), tuple(self.paths[i] for i in kept), tuple(self.sizes[i] for i in kept)
+        )
 
 
 @dataclass(frozen=True)
@@ -114,18 +125,21 @@ async def find_scope(
     excludes: Sequence[str] = (),
     hidden: bool = True,
     max_files: int = MAX_FILES,
+    keep: Callable[[str], bool] | None = None,
 ) -> Scope:
     """The files below directory ``root`` (None: ``/``) that match glob ``include`` (None: all), as ``vfs_glob``
     walks them without the files and directories ``excludes`` match (``minifs.vfs.glob.compile_excludes``), each
-    reported as ``prefix`` plus its path relative to ``root``. Reads only ``vfs_nodes``. At most ``max_files + 1``
-    files are listed, so ``check_scope`` can tell the cap was passed. ``.git`` is never walked. Raises GlobError
-    for a bad ``include`` or exclude, ``VFSError`` ENOENT / ENOTDIR (for ``prefix``) for a bad ``root``."""
+    reported as ``prefix`` plus its path relative to ``root``, and only those whose reported path ``keep`` accepts
+    (None: all). Reads only ``vfs_nodes``. At most ``max_files + 1`` files are listed, so ``check_scope`` can tell
+    the cap was passed; a listing over the cap is returned unfiltered, for ``check_scope`` to refuse. ``.git`` is
+    never walked. Raises GlobError for a bad ``include`` or exclude, ``VFSError`` ENOENT / ENOTDIR (for ``prefix``)
+    for a bad ``root``."""
     plan = compile_glob(include or _ALL_FILES)
     ex = compile_excludes(excludes)
     cur = await conn.execute(
         "SELECT coalesce(array_agg(id ORDER BY path) FILTER (WHERE err IS NULL), '{}'),"
         " coalesce(array_agg(%s || path ORDER BY path) FILTER (WHERE err IS NULL), '{}'),"
-        " coalesce(sum(size), 0), min(err), min(err_detail)"
+        " coalesce(array_agg(size ORDER BY path) FILTER (WHERE err IS NULL), '{}'), min(err), min(err_detail)"
         " FROM vfs_glob(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             prefix,
@@ -142,10 +156,13 @@ async def find_scope(
     )
     row = await cur.fetchone()
     assert row is not None
-    ids, paths, size, err, detail = row
+    ids, paths, sizes, err, detail = row
     if err is not None:
         raise VFSError(err, prefix.removesuffix("/") or "/", detail=detail or "")
-    return Scope(tuple(ids), tuple(paths), int(size))
+    scope = Scope(tuple(ids), tuple(paths), tuple(sizes))
+    if keep is None or scope.files > max_files:  # over the cap: not every file was listed, so refuse it whole
+        return scope
+    return scope.only(keep)
 
 
 def check_scope(scope: Scope, *, max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES) -> None:
