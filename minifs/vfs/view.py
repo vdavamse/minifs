@@ -9,11 +9,12 @@ moved or removed. There are no symlinks in the tree (``vfs_nodes.kind`` is ``fil
 never leads elsewhere.
 
 Every operation checks the ``Policy`` for the view's actor on the visible path before it runs (EACCES, counted
-in ``policy.denials``), then runs as the ``VFSClient`` operation on the real path. The check needs no
-transaction of its own: it depends on the path alone, and the operation resolves that same path in its one
-statement. Results and errors come back in visible paths: a ``VFSError`` keeps its errno and message, gets the
-visible path, and drops ``detail`` and ``db_error``, which name real paths and node ids. Entries the actor may
-not read are left out of listings, glob results and the files a grep searches.
+in ``policy.denials`` unless a read passes ``count_denials=False``), then runs as the ``VFSClient`` operation on
+the real path. The check needs no transaction of its own: it depends on the path alone, and the operation
+resolves that same path in its one statement. Results and errors come back in visible paths: a ``VFSError``
+keeps its errno and message, gets the visible path, and drops ``detail`` and ``db_error``, which name real paths
+and node ids. Entries the actor may not read are left out of listings, glob results and the files a grep
+searches.
 
 What each operation needs:
 
@@ -126,9 +127,10 @@ class VFSView:
         entry = await self._mapped(self._client.stat(_real(target)), target)
         return self._entry(entry, target)
 
-    async def readdir(self, path: str) -> list[Entry]:
-        """The entries of directory ``path`` the actor may read, in byte order of name."""
-        target = self._target(path, "read")
+    async def readdir(self, path: str, *, count_denials: bool = True) -> list[Entry]:
+        """The entries of directory ``path`` the actor may read, in byte order of name. With
+        ``count_denials=False`` a refusal isn't counted in ``policy.denials``: for a speculative lookup."""
+        target = self._target(path, "read", count_denials=count_denials)
         if target.real is None:
             entries = await self._virtual_entries(target.path)
         else:
@@ -151,27 +153,34 @@ class VFSView:
         max_bytes: int = DEFAULT_LINE_BYTES,
         *,
         max_line_bytes: int | None = None,
+        count_denials: bool = True,
     ) -> LineReadResult:
-        """``VFSClient.pread_lines`` of ``path``."""
-        target = self._target(path, "read")
+        """``VFSClient.pread_lines`` of ``path``. With ``count_denials=False`` a refusal isn't counted in
+        ``policy.denials``: for a read made alongside another that decides (``Policy``)."""
+        target = self._target(path, "read", count_denials=count_denials)
         if target.real is None:
             raise VFSError("EISDIR", target.visible)
         call = self._client.pread_lines(_real(target), first_line, max_lines, max_bytes, max_line_bytes=max_line_bytes)
         return await self._mapped(call, target)
 
     async def pread_many(
-        self, reads: Sequence[tuple[str, int, int]], *, groups: Sequence[int] | None = None
+        self,
+        reads: Sequence[tuple[str, int, int]],
+        *,
+        groups: Sequence[int] | None = None,
+        count_denials: bool = True,
     ) -> list[ReadResult | VFSError]:
         """``VFSClient.pread_many`` of ``reads``: each read's error in its place, a policy denial (EACCES), a path
         outside every mount (ENOENT) and a virtual directory (EISDIR) among them. Those aren't sent, so in a group
-        they never stand in for a file."""
+        they never stand in for a file. With ``count_denials=False`` the denials aren't counted in
+        ``policy.denials``: for speculative lookups, such as Read's instruction files."""
         if groups is not None and len(groups) != len(reads):
             raise ValueError(f"{len(groups)} groups for {len(reads)} reads")
         results: list[ReadResult | VFSError] = []
         asked: list[tuple[int, _Target, int, int, int]] = []  # (index in results, target, offset, limit, group)
         for n, (path, offset, limit) in enumerate(reads):
             try:
-                target = self._target(path, "read")
+                target = self._target(path, "read", count_denials=count_denials)
             except VFSError as e:
                 results.append(e)
                 continue
@@ -452,8 +461,9 @@ class VFSView:
 
     # Mapping
 
-    def _target(self, path: str, action: Action | None = None) -> _Target:
-        """``path`` mapped to the real tree, after checking ``action`` on it. ENOENT outside every mount."""
+    def _target(self, path: str, action: Action | None = None, *, count_denials: bool = True) -> _Target:
+        """``path`` mapped to the real tree, after checking ``action`` on it (``Policy.check``). ENOENT outside
+        every mount."""
         segments = split(path)
         target: _Target | None = None
         for mount in self._mounts:
@@ -464,7 +474,7 @@ class VFSView:
         if target is None:
             raise VFSError("ENOENT", join(*segments))
         if action is not None:
-            self.policy.check(self.actor, action, target.visible)
+            self.policy.check(self.actor, action, target.visible, count_denials=count_denials)
         return target
 
     def _creatable(self, path: str, parents: bool) -> _Target:

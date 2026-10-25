@@ -212,6 +212,32 @@ async def test_unreadable_instructions_are_skipped(client: VFSClient, view: VFSV
     assert "Instructions from: /workspace/pkg/CLAUDE.md\nvisible" in out
 
 
+async def test_instruction_lookups_count_no_denials(client: VFSClient) -> None:
+    """Every Read looks up AGENTS.md and CLAUDE.md, whatever the path is: the ones the policy refuses aren't
+    denials the model asked for, so ``policy.denials`` counts only a Read the policy refuses, once."""
+    rules = [Rule("/workspace/pkg/AGENTS.md"), Rule("/workspace/pkg/CLAUDE.md"), Rule("/workspace/pkg/secret.txt")]
+    rules.append(Rule("/workspace/private"))  # a missing path's suggestions can't list it
+    policy = Policy({"agent": [*rules, Rule("/workspace/**", "read", "write")]})
+    deps = Deps(VFSView(client, workspace_mounts(W1), policy, "agent"))
+    await put(client, "/workspace/pkg/AGENTS.md", b"no")
+    await put(client, "/workspace/pkg/f.py", b"x\n")
+    await put(client, "/workspace/pkg/blob.bin", b"\x00\x01" * 100)
+    await put(client, "/workspace/pkg/sub/g.py", b"y\n")
+    await put(client, "/workspace/pkg/secret.txt", b"s\n")
+    assert "1: x" in await run_tool(Read, deps, filePath="pkg/f.py")
+    assert (await call_tool(Read, deps, filePath="pkg/blob.bin")).retried
+    assert "<type>directory</type>" in await run_tool(Read, deps, filePath="pkg/sub")
+    assert (await call_tool(Read, deps, filePath="pkg/missing.py")).retried
+    assert (
+        await retry_message(Read, deps, filePath="private/missing.py")
+        == "File not found: /workspace/private/missing.py"
+    )
+    assert "1: y" in await run_tool(Read, deps, filePath="pkg/sub/g.py")
+    assert policy.denials == {}
+    assert await run_tool(Read, deps, filePath="pkg/secret.txt") == "Permission denied: read /workspace/pkg/secret.txt"
+    assert policy.denials == {("agent", "read"): 1}
+
+
 # The view
 
 
@@ -421,11 +447,11 @@ async def test_instructions_already_shown_are_looked_up_not_read(
     pread_many = view.pread_many
 
     async def recording(
-        reads: list[tuple[str, int, int]], *, groups: list[int] | None = None
+        reads: list[tuple[str, int, int]], *, groups: list[int] | None = None, count_denials: bool = True
     ) -> list[ReadResult | VFSError]:
         asked.append(list(reads))
-        assert groups == [0, 0]
-        found = await pread_many(reads, groups=groups)
+        assert groups == [0, 0] and not count_denials
+        found = await pread_many(reads, groups=groups, count_denials=count_denials)
         transferred.append([r.content for r in found if isinstance(r, ReadResult)])
         return found
 
@@ -675,7 +701,7 @@ async def test_instruction_lookups_that_fail_or_find_a_directory(
     )
 
     async def failing(
-        reads: list[tuple[str, int, int]], *, groups: list[int] | None = None
+        reads: list[tuple[str, int, int]], *, groups: list[int] | None = None, count_denials: bool = True
     ) -> list[ReadResult | VFSError]:
         raise VFSError("EIO", reads[0][0], "database error")
 
