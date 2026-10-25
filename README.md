@@ -4,12 +4,12 @@ A small POSIX-like virtual filesystem stored entirely in PostgreSQL, built for c
 
 ## Overview
 
-An agent sees one filesystem tree, stored entirely in Postgres, and works on it with four tools: `Read`, `Write`, `Glob` and `Grep`. `Read` on a directory lists it, so there is no separate `ls`. Source files, notes, logs, working memory and ingested documents are all ordinary files in that tree. Nothing is mounted, so it runs where FUSE and root are unavailable: sandboxes, serverless containers and managed app platforms.
+An agent sees one filesystem tree, stored entirely in Postgres, and works on it with five tools: `Read`, `Write`, `Edit`, `Glob` and `Grep`. `Read` on a directory lists it, so there is no separate `ls`. Source files, notes, logs, working memory and ingested documents are all ordinary files in that tree. Nothing is mounted, so it runs where FUSE and root are unavailable: sandboxes, serverless containers and managed app platforms.
 
 **Goals**
 
 - One storage model and one set of operations for every kind of data. There are no special tables for logs, memory or task queues.
-- The tools follow ladderframe's tool contracts (`Read` with line-based `offset` and `limit`, `Glob`, `Grep`), which track opencode's and Claude Code's, so models already use them well.
+- The tools are pydantic-ai tools with ladderframe's (opencode's) contracts (`Read` with line-based `offset` and `limit`, `Write`, `Edit`, `Glob`, `Grep`), which track Claude Code's too, so models already use them well. Any pydantic-ai agent can use them.
 - Incremental reads: a reader can tail a growing file and get only what is new since its last read, by byte offset in the library and by line number in the tools.
 - Search and glob run inside Postgres, so there's no local mirror, no sync and no `rg` binary.
 - PostgreSQL is the single source of truth, and every read reflects the latest committed write.
@@ -21,7 +21,7 @@ An agent sees one filesystem tree, stored entirely in Postgres, and works on it 
 - Full POSIX: no hard links, permission bits, xattrs or random-offset writes in v1.
 - Large binary files. The design targets text (source code, markdown, logs) from kilobytes to a few megabytes per file.
 
-**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly, line-aligned extents in `vfs_extents`: each starts at a line start and knows its first line number and where its lines start. SQL functions implement append, overwrite, positional and line reads, rename, compaction and watch (via NOTIFY). Search scans the current bytes of the files in scope inside Postgres, extent by extent, the way ripgrep scans a disk, so there is no line table or search index to keep in step with writes. A recursive walk over the parent pointers powers `Glob`. A Python VFS library wraps these functions and caches what can't go stale: directory entries. Agent tools with ladderframe's contracts (for example PydanticAI tools) wrap the library; `Read` and `Grep` get their line numbers from Postgres.
+**In one paragraph:** files are inodes in `vfs_nodes`, and their bytes are append-friendly, line-aligned extents in `vfs_extents`: each starts at a line start and knows its first line number and where its lines start. SQL functions implement append, overwrite, positional and line reads, rename, compaction and watch (via NOTIFY). Search scans the current bytes of the files in scope inside Postgres, extent by extent, the way ripgrep scans a disk, so there is no line table or search index to keep in step with writes. A recursive walk over the parent pointers powers `Glob`. A Python VFS library wraps these functions and caches what can't go stale: directory entries. pydantic-ai tools with ladderframe's (opencode's) contracts wrap the library's chroot view; `Read` and `Grep` get their line numbers from Postgres.
 
 ## Context
 
@@ -51,7 +51,7 @@ Any number of clients share one VFS library and one set of SQL functions. Postgr
 
 | Component | Role |
 | --- | --- |
-| Agent tools | `Read`, `Write`, `Glob`, `Grep` exposed to the model, with ladderframe's signatures, output formats and errors |
+| Agent tools | `Read`, `Write`, `Edit`, `Glob`, `Grep`: pydantic-ai tools with ladderframe's signatures, output formats and errors |
 | VFS library | Path resolution, the chroot view, write policy, glob and regex translation, caching, cursors and watch |
 | SQL functions | Append, overwrite, positional and line reads, resolve, readdir, create, rename, unlink, search, compact |
 | PostgreSQL | Tables, the NOTIFY trigger, and routine compaction |
@@ -84,7 +84,7 @@ All clients share one tree. A file's purpose comes from where it sits and how it
 | `/workspace/log.md` | read, append | — | read |
 | `/docs/**` | read | read, write | read |
 
-Rules are ordered and the first match wins, so specific rules come first (`/workspace/log.md` before `/workspace/**`). A path no rule matches may be read but not written. The view enforces the policy on visible paths, as a second gate after ladderframe's own permission rules; a denial is `EACCES`, counted per actor and action. The agent's tools have no append (`Write` replaces whole files and the policy refuses it on `log.md`), so the harness appends the agent's log entries through `vfs.append`, acting as the agent.
+Rules are ordered and the first match wins, so specific rules come first (`/workspace/log.md` before `/workspace/**`). A path no rule matches may be read but not written. The view enforces the policy on visible paths, the tools' only permission gate; a denial is `EACCES`, counted per actor and action. The agent's tools have no append (`Write` replaces whole files and the policy refuses it on `log.md`), so the harness appends the agent's log entries through `vfs.append`, acting as the agent.
 
 **Coordination through rename (Maildir).** When several agents or workers share work, a file's status can be the directory it sits in. Claiming a file is an atomic rename (see Core operations), so exactly one worker wins.
 
@@ -740,9 +740,9 @@ Postgres's built-in ARE engine is the only regex engine available everywhere, so
 - **Rejections match rg:** every pattern regex-syntax rejects is also rejected by the real `rg` binary, checked in CI.
 - **The file filter never drops a match:** whenever some line matches the line form, the whole file matches the file form. A failure here would be a silent missed hit, so it gets its own property test.
 
-## Agent integration
+## Agent tools
 
-The agent tools follow ladderframe's tool contracts (`packages/harness/src/ladderframe/tools`): the same names, parameters, output formats and error handling as its `Read`, `Glob` and `Grep`, and as its upcoming `Write`. ladderframe's tools track opencode's, which mirror Claude Code's, so models apply what they already practice, and an agent moves between a ladderframe workspace on disk and minifs without prompt changes. The examples use PydanticAI, but the tools are plain async functions over the VFS library and fit any agent framework or an MCP server.
+minifs ships pydantic-ai tools with ladderframe's (opencode's) contracts, in `minifs.tools` behind the `minifs[pydantic-ai]` extra: the same names, parameters, descriptions, output formats and error handling as ladderframe's `Read`, `Write`, `Edit`, `Glob` and `Grep` (`packages/harness/src/ladderframe/tools`). ladderframe's tools track opencode's, which mirror Claude Code's, so models apply what they already practice, and an agent moves between a workspace on disk and minifs without prompt changes. Nothing in minifs imports ladderframe: ladderframe is a pydantic-ai harness, so it uses these tools like any other pydantic-ai project. The tools are plain `async def` functions over a `VFSView`, each also wrapped in a `pydantic_ai.Tool`.
 
 | Tool | Signature | Backed by |
 | --- | --- | --- |
@@ -750,8 +750,9 @@ The agent tools follow ladderframe's tool contracts (`packages/harness/src/ladde
 | Glob | `Glob(pattern, path)`: absolute paths, at most 100 | `vfs_glob` over `vfs_nodes` |
 | Grep | `Grep(pattern, path, include)`: hits grouped by file, at most 100 | `vfs_glob` and a scan of `vfs_extents` |
 | Write | `Write(filePath, content)` | `vfs_write` or `vfs_create`, subject to the write policy |
+| Edit | `Edit(filePath, oldString, newString, replaceAll)` | `vfs_pread` and a compare-and-swap `vfs_write`, subject to the write policy |
 
-Paths are absolute in the agent's chroot view; a relative path resolves against `/workspace`, the agent's working directory. Options without a ladderframe parameter (Glob's `exclude`, Grep's `ignore_case`, `fixed_strings`, `context` and `max_count`, byte offsets) stay in the library.
+Paths are absolute in the agent's chroot view; a relative path resolves against the deps' `vfs_workdir`, `/workspace` (the agent's working directory) by default. Options without a ladderframe parameter (Glob's `exclude`, Grep's `ignore_case`, `fixed_strings`, `context` and `max_count`, byte offsets) stay in the library.
 
 **Write.** ladderframe has no `Write` yet. Until it lands, minifs follows opencode's `write`, which ladderframe's tools track: `filePath` and `content`, creating the file and any missing parent directories, or replacing the whole file as a new generation. Details, from opencode:
 
@@ -788,8 +789,11 @@ minifs/
     watch.py     LISTEN vfs and async iterators per path
     cache.py     directory-entry cache, content and line-map cache, NOTIFY eviction
     cursor.py    Cursor and read_from: generation-aware tailing for library callers
-  tools/
-    tools.py     Read / Write / Glob / Grep, with ladderframe's contracts
+  tools/         pydantic-ai tools (the pydantic-ai extra), with ladderframe's contracts
+    deps.py      HasVFS (the deps protocol), ToolSettings, resolve
+    errors.py    VFSError -> ModelRetry, or the returned denial
+    base.py      vfs_tool: a function as a pydantic_ai.Tool with ladderframe's description
+    read.py, write.py, edit.py, glob.py, grep.py
   db/
     pool.py      psycopg pool and credential refresh
     schema.sql
@@ -799,18 +803,27 @@ crates/
 
 ### Deps and tools
 
+The tools take `RunContext[HasVFS]`, where `HasVFS` is a protocol whose only member is `vfs: VFSView`, so the caller's own deps dataclass works as long as it has a `vfs`. Two optional attributes are read with defaults: `vfs_workdir` (`/workspace`) and `vfs_settings` (a `ToolSettings`, with ladderframe's limits: `Read` 2,000 lines of at most 2,000 characters and 50 KB, `Glob` and `Grep` 100 results, `Grep` lines cut at 2,000 characters and a 2 s timeout).
+
 ```python
+from minifs.tools import Read, Write, Edit, Glob, Grep, toolset
+
 @dataclass
 class Deps:
-    vfs: VFSClient
-    workspace_id: UUID
-    actor: str = "agent"
-    versions: dict[str, tuple[UUID, int, int]] = field(default_factory=dict)  # path -> (node_id, generation, size) at last Read or Write
+    vfs: VFSView
+    vfs_workdir: str = "/workspace"   # optional
 
-agent = Agent("<model>", deps_type=Deps, instructions=AGENT_PROMPT, retries=3)   # ladderframe's tool_retries
+agent = Agent("<model>", deps_type=Deps, tools=[Read, Write, Edit, Glob, Grep], retries=3)  # ladderframe's tool_retries
+# or: Agent("<model>", deps_type=Deps, toolsets=[toolset()])
 
-@agent.tool
-async def Read(ctx: RunContext[Deps], filePath: str, offset: int | None = None, limit: int | None = None) -> str:
+view = VFSView(client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")
+await agent.run("fix the failing test", deps=Deps(vfs=view))
+```
+
+Each tool is a plain function and a prebuilt `Tool` carrying ladderframe's description:
+
+```python
+async def read(ctx: RunContext[HasVFS], filePath: str, offset: int | None = None, limit: int | None = None) -> str:
     """Read a file or directory.
 
     Args:
@@ -820,25 +833,12 @@ async def Read(ctx: RunContext[Deps], filePath: str, offset: int | None = None, 
     """
     ...
 
-@agent.tool
-async def Glob(ctx: RunContext[Deps], pattern: str, path: str | None = None) -> str:
-    """Find files by glob pattern."""
-    ...
-
-@agent.tool
-async def Grep(ctx: RunContext[Deps], pattern: str, path: str | None = None, include: str | None = None) -> str:
-    """Search file contents with a regular expression."""
-    ...
-
-@agent.tool
-async def Write(ctx: RunContext[Deps], filePath: str, content: str) -> str:
-    """Write a file, creating it or replacing its contents."""
-    ...
+Read = vfs_tool(read, "Read", DESCRIPTION)
 ```
 
 The tool descriptions start from ladderframe's text, so a model sees the same instructions on disk and in minifs. minifs drops the lines that point to tools or features it doesn't have (Bash with `rg`, the Agent tool, image and PDF attachments, "the local filesystem"). It adds one line to `Grep`'s description: use `(?i)` for case-insensitive search; lookaround and backreferences aren't supported.
 
-**Errors follow ladderframe.** A mistake the model can fix by calling again raises `ModelRetry`, with a message that says what to change: a missing path (`File not found: /workspace/notes.md`, with up to three similar names), an offset past the end, a binary file, a `Glob` path that isn't a directory (`glob path must be a directory: ...`, `No such directory: ...`), a missing `Grep` path (`No such file or directory: ...`) or empty pattern (`pattern is required`), a pattern the translator rejects (ripgrep's message and position), a search scope over the cap, or a timeout. A path outside the agent's view gets each tool's not-found error (`File not found` for `Read` and `Write`, `No such directory` for `Glob`, `No such file or directory` for `Grep`), and `Read` never suggests similar names from outside the view, so errors don't reveal what exists beyond the chroot. A permission denial (the write policy) is returned as a string, as ladderframe's permission guard does: retrying won't help, and the model reads the refusal and moves on. Each tool maps `VFSError` to one of the two at its boundary, and nothing else escapes.
+**Errors follow ladderframe.** A mistake the model can fix by calling again raises `ModelRetry`, with a message that says what to change: a missing path (`File not found: /workspace/notes.md`, with up to three similar names), an offset past the end, a binary file, a `Glob` path that isn't a directory (`glob path must be a directory: ...`, `No such directory: ...`), a missing `Grep` path (`No such file or directory: ...`) or empty pattern (`pattern is required`), a pattern the translator rejects (ripgrep's message and position), a search scope over the cap, or a timeout. A path outside the agent's view gets each tool's not-found error (`File not found` for `Read` and `Write`, `No such directory` for `Glob`, `No such file or directory` for `Grep`), and `Read` never suggests similar names from outside the view, so errors don't reveal what exists beyond the chroot. A permission denial (the write policy) is returned as a string, as ladderframe's permission guard does: retrying won't help, and the model reads the refusal and moves on. Each tool maps `VFSError` to one of the two at its boundary with `minifs.tools.errors.tool_error`, and nothing else escapes: `EACCES` becomes the result `Permission denied: <action> <path>`, `ESTALE` the retry `<path> was modified since it was read. Read it again before writing.`, a database error `Internal error reading <path>`, and a refused search its own message.
 
 **Pre-fill reads that happen every time.** Each tool call costs a full extra LLM inference: the model stops, waits for the result, then reprocesses its whole context. The database query takes milliseconds; the extra inference takes roughly 0.5 to 1.5 s. If a harness always reads the same file at the start of a run (for example `notes.md`), it can run that `Read` itself, through the same tool function so the version is recorded for a later `Write`, and put the result in the prompt as if the agent had run it. A read that depends on what the agent is thinking stays a tool call.
 
