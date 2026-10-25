@@ -124,6 +124,13 @@ path is checked link by link in the same statement instead of walked, and falls 
 went stale, so a stale cache never reaches the wrong node. `minifs.vfs.cache.DirEntryCache` is that cache: positive
 entries with a 2 s TTL, kept fresh by `follow(watcher)` (evict by id on `move` and `delete`, clear on `rescan`).
 
+`minifs.vfs.view.VFSView(client, mounts, policy, actor)` is what the agent tools call: the same operations in
+the paths of an actor's chroot (`workspace_mounts(workspace_id)` gives the agent's), each checked against the
+ordered rules of `minifs.vfs.policy.Policy` first. Paths outside every mount are ENOENT, a denial is EACCES and
+moving a mount point is EBUSY; errors come back with the visible path and no `detail`, other database errors
+as EIO. A new client operation reaches the tools by a view method that maps its paths with `_target` and wraps
+the call in `_mapped`.
+
 Connections come from `minifs.db.pool`: a `Connector` (a static conninfo, plus an optional callable that returns
 a fresh password per connection, for Lakebase OAuth tokens) is also the `ConnectionFactory` for LISTEN, and
 `open_pool` / `Pools` build psycopg pools on it that check each connection at checkout, so connections closed by

@@ -82,9 +82,9 @@ All clients share one tree. A file's purpose comes from where it sits and how it
 | --- | --- | --- | --- |
 | `/workspace/**` | read, write | — | read, write |
 | `/workspace/log.md` | read, append | — | read |
-| `/docs/**` | read | write | read |
+| `/docs/**` | read | read, write | read |
 
-The most specific rule wins. The agent's tools have no append (`Write` replaces whole files and the policy refuses it on `log.md`), so the harness appends the agent's log entries through `vfs.append`, acting as the agent.
+Rules are ordered and the first match wins, so specific rules come first (`/workspace/log.md` before `/workspace/**`). A path no rule matches may be read but not written. The view enforces the policy on visible paths, as a second gate after ladderframe's own permission rules; a denial is `EACCES`, counted per actor and action. The agent's tools have no append (`Write` replaces whole files and the policy refuses it on `log.md`), so the harness appends the agent's log entries through `vfs.append`, acting as the agent.
 
 **Coordination through rename (Maildir).** When several agents or workers share work, a file's status can be the directory it sits in. Claiming a file is an atomic rename (see Core operations), so exactly one worker wins.
 
@@ -779,7 +779,8 @@ ladderframe's tools run over a disk, `Glob` and `Grep` through ripgrep; minifs i
 ```
 minifs/
   vfs/
-    core.py      Entry, ReadResult, VFSError, path normalization, chroot mapping
+    core.py      Entry, ReadResult, VFSError, path normalization
+    view.py      VFSView: the chroot (mounts) with the write policy enforced
     client.py    thin async wrappers over the SQL functions
     policy.py    per-actor write rules
     glob.py      glob translator and pruning hints
