@@ -92,7 +92,7 @@ async def test_invalid_arguments_are_a_retry(deps: Deps) -> None:
 def test_toolset_holds_every_tool() -> None:
     tools = toolset()
     assert isinstance(tools, FunctionToolset)
-    assert list(tools.tools.values()) == list(TOOLS)  # empty until #11, #12, #13, #39 and #40 add theirs
+    assert list(tools.tools.values()) == list(TOOLS)
 
 
 def test_agents_accept_the_tools_for_their_own_deps() -> None:

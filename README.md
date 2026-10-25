@@ -764,6 +764,15 @@ Paths are absolute in the agent's chroot view; a relative path resolves against 
 
 When ladderframe's `Write` lands, minifs adopts its signature and messages.
 
+### Glob
+
+`Glob(pattern, path)` (`minifs/tools/glob.py`) is ladderframe's `Glob` over `VFSView.glob`: the same description (less its line about the Agent tool), parameters and output. `path` defaults to the working directory and resolves against it. The result is the matching files' visible absolute paths, one per line, newest first, or `No files found`. Past `GlobSettings.limit` (100) matches, it keeps the first 100 and adds, after a blank line, `(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)` with the actual limit. Exactly `limit` matches get no footer.
+
+- **Errors.** A `path` that is a file is `ModelRetry: glob path must be a directory: <path>`. A missing one, one below a file and one outside the view are all `ModelRetry: No such directory: <path>`. A bad pattern is a `ModelRetry` with rg's message, `error parsing glob '<pattern>': <reason>`; inside the view it is reported before a bad `path`. From a virtual directory such as `/`, a pattern that can't be restated in each mount is `ModelRetry: <path>: '<pattern>' spans mount points here: glob from inside a mount` (see `VFSView.glob`). A bad `GlobSettings` limit or exclude fails when the settings are built. A `path` the policy doesn't let the agent read returns `Permission denied: read <path>`.
+- **What is skipped.** As `rg --files`: hidden directories are never descended into, and a hidden file is listed when the pattern matches it. `**/.git/**` (`ALWAYS_EXCLUDED`) is always skipped, and the caches in `GlobSettings.excludes` (`DEFAULT_EXCLUDES`: `node_modules`, `.venv`, `__pycache__`, `.mypy_cache`) by default, in place of ladderframe's `.gitignore` handling (see Differences from ladderframe). Files the policy hides are left out and don't count toward the limit.
+- **Patterns differ from rg's** in a few corners, all listed in Glob, Divergences from rg: `?` matches a character, not a byte; a class never matches `/`; a leading `!` or `#`, an empty pattern, `/` and a trailing `/` are errors rather than a negation, a comment, every file or nothing; and globset 0.4.18 accepts nested braces and rejects a stray `}`, where rg 14.1 does the reverse. As in rg, POSIX classes aren't supported and an empty brace alternative is dropped (`a{b,}` is `ab`). None of these is in the tool's description: a model rarely writes them, and the error says what's wrong.
+- **A truncation the tool can't see.** When the policy hides files, the view looks a bounded distance past the limit (8 times it) for one more readable match. If hidden files fill that whole window, the result has no footer, though readable matches may lie past it (see `VFSView.glob`).
+
 ### Differences from ladderframe
 
 ladderframe's tools run over a disk, `Glob` and `Grep` through ripgrep; minifs implements the same contracts in Postgres. These differences remain, by design:

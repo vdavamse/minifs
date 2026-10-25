@@ -16,7 +16,11 @@ from typing import Protocol
 
 from pydantic_ai import RunContext
 
+from minifs.vfs.glob import compile_excludes
 from minifs.vfs.view import VFSView
+
+_MAX_GLOB_LIMIT = 2**31 - 2
+"""``VFSView.glob``'s largest ``limit``."""
 
 DEFAULT_WORKDIR = "/workspace"
 
@@ -38,10 +42,26 @@ class ReadSettings:
     """Output cap per call."""
 
 
+ALWAYS_EXCLUDED: tuple[str, ...] = ("**/.git/**",)
+"""Skipped by every search whatever the settings say, as ladderframe hard-codes ``-g '!**/.git/**'``."""
+
+DEFAULT_EXCLUDES: tuple[str, ...] = ("**/node_modules/**", "**/.venv/**", "**/__pycache__/**", "**/.mypy_cache/**")
+"""Skipped by default, in place of rg's ``.gitignore`` handling: unambiguous caches only (README: Differences
+from ladderframe). Patterns are rg's ``-g '!...'`` excludes, matched relative to the search root."""
+
+
 @dataclass(frozen=True)
 class GlobSettings:
     limit: int = 100
     """Paths returned at most."""
+    excludes: tuple[str, ...] = DEFAULT_EXCLUDES
+    """Skipped as well as ``ALWAYS_EXCLUDED``, which a caller can't turn off."""
+
+    def __post_init__(self) -> None:
+        """A bad limit or exclude is the caller's mistake, so it fails here, not as a retry the model can't fix."""
+        if not 0 <= self.limit <= _MAX_GLOB_LIMIT:
+            raise ValueError(f"glob limit must be 0 to {_MAX_GLOB_LIMIT}, not {self.limit}")
+        compile_excludes(self.excludes)  # GlobError
 
 
 @dataclass(frozen=True)
