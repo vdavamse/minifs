@@ -52,12 +52,12 @@ jobs:
       - name: Install the pydantic-ai extra from the wheel
         run: |
           cd "$RUNNER_TEMP"
-          # Without the extra, importing minifs.tools names it.
+          # Without the extra, importing minifs.tools names it (whatever the distribution is called).
           /tmp/smoke/bin/python -c "
           try:
               import minifs.tools
           except ImportError as e:
-              assert 'minifs[pydantic-ai]' in str(e), e
+              assert '[pydantic-ai]' in str(e), e
           else:
               raise AssertionError('minifs.tools imported without pydantic-ai')
           "

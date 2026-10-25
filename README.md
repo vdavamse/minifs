@@ -854,7 +854,7 @@ crates/
 
 ### Using the tools with pydantic-ai
 
-**Install.** `pip install 'minifs[pydantic-ai]'` adds `pydantic-ai-slim`, which `minifs.tools` needs (`minifs.vfs` and `minifs.db` work without it, and importing `minifs.tools` without it raises an `ImportError` that names the extra). Add `minifs[binary]` for a bundled libpq, and your model provider's extra (`pydantic-ai-slim[anthropic]`, say). Run `minifs db migrate` once per database.
+**Install.** `pip install "minifs-pg[pydantic-ai]"` (the distribution is `minifs-pg`; the package is still `import minifs`) adds `pydantic-ai-slim`, which `minifs.tools` needs (`minifs.vfs` and `minifs.db` work without it, and importing `minifs.tools` without it raises an `ImportError` that names the extra). Add `minifs-pg[binary]` for a bundled libpq, and your model provider's extra (`pydantic-ai-slim[anthropic]`, say). Run `minifs db migrate` once per database.
 
 **A minimal agent.** This is `examples/agent.py` below its docstring, which `tests/tools/test_example.py` runs, and the snippet runs as pasted. `examples/provision.py` migrates a database and seeds a demo workspace for it.
 
