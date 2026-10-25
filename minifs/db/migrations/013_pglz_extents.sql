@@ -1,0 +1,12 @@
+-- vfs_extents.data is compressed with pglz whatever default_toast_compression says (#59). substring of a stored
+-- value decompresses only up to the slice's end, and under pglz also fetches only the TOAST chunks it needs;
+-- under lz4 it fetches the whole compressed value first. So a Read page of a minified 10 MB line (an extent of
+-- its own) fetches 2 TOAST blocks under pglz and 512 under lz4 (PG 18, real source text, about 2.5:1 either
+-- way); for extents of the default 64 KB, read whole, the two cost the same. lz4 compresses large values about 3
+-- times faster, and reads deep into a multi-megabyte compacted extent faster, but vfs_compact's target stays
+-- near 64 KB for that reason. The default is pglz up to PG 18; PG 19 makes it lz4 where the server has lz4, and
+-- Lakebase doesn't document its own, so the column says it.
+--
+-- SET COMPRESSION changes only values stored from now on: an existing lz4 extent stays lz4 until a write,
+-- append or compaction replaces it. Table owner only, no superuser.
+ALTER TABLE vfs_extents ALTER COLUMN data SET COMPRESSION pglz;
