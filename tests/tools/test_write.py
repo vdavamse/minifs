@@ -391,6 +391,19 @@ async def test_over_the_cap_the_bom_is_kept(view: VFSView, client: VFSClient) ->
     assert await content(client, "big.txt") == text.BOM.encode() + b"new\n"
 
 
+@pytest.mark.parametrize(
+    ("old", "kept"),
+    [(b"x", b""), (b"\xef\xbb", b""), (text.BOM.encode(), text.BOM.encode())],
+    ids=["one byte", "half a BOM", "only a BOM"],
+)
+async def test_over_the_cap_short_files(view: VFSView, client: VFSClient, old: bytes, kept: bytes) -> None:
+    """Shorter than a BOM: the BOM read returns what there is, which is a BOM only if it is all of one."""
+    await client.create(f"/workspaces/{W1}/short.txt", old)
+    _, meta = await write(capped(view, 0), "short.txt", "new\n")
+    assert meta["diff"] == ""
+    assert await content(client, "short.txt") == kept + b"new\n"
+
+
 async def test_over_the_cap_a_concurrent_writer_is_detected(view: VFSView, client: VFSClient) -> None:
     await client.create(f"/workspaces/{W1}/big.txt", b"x" * 200)
     racing = Racing(view, client, [overwrite(client, "big.txt", b"y" * 200)])
@@ -405,7 +418,7 @@ async def test_over_the_cap_a_concurrent_writer_is_detected(view: VFSView, clien
 
 
 async def test_a_file_grown_past_the_cap_after_its_stat_is_not_diffed(view: VFSView, client: VFSClient) -> None:
-    """The size is checked again on the first page; the version of that page is not the one written over, so the
+    """The size is checked again on the first page. ``TooLarge`` doesn't carry that page's version, so the
     compare-and-swap uses that of the BOM read."""
     big = f"/workspaces/{W1}/big.txt"
     await client.create(big, b"small\n")
