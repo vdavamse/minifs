@@ -82,7 +82,7 @@ All clients share one tree. A file's purpose comes from where it sits and how it
 | --- | --- | --- | --- |
 | `/workspace/**` | read, write | — | read, write |
 | `/workspace/log.md` | read, append | — | read |
-| `/docs/**` | read | write | read |
+| `/docs/**` | read | read, write | read |
 
 Rules are ordered and the first match wins, so specific rules come first (`/workspace/log.md` before `/workspace/**`). A path no rule matches may be read but not written. The view enforces the policy on visible paths, as a second gate after ladderframe's own permission rules; a denial is `EACCES`, counted per actor and action. The agent's tools have no append (`Write` replaces whole files and the policy refuses it on `log.md`), so the harness appends the agent's log entries through `vfs.append`, acting as the agent.
 

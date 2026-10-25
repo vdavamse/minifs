@@ -141,7 +141,7 @@ DEFAULT_POLICY = Policy(
         ],
         "ingestion": [
             Rule("/workspace/**"),
-            Rule("/docs/**", "write"),
+            Rule("/docs/**", "read", "write"),
         ],
         "operator": [
             Rule("/workspace/log.md", "read"),

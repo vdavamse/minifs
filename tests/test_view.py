@@ -1,6 +1,9 @@
 """VFSView (the chroot) and the write policy, over a real database."""
 
-from collections.abc import AsyncIterator, Awaitable
+import itertools
+import re
+from collections.abc import AsyncIterator, Awaitable, Sequence
+from functools import cache
 from typing import Any
 
 import psycopg
@@ -11,6 +14,7 @@ from psycopg_pool import AsyncConnectionPool
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import VFSError
+from minifs.vfs.glob import GlobError, compile_excludes, compile_glob
 from minifs.vfs.policy import DEFAULT_POLICY, Policy, Rule
 from minifs.vfs.view import VFSView, _below, workspace_mounts  # pyright: ignore[reportPrivateUsage]
 
@@ -207,9 +211,10 @@ async def test_ingestion_policy(vfs: VFSClient, policy: Policy) -> None:
     await raises("EACCES", ingestion.create("/workspace/x.md", b"x"), "/workspace/x.md")
     await raises("EACCES", ingestion.append("/workspace/log.md", b"x"))
     await raises("EACCES", ingestion.pread("/workspace/notes.md"))
-    await raises("EACCES", ingestion.readdir("/docs"))  # the README grants ingestion write, not read
-    assert await ingestion.readdir("/") == []
-    assert policy.denials == {("ingestion", "write"): 1, ("ingestion", "append"): 1, ("ingestion", "read"): 2}
+    assert (await ingestion.pread("/docs/guide.md")).content == b"v2!"
+    assert [e.path for e in await ingestion.readdir("/docs")] == ["/docs/guide.md", "/docs/new.md"]
+    assert [e.path for e in await ingestion.readdir("/")] == ["/docs"]
+    assert policy.denials == {("ingestion", "write"): 1, ("ingestion", "append"): 1, ("ingestion", "read"): 1}
 
 
 async def test_operator_policy(vfs: VFSClient, policy: Policy) -> None:
@@ -377,6 +382,15 @@ async def test_glob_below_a_virtual_directory(vfs: VFSClient, policy: Policy) ->
         ("**/w?/x", False, "EINVAL"),
         ("{a/b,c}/x", False, "EINVAL"),
         ("a//x", False, None),
+        ("ws//x", False, None),  # a path has no empty segments
+        ("ws/./x", False, None),
+        ("ws\\/x.md", False, "EINVAL"),  # an escaped / is a separator: segments aren't where split() puts them
+        ("[!/]*.md", False, "EINVAL"),
+        ("{**}/x.md", False, "/x.md"),  # globset keeps a brace in its segment: {**} is *, not **
+        ("{a,**}/x", False, "/x"),
+        ("ws\\/", True, "EINVAL"),
+        ("ws//", True, "EINVAL"),
+        ("**//", True, "EINVAL"),  # globset reads it as **/, every directory
         ("node_modules", True, "node_modules"),
         ("*.tmp", True, "*.tmp"),
         ("w*", True, True),
@@ -396,3 +410,105 @@ def test_patterns_restated_below_a_mount_point(pattern: str, dirs: bool, expecte
             _below(pattern, ("ws",), dirs=dirs, path="/")
     else:
         assert _below(pattern, ("ws",), dirs=dirs, path="/") == expected
+
+
+# `_below` against globbing the mounts directly: a glob from a virtual directory, restated per mount, matches
+# exactly what the pattern matches in the visible tree, or is EINVAL.
+
+_SEGMENTS = (
+    *("ws", "w*", "w?", "w[st]", "w[!x]", "[!/]*", "\\w\\s", "w\\*", "w\\[s]", "{ws,c}", "{w*,x}", "{,ws}"),
+    *("{a,{b,ws}}", "{a/b,c}", "{a,**}", "{**}", "*{*}", "ws\\/b", "[/]", "*", "**", "**.md", "a**", "a"),
+    *("*.md", "", ".", ".."),
+)
+_PREFIXES = (("ws",), ("a", "b"), ("w[s]",))
+_NAMES = ("x.md", "ws", "a", "b", "w[s]", "{a,b}", "*", "\\")
+_FILES = tuple(
+    "/".join([*dirs, name])
+    for depth in range(3)
+    for dirs in itertools.product(("ws", "a", "b", "x.md"), repeat=depth)
+    for name in _NAMES
+)
+
+
+def _patterns() -> list[str]:
+    patterns = ["/".join(p) for n in (1, 2) for p in itertools.product(_SEGMENTS, repeat=n)]
+    return list(dict.fromkeys(q for p in patterns for q in (p, "/" + p, p + "/")))
+
+
+@cache
+def _matches(regex: str, path: str) -> bool:
+    return re.fullmatch(regex, path) is not None
+
+
+def _excluded(regexes: Sequence[str], path: str) -> bool:
+    """As vfs_glob: a file is skipped when its path matches, or a directory above it does, as "dir/"."""
+    parts = path.split("/")
+    dirs = ["/".join(parts[:k]) + "/" for k in range(1, len(parts))]
+    return any(_matches(r, p) for r in regexes for p in (*dirs, path))
+
+
+def _check_restated(pattern: str, prefix: tuple[str, ...], dirs: bool) -> bool:
+    """Whether ``_below`` restates ``pattern`` exactly for the mount at ``prefix`` (False: it was EINVAL)."""
+    try:
+        restated = _below(pattern, prefix, dirs=dirs, path="/")
+    except VFSError as e:
+        assert e.errno == "EINVAL"
+        return False
+    mount = "/".join(prefix)
+    where = f"{pattern!r} restated as {restated!r} below {mount}"
+    if dirs:
+        original = compile_excludes([pattern], prune=False).regexes
+        if restated is True:  # the exclude takes a directory at or above the mount point
+            assert any(_excluded(original, "/".join(prefix[:k]) + "/") for k in range(1, len(prefix) + 1)), where
+            return True
+        mine = compile_excludes([restated], prune=False).regexes if restated is not None else ()
+        for f in _FILES:
+            assert _excluded(original, f"{mount}/{f}") == _excluded(mine, f), f"{where}: {f}"
+    else:
+        assert restated is not True, where
+        regex = compile_glob(pattern).regex
+        mine = compile_glob(restated).regex if restated is not None else None
+        for f in _FILES:
+            assert _matches(regex, f"{mount}/{f}") == (mine is not None and _matches(mine, f)), f"{where}: {f}"
+    return True
+
+
+@pytest.mark.parametrize("dirs", [False, True], ids=["pattern", "exclude"])
+def test_restated_patterns_match_what_globbing_the_mount_does(dirs: bool) -> None:
+    checked = 0
+    for pattern in _patterns():
+        try:
+            compile_excludes([pattern]) if dirs else compile_glob(pattern)
+        except GlobError:
+            continue  # the view reports a bad pattern before restating it
+        checked += sum(_check_restated(pattern, prefix, dirs) for prefix in _PREFIXES)
+    assert checked > 2000  # most patterns are restated, not refused
+
+
+_MIRROR = "/mirror"
+_MIRROR_FILES = ("x.md", "ws/x.md", "ws/c/x", "a/x.md", "a/ws/y.md", ".h/x.md", "c/x", "x", "w[s]/x.md", "{a,b}")
+
+
+@pytest.mark.parametrize("hidden", [False, True])
+async def test_glob_from_a_virtual_directory_matches_globbing_the_tree(vfs: VFSClient, hidden: bool) -> None:
+    # The mounts, each a copy of the same tree, are also laid out under /mirror as the view shows them, so a glob
+    # from /mirror is what the view's glob from / has to return.
+    mounts = {"/ws": "/mirror/ws", "/docs": "/mirror/docs", "/a/b": "/mirror/a/b", "/.h": "/mirror/.h"}
+    for visible in mounts:
+        for f in _MIRROR_FILES:
+            await vfs.create(f"{_MIRROR}{visible}/{f}", b"", parents=True)
+    tester = VFSView(vfs, mounts, Policy({"tester": [Rule("/**", "read", "write")]}), "tester")
+    cases = [(p, ()) for p in ("*.md", "**", "ws/**", "**/x.md", "*/x.md", "a/b/ws/*.md", "{ws,docs}/*", "x")]
+    cases += [(p, ()) for p in ("w[s]/*", "w\\[s]/**", "{a,**}/x.md", "**/c/x", "a/*/c/x", "/ws/**/x", "a**/x")]
+    cases += [("**", (e,)) for e in ("ws", "ws/", "**/ws/", "x.md", "*/c/", "a/b/", "a/*/ws/", "{ws,a}/x.md")]
+    cases += [("**", ("**/x.md", "docs/**")), ("*.md", ("**/node_modules/**", "w*/a/"))]
+    for directory in ("/", "/a"):
+        for pattern, excludes in cases:
+            try:
+                seen = await tester.glob(pattern, directory, excludes=excludes, hidden=hidden)
+            except VFSError as e:
+                assert e.errno == "EINVAL", (pattern, excludes)
+                continue
+            real = await vfs.glob(pattern, _MIRROR + directory.rstrip("/"), excludes=excludes, hidden=hidden)
+            expected = sorted(e.path.removeprefix(_MIRROR) for e in real)
+            assert sorted(e.path for e in seen) == expected, (directory, pattern, excludes)

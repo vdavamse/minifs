@@ -41,7 +41,6 @@ from minifs.vfs.policy import Action, Policy
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
 _REFETCH_FACTOR = 8
-_BRACED_STAR = re.compile(r"\{[^}]*\*")
 _log = logging.getLogger(__name__)
 
 
@@ -140,10 +139,17 @@ class VFSView:
 
         Below a virtual directory, the glob runs in each mount and the results are merged, newest first. The
         pattern and excludes still match paths relative to ``path``, restated relative to each mount point. Where
-        that can't be done exactly, the glob is EINVAL (glob from inside a mount instead): a ``**`` segment
-        followed by one that can match a directory above or at a mount point (``**/workspace/*.md`` from ``/``),
-        an escaped ``/``, a brace with a ``*`` in a segment that reaches a mount point (``{a,**}/x.md``), and a
-        brace or class with a ``/`` in it."""
+        that can't be done exactly, the glob is EINVAL (glob from inside a mount instead). Only a pattern or
+        exclude with one of these can be, and only where it reaches a mount point:
+
+        - an escaped ``/`` (``a\\/b``);
+        - a brace or class with a ``/`` in it (``{a/b,c}/x``, ``[!/]*.md``);
+        - a ``**`` segment followed by a segment that can match a directory at or above a mount point:
+          ``**/workspace/*.md`` from ``/``, and for an exclude, which matches directories too, also
+          ``**/w*`` or ``**/*s/``;
+        - for an exclude, a trailing ``//`` (``**//``).
+
+        EINVAL too for a ``limit`` outside 0 to 2**31 - 1."""
         target = self._target(path, "read")
         if limit is not None and not 0 <= limit <= _MAX_LIMIT:
             raise VFSError("EINVAL", target.visible, f"invalid limit {limit}")
@@ -378,7 +384,8 @@ def _real(target: _Target) -> str:
 def _below(pattern: str, prefix: tuple[str, ...], *, dirs: bool, path: str) -> str | Literal[True] | None:
     """Glob ``pattern``, relative to virtual directory ``path``, restated relative to the mount point ``prefix``
     below it: None if it matches nothing in the mount, True if it matches the mount point or a directory above it
-    (only for ``dirs``, an exclude, which can match directories). EINVAL when it can't be restated exactly."""
+    (only for ``dirs``, an exclude, which can match directories). EINVAL when it can't be restated exactly: the
+    cases ``VFSView.glob`` lists. ``tests/test_view.py`` checks it against compiling the pattern itself."""
     if "\\/" in pattern:  # an escaped / is still a separator to glob.py: don't guess where segments are
         raise _unrestatable(pattern, path)
     body = pattern[:-1] if dirs and pattern.endswith("/") else pattern
@@ -388,6 +395,10 @@ def _below(pattern: str, prefix: tuple[str, ...], *, dirs: bool, path: str) -> s
             return pattern  # a file name is never a directory above the mount
         return True if _matches_any(body, prefix, pattern, path) else pattern
     segments = (body[1:] if body.startswith("/") else body).split("/")
+    if segments[-1] == "":  # globset reads `**//` as `**/`, any directory: don't guess what it means
+        raise _unrestatable(pattern, path)
+    if any(segment in ("", ".", "..") for segment in segments):  # never in a path: `a//x` matches nothing
+        return None
     for i, name in enumerate(prefix):
         if i == len(segments):  # the pattern names a directory above the mount point
             return True if dirs else None
@@ -411,9 +422,6 @@ def _below(pattern: str, prefix: tuple[str, ...], *, dirs: bool, path: str) -> s
 
 def _matches_any(segment: str, names: Sequence[str], pattern: str, path: str) -> bool:
     """Whether the glob path segment ``segment`` (of ``pattern``) matches one of ``names``."""
-    if segment in ("", ".", "..") or _BRACED_STAR.search(segment):
-        # A brace with a `*` in it is expanded before translation and may turn into a `**` segment.
-        raise _unrestatable(pattern, path)
     try:
         regex = globbing.compile_glob(segment).regex  # literals and explicit ranges only: Python reads it the same
     except globbing.GlobError:
