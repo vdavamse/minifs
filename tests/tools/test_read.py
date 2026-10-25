@@ -22,7 +22,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from minifs.tools import TOOLS, Read
 from minifs.tools.deps import ReadSettings, ToolSettings
-from minifs.tools.read import DESCRIPTION, MAX_ATTACHMENT_BYTES
+from minifs.tools.read import DESCRIPTION, MAX_ATTACHMENT_BYTES, SAMPLE_BYTES
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import Entry, LineReadResult, ReadResult
 from minifs.vfs.policy import Policy, Rule
@@ -476,7 +476,7 @@ async def test_an_attachment_that_grew_past_the_limit(
 
     async def growing(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
         result = await pread(path, offset, limit)
-        if limit == 4096:
+        if limit == SAMPLE_BYTES:
             await view.append(path, b"\x00" * MAX_ATTACHMENT_BYTES)
         return result
 
@@ -514,21 +514,113 @@ async def test_a_page_from_another_file_than_the_sample(
 
 
 async def test_a_page_that_never_settles(client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The file changes after every batch: after three attempts the tool returns the last one's page."""
-    settings = ReadSettings(max_line_length=100, max_bytes=1024)  # one long line per batch
+    """The file changes after every batch: after three attempts the tool returns the last one's page, whole."""
+    settings = ReadSettings(max_line_length=100, max_bytes=1024)  # one long line per batch, 7 lines a page
     data = b"".join(b"a" * 1000 + b"\n" for _ in range(10))
     await put(client, "/workspace/f.txt", data)
+    sampled = asyncio.Event()
     calls = 0
-    pread_lines = view.pread_lines
+    pread, pread_lines = view.pread, view.pread_lines
+
+    async def sampling(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        result = await pread(path, offset, limit)
+        sampled.set()
+        return result
 
     async def rewriting(*args: Any) -> LineReadResult:
         nonlocal calls
+        await sampled.wait()  # the sample sees the generation the page starts at
+        sampled.clear()
         calls += 1
         result = await pread_lines(*args)
         await view.write("/workspace/f.txt", data)  # same bytes, a new generation
+        sampled.set()
         return result
 
+    monkeypatch.setattr(view, "pread", sampling)
     monkeypatch.setattr(view, "pread_lines", rewriting)
     out = await run_tool(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="f.txt")
     assert out == ladderframe_output("/workspace/f.txt", data, None, None, settings)
-    assert calls < 20
+    assert calls == 2 + 2 + 8  # two batches per failed attempt, then lines 1 to 8 (the cap falls in line 8)
+
+
+async def test_an_attachment_replaced_after_the_sample(
+    client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PNG (by its magic bytes alone) replaced by text between the sample and the whole read: the tool samples
+    again and reads the text, rather than attach it as an image."""
+    await put(client, "/workspace/a", PNG + b"\x01" * 5000)
+    pread = view.pread
+    replaced = False
+
+    async def replacing(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        nonlocal replaced
+        result = await pread(path, offset, limit)
+        if not replaced:
+            replaced = True
+            await view.unlink(path)
+            await view.create(path, b"now text\n")
+        return result
+
+    monkeypatch.setattr(view, "pread", replacing)
+    out = await run_tool(Read, Deps(view), filePath="a")
+    assert out.endswith("<content>\n1: now text\n\n(End of file - total 1 lines)\n</content>")
+
+
+async def test_a_file_that_became_a_directory(
+    client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The page's first batch fails after the sample succeeded: the tool reads the path again."""
+    await put(client, "/workspace/f", b"text\n")
+    sampled = asyncio.Event()
+    pread, pread_lines = view.pread, view.pread_lines
+    swapped = False
+
+    async def sampling(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        try:
+            return await pread(path, offset, limit)
+        finally:
+            sampled.set()
+
+    async def swapping(*args: Any) -> LineReadResult:
+        nonlocal swapped
+        await sampled.wait()
+        if not swapped:
+            swapped = True
+            await view.unlink("/workspace/f")
+            await view.mkdir("/workspace/f")
+        return await pread_lines(*args)
+
+    monkeypatch.setattr(view, "pread", sampling)
+    monkeypatch.setattr(view, "pread_lines", swapping)
+    out = await run_tool(Read, Deps(view), filePath="f")
+    assert out == "<path>/workspace/f</path>\n<type>directory</type>\n<entries>\n\n\n(0 entries)\n</entries>"
+
+
+async def test_a_read_holds_at_most_three_connections(
+    client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Calls in flight at once, for a file five directories deep with instruction files on the way."""
+    for d in ("a", "a/b/c"):
+        await put(client, f"/workspace/{d}/CLAUDE.md", b"rules")
+    await put(client, "/workspace/a/b/c/d/e/f.txt", b"x\n" * 3000)
+    in_flight = peak = 0
+
+    def counted(method: Any) -> Any:
+        async def call(*args: Any, **kwargs: Any) -> Any:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                return await method(*args, **kwargs)
+            finally:
+                in_flight -= 1
+
+        return call
+
+    for name in ("stat", "readdir", "pread", "pread_lines"):
+        monkeypatch.setattr(view, name, counted(getattr(view, name)))
+    settings = ReadSettings(max_bytes=1024)
+    out = await run_tool(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="a/b/c/d/e/f.txt")
+    assert "Instructions from: /workspace/a/b/c/CLAUDE.md" in out and "Instructions from: /workspace/a/CLAUDE.md" in out
+    assert 2 <= peak <= 3  # the sample and the first batch; the instruction lookups, two at a time

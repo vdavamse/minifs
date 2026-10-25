@@ -44,8 +44,11 @@ INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
 MAX_ATTACHMENT_BYTES = 3_750_000
 """Largest image or PDF attached to a result: about 5 MB once base64-encoded, the providers' usual limit."""
 _PAGE_ATTEMPTS = 3
-"""Reads of a page that changes between its batches before the tool settles for the last snapshot's numbers."""
-_MAX_LINES = 2**31 - 1  # pread_lines' max_lines and max_bytes are int
+"""Reads of a file that changes under the tool (between the sample and the page or attachment, or between a page's
+batches) before it settles for what the last attempt read."""
+_INSTRUCTION_CALLS = 2
+"""Instruction-file lookups in flight at once, so a Read holds at most three pool connections."""
+_MAX_LINES = 2**31 - 1  # pread_lines' max_lines and max_bytes, and pread's limit, are int
 _MAX_LINE = 2**63 - 1  # and first_line a bigint; no file has that many lines
 
 
@@ -68,12 +71,11 @@ async def read(
     count = limit if limit is not None else config.default_limit
     try:
         for attempt in range(_PAGE_ATTEMPTS):
-            last_try = attempt + 1 == _PAGE_ATTEMPTS
-            # The sample, the page's first batch and the instruction files at once: one round trip for most reads.
-            sample, first, instructions = await asyncio.gather(
+            settle = attempt + 1 == _PAGE_ATTEMPTS
+            # The sample and the page's first batch at once: one round trip for most reads.
+            sample, first = await asyncio.gather(
                 vfs.pread(path, 0, SAMPLE_BYTES),
                 vfs.pread_lines(path, min(start, _MAX_LINE), min(count, _MAX_LINES), _fetch(config)),
-                _nearby_instructions(ctx, path),
                 return_exceptions=True,
             )
             if isinstance(sample, VFSError):
@@ -84,8 +86,6 @@ async def read(
                 raise sample
             if isinstance(sample, BaseException):
                 raise sample
-            if isinstance(instructions, BaseException):
-                raise instructions
             version = (sample.id, sample.generation)
 
             mime = _sniff_mime(sample.content, path)
@@ -97,7 +97,7 @@ async def read(
                 data = sample.content
                 if not sample.eof:
                     whole = await vfs.pread(path, 0, MAX_ATTACHMENT_BYTES)
-                    if (whole.id, whole.generation) != version and not last_try:
+                    if (whole.id, whole.generation) != version and not settle:
                         continue  # replaced since the sample: sniff it again
                     if not whole.eof:  # grew past the limit since the sample
                         raise ModelRetry(
@@ -109,11 +109,25 @@ async def read(
             if _is_binary(path, sample.content):
                 raise ModelRetry(f"Cannot read binary file: {path}")
 
+            if isinstance(first, VFSError) and not settle:
+                continue  # gone, or replaced by a directory, since the sample
             if isinstance(first, BaseException):
                 raise first
-            if (first.id, first.generation) != version and not last_try:
+            if (first.id, first.generation) != version and not settle:
                 continue  # the page isn't the sampled file's
-            lines, total, more, capped = await _read_lines(ctx, path, start, count, config, first)
+            # A text file: its instruction files are looked up while the rest of the page is read.
+            page, instructions = await asyncio.gather(
+                _read_lines(ctx, path, start, count, config, first, None if settle else version),
+                _nearby_instructions(ctx, path),
+                return_exceptions=True,
+            )
+            if isinstance(page, BaseException):
+                raise page
+            if isinstance(instructions, BaseException):
+                raise instructions
+            if page is None:
+                continue  # changed between the page's batches
+            lines, total, more, capped = page
             if total < start and not (total == 0 and start == 1):
                 raise ModelRetry(f"Offset {start} is out of range for this file ({total} lines)")
             break
@@ -202,46 +216,46 @@ def _is_binary(path: str, sample: bytes) -> bool:
 
 
 async def _read_lines(
-    ctx: RunContext[HasVFS], path: str, start: int, limit: int, config: ReadSettings, first: LineReadResult | None
-) -> tuple[list[str], int, bool, bool]:
+    ctx: RunContext[HasVFS],
+    path: str,
+    start: int,
+    limit: int,
+    config: ReadSettings,
+    first: LineReadResult,
+    version: tuple[UUID, int] | None,
+) -> tuple[list[str], int, bool, bool] | None:
     """Lines from ``start`` (1-indexed): ``(lines, the file's line count, more after these, stopped at the byte
-    cap)``, as ladderframe's ``_read_lines`` gives them from the whole file.
+    cap)``, as ladderframe's ``_read_lines`` gives them from the whole file. ``first`` is the page's first batch,
+    already read.
 
     The page comes in batches of ``pread_lines``, each capped at raw bytes. A line the cap cut is decoded as is when
     it's the first of its batch: the batch holds more than ``max_line_length`` characters of it, so it's truncated
-    to the same text as the whole line would be. Otherwise it's left to the next batch. A page whose file changes
-    between batches (a new generation, or another file renamed over it) is read again, up to ``_PAGE_ATTEMPTS``
-    times. A ``limit`` or ``start`` beyond what ``pread_lines`` takes is clamped, as no file has that many lines.
-    ``first`` is the page's first batch, already read."""
+    to the same text as the whole line would be. Otherwise it's left to the next batch. None when a batch isn't
+    from file version ``version`` (a new generation, or another file moved to the path); with no ``version`` the
+    page is taken as it comes. A ``limit`` or ``start`` beyond what ``pread_lines`` takes is clamped, as no file
+    has that many lines."""
     fetch = _fetch(config)
-    for attempt in range(_PAGE_ATTEMPTS):
-        lines: list[str] = []
-        size = 0
-        line = start
-        version: tuple[UUID, int] | None = None
-        while True:
-            if first is not None:
-                batch, first = first, None
-            else:
-                count = min(limit - len(lines), _MAX_LINES)
-                batch = await ctx.deps.vfs.pread_lines(path, min(line, _MAX_LINE), count, fetch)
-            if version is not None and (batch.id, batch.generation) != version and attempt + 1 < _PAGE_ATTEMPTS:
-                break  # changed since the page's first batch: read it again
-            version = (batch.id, batch.generation)
-            total = batch.lines
-            for raw in _batch_lines(batch):
-                text = raw.decode("utf-8", errors="replace").removesuffix("\r")
-                if len(text) > config.max_line_length:
-                    text = text[: config.max_line_length] + f"... (line truncated to {config.max_line_length} chars)"
-                line_size = len(text.encode("utf-8")) + (1 if lines else 0)
-                if size + line_size > config.max_bytes:
-                    return lines, total, True, True
-                lines.append(text)
-                size += line_size
-                line += 1
-            if batch.eof or len(lines) >= limit or not batch.content:
-                return lines, total, start + len(lines) <= total, False
-    raise AssertionError("not reached: the last attempt returns")  # pragma: no cover
+    lines: list[str] = []
+    size = 0
+    line = start
+    batch = first
+    while True:
+        if version is not None and (batch.id, batch.generation) != version:
+            return None
+        total = batch.lines
+        for raw in _batch_lines(batch):
+            text = raw.decode("utf-8", errors="replace").removesuffix("\r")
+            if len(text) > config.max_line_length:
+                text = text[: config.max_line_length] + f"... (line truncated to {config.max_line_length} chars)"
+            line_size = len(text.encode("utf-8")) + (1 if lines else 0)
+            if size + line_size > config.max_bytes:
+                return lines, total, True, True
+            lines.append(text)
+            size += line_size
+            line += 1
+        if batch.eof or len(lines) >= limit or not batch.content:
+            return lines, total, start + len(lines) <= total, False
+        batch = await ctx.deps.vfs.pread_lines(path, min(line, _MAX_LINE), min(limit - len(lines), _MAX_LINES), fetch)
 
 
 def _fetch(config: ReadSettings) -> int:
@@ -272,30 +286,49 @@ async def _nearby_instructions(ctx: RunContext[HasVFS], path: str) -> list[str]:
     if len(current) <= len(root) or current[: len(root)] != root:
         return []
     dirs = [current[:end] for end in range(len(current), len(root), -1)]
-    chosen = await asyncio.gather(*(_instruction_file(ctx, d) for d in dirs))
+    calls = asyncio.Semaphore(_INSTRUCTION_CALLS)
+    chosen = await asyncio.gather(*(_instruction_file(ctx, d, calls) for d in dirs))
     seen = _loaded_instructions(ctx)
     wanted = [e for e in chosen if e is not None and e.path != path and e.path not in seen]
-    texts = await asyncio.gather(*(_instruction_text(ctx, e) for e in wanted))
+    texts = await asyncio.gather(*(_instruction_text(ctx, e, calls) for e in wanted))
     return [f"Instructions from: {e.path}\n{text}" for e, text in zip(wanted, texts, strict=True) if text]
 
 
-async def _instruction_file(ctx: RunContext[HasVFS], directory: tuple[str, ...]) -> Entry | None:
-    """The first of ``INSTRUCTION_FILES`` in ``directory`` that is a file the actor may read."""
-    entries = await asyncio.gather(*(_stat(ctx, join(*directory, name)) for name in INSTRUCTION_FILES))
-    return next((e for e in entries if e is not None and not e.is_dir), None)
+async def _instruction_file(
+    ctx: RunContext[HasVFS], directory: tuple[str, ...], calls: asyncio.Semaphore
+) -> Entry | None:
+    """The first of ``INSTRUCTION_FILES`` in ``directory`` that is a file the actor may read. None when a lookup
+    failed otherwise (EIO): picking the next name then could attach a file ladderframe never would."""
+    found = await asyncio.gather(
+        *(_stat(ctx, join(*directory, n), calls) for n in INSTRUCTION_FILES), return_exceptions=True
+    )
+    for entry in found:
+        if isinstance(entry, VFSError):
+            if entry.errno not in _ABSENT:
+                return None
+            continue
+        if isinstance(entry, BaseException):
+            raise entry
+        if not entry.is_dir:
+            return entry
+    return None
 
 
-async def _stat(ctx: RunContext[HasVFS], path: str) -> Entry | None:
-    try:
+_ABSENT = frozenset({"ENOENT", "ENOTDIR", "EACCES"})
+"""What a lookup of an instruction file says when it's missing or the actor may not read it."""
+
+
+async def _stat(ctx: RunContext[HasVFS], path: str, calls: asyncio.Semaphore) -> Entry:
+    async with calls:
         return await ctx.deps.vfs.stat(path)
-    except VFSError:
-        return None  # missing or unreadable: absent
 
 
-async def _instruction_text(ctx: RunContext[HasVFS], entry: Entry) -> str:
-    """The whole of instruction file ``entry``, stripped; empty if it's gone or replaced since its stat."""
+async def _instruction_text(ctx: RunContext[HasVFS], entry: Entry, calls: asyncio.Semaphore) -> str:
+    """The whole of instruction file ``entry``, as ladderframe reads it, stripped; empty if it's gone or replaced
+    since its stat."""
     try:
-        result = await ctx.deps.vfs.pread(entry.path, 0, _MAX_LINES)
+        async with calls:
+            result = await ctx.deps.vfs.pread(entry.path, 0, _MAX_LINES)
     except VFSError:
         return ""
     if result.id != entry.id:
