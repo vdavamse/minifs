@@ -2,6 +2,7 @@
 
 import asyncio
 import itertools
+import logging
 import pickle
 import re
 from collections.abc import AsyncIterator, Awaitable, Sequence
@@ -208,6 +209,23 @@ async def test_agent_policy(vfs: VFSClient, policy: Policy) -> None:
     assert (await vfs.pread("/docs/guide.md")).content == b"guide"
     assert policy.denials == {("agent", "write"): 10, ("agent", "append"): 1}
     assert await agent.mkdir_p("/") is None  # a virtual directory exists already: nothing to deny
+
+
+async def test_uncounted_reads_are_refused_but_not_counted(vfs: VFSClient, caplog: pytest.LogCaptureFixture) -> None:
+    policy = Policy({"agent": [Rule("/workspace/secret.md"), Rule("/workspace/**", "read", "write")]})
+    agent = view(vfs, policy)
+    await vfs.create(f"/workspaces/{W1}/secret.md", b"s")
+    with caplog.at_level(logging.INFO, logger="minifs.vfs.policy"):
+        found = await agent.pread_many(
+            [("/workspace/notes.md", 0, 10), ("/workspace/secret.md", 0, 10)], count_denials=False
+        )
+        await raises("EACCES", agent.pread_lines("/workspace/secret.md", count_denials=False))
+        await raises("EACCES", agent.readdir("/workspace/secret.md", count_denials=False))
+    assert isinstance(found[0], ReadResult) and found[0].content == b"mine"
+    assert isinstance(found[1], VFSError) and (found[1].errno, found[1].path) == ("EACCES", "/workspace/secret.md")
+    assert policy.denials == {} and not caplog.records
+    await raises("EACCES", agent.pread_lines("/workspace/secret.md"))
+    assert policy.denials == {("agent", "read"): 1}
 
 
 async def test_ingestion_policy(vfs: VFSClient, policy: Policy) -> None:
@@ -653,6 +671,9 @@ def test_rules() -> None:
     with pytest.raises(VFSError) as info:
         p.check("a", "write", "/w/keep.md")
     assert info.value.errno == "EACCES" and p.denials == {("a", "write"): 1}
+    with pytest.raises(PolicyDenied):  # a speculative lookup: refused all the same, but not counted
+        p.check("a", "write", "/w/keep.md", count_denials=False)
+    assert p.denials == {("a", "write"): 1}
     denial = info.value
     assert isinstance(denial, PolicyDenied) and (denial.actor, denial.action) == ("a", "write")
     copy = pickle.loads(pickle.dumps(denial))

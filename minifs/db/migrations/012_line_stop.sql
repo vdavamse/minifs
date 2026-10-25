@@ -25,7 +25,8 @@
 -- is taken, and of a line longer than an extent's target (an extent of its own, vfs_cut), only its prefix.
 -- substring of a stored value decompresses only up to the slice's end; with pglz (migration 013) it also fetches
 -- only the TOAST chunks it needs, while lz4 fetches the whole compressed value first. Of each extent's
--- line_offsets, only the lines from v_first to v_last are unnested, and the start of the next.
+-- line_offsets, only the lines from v_first to v_last are unnested, and the start of the next (a slice past the
+-- array's end stops at its end, so hi is clamped only to fit an int).
 CREATE OR REPLACE FUNCTION vfs_pread_lines(p_node uuid, p_first_line bigint, p_max_lines int, p_max_bytes int,
                                 p_max_line_bytes int DEFAULT NULL)
 RETURNS TABLE (size bigint, generation int, lines bigint, first_line bigint, byte_offset bigint, data bytea,
@@ -112,14 +113,14 @@ BEGIN
     -- left (a line's piece is the smaller of its length and p_max_line_bytes + 1), so a page of a big extent of
     -- long lines doesn't take the extent's slice up to the last line asked for: step 3a's bound counts at most
     -- p_max_line_bytes + 1 bytes for any extent, so it never stops inside one. No data is read: only lengths
-    -- (headers) and line_offsets, detoasted once more than in migration 011.
+    -- (headers) and line_offsets: one detoast of each extent's array more than migration 011 made.
     SELECT min(w.ends_at) INTO v_bound
       FROM (SELECT x.byte_offset + u.o_end AS ends_at,
                    sum(least(u.o_end - u.o, p_max_line_bytes::bigint + 1))
                        OVER (ORDER BY x.byte_offset, u.k) AS held
               FROM (SELECT e.byte_offset, e.line_start, e.line_offsets, length(e.data) AS len,
                            greatest(v_first - e.line_start, 1)::int AS lo,
-                           least(v_last - e.line_start + 1, cardinality(e.line_offsets))::int AS hi
+                           least(v_last - e.line_start + 1, 2147483647)::int AS hi
                       FROM vfs_extents e
                      WHERE e.node_id = p_node AND e.generation = v_gen AND e.byte_offset >= v_ext
                        AND e.byte_offset < v_stop) x
@@ -148,7 +149,7 @@ BEGIN
                            t.is_cut
                       FROM (SELECT e.byte_offset, e.line_start, e.line_offsets, length(e.data) AS len, r.s, r.prefix,
                                    greatest(v_first - e.line_start, 1)::int AS lo,
-                                   least(v_last - e.line_start + 1, cardinality(e.line_offsets))::int AS hi,
+                                   least(v_last - e.line_start + 1, 2147483647)::int AS hi,
                                    substring(e.data FROM r.s + 1
                                              FOR CASE WHEN r.prefix THEN p_max_line_bytes
                                                       ELSE (least(length(e.data), v_stop - e.byte_offset) - r.s)::int END) AS d
