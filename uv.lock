@@ -306,7 +306,7 @@ wheels = [
 ]
 
 [[package]]
-name = "minifs"
+name = "minifs-pg"
 source = { editable = "." }
 dependencies = [
     { name = "psycopg" },
@@ -324,6 +324,7 @@ pydantic-ai = [
 [package.dev-dependencies]
 dev = [
     { name = "maturin" },
+    { name = "packaging" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic-ai-slim" },
     { name = "pyright" },
@@ -338,13 +339,14 @@ requires-dist = [
     { name = "psycopg", specifier = ">=3.3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'binary'", specifier = ">=3.3" },
     { name = "psycopg-pool", specifier = ">=3.3" },
-    { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.51" },
+    { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.61" },
 ]
 provides-extras = ["binary", "pydantic-ai"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "maturin", specifier = ">=1.9,<2" },
+    { name = "packaging", specifier = ">=24" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3" },
     { name = "pydantic-ai-slim", specifier = ">=2.61" },
     { name = "pyright", specifier = ">=1.1.390" },

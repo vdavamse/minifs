@@ -3,23 +3,46 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
-name = "minifs"
+name = "minifs-pg"  # `minifs` is a prohibited name on PyPI; the import package is still minifs
 dynamic = ["version"]  # from crates/minifs-regex/Cargo.toml
 description = "Postgres based VFS for agents"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
+authors = [{ name = "vdavamse" }]
+keywords = ["vfs", "filesystem", "postgres", "postgresql", "agents", "llm", "pydantic-ai", "lakebase"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Framework :: Pydantic",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: System :: Filesystems",
+    "Typing :: Typed",
+]
 dependencies = [
     "psycopg>=3.3",  # watch relies on notifies(timeout=) keeping notifications that arrive between calls
     "psycopg-pool>=3.3",  # callable connection kwargs: a fresh credential per connection
 ]
 
+[project.urls]
+Homepage = "https://github.com/vdavamse/minifs"
+Repository = "https://github.com/vdavamse/minifs"
+Issues = "https://github.com/vdavamse/minifs/issues"
+
 [project.optional-dependencies]
 # Bundled libpq; without it psycopg needs a system libpq.
 binary = ["psycopg[binary]>=3.3"]
 # The agent tools (minifs.tools). minifs.vfs and minifs.db work without it.
-pydantic-ai = ["pydantic-ai-slim>=2.51"]
+pydantic-ai = ["pydantic-ai-slim>=2.61"]  # examples/agent.py uses 2.61 event types; the floor matches the dev group
 
 [project.scripts]
 minifs = "minifs.cli:main"
@@ -34,6 +57,7 @@ dev = [
     "ruff>=0.9",
     "pyright>=1.1.390",
     "maturin>=1.9,<2",
+    "packaging>=24",  # tests/test_regex_extension.py compares versions
 ]
 
 [tool.maturin]
@@ -45,7 +69,7 @@ include = [{ path = "minifs/db/migrations/*.sql", format = ["sdist", "wheel"] }]
 [tool.uv]
 # The development build (uv sync) enables the regex oracle. uv applies this only to builds it runs in this
 # checkout: not maturin-action's release wheels, and not an sdist installed from anywhere else.
-config-settings-package = { minifs = { build-args = "--features oracle" } }
+config-settings-package = { minifs-pg = { build-args = "--features oracle" } }
 # Rebuild the extension on `uv sync` when the Rust sources change.
 cache-keys = [
     { file = "pyproject.toml" },
