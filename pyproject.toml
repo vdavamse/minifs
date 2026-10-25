@@ -10,10 +10,33 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
+authors = [{ name = "vdavamse" }]
+keywords = ["vfs", "filesystem", "postgres", "postgresql", "agents", "llm", "pydantic-ai", "lakebase"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Framework :: Pydantic",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: System :: Filesystems",
+    "Typing :: Typed",
+]
 dependencies = [
     "psycopg>=3.3",  # watch relies on notifies(timeout=) keeping notifications that arrive between calls
     "psycopg-pool>=3.3",  # callable connection kwargs: a fresh credential per connection
 ]
+
+[project.urls]
+Homepage = "https://github.com/vdavamse/minifs"
+Repository = "https://github.com/vdavamse/minifs"
+Issues = "https://github.com/vdavamse/minifs/issues"
 
 [project.optional-dependencies]
 # Bundled libpq; without it psycopg needs a system libpq.

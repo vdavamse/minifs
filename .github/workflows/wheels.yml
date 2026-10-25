@@ -32,15 +32,19 @@ jobs:
           - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
           - { name: macos-arm64, runner: macos-14, target: aarch64-apple-darwin }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       # Release wheels are built without the `oracle` feature.
-      - uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1.51.0
         with:
           maturin-version: v1.15.0
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+        with:
+          enable-cache: false  # these jobs build the release, so nothing from a cache goes into it
       - name: Install and import the wheel
         run: |
           # Install from outside the checkout, so uv doesn't apply the checkout's [tool.uv] oracle build setting.
@@ -49,7 +53,7 @@ jobs:
           uv pip install --python /tmp/smoke/bin/python "$GITHUB_WORKSPACE"/dist/*.whl "psycopg[binary]"
           /tmp/smoke/bin/python -c "import minifs._regex as r; assert not r.HAS_ORACLE; from minifs.db.migrate import load_migrations; assert load_migrations()"
           /tmp/smoke/bin/minifs db --help
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: wheel-${{ matrix.name }}
           path: dist/*.whl
@@ -57,22 +61,57 @@ jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1.51.0
         with:
           maturin-version: v1.15.0
           command: sdist
           args: --out dist
       # The sdist builds the extension from source, so this also checks it needs only a Rust toolchain.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v6
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec  # stable
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+        with:
+          enable-cache: false  # these jobs build the release, so nothing from a cache goes into it
       - name: Install and import the sdist
         run: |
           cd "$RUNNER_TEMP"
           uv venv --python 3.12 /tmp/smoke
           uv pip install --python /tmp/smoke/bin/python "$GITHUB_WORKSPACE"/dist/*.tar.gz "psycopg[binary]"
           /tmp/smoke/bin/python -c "import minifs._regex as r; assert not r.HAS_ORACLE; from minifs.db.migrate import load_migrations; assert load_migrations()"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sdist
           path: dist/*.tar.gz
+
+  # Uploads to PyPI through Trusted Publishing (OIDC): no token, PyPI trusts this workflow in the `pypi`
+  # environment. Only a pushed v* tag publishes; RELEASING.md has the steps.
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [wheel, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/minifs/${{ steps.version.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      # A version can never be uploaded twice, so refuse a tag that doesn't name the version the files carry.
+      - name: Check the tag matches the version
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ls dist
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              "minifs-$version-"*.whl | "minifs-$version.tar.gz") ;;
+              *) echo "::error::$f is not version $version (tag $GITHUB_REF_NAME)"; exit 1 ;;
+            esac
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3

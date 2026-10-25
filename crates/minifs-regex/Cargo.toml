@@ -1,6 +1,6 @@
 [package]
 name = "minifs-regex"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 description = "Rust regex syntax to PostgreSQL ARE translator, built as minifs._regex"
 edition.workspace = true
 rust-version.workspace = true

@@ -1,11 +1,13 @@
 import pytest
+from packaging.version import Version
 
 import minifs
 from minifs import _regex
 
 
 def test_extension_version_matches_package() -> None:
-    assert _regex.__version__ == minifs.__version__
+    # Cargo spells a pre-release 0.1.0-alpha.1, the package's metadata 0.1.0a1.
+    assert Version(_regex.__version__) == Version(minifs.__version__)
 
 
 def test_development_build_has_oracle() -> None:
