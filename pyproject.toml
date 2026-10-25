@@ -57,6 +57,7 @@ dev = [
     "ruff>=0.9",
     "pyright>=1.1.390",
     "maturin>=1.9,<2",
+    "packaging>=24",  # tests/test_regex_extension.py compares versions
 ]
 
 [tool.maturin]

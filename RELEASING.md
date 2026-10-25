@@ -17,17 +17,21 @@ uploaded twice, even after it's deleted, so check it before you tag.
    turns `0.2.0-alpha.1` into PEP 440's `0.2.0a1`, `-beta.N` into `bN` and `-rc.N` into `rcN`. pip skips pre-releases
    unless asked (`pip install --pre minifs`).
 2. Run `cargo metadata --format-version 1 > /dev/null` to update `Cargo.lock`, then open a PR and merge it.
-3. Tag the merge commit on `main` with the PEP 440 version and push the tag:
+3. Tag the commit that merged the bump, by its SHA, not whatever `main` points to by then, and push the tag:
 
    ```sh
-   git switch main && git pull
-   git tag v0.2.0a1 && git push origin v0.2.0a1
+   git fetch origin && git log --oneline origin/main   # find the bump's merge commit
+   git tag v0.2.0a1 <sha> && git push origin v0.2.0a1
    ```
 
-4. The workflow builds the wheels and the sdist, and smoke-tests each one. Then `publish` checks that every file
-   carries the tag's version and waits for approval on the `pypi` environment. Approve it to upload.
-5. Check <https://pypi.org/project/minifs/>, then install from a clean environment:
-   `uv run --no-project --with "minifs==0.2.0a1" python -c "import minifs; print(minifs.__version__)"`.
+4. The workflow builds the wheels and the sdist and smoke-tests each one. Next, `check-tag` checks that the tagged
+   commit is on `main` and that every file carries the tag's version. Only then does `publish` wait for approval on the
+   `pypi` environment. Approve it to upload.
+5. Check <https://pypi.org/project/minifs/>, then install the release in a clean environment and load the extension:
+   `uv run --no-project --with "minifs[binary]==0.2.0a1" python -c "import minifs, minifs._regex as r; print(minifs.__version__); assert not r.HAS_ORACLE"`.
 
-If `publish` fails before the upload, fix the problem and rerun the job; nothing reached PyPI. If a broken version was
-uploaded, yank it on PyPI and release the next version. The number can't be reused.
+If `publish` fails for a setup reason (a missing environment, or a mismatched trusted publisher), fix the setting and
+rerun the job. A rerun uploads the files already built from the tagged commit, so a problem in the code or metadata
+needs a new commit: delete the tag (`git push origin :v0.2.0a1 && git tag -d v0.2.0a1`), merge the fix, and tag again.
+That works only while nothing has reached PyPI. If a broken version was uploaded, yank it on PyPI and release the next
+version, since the number can't be reused.

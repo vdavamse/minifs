@@ -324,6 +324,7 @@ pydantic-ai = [
 [package.dev-dependencies]
 dev = [
     { name = "maturin" },
+    { name = "packaging" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic-ai-slim" },
     { name = "pyright" },
@@ -345,6 +346,7 @@ provides-extras = ["binary", "pydantic-ai"]
 [package.metadata.requires-dev]
 dev = [
     { name = "maturin", specifier = ">=1.9,<2" },
+    { name = "packaging", specifier = ">=24" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3" },
     { name = "pydantic-ai-slim", specifier = ">=2.61" },
     { name = "pyright", specifier = ">=1.1.390" },
