@@ -766,7 +766,9 @@ def _walks(refs: Sequence[_Ref], *, first_row: bool = False) -> str:
     """The leading columns of a query over ``refs`` (as ``r0``, ``r1``, ...): each one's chain, kind and err, which
     ``_run`` stores in the cache. They come back in the statement's own rows, so learning a walk costs no round
     trip. ``first_row``: NULL past the first row (``_run`` reads only that one), so a long listing doesn't repeat
-    the chain on every row. ``row_number() OVER ()`` numbers the rows in the order they are returned."""
+    the chain on every row. ``row_number() OVER ()`` numbers the rows in the order they are returned only because
+    the query has no ORDER BY, DISTINCT or LIMIT (they apply after window functions): keep ``_gated`` unordered, and
+    let the called function order its rows."""
     if not first_row:
         return "".join(f"r{i}.chain, r{i}.kind, r{i}.err, " for i in range(len(refs)))
     first = "row_number() OVER () = 1"
