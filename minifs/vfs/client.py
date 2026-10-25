@@ -21,16 +21,19 @@ Without a cache, every path is resolved on the server.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from typing import Any, Protocol, cast
 from uuid import UUID
 
 import psycopg
 from psycopg import AsyncConnection
-from psycopg_pool import AsyncConnectionPool
+from psycopg.pq import TransactionStatus
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from minifs.db.pool import retry_serializable
+from minifs.vfs import budget
 from minifs.vfs import glob as globbing
 from minifs.vfs import search as searching
 from minifs.vfs.core import (
@@ -50,7 +53,7 @@ DEFAULT_LINE_LIMIT = 2000
 DEFAULT_LINE_BYTES = 50 * 1024
 _MAX_INT = 2**31 - 1  # vfs_pread's limit, vfs_pread_lines' limits and vfs_compact's target are int
 _MAX_BIGINT = 2**63 - 1
-MAX_TIMEOUT = _MAX_INT / 1000  # seconds: statement_timeout is an int of milliseconds
+MAX_TIMEOUT = budget.MAX_TIMEOUT  # seconds: statement_timeout is an int of milliseconds
 _log = logging.getLogger(__name__)
 _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache links
 
@@ -117,7 +120,9 @@ class VFSClient:
     """Path-based filesystem operations over the minifs SQL functions.
 
     ``pool`` serves every operation; ``search_pool`` (default: ``pool``) serves the scans (glob, grep).
-    Both come from ``minifs.db.pool``. ``cache`` is an optional ``DirCache``.
+    Both come from ``minifs.db.pool``. ``cache`` is an optional ``DirCache``. ``timeout`` is the
+    ``statement_timeout`` of every statement but a grep's (which has its own), in seconds, or less inside a
+    ``minifs.vfs.budget.budget``; None for no limit. A timeout raises ETIMEDOUT.
     """
 
     def __init__(
@@ -126,10 +131,14 @@ class VFSClient:
         *,
         search_pool: AsyncConnectionPool[AsyncConnection[Any]] | None = None,
         cache: DirCache | None = None,
+        timeout: float | None = budget.DEFAULT_TIMEOUT,
     ) -> None:
+        if timeout is not None and not 0 < timeout <= MAX_TIMEOUT:
+            raise ValueError(f"timeout must be over 0 and at most {MAX_TIMEOUT} seconds, not {timeout!r}")
         self.pool = pool
         self.search_pool = search_pool or pool
         self.cache = cache
+        self.timeout = timeout
         self._background: set[asyncio.Task[None]] = set()
         self._evicting: dict[tuple[_Link, ...], asyncio.Task[None]] = {}  # by links, see _evict_stale_task
 
@@ -304,8 +313,7 @@ class VFSClient:
         ref = self._dir_ref(segments)
 
         async def attempt() -> tuple[_Error, UUID | None, list[globbing.GlobMatch]]:
-            async with self.search_pool.connection() as conn, conn.transaction():
-                await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # one snapshot for both
+            async with self._transaction(self.search_pool, path, repeatable=True) as conn:  # one snapshot for both
                 root: UUID | None = None
                 if segments:
                     node, error, kind, _ = await _lookup(conn, ref)
@@ -376,9 +384,8 @@ class VFSClient:
         ref = self._dir_ref(segments)
 
         async def attempt() -> tuple[_Error, UUID | None, searching.GrepResult | None]:
-            async with self.search_pool.connection() as conn, conn.transaction():
-                await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # one snapshot for both
-                await searching.set_timeout(conn, timeout)
+            # One snapshot for both, each statement under the search's timeout (or what's left of the budget).
+            async with self._transaction(self.search_pool, path, timeout=timeout, repeatable=True) as conn:
                 try:
                     node: UUID | None = None
                     scope: searching.Scope | None = None
@@ -404,7 +411,12 @@ class VFSClient:
                         )
                     searching.check_scope(scope, max_files=max_files, max_bytes=max_bytes)
                     result = await searching.search(
-                        conn, scope, matcher, limit=limit, max_line_chars=max_line_chars, timeout=timeout
+                        conn,
+                        scope,
+                        matcher,
+                        limit=limit,
+                        max_line_chars=max_line_chars,
+                        timeout=budget.remaining(timeout, path),  # validation's limit, cut to the budget too
                     )
                 except psycopg.errors.QueryCanceled:
                     raise searching.timed_out() from None
@@ -721,6 +733,7 @@ class VFSClient:
                 if started is not None:
                     started()
                     started = None
+                await budget.set_timeout(conn, _EVICT_TIMEOUT)
                 cur = await conn.execute(
                     "SELECT c.id FROM unnest(%s::uuid[], %s::uuid[], %s::text[]) AS c(id, parent, name)"
                     " WHERE NOT EXISTS (SELECT FROM vfs_nodes n"
@@ -773,6 +786,43 @@ class VFSClient:
                     await self._await_eviction(refs)
                 raise VFSError(err, normalize(path), detail=detail or "")
 
+    @contextlib.asynccontextmanager
+    async def _transaction(
+        self,
+        pool: AsyncConnectionPool[AsyncConnection[Any]],
+        path: str,
+        *,
+        timeout: float | None = None,
+        repeatable: bool = False,
+    ) -> AsyncGenerator[AsyncConnection[Any]]:
+        """A transaction on a connection from ``pool`` (``repeatable``: REPEATABLE READ), each statement under
+        ``timeout`` (default: the client's), cut to what's left of the budget; the wait for the connection is
+        bounded by that too. It commits if the block returns and rolls back if it raises.
+
+        BEGIN and ``SET LOCAL statement_timeout`` go in one simple query, so a one-statement operation costs three
+        round trips (BEGIN, the statement, COMMIT), as without a timeout: the connection is in autocommit mode
+        for the block, and the transaction is driven by hand. A connection already in a transaction (a test's
+        stand-in pool) joins it instead: the timeout is set, and nothing is committed or rolled back."""
+        limit = self.timeout if timeout is None else timeout
+        async with pool.connection(timeout=budget.remaining(limit, path)) as conn:
+            seconds = budget.remaining(limit, path)  # less, after waiting for the connection
+            if conn.info.transaction_status != TransactionStatus.IDLE:
+                if setting := budget.begin(seconds, joining=True):
+                    await conn.execute(cast(Any, setting))
+                yield conn
+                return
+            await conn.set_autocommit(True)
+            try:
+                await conn.execute(cast(Any, budget.begin(seconds, repeatable=repeatable)))
+                yield conn
+                await conn.execute("COMMIT")
+            finally:
+                if conn.info.transaction_status != TransactionStatus.IDLE:
+                    with contextlib.suppress(psycopg.Error):  # a broken connection: the pool discards it
+                        await conn.execute("ROLLBACK")
+                if conn.info.transaction_status == TransactionStatus.IDLE:
+                    await conn.set_autocommit(False)  # else the pool rolls it back, and the next use resets it
+
     async def _run(
         self, path: str, query: str, params: Sequence[object], refs: Sequence[_Ref] = ()
     ) -> list[tuple[Any, ...]]:
@@ -784,12 +834,13 @@ class VFSClient:
         from the rows returned, which begin with the columns after them."""
 
         async def attempt() -> list[tuple[Any, ...]]:
-            async with self.pool.connection() as conn, conn.transaction():
+            async with self._transaction(self.pool, path) as conn:
                 cur = await conn.execute(cast(Any, query), params)
+                rows = await cur.fetchall()
                 if refs:  # a query that forgot the prefix would shift every column the caller reads
                     names = [column.name for column in cur.description or ()]
                     assert names[: 3 * len(refs)] == ["chain", "kind", "err"] * len(refs), names
-                return await cur.fetchall()
+                return rows
 
         try:
             rows = await _mapped(path, attempt)
@@ -868,6 +919,13 @@ async def _lookup(conn: AsyncConnection[Any], ref: _Ref) -> tuple[UUID | None, _
 async def _mapped[T](path: str, call: Callable[[], Awaitable[T]]) -> T:
     try:
         return await retry_serializable(call)
+    except PoolTimeout:
+        raise budget.timed_out(normalize(path), "pool") from None
+    except psycopg.errors.QueryCanceled as e:
+        # A statement timeout (or an administrator's cancel: the server reports both the same way).
+        error = budget.timed_out(normalize(path), "statement")
+        error.db_error = e
+        raise error from None
     except psycopg.Error as e:
         error = VFSError.from_db(e, normalize(path))
         if error is None:

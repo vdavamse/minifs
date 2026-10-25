@@ -20,6 +20,7 @@ try:
 except ImportError as e:  # pragma: no cover - exercised by test_import_without_pydantic_ai
     raise ImportError("minifs.tools needs the pydantic-ai extra: pip install 'minifs-pg[pydantic-ai]'") from e
 
+from minifs.tools.base import RunMetrics
 from minifs.tools.deps import HasVFS, ToolSettings
 from minifs.tools.edit import Edit
 from minifs.tools.glob import Glob
@@ -36,4 +37,4 @@ def toolset() -> FunctionToolset[HasVFS]:
     return FunctionToolset(list(TOOLS))
 
 
-__all__ = ["TOOLS", "Edit", "Glob", "Grep", "HasVFS", "Read", "ToolSettings", "Write", "toolset"]
+__all__ = ["TOOLS", "Edit", "Glob", "Grep", "HasVFS", "Read", "RunMetrics", "ToolSettings", "Write", "toolset"]

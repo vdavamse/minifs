@@ -48,6 +48,7 @@ fn error(message: impl Into<String>, syntax: bool) -> Error {
         message: message.into(),
         span: None,
         syntax,
+        construct: "glob",
     }
 }
 

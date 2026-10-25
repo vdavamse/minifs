@@ -43,6 +43,8 @@ Issues = "https://github.com/vdavamse/minifs/issues"
 binary = ["psycopg[binary]>=3.3"]
 # The agent tools (minifs.tools). minifs.vfs and minifs.db work without it.
 pydantic-ai = ["pydantic-ai-slim>=2.61"]  # examples/agent.py uses 2.61 event types; the floor matches the dev group
+# OpenTelemetry metrics (minifs.metrics); without it they're no-ops. The application configures the SDK and exporter.
+otel = ["opentelemetry-api>=1.28"]  # explicit_bucket_boundaries_advisory; the floor pydantic-ai-slim requires
 
 [project.scripts]
 minifs = "minifs.cli:main"
@@ -58,6 +60,7 @@ dev = [
     "pyright>=1.1.390",
     "maturin>=1.9,<2",
     "packaging>=24",  # tests/test_regex_extension.py compares versions
+    "opentelemetry-sdk>=1.28",  # tests/test_metrics.py reads the metrics with an in-memory reader
 ]
 
 [tool.maturin]

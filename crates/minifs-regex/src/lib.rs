@@ -20,8 +20,9 @@ pyo3::create_exception!(
     RegexError,
     pyo3::exceptions::PyValueError,
     "A pattern the translator rejects. `message` is the text to show (ripgrep's format for \
-     parse errors), `span` the character offsets of the offending part when known, and \
-     `syntax` whether regex-syntax (and so ripgrep) rejected it."
+     parse errors), `span` the character offsets of the offending part when known, \
+     `syntax` whether regex-syntax (and so ripgrep) rejected it, and `construct` a label of what \
+     was rejected, for metrics."
 );
 
 fn regex_error(py: Python<'_>, err: translate::Error) -> PyErr {
@@ -30,7 +31,8 @@ fn regex_error(py: Python<'_>, err: translate::Error) -> PyErr {
     let set = || -> PyResult<()> {
         value.setattr("message", &err.message)?;
         value.setattr("span", err.span)?;
-        value.setattr("syntax", err.syntax)
+        value.setattr("syntax", err.syntax)?;
+        value.setattr("construct", err.construct)
     };
     match set() {
         Ok(()) => pyerr,
@@ -77,6 +79,7 @@ fn py_glob_to_are(py: Python<'_>, pattern: &str) -> PyResult<String> {
                 message: glob::ONLY_DIR.to_string(),
                 span: None,
                 syntax: false,
+                construct: "glob",
             },
         ));
     }

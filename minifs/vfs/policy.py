@@ -23,6 +23,7 @@ from fnmatch import fnmatchcase
 from functools import lru_cache
 from typing import Literal, get_args
 
+from minifs import metrics
 from minifs.vfs.core import VFSError, split
 
 Action = Literal["read", "write", "append"]
@@ -134,10 +135,12 @@ class Policy:
         self, actor: str, action: Action, path: str, *, subtree: bool = False, count_denials: bool = True
     ) -> None:
         """Raises EACCES (``PolicyDenied``) for ``path`` unless ``actor`` may ``action`` there (``allows``), and
-        counts the denial unless ``count_denials`` is False (a speculative lookup)."""
+        counts the denial, in ``denials`` and the ``minifs.policy.denials`` metric, unless ``count_denials`` is
+        False (a speculative lookup)."""
         if not self.allows(actor, action, path, subtree=subtree):
             if count_denials:
                 self.denials[actor, action] += 1
+                metrics.POLICY_DENIALS.add(1, {"minifs.actor": actor, "minifs.action": action})
                 _log.info("write policy denied %s %s on %s", actor, action, path)
             else:
                 _log.debug("write policy refused the lookup %s %s on %s", actor, action, path)
