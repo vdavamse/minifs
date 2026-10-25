@@ -6,9 +6,11 @@ decides, so specific rules go before general ones. A rule grants any of ``read``
 A path no rule matches may be read but not written. Rules match the paths of the agent's view (the chroot,
 ``minifs.vfs.view``), normalised, so ``/workspace/../docs/a.md`` meets the ``/docs/**`` rule.
 
-Patterns are absolute paths whose segments may use ``*``, ``?`` and ``[...]`` within one segment
-(``fnmatch``), and ``**`` as a whole segment for zero or more segments: ``/workspace/**`` matches
-``/workspace`` itself and everything below it.
+Patterns are absolute paths whose segments may use ``*``, ``?`` and ``[...]`` (``[!...]`` negates) within one
+segment (``fnmatch``), and ``**`` as a whole segment for zero or more segments: ``/workspace/**`` matches
+``/workspace`` itself and everything below it. Glob syntax that ``fnmatch`` would read literally, which the Glob
+tool's globs give a meaning (``{a,b}``, ``[^...]`` and backslash escapes), is refused, so a rule can't silently
+match nothing.
 """
 
 from __future__ import annotations
@@ -43,6 +45,10 @@ class Rule:
         segments = tuple(pattern.split("/")[1:]) if pattern != "/" else ()
         if not pattern.startswith("/") or any(s in ("", ".", "..") for s in segments):
             raise ValueError(f"rule pattern must be a normalised absolute path: {pattern!r}")
+        if any(c in pattern for c in "{}\\") or "[^" in pattern:
+            raise ValueError(
+                f"rule pattern has braces, a [^ class or a backslash, which fnmatch reads literally: {pattern!r}"
+            )
         object.__setattr__(self, "pattern", pattern)
         object.__setattr__(self, "actions", frozenset(actions))
         object.__setattr__(self, "segments", segments)

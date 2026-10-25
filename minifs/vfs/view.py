@@ -13,34 +13,46 @@ in ``policy.denials``), then runs as the ``VFSClient`` operation on the real pat
 transaction of its own: it depends on the path alone, and the operation resolves that same path in its one
 statement. Results and errors come back in visible paths: a ``VFSError`` keeps its errno and message, gets the
 visible path, and drops ``detail`` and ``db_error``, which name real paths and node ids. Entries the actor may
-not read are left out of listings and glob results.
+not read are left out of listings and glob results; a grep needs ``read`` on everything it searches.
 
-What each operation needs: ``read`` for ``stat``, ``readdir``, ``pread`` and ``glob``; ``write`` on the path for
-``create``, ``mkdir``, ``mkdir_p`` (directories a call creates above the path come with it), ``write`` and
-``unlink``, and on both paths for ``rename`` and ``claim``; ``append`` (or ``write``) for ``append``. A move or
-an unlink also needs ``write`` everywhere below its paths (``Policy.allows(subtree=True)``), so moving a directory
-can't carry a file out from under a more specific rule. Moving or removing a mount point or a virtual directory
-is EBUSY. A database error other than a ``VFSError`` comes back as EIO, since its text may name real paths.
+What each operation needs:
+
+- ``read`` for ``stat``, ``readdir``, ``pread``, ``pread_lines``, ``glob`` and ``grep``;
+- ``write`` on the path for ``create``, ``mkdir``, ``mkdir_p``, ``write`` and ``unlink``, and on every directory
+  between the mount point and the path when a call may create missing parents (``mkdir_p``, ``parents=True``);
+- ``write`` on both paths for ``rename`` and ``claim``, and ``read`` on the source. Moving a directory also
+  needs ``write`` everywhere below both paths and ``read`` everywhere below the source
+  (``Policy.allows(subtree=True)``), so a move can't carry a file out from under a more specific rule or land
+  an unreadable file where it can be read. A file has nothing below it: when the policy would refuse a
+  directory there, the view checks that the source is a file and moves only that node (``expect``);
+- ``append`` (or ``write``) for ``append``.
+
+An actor may learn a little about a path it can write or append to but not read: ``append`` returns the new
+size, and ``create`` is EEXIST if something is there. Moving or removing a mount point or a virtual directory is
+EBUSY. A database error other than a ``VFSError`` comes back as EIO, since its text may name real paths.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 from collections.abc import Awaitable, Mapping, Sequence
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 import psycopg
 
 from minifs.vfs import glob as globbing
-from minifs.vfs.client import DEFAULT_READ_LIMIT, VFSClient
-from minifs.vfs.core import Entry, FileVersion, ReadResult, VFSError, join, split
+from minifs.vfs import search as searching
+from minifs.vfs.client import DEFAULT_LINE_BYTES, DEFAULT_LINE_LIMIT, DEFAULT_READ_LIMIT, VFSClient
+from minifs.vfs.core import Entry, FileVersion, LineReadResult, ReadResult, VFSError, join, split
 from minifs.vfs.policy import Action, Policy
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
 _REFETCH_FACTOR = 8
+_NO_NODE = UUID(int=0)  # never a node id: a pin that nothing matches
 _log = logging.getLogger(__name__)
 
 
@@ -122,6 +134,15 @@ class VFSView:
             raise VFSError("EISDIR", target.visible)
         return await self._mapped(self._client.pread(_real(target), offset, limit), target)
 
+    async def pread_lines(
+        self, path: str, first_line: int = 1, max_lines: int = DEFAULT_LINE_LIMIT, max_bytes: int = DEFAULT_LINE_BYTES
+    ) -> LineReadResult:
+        """``VFSClient.pread_lines`` of ``path``."""
+        target = self._target(path, "read")
+        if target.real is None:
+            raise VFSError("EISDIR", target.visible)
+        return await self._mapped(self._client.pread_lines(_real(target), first_line, max_lines, max_bytes), target)
+
     async def glob(
         self,
         pattern: str,
@@ -149,7 +170,8 @@ class VFSView:
           ``**/w*`` or ``**/*s/``;
         - for an exclude, a trailing ``//`` (``**//``).
 
-        EINVAL too for a ``limit`` outside 0 to 2**31 - 1."""
+        Every mount's pattern and excludes are restated before any is searched, so whether a glob is EINVAL
+        doesn't depend on the order of the mounts. EINVAL too for a ``limit`` outside 0 to 2**31 - 1."""
         target = self._target(path, "read")
         if limit is not None and not 0 <= limit <= _MAX_LIMIT:
             raise VFSError("EINVAL", target.visible, f"invalid limit {limit}")
@@ -176,6 +198,138 @@ class VFSView:
         globbing.compile_excludes(excludes)
         return await self._virtual_glob(target, pattern, excludes, hidden, limit)
 
+    async def grep(
+        self,
+        pattern: str,
+        path: str = "/",
+        *,
+        include: str | None = None,
+        excludes: Sequence[str] = (),
+        ignore_case: bool = False,
+        fixed: bool = False,
+        hidden: bool = True,
+        limit: int = searching.DEFAULT_LIMIT,
+        max_files: int = searching.MAX_FILES,
+        max_bytes: int = searching.MAX_BYTES,
+        max_line_chars: int | None = searching.MAX_LINE_CHARS,
+        timeout: float = searching.TIMEOUT,
+    ) -> searching.GrepResult:
+        """``VFSClient.grep`` of ``path``, with hits in visible paths.
+
+        The actor must be allowed to read everything it searches, or the grep is EACCES (grep a narrower path):
+        filtering hits afterwards would let unreadable files count against ``limit`` and the caps, and show in
+        ``files`` and ``bytes``. A file ``path`` needs ``read`` on the file only. Mounts the actor can read
+        nothing in are not searched.
+
+        Below a virtual directory, the grep runs in each mount in turn, in path order, until ``limit`` hits, with
+        ``include`` and ``excludes`` restated as for ``glob`` (EINVAL in the same cases). Each mount is its own
+        snapshot, and the caps and the timeout apply to each mount's search; ``files`` and ``bytes`` are the
+        totals of the mounts searched. Once there are ``limit`` hits, a later mount only tells whether there are
+        more (``truncated``), and is taken to have more if its search is refused."""
+        target = self._target(path, "read")
+        if target.real is not None:
+            return await self._grep_in_mount(
+                target,
+                pattern,
+                include,
+                excludes,
+                hidden,
+                limit,
+                ignore_case=ignore_case,
+                fixed=fixed,
+                max_files=max_files,
+                max_bytes=max_bytes,
+                max_line_chars=max_line_chars,
+                timeout=timeout,
+            )
+        # As the client does: bad arguments and patterns are reported before anything about the path.
+        if not 0 <= limit < _MAX_LIMIT:
+            raise VFSError("EINVAL", target.visible, f"invalid limit {limit}")
+        if not 0 <= max_files < _MAX_LIMIT or max_bytes < 0:
+            raise VFSError("EINVAL", target.visible, f"invalid caps {max_files} files, {max_bytes} bytes")
+        if max_line_chars is not None and not 0 <= max_line_chars <= _MAX_LIMIT:
+            raise VFSError("EINVAL", target.visible, f"invalid line length {max_line_chars}")
+        if timeout <= 0:
+            raise VFSError("EINVAL", target.visible, f"invalid timeout {timeout}")
+        searching.compile_pattern(pattern, ignore_case=ignore_case, fixed=fixed)
+        if include is not None:
+            globbing.compile_glob(include)
+        globbing.compile_excludes(excludes)
+        hits: list[searching.GrepHit] = []
+        files = size = 0
+        truncated = False
+        mounts = self._restated(target, include, excludes, hidden)
+        for mount_target, _, _ in mounts:  # all before any search
+            self.policy.check(self.actor, "read", mount_target.visible, subtree=True)
+        for mount_target, mount_include, mount_excludes in mounts:
+            try:
+                result = await self._mapped(
+                    self._client.grep(
+                        pattern,
+                        _real(mount_target),
+                        include=mount_include,
+                        excludes=mount_excludes,
+                        ignore_case=ignore_case,
+                        fixed=fixed,
+                        hidden=hidden,
+                        limit=limit - len(hits),
+                        max_files=max_files,
+                        max_bytes=max_bytes,
+                        max_line_chars=max_line_chars,
+                        timeout=timeout,
+                    ),
+                    mount_target,
+                )
+            except VFSError as e:
+                if e.errno in ("ENOENT", "ENOTDIR"):
+                    continue  # nothing to search in this mount
+                raise
+            except searching.SearchRefused:
+                if len(hits) < limit:
+                    raise
+                truncated = True  # the limit was reached before this mount: there may be more
+                break
+            hits.extend(self._hit(hit, mount_target) for hit in result.hits)
+            files, size = files + result.files, size + result.bytes
+            if result.truncated:
+                truncated = True
+                break
+        return searching.GrepResult(hits, truncated, files, size)
+
+    async def _grep_in_mount(
+        self,
+        target: _Target,
+        pattern: str,
+        include: str | None,
+        excludes: Sequence[str],
+        hidden: bool,
+        limit: int,
+        **options: Any,
+    ) -> searching.GrepResult:
+        expect: UUID | None = None
+        if not self.policy.allows(self.actor, "read", target.visible, subtree=True):
+            # Only a file may be searched, since nothing is below it: pin it, in case a directory takes its place.
+            entry = await self._mapped(self._client.stat(_real(target)), target)
+            if entry.is_dir:
+                self.policy.check(self.actor, "read", target.visible, subtree=True)  # EACCES
+            expect = entry.id
+        result = await self._mapped(
+            self._client.grep(
+                pattern,
+                _real(target),
+                include=include,
+                excludes=excludes,
+                hidden=hidden,
+                limit=limit,
+                expect=expect,
+                **options,
+            ),
+            target,
+        )
+        return searching.GrepResult(
+            [self._hit(hit, target) for hit in result.hits], result.truncated, result.files, result.bytes
+        )
+
     # Writes
 
     async def create(self, path: str, data: bytes | None = None, *, parents: bool = False) -> FileVersion:
@@ -198,7 +352,7 @@ class VFSView:
         return await self._mapped(self._client.mkdir_p(_real(target)), target)
 
     async def append(self, path: str, data: bytes) -> int:
-        """``VFSClient.append`` to ``path``."""
+        """``VFSClient.append`` to ``path``: the new size, even for an actor that may not read the file."""
         target = self._target(path, "append")
         if target.real is None:
             raise VFSError("EISDIR", target.visible)
@@ -212,14 +366,17 @@ class VFSView:
         return await self._mapped(self._client.write(_real(target), data, expect=expect), target)
 
     async def rename(self, src: str, dst: str) -> None:
-        """``VFSClient.rename``; both paths may be in different mounts."""
+        """``VFSClient.rename``; both paths may be in different mounts. ESTALE if the policy allows moving only a
+        file from ``src`` and a directory took its place while the move was checked."""
         source, dest = self._moved(src), self._movable(dst)
-        await self._mapped(self._client.rename(_real(source), _real(dest)), source, dest)
+        pin = await self._pin(source, dest, claim=False)
+        await self._mapped(self._client.rename(_real(source), _real(dest), expect=pin), source, dest)
 
     async def claim(self, src: str, dst: str) -> bool:
         """``VFSClient.claim``: whether this caller moved ``src`` to ``dst``."""
         source, dest = self._moved(src), self._movable(dst)
-        return await self._mapped(self._client.claim(_real(source), _real(dest)), source, dest)
+        pin = await self._pin(source, dest, claim=True)
+        return await self._mapped(self._client.claim(_real(source), _real(dest), expect=pin), source, dest)
 
     async def unlink(self, path: str) -> None:
         """``VFSClient.unlink`` of ``path``."""
@@ -255,29 +412,52 @@ class VFSView:
 
     def _check_parents(self, target: _Target) -> None:
         """Checks ``write`` on every directory between the mount point and ``target``, which creating
-        ``target``'s missing parents may create. Conservative: it doesn't look which are missing."""
+        ``target``'s missing parents may create. Conservative: it doesn't look which are missing, so a rule that
+        refuses ``write`` on an existing directory refuses creating files below it with ``parents`` too."""
         assert target.mount is not None
         for end in range(len(target.mount.visible) + 1, len(target.path)):
             self.policy.check(self.actor, "write", join(*target.path[:end]))
 
     def _movable(self, path: str) -> _Target:
-        """``path``, to be moved or removed (or replaced by a move). What is below it moves too, so the actor must
-        be allowed to write there as well. EBUSY for a mount point or a virtual directory."""
+        """``path``, to be moved or removed (or replaced by a move), after checking ``write`` on it. EBUSY for a
+        mount point or a virtual directory. An unlink needs no more: it removes a file or an empty directory."""
         target = self._target(path)
         if target.real is None or target.is_mount_point:
             raise VFSError("EBUSY", target.visible, "a mount point")
-        self.policy.check(self.actor, "write", target.visible, subtree=True)
+        self.policy.check(self.actor, "write", target.visible)
         return target
 
     def _moved(self, src: str) -> _Target:
-        """The source of a move: as ``_movable``, and readable throughout, since a move can land files where
-        the actor may read them."""
+        """The source of a move: as ``_movable``, and readable, since a move can land it where the actor may
+        read it."""
         source = self._movable(src)
-        self.policy.check(self.actor, "read", source.visible, subtree=True)
+        self.policy.check(self.actor, "read", source.visible)
         return source
+
+    async def _pin(self, source: _Target, dest: _Target, *, claim: bool) -> UUID | None:
+        """None when the policy allows moving a directory from ``source`` to ``dest``: ``write`` below both and
+        ``read`` below ``source``. Otherwise only a file may move, since nothing is below it: the id of the file
+        at ``source``, for the move to expect, or EACCES for a directory."""
+        checks: list[tuple[Action, _Target]] = [("write", source), ("write", dest), ("read", source)]
+        if all(self.policy.allows(self.actor, action, t.visible, subtree=True) for action, t in checks):
+            return None
+        try:
+            entry = await self._mapped(self._client.stat(_real(source)), source)
+        except VFSError as e:
+            if claim and e.errno == "ENOENT" and e.path == source.visible:
+                return _NO_NODE  # the claim lost the race, or never could: the client tells which
+            raise
+        if entry.is_dir:
+            for action, t in checks:
+                self.policy.check(self.actor, action, t.visible, subtree=True)
+        assert entry.id is not None
+        return entry.id
 
     def _entry(self, entry: Entry, target: _Target) -> Entry:
         return Entry(self._visible(entry.path, target), entry.id, entry.kind, entry.size, entry.mtime, entry.generation)
+
+    def _hit(self, hit: searching.GrepHit, target: _Target) -> searching.GrepHit:
+        return dataclasses.replace(hit, path=self._visible(hit.path, target))
 
     def _visible(self, real: str, *targets: _Target) -> str:
         """The visible path of ``real``, a path the operation on ``targets`` reported: one of their real paths, or
@@ -334,7 +514,33 @@ class VFSView:
         self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
     ) -> list[Entry]:
         entries: list[Entry] = []
-        for mount in self._mounts:
+        for mount_target, mount_pattern, mount_excludes in self._restated(target, pattern, excludes, hidden):
+            assert mount_pattern is not None
+            try:
+                matches = await self._mapped(
+                    self._client.glob(
+                        mount_pattern, _real(mount_target), excludes=mount_excludes, hidden=hidden, limit=limit
+                    ),
+                    mount_target,
+                )
+            except VFSError as e:
+                if e.errno in ("ENOENT", "ENOTDIR"):
+                    continue  # nothing to search in this mount
+                raise
+            entries.extend(self._entry(e, mount_target) for e in matches)
+        entries.sort(key=lambda e: e.path)
+        entries.sort(key=lambda e: _mtime(e), reverse=True)  # newest first, then by path, as vfs_glob
+        return entries if limit is None else entries[:limit]
+
+    def _restated(
+        self, target: _Target, pattern: str | None, excludes: Sequence[str], hidden: bool
+    ) -> list[tuple[_Target, str | None, list[str]]]:
+        """The mounts below virtual directory ``target`` to search for ``pattern`` (None: every file) without
+        ``excludes``, in path order, each with the pattern and excludes restated relative to its mount point
+        (``_below``). Leaves out the mounts the patterns rule out, hidden ones unless ``hidden``, and those the
+        actor can read nothing in. EINVAL, before anything is searched, where a pattern can't be restated."""
+        mounts: list[tuple[_Target, str | None, list[str]]] = []
+        for mount in sorted(self._mounts, key=lambda m: join(*m.visible) + "/"):  # as their files sort
             prefix = mount.visible[len(target.path) :]
             if mount.visible[: len(target.path)] != target.path or not prefix:
                 continue
@@ -342,33 +548,13 @@ class VFSView:
                 continue
             if not self.policy.allows_any(self.actor, "read", join(*mount.visible)):
                 continue
-            mount_pattern = _below(pattern, prefix, dirs=False, path=target.visible)
-            if mount_pattern is None or mount_pattern is True:
-                continue
-            mount_excludes: list[str] = []
-            for exclude in excludes:
-                restated = _below(exclude, prefix, dirs=True, path=target.visible)
-                if restated is True:
-                    break  # the exclude covers the whole mount
-                if restated is not None:
-                    mount_excludes.append(restated)
-            else:
-                mount_target = _Target(mount.visible, mount)
-                try:
-                    matches = await self._mapped(
-                        self._client.glob(
-                            mount_pattern, _real(mount_target), excludes=mount_excludes, hidden=hidden, limit=limit
-                        ),
-                        mount_target,
-                    )
-                except VFSError as e:
-                    if e.errno in ("ENOENT", "ENOTDIR"):
-                        continue  # nothing to search in this mount
-                    raise
-                entries.extend(self._entry(e, mount_target) for e in matches)
-        entries.sort(key=lambda e: e.path)
-        entries.sort(key=lambda e: _mtime(e), reverse=True)  # newest first, then by path, as vfs_glob
-        return entries if limit is None else entries[:limit]
+            restated = pattern if pattern is None else _below(pattern, prefix, dirs=False, path=target.visible)
+            mount_excludes = [_below(exclude, prefix, dirs=True, path=target.visible) for exclude in excludes]
+            if (pattern is not None and restated is None) or restated is True or True in mount_excludes:
+                continue  # the pattern matches nothing in the mount, or an exclude covers all of it
+            kept = [e for e in mount_excludes if isinstance(e, str)]
+            mounts.append((_Target(mount.visible, mount), restated, kept))
+        return mounts
 
 
 def _mtime(entry: Entry) -> datetime:

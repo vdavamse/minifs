@@ -259,6 +259,7 @@ class VFSClient:
         max_bytes: int = searching.MAX_BYTES,
         max_line_chars: int | None = searching.MAX_LINE_CHARS,
         timeout: float = searching.TIMEOUT,
+        expect: UUID | None = None,
     ) -> searching.GrepResult:
         """The lines matching ripgrep ``pattern`` (``fixed``: a literal string) in the files below directory
         ``path`` that match glob ``include`` (None: all) and none of ``excludes`` (as in ``glob``), or in file ``path``
@@ -269,7 +270,8 @@ class VFSClient:
         One snapshot on a search-pool connection, each statement under ``timeout`` seconds: the scope is read from
         the tree first, and refused over ``max_files`` files or ``max_bytes`` bytes before any content is read.
         ``SearchRefused`` for a refused or timed-out search; ``RegexError`` for a bad pattern, ``GlobError`` for a
-        bad ``include`` or exclude; ENOENT, ENOTDIR for ``path``; EINVAL for a bad limit or timeout."""
+        bad ``include`` or exclude; ENOENT, ENOTDIR for ``path``; EINVAL for a bad limit or timeout. With
+        ``expect``, ESTALE unless ``path`` is that file, checked in the search's snapshot."""
         segments = split(path)
         if not 0 <= limit < _MAX_INT:  # limit + 1 is asked for
             raise VFSError("EINVAL", join(*segments), f"invalid limit {limit}")
@@ -297,6 +299,8 @@ class VFSClient:
                         node, error, kind, size = await _lookup(conn, ref)
                         if error[0] is not None:
                             return error, None, None  # committed, not rolled back: nothing failed on the server
+                        if expect is not None and (node != expect or kind != "file"):
+                            raise VFSError("ESTALE", join(*segments), "not the expected file")
                         if kind == "file":
                             assert node is not None and size is not None
                             scope = searching.Scope((node,), (join(*segments),), size)
@@ -384,18 +388,19 @@ class VFSClient:
         )
         return FileVersion(expect.id, *rows[0][3:5])
 
-    async def rename(self, src: str, dst: str) -> None:
+    async def rename(self, src: str, dst: str, *, expect: UUID | None = None) -> None:
         """Moves ``src`` to ``dst``, like rename(2) with RENAME_NOREPLACE. ENOENT, ENOTDIR (on ``src`` or ``dst``,
         whichever the error concerns), EEXIST (``dst`` exists), EINVAL (a directory into its own subtree, or the
-        root)."""
-        await self._rename(src, dst, claim=False)
+        root). With ``expect``, ESTALE if ``src`` is no longer that node."""
+        await self._rename(src, dst, claim=False, expect=expect)
 
-    async def claim(self, src: str, dst: str) -> bool:
+    async def claim(self, src: str, dst: str, *, expect: UUID | None = None) -> bool:
         """Moves ``src`` to ``dst`` only if it is still in ``src``'s directory when the move locks it, and returns
         whether it moved: of clients claiming the same file, exactly one gets True (a Maildir claim from
         ``tasks/new`` to ``tasks/cur``) and the others False, including those that find ``src`` already gone.
-        Errors as ``rename``; ENOENT if ``src``'s directory is missing, EINVAL for a ``src`` in the root."""
-        return await self._rename(src, dst, claim=True)
+        Errors as ``rename``; ENOENT if ``src``'s directory is missing, EINVAL for a ``src`` in the root. With
+        ``expect``, False if ``src`` is no longer that node."""
+        return await self._rename(src, dst, claim=True, expect=expect)
 
     async def unlink(self, path: str) -> None:
         """Removes file or empty directory ``path``, like unlink(2) / rmdir(2). ENOENT, ENOTEMPTY; EINVAL for
@@ -446,7 +451,7 @@ class VFSClient:
             self.cache.store(parent_id, segments[-1], version.id, kind)
         return version
 
-    async def _rename(self, src: str, dst: str, *, claim: bool) -> bool:
+    async def _rename(self, src: str, dst: str, *, claim: bool, expect: UUID | None) -> bool:
         src_segments, dst_segments = split(src), split(dst)
         if not src_segments:
             raise VFSError("EINVAL", "/", "cannot move the root")
@@ -456,20 +461,29 @@ class VFSClient:
             raise VFSError("EINVAL", join(*src_segments), "a claim needs a source directory other than the root")
         node = self._ref(src_segments)
         parent = self._dir_ref(dst_segments[:-1])
-        expect = self._dir_ref(src_segments[:-1]) if claim else _Ref(_NULL, [])  # NULL: no compare-and-swap
-        refs = [node, parent, expect]
+        expect_parent = self._dir_ref(src_segments[:-1]) if claim else _Ref(_NULL, [])  # NULL: no compare-and-swap
+        refs = [node, parent, expect_parent]
+        pin: tuple[str, list[object]] = (
+            (" AND r0.id = %s", [expect]) if expect is not None else ("", [])
+        )  # the call runs only on that node
         try:
             # Raised errors too (a create that commits during the move raises EEXIST), so both get the same paths.
             rows = await self._run(
                 src,
-                _gated(refs, "vfs_rename({0}, {1}, %s, {2})"),
-                [*node.params, *parent.params, *expect.params, dst_segments[-1]],
+                _gated(refs, "vfs_rename({0}, {1}, %s, {2})", pin[0]),
+                [*node.params, *parent.params, *expect_parent.params, dst_segments[-1], *pin[1]],
                 refs,
             )
             if rows[0][-2] == "ESTALE":  # lost the compare-and-swap: someone else moved it first
                 self._evict(node, rows[0][0])
                 return False
-            await self._outcome(src, refs, *_lookup_errors(rows[0], len(refs)), (rows[0][-2], rows[0][-1]))
+            lookups = _lookup_errors(rows[0], len(refs))
+            if expect is not None and all(err is None for err, _ in lookups) and rows[0][0] != expect:
+                # `src` is a node other than `expect`, so the gate kept vfs_rename from running: nothing moved.
+                if claim:
+                    return False  # the claimed node is gone from `src`
+                raise VFSError("ESTALE", join(*src_segments), "a different node is there now")
+            await self._outcome(src, refs, *lookups, (rows[0][-2], rows[0][-1]))
         except VFSError as e:
             if e.errno == "EEXIST":
                 raise e.at(join(*dst_segments)) from None
@@ -658,7 +672,7 @@ class VFSClient:
 type _Error = tuple[str | None, str | None]  # a returned (err, err_detail); (None, None) for success
 
 
-def _gated(refs: Sequence[_Ref], call: str) -> str:
+def _gated(refs: Sequence[_Ref], call: str, condition: str = "") -> str:
     """A query that looks up ``refs`` (as ``r0``, ``r1``, ...) and runs ``call``, a set-returning function call over
     their ids, only if every lookup succeeded. Each row has every ref's id, err and err_detail, then
     the call's columns, ending with its err and err_detail; there is always at least one row, with the call's
@@ -667,11 +681,12 @@ def _gated(refs: Sequence[_Ref], call: str) -> str:
     ``call`` names the ids ``{0}``, ``{1}``, ...: each is the ref's id through ``vfs_gate``. The call is in a
     subquery whose WHERE refers only to the lookups, so the planner makes it a one-time filter, checked before the
     call runs (OFFSET 0 keeps the subquery from being merged into the join). Were it ever not, ``vfs_gate`` would
-    raise EINVAL rather than pass on a failed lookup's NULL, which for a directory would mean the root."""
+    raise EINVAL rather than pass on a failed lookup's NULL, which for a directory would mean the root.
+    ``condition`` (`` AND ...`` over the lookups, with parameters after the call's) gates the call further."""
     call = call.format(*(f"vfs_gate(r{i}.id, r{i}.err)" for i in range(len(refs))))
     lookups = " CROSS JOIN ".join(f"{ref.sql} r{i}" for i, ref in enumerate(refs))
     columns = "".join(f"r{i}.id, r{i}.err, r{i}.err_detail, " for i in range(len(refs)))
-    gate = " AND ".join(f"r{i}.err IS NULL" for i in range(len(refs)))
+    gate = " AND ".join(f"r{i}.err IS NULL" for i in range(len(refs))) + condition
     return (
         f"SELECT {columns}f.* FROM {lookups} LEFT JOIN LATERAL (SELECT * FROM {call} WHERE {gate} OFFSET 0) f ON true"
     )

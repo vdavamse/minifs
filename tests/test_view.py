@@ -13,9 +13,10 @@ from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import VFSError
+from minifs.vfs.core import Entry, VFSError
 from minifs.vfs.glob import GlobError, compile_excludes, compile_glob
 from minifs.vfs.policy import DEFAULT_POLICY, Policy, Rule
+from minifs.vfs.search import SearchRefused
 from minifs.vfs.view import VFSView, _below, workspace_mounts  # pyright: ignore[reportPrivateUsage]
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
@@ -230,7 +231,10 @@ async def test_a_move_carries_its_subtree(vfs: VFSClient) -> None:
     agent = view(vfs, Policy({"agent": rules}))
     await vfs.create(f"/workspaces/{W1}/keep/f.md", b"kept", parents=True)
     await raises("EACCES", agent.rename("/workspace/keep", "/workspace/moved"), "/workspace/keep")
-    await raises("EACCES", agent.rename("/workspace/notes.md", "/workspace/keep"), "/workspace/keep")
+    # A file moves alone, and can't replace the directory (RENAME_NOREPLACE), so f.md is safe either way.
+    await raises("EEXIST", agent.rename("/workspace/notes.md", "/workspace/keep"), "/workspace/keep")
+    await raises("ENOTEMPTY", agent.unlink("/workspace/keep"), "/workspace/keep")  # an unlink takes nothing below
+    await raises("EACCES", agent.unlink("/workspace/keep/f.md"), "/workspace/keep/f.md")
     await agent.rename("/workspace/notes.md", "/workspace/keep2.md")
     assert (await vfs.pread(f"/workspaces/{W1}/keep/f.md")).content == b"kept"
 
@@ -259,6 +263,44 @@ async def test_a_move_needs_read_on_its_source(vfs: VFSClient) -> None:
     await agent.rename("/workspace/notes.md", "/workspace/drop/notes.md")  # into the drop box is fine
 
 
+async def test_a_rule_below_a_directory_still_lets_its_files_move(vfs: VFSClient) -> None:
+    env = Policy({"agent": [Rule("/workspace/**/.env", "read"), Rule("/workspace/**", "read", "write")]})
+    agent = view(vfs, env)
+    await vfs.create(f"/workspaces/{W1}/app/.env", b"KEY=1", parents=True)
+    await vfs.create(f"/workspaces/{W1}/tasks/new/t.md", b"t", parents=True)
+    await vfs.mkdir(f"/workspaces/{W1}/tasks/cur")
+    await agent.rename("/workspace/notes.md", "/workspace/notes2.md")  # a file has nothing below it
+    assert await agent.claim("/workspace/tasks/new/t.md", "/workspace/tasks/cur/t.md")
+    assert not await agent.claim("/workspace/tasks/new/t.md", "/workspace/tasks/cur/t2.md")  # lost, not EACCES
+    await agent.unlink("/workspace/notes2.md")
+    await raises("EACCES", agent.unlink("/workspace/app/.env"), "/workspace/app/.env")
+    await raises("EACCES", agent.rename("/workspace/app", "/workspace/app2"), "/workspace/app")  # a directory
+    await raises("EACCES", agent.rename("/workspace/tasks", "/workspace/t"), "/workspace/tasks")  # conservative
+    assert (await vfs.pread(f"/workspaces/{W1}/app/.env")).content == b"KEY=1"
+
+
+async def test_a_move_pinned_to_a_node_refuses_another(vfs: VFSClient) -> None:
+    # What the view relies on when only a file may move: the move takes the node it checked, or nothing.
+    other = (await vfs.stat(f"/workspaces/{W1}/log.md")).id
+    assert other is not None
+    src, dst = f"/workspaces/{W1}/notes.md", f"/workspaces/{W1}/moved.md"
+    await raises("ESTALE", vfs.rename(src, dst, expect=other), src)
+    assert not await vfs.claim(src, dst, expect=other)
+    assert (await vfs.pread(src)).content == b"mine"
+    await vfs.rename(src, dst, expect=(await vfs.stat(src)).id)
+    assert (await vfs.pread(dst)).content == b"mine"
+
+
+async def test_a_claim_across_mounts(vfs: VFSClient) -> None:
+    both = view(vfs, Policy({"agent": [Rule("/**", "read", "write")]}))
+    assert await both.claim("/workspace/notes.md", "/docs/notes.md")
+    assert not await both.claim("/workspace/notes.md", "/docs/notes2.md")
+    assert (await vfs.pread("/docs/notes.md")).content == b"mine"
+    agent = view(vfs, Policy(DEFAULT_POLICY.rules))
+    await vfs.create(f"/workspaces/{W1}/n.md", b"")
+    await raises("EACCES", agent.claim("/workspace/n.md", "/docs/n.md"), "/docs/n.md")
+
+
 async def test_glob_skips_mounts_it_cannot_read(vfs: VFSClient) -> None:
     hidden = view(vfs, Policy({"agent": [Rule("/workspace/**"), Rule("/**", "read")]}))
     assert [e.path for e in await hidden.glob("**", "/")] == ["/docs/guide.md"]
@@ -274,6 +316,30 @@ async def test_glob_limit_counts_only_readable_files(vfs: VFSClient) -> None:
     assert [e.path for e in await hiding.glob("**/log.md", "/", limit=1)] == []
 
 
+async def test_glob_looks_past_hidden_matches_a_bounded_distance(vfs: VFSClient) -> None:
+    hiding = view(vfs, Policy({"agent": [Rule("/workspace/hid/**"), Rule("/**", "read")]}))
+    for i in range(7):  # newer than notes.md and log.md
+        await vfs.create(f"/workspaces/{W1}/hid/{i}.md", b"", parents=True)
+    assert [e.path for e in await hiding.glob("**", "/workspace", limit=1)] == ["/workspace/log.md"]
+    for i in range(7, 9):  # now 9 hidden matches come first, past the 8 the re-fetch looks at
+        await vfs.create(f"/workspaces/{W1}/hid/{i}.md", b"")
+    assert await hiding.glob("**", "/workspace", limit=1) == []
+
+
+async def test_ingestion_globs_only_the_docs(vfs: VFSClient, policy: Policy) -> None:
+    ingestion = view(vfs, policy, "ingestion")
+    assert [e.path for e in await ingestion.glob("**", "/")] == ["/docs/guide.md"]
+    await raises("EACCES", ingestion.glob("**", "/workspace"), "/workspace")
+
+
+async def test_every_exclude_is_restated_even_after_one_covers_the_mount(vfs: VFSClient, policy: Policy) -> None:
+    agent = view(vfs, policy)
+    for excludes in (["workspace", "**/w*/"], ["**/w*/", "workspace"]):
+        # "workspace" covers that mount, but "**/w*/" can't be restated there: EINVAL whatever the order.
+        await raises("EINVAL", agent.glob("*.md", "/", excludes=excludes), "/")
+        await raises("EINVAL", agent.grep("x", "/", excludes=excludes), "/")
+
+
 async def test_other_database_errors_are_eio(db: str) -> None:
     async with open_pool(Connector(db), max_size=1) as pool:
         client = VFSClient(pool)
@@ -282,6 +348,110 @@ async def test_other_database_errors_are_eio(db: str) -> None:
         await pool.close()
         error = await raises("EIO", agent.stat("/workspace/f.md"), "/workspace/f.md")
         assert (error.detail, error.db_error, error.__context__) == ("", None, None)
+
+
+# Read by line, and grep
+
+
+async def test_pread_lines(vfs: VFSClient, policy: Policy) -> None:
+    agent = view(vfs, policy)
+    await vfs.write(f"/workspaces/{W1}/notes.md", b"one\ntwo\nthree\n")
+    page = await agent.pread_lines("/workspace/notes.md", 2, max_lines=1)
+    assert (page.content, page.first_line, page.lines) == (b"two\n", 2, 3)
+    await raises("EISDIR", agent.pread_lines("/"), "/")
+    await raises("ENOENT", agent.pread_lines("/workspace/none.md"), "/workspace/none.md")
+    await raises("ENOENT", agent.pread_lines(f"/workspaces/{W2}/secret.md"))
+    ingestion = view(vfs, policy, "ingestion")
+    await raises("EACCES", ingestion.pread_lines("/workspace/notes.md"), "/workspace/notes.md")
+
+
+async def test_grep_in_visible_paths(vfs: VFSClient, policy: Policy) -> None:
+    agent = view(vfs, policy)
+    await vfs.create(f"/workspaces/{W1}/src/a.py", b"x = 1\nmine = 2\n", parents=True)
+    hits = (await agent.grep("mine", "/workspace")).hits
+    assert [(h.path, h.line) for h in hits] == [("/workspace/notes.md", 1), ("/workspace/src/a.py", 2)]
+    assert [h.path for h in (await agent.grep("mine", "/workspace/src/a.py")).hits] == ["/workspace/src/a.py"]
+    assert [h.path for h in (await agent.grep("mine", "/workspace", include="*.py")).hits] == ["/workspace/src/a.py"]
+    await raises("ENOENT", agent.grep("theirs", f"/workspaces/{W2}"))
+    await raises("ENOENT", agent.grep("x", "/workspace/none"), "/workspace/none")
+
+
+async def test_grep_from_a_virtual_directory(vfs: VFSClient, policy: Policy) -> None:
+    agent = view(vfs, policy)
+    await vfs.write("/docs/guide.md", b"needle\n")
+    await vfs.write(f"/workspaces/{W1}/notes.md", b"needle\nneedle\n")
+    result = await agent.grep("needle", "/")
+    assert [(h.path, h.line) for h in result.hits] == [
+        ("/docs/guide.md", 1),
+        ("/workspace/notes.md", 1),
+        ("/workspace/notes.md", 2),
+    ]  # in path order, across mounts
+    assert (result.truncated, result.files) == (False, 3)
+    limited = await agent.grep("needle", "/", limit=2)
+    assert ([h.path for h in limited.hits], limited.truncated) == (["/docs/guide.md", "/workspace/notes.md"], True)
+    exact = await agent.grep("needle", "/", limit=1)
+    assert (len(exact.hits), exact.truncated) == (1, True)  # the next mount still says there is more
+    assert [h.path for h in (await agent.grep("needle", "/", include="workspace/*.md")).hits] == [
+        "/workspace/notes.md",
+        "/workspace/notes.md",
+    ]
+    assert (await agent.grep("needle", "/", excludes=["docs/"])).files == 2
+    assert [h.path for h in (await view(vfs, policy, "ingestion").grep("needle", "/")).hits] == ["/docs/guide.md"]
+    await raises("EINVAL", agent.grep("needle", "/", include="**/workspace/*.md"), "/")
+    with pytest.raises(GlobError):
+        await agent.grep("needle", "/", include="[")
+
+
+async def test_grep_stops_at_its_limit(vfs: VFSClient, policy: Policy) -> None:
+    agent = view(vfs, policy)
+    await vfs.write("/docs/guide.md", b"needle\n")
+    for i in range(3):
+        await vfs.create(f"/workspaces/{W1}/f{i}.md", b"")
+    with pytest.raises(SearchRefused):
+        await agent.grep("needle", "/workspace", max_files=2)
+    result = await agent.grep("needle", "/", limit=1, max_files=2)  # /workspace is over the cap, but it's full
+    assert ([h.path for h in result.hits], result.truncated, result.files) == (["/docs/guide.md"], True, 1)
+    with pytest.raises(SearchRefused):
+        await agent.grep("needle", "/", limit=2, max_files=2)
+    await raises("EINVAL", agent.grep("needle", "/", max_files=-1), "/")
+    await raises("EINVAL", agent.grep("needle", "/", timeout=0), "/")
+
+
+async def test_grep_skips_a_missing_mount_root(vfs: VFSClient, policy: Policy) -> None:
+    agent = VFSView(vfs, {"/workspace": "/workspaces/none", "/docs": "/docs"}, policy, "agent")
+    assert [h.path for h in (await agent.grep("guide", "/")).hits] == ["/docs/guide.md"]
+
+
+async def test_grep_needs_read_on_everything_it_searches(vfs: VFSClient) -> None:
+    env = Policy({"agent": [Rule("/workspace/**/.env"), Rule("/**", "read", "write")]})
+    agent = view(vfs, env)
+    await vfs.create(f"/workspaces/{W1}/app/.env", b"KEY=secret", parents=True)
+    await raises("EACCES", agent.grep("secret", "/workspace"), "/workspace")
+    await raises("EACCES", agent.grep("secret", "/"), "/workspace")
+    await raises("EACCES", agent.grep("secret", "/workspace/app/.env"), "/workspace/app/.env")
+    assert (await agent.grep("mine", "/workspace/notes.md")).files == 1  # a file needs read on itself only
+    assert (await agent.grep("secret", "/docs")).hits == []
+    assert env.denials == {("agent", "read"): 3}
+
+
+async def test_a_file_checked_alone_is_pinned(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The policy lets only a file be moved or searched at these paths. If a directory takes the file's place
+    # after the view's stat, the operation must not reach it.
+    env = Policy({"agent": [Rule("/workspace/**/.env"), Rule("/**", "read", "write")]})
+    agent = view(vfs, env)
+    await vfs.create(f"/workspaces/{W1}/app/.env", b"KEY=secret", parents=True)
+    real_stat = vfs.stat
+    file_id = (await vfs.stat(f"/workspaces/{W1}/notes.md")).id
+
+    async def stale_stat(path: str) -> Entry:  # what a stat just before the swap saw: a file
+        entry = await real_stat(path)
+        return Entry(entry.path, file_id, "file", 4, entry.mtime, entry.generation)
+
+    monkeypatch.setattr(vfs, "stat", stale_stat)
+    await raises("ESTALE", agent.rename("/workspace/app", "/workspace/app2"), "/workspace/app")
+    assert not await agent.claim("/workspace/app", "/docs/app")
+    await raises("ESTALE", agent.grep("secret", "/workspace/app"), "/workspace/app")
+    assert (await real_stat(f"/workspaces/{W1}/app/.env")).size == 10
 
 
 def test_rules() -> None:
@@ -309,6 +479,9 @@ def test_rules() -> None:
     for bad in ("w/**", "/w/../x", "/w//x", "/w/"):
         with pytest.raises(ValueError):
             Rule(bad)
+    for literal in ("/w/{a,b}/**", "/w/[^.]*", "/w/a\\*"):  # fnmatch would read these literally
+        with pytest.raises(ValueError, match="fnmatch"):
+            Rule(literal)
     with pytest.raises(ValueError, match="unknown"):
         Rule("/w", "delete")  # pyright: ignore[reportArgumentType]
 
