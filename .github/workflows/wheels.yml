@@ -53,6 +53,14 @@ jobs:
           uv pip install --python /tmp/smoke/bin/python "$GITHUB_WORKSPACE"/dist/*.whl "psycopg[binary]"
           /tmp/smoke/bin/python -c "import minifs._regex as r; assert not r.HAS_ORACLE; from minifs.db.migrate import load_migrations; assert load_migrations()"
           /tmp/smoke/bin/minifs db --help
+      - name: Install the otel extra from the wheel
+        run: |
+          cd "$RUNNER_TEMP"
+          # Without the extra, the metrics are no-ops.
+          /tmp/smoke/bin/python -c "import minifs.metrics as m; assert not m.AVAILABLE; m.TOOL_DURATION.record(1.0)"
+          wheel=$(ls "$GITHUB_WORKSPACE"/dist/*.whl)
+          uv pip install --python /tmp/smoke/bin/python "${wheel}[otel]"
+          /tmp/smoke/bin/python -c "import minifs.metrics as m; assert m.AVAILABLE; m.TOOL_DURATION.record(1.0)"
       - name: Install the pydantic-ai extra from the wheel
         run: |
           cd "$RUNNER_TEMP"

@@ -51,6 +51,7 @@ from uuid import UUID
 
 import psycopg
 
+from minifs import metrics
 from minifs.vfs import glob as globbing
 from minifs.vfs import search as searching
 from minifs.vfs.client import DEFAULT_LINE_BYTES, DEFAULT_LINE_LIMIT, DEFAULT_READ_LIMIT, MAX_TIMEOUT, VFSClient
@@ -141,7 +142,9 @@ class VFSView:
         target = self._target(path, "read")
         if target.real is None:
             raise VFSError("EISDIR", target.visible)
-        return await self._mapped(self._client.pread(_real(target), offset, limit), target)
+        result = await self._mapped(self._client.pread(_real(target), offset, limit), target)
+        metrics.READ_BYTES.record(len(result.content), {"minifs.op": "pread"})
+        return result
 
     async def pread_lines(
         self,
@@ -157,7 +160,9 @@ class VFSView:
         if target.real is None:
             raise VFSError("EISDIR", target.visible)
         call = self._client.pread_lines(_real(target), first_line, max_lines, max_bytes, max_line_bytes=max_line_bytes)
-        return await self._mapped(call, target)
+        result = await self._mapped(call, target)
+        metrics.READ_BYTES.record(len(result.content), {"minifs.op": "pread_lines"})
+        return result
 
     async def pread_many(
         self, reads: Sequence[tuple[str, int, int]], *, groups: Sequence[int] | None = None
@@ -185,6 +190,8 @@ class VFSView:
             )
             for (i, target, *_), read in zip(asked, await self._mapped(call, *targets), strict=True):
                 results[i] = VFSError(read.errno, target.visible, read.message) if isinstance(read, VFSError) else read
+            read_bytes = sum(len(r.content) for r in results if not isinstance(r, VFSError))
+            metrics.READ_BYTES.record(read_bytes, {"minifs.op": "pread_many"})
         return results
 
     async def glob(

@@ -36,6 +36,8 @@ cross-check against it; without it they skip, while in CI they fail.
 | `minifs/db/migrate.py` | Migration runner, also `minifs db migrate` / `minifs db status` |
 | `minifs/db/migrations/NNN_name.sql` | Schema migrations, applied in order, each once |
 | `crates/minifs-regex/` | Rust regex translator, imported as `minifs._regex` (stubs in `minifs/_regex.pyi`) |
+| `minifs/metrics.py` | OpenTelemetry instruments, no-ops without the `otel` extra |
+| `benchmarks/` | Scripts that measure, run by hand (`benchmarks/notify_latency.py`: commit latency with and without NOTIFY) |
 | `tests/conftest.py` | Postgres fixtures |
 
 ## Migrations
@@ -136,6 +138,11 @@ more readable match exists, so exactly `limit` matches is not truncated, with tw
 hidden files fill its refetch window, and a grep from a virtual directory reports True when a later mount's
 search is refused after the limit is reached. A new client operation reaches the tools by a view method that
 maps its paths with `_target` and wraps the call in `_mapped`.
+
+Every transaction the client runs goes through `VFSClient._transaction`, which sets `statement_timeout` (`SET LOCAL`,
+in the simple query that sends BEGIN, so the connection is in autocommit mode for the block) to the client's `timeout`, cut to what is left of the current
+`minifs.vfs.budget.budget`; a timeout is ETIMEDOUT. Metrics are recorded through `minifs.metrics`, never the
+OpenTelemetry API directly, so they stay optional; tests read them with `tests/otel.py`.
 
 Connections come from `minifs.db.pool`: a `Connector` (a static conninfo, plus an optional callable that returns
 a fresh password per connection, for Lakebase OAuth tokens) is also the `ConnectionFactory` for LISTEN, and

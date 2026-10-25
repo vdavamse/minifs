@@ -30,16 +30,20 @@ MESSAGES: dict[str, str] = {
     "ESTALE": "{path} was modified since it was read. Read it again before writing.",
     "ENAMETOOLONG": "File name too long: {path}",
     "EIO": "Internal error reading {path}",
+    "ETIMEDOUT": "Timed out on {path}; try again, or ask for less (a smaller range, a narrower path)",
 }
 """The ``ModelRetry`` message for each errno. EINVAL, and any errno not here, gets ``<path>: <the error's message>``
 (the view's messages name no real paths), or ``<errno>: <path>`` without one."""
 
 _OVERRIDABLE = frozenset(MESSAGES) | {"EINVAL"}
 
+DENIED = "Permission denied: "
+"""How every denial starts, which ``minifs.tool.duration`` reads as the ``denied`` outcome."""
+
 
 def denied(action: Action, path: str) -> str:
     """The result of a call the policy refused."""
-    return f"Permission denied: {action} {path}"
+    return f"{DENIED}{action} {path}"
 
 
 def tool_error(error: VFSError | SearchRefused, action: Action, **messages: str) -> str:

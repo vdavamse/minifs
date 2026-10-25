@@ -812,7 +812,8 @@ async def test_error_path_callers_keep_their_error_whatever_the_eviction_does(
 
 
 class _NoTransaction:
-    """A connection whose ``transaction()`` does nothing, so every statement runs in the caller's transaction."""
+    """A connection whose ``transaction()`` does nothing, so every statement runs in the caller's transaction (which
+    ``VFSClient`` joins, since the connection is already in one)."""
 
     def __init__(self, conn: AsyncConnection[Any]) -> None:
         self._conn = conn
@@ -820,8 +821,8 @@ class _NoTransaction:
     def transaction(self) -> contextlib.nullcontext[None]:
         return contextlib.nullcontext()
 
-    async def execute(self, *args: Any, **kwargs: Any) -> Any:
-        return await self._conn.execute(*args, **kwargs)
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
 
 
 class _OneTransaction:

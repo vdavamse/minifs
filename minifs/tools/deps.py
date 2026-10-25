@@ -16,7 +16,7 @@ from typing import Protocol
 
 from pydantic_ai import RunContext
 
-from minifs.vfs.client import MAX_TIMEOUT
+from minifs.vfs.budget import MAX_TIMEOUT
 from minifs.vfs.glob import compile_excludes
 from minifs.vfs.view import MAX_GLOB_LIMIT, VFSView
 
@@ -30,6 +30,11 @@ class HasVFS(Protocol):
     def vfs(self) -> VFSView: ...
 
 
+def _check_budget(tool: str, budget: float | None) -> None:
+    if budget is not None and (isinstance(budget, bool) or not 0 < budget <= MAX_TIMEOUT):
+        raise ValueError(f"{tool} budget must be over 0 and at most {MAX_TIMEOUT} seconds, or None, not {budget!r}")
+
+
 @dataclass(frozen=True)
 class ReadSettings:
     default_limit: int = 2000
@@ -38,6 +43,12 @@ class ReadSettings:
     """Characters kept of each line; longer lines are cut."""
     max_bytes: int = 50 * 1024
     """Output cap per call."""
+    budget: float | None = 10.0
+    """Seconds a call may spend in the database, every statement and connection wait together (None: no limit
+    beyond the client's per-statement ``timeout``). Past it, the model is told to retry."""
+
+    def __post_init__(self) -> None:
+        _check_budget("read", self.budget)
 
 
 ALWAYS_EXCLUDED: tuple[str, ...] = ("**/.git/**",)
@@ -58,9 +69,12 @@ class GlobSettings:
     ``**`` segment followed by one that can match a directory at or above a mount point (``**/w*/`` or
     ``**/workspace/**``, though not ``**/*.pyc``), a brace or class with ``/``, an escaped ``/``, a trailing
     ``//``. They make every such glob EINVAL, which the model sees as a retry naming a pattern it never wrote."""
+    budget: float | None = 10.0
+    """Seconds a call may spend in the database, as ``ReadSettings.budget``."""
 
     def __post_init__(self) -> None:
         """A bad limit or exclude is the caller's mistake, so it fails here, not as a retry the model can't fix."""
+        _check_budget("glob", self.budget)
         if isinstance(self.limit, bool) or not isinstance(self.limit, int):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"glob limit must be an int, not {self.limit!r}")
         if not 0 <= self.limit <= MAX_GLOB_LIMIT:
@@ -81,9 +95,13 @@ class GrepSettings:
     (``/``) restates each exclude in every mount, as a glob does, so avoid the forms ``GlobSettings.excludes``
     lists (``**/workspace/**``, say): they make every such grep EINVAL, which the model sees as a retry naming a
     pattern it never wrote."""
+    budget: float | None = 10.0
+    """Seconds a call may spend in the database, as ``ReadSettings.budget``; each statement still stops at
+    ``timeout``."""
 
     def __post_init__(self) -> None:
         """A bad setting is the caller's mistake, so it fails here, not as a retry the model can't fix."""
+        _check_budget("grep", self.budget)
         for name in ("limit", "max_line_chars"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -99,8 +117,12 @@ class GrepSettings:
 class EditSettings:
     max_bytes: int = 10 * 1024 * 1024
     """Largest file ``Edit`` takes, since it holds the whole file in memory; ``Write`` replaces larger ones."""
+    budget: float | None = 30.0
+    """Seconds a call may spend in the database, as ``ReadSettings.budget``: more than a read's, since an edit
+    reads and rewrites a file of up to ``max_bytes``."""
 
     def __post_init__(self) -> None:
+        _check_budget("edit", self.budget)
         if isinstance(self.max_bytes, bool) or not isinstance(self.max_bytes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"edit max_bytes must be an int, not {self.max_bytes!r}")
         if self.max_bytes < 0:
@@ -113,8 +135,11 @@ class WriteSettings:
     """Largest existing file ``Write`` reads to diff against its new text. A larger one is overwritten without
     reading it (ladderframe has no such limit), and the metadata has no diff. Only the old file counts: new content
     of any size is diffed against an old file under the cap."""
+    budget: float | None = 30.0
+    """Seconds a call may spend in the database, as ``EditSettings.budget``."""
 
     def __post_init__(self) -> None:
+        _check_budget("write", self.budget)
         if isinstance(self.max_diff_bytes, bool) or not isinstance(self.max_diff_bytes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"write max_diff_bytes must be an int, not {self.max_diff_bytes!r}")
         if self.max_diff_bytes < 0:

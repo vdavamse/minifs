@@ -71,6 +71,7 @@ class RegexTooExpensive(RegexError):
         self.message = message
         self.span = None
         self.syntax = False
+        self.construct = "postgres_limit"
 
 
 @dataclass(frozen=True, slots=True)

@@ -444,7 +444,8 @@ async def test_each_operation_is_one_statement(pool: Pool, monkeypatch: pytest.M
     execute = AsyncConnection.execute
 
     async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
-        if str(query).strip():  # the pool's check at checkout is an empty query
+        # The pool's check at checkout is an empty query; BEGIN (with the timeout) and COMMIT frame every statement.
+        if str(query).strip() and not str(query).startswith(("BEGIN", "COMMIT")):
             statements.append(str(query))
         return await execute(self, query, *args, **kwargs)
 

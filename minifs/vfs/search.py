@@ -14,13 +14,16 @@ its statements (resolving the path, the scope, the search; ``regex.validate`` us
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
 from psycopg import AsyncConnection
+from psycopg.errors import QueryCanceled
 
+from minifs import metrics
 from minifs.vfs import regex
 from minifs.vfs.core import VFSError
 from minifs.vfs.glob import compile_excludes, compile_glob
@@ -107,13 +110,22 @@ class GrepResult:
 def compile_pattern(pattern: str, *, ignore_case: bool = False, fixed: bool = False) -> Matcher:
     """The matcher for a ripgrep pattern (``fixed``: a literal string, rg ``-F``). Raises ``RegexError`` with
     ripgrep's message for a pattern it rejects, such as one with a literal newline."""
-    if fixed:
-        translation = regex.translate_fixed(pattern, ignore_case)  # rejects what rg -F does
-        if not ignore_case and "\0" not in pattern:  # a text parameter can't hold NUL; the regex spells it
-            return Matcher(pattern, pattern, True, None)  # strpos is cheaper than a regex
-    else:
-        translation = regex.translate(pattern, ignore_case)
+    try:
+        if fixed:
+            translation = regex.translate_fixed(pattern, ignore_case)  # rejects what rg -F does
+            if not ignore_case and "\0" not in pattern:  # a text parameter can't hold NUL; the regex spells it
+                return Matcher(pattern, pattern, True, None)  # strpos is cheaper than a regex
+        else:
+            translation = regex.translate(pattern, ignore_case)
+    except regex.RegexError as e:
+        _rejected(e)
+        raise
     return Matcher(translation.file_form, translation.line_form, False, translation)
+
+
+def _rejected(error: regex.RegexError) -> None:
+    """Counts a rejected pattern in ``minifs.regex.rejections``, by the construct the translator names."""
+    metrics.REGEX_REJECTIONS.add(1, {"minifs.construct": error.construct})
 
 
 async def find_scope(
@@ -168,9 +180,9 @@ async def find_scope(
 def check_scope(scope: Scope, *, max_files: int = MAX_FILES, max_bytes: int = MAX_BYTES) -> None:
     """Raises SearchRefused if ``scope`` has more than ``max_files`` files or ``max_bytes`` bytes."""
     if scope.files > max_files:
-        raise SearchRefused("files", f"Search scope is over {max_files} files; narrow the path or include pattern")
+        raise _refused("files", f"Search scope is over {max_files} files; narrow the path or include pattern")
     if scope.bytes > max_bytes:
-        raise SearchRefused(
+        raise _refused(
             "bytes",
             f"Search scope is {_megabytes(scope.bytes)} (over the {_megabytes(max_bytes)} cap); narrow the path or"
             " include pattern",
@@ -188,11 +200,35 @@ async def search(
 ) -> GrepResult:
     """The lines of ``scope``'s files that match, at most ``limit`` (``vfs_search``). Validates the translated
     pattern in Postgres first (see ``minifs.vfs.regex.validate``), within ``timeout`` seconds if given (the
-    transaction's statement timeout, which validation would otherwise lengthen to its own)."""
+    transaction's statement timeout, which validation would otherwise lengthen to its own).
+
+    Records the scan in ``minifs.search.duration``, with its outcome, and ``minifs.search.bytes``: the scope's
+    bytes, the most it reads."""
     if matcher.translation is not None:
-        await regex.validate(conn, matcher.translation, timeout)
+        try:
+            await regex.validate(conn, matcher.translation, timeout)
+        except regex.RegexTooExpensive as e:
+            _rejected(e)
+            raise
     if not scope.ids:
         return GrepResult([], False, 0, 0)
+    start = time.perf_counter()
+    outcome = "error"
+    try:
+        hits = await _scan(conn, scope, matcher, limit, max_line_chars)
+        outcome = "ok"
+    except QueryCanceled:
+        outcome = "timeout"
+        raise
+    finally:
+        metrics.SEARCH_DURATION.record(time.perf_counter() - start, {"minifs.outcome": outcome})
+        metrics.SEARCH_BYTES.record(scope.bytes)
+    return GrepResult(hits[:limit], len(hits) > limit, scope.files, scope.bytes)
+
+
+async def _scan(
+    conn: AsyncConnection, scope: Scope, matcher: Matcher, limit: int, max_line_chars: int | None
+) -> list[GrepHit]:
     cur = await conn.execute(
         "SELECT path, line_no, byte_offset, line, cut FROM vfs_search(%s, %s, %s, %s, %s, %s, %s)",
         (
@@ -205,8 +241,7 @@ async def search(
             max_line_chars,
         ),
     )
-    hits = [GrepHit(*row) for row in await cur.fetchall()]
-    return GrepResult(hits[:limit], len(hits) > limit, scope.files, scope.bytes)
+    return [GrepHit(*row) for row in await cur.fetchall()]
 
 
 async def set_timeout(conn: AsyncConnection, seconds: float = TIMEOUT) -> None:
@@ -219,7 +254,13 @@ def timed_out() -> SearchRefused:
     """What a cancelled search statement raises. The server reports a statement timeout and an administrator's
     pg_cancel_backend with the same SQLSTATE and only a localized message to tell them apart, so both count as a
     timeout. (A cancelled asyncio task raises CancelledError instead.)"""
-    return SearchRefused("timeout", "Search timed out; narrow the pattern or path")
+    return _refused("timeout", "Search timed out; narrow the pattern or path")
+
+
+def _refused(reason: Literal["files", "bytes", "timeout"], message: str) -> SearchRefused:
+    """The refusal, counted in ``minifs.search.refusals``."""
+    metrics.SEARCH_REFUSALS.add(1, {"minifs.reason": reason})
+    return SearchRefused(reason, message)
 
 
 def _megabytes(size: int) -> str:

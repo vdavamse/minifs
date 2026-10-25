@@ -23,6 +23,7 @@ from fnmatch import fnmatchcase
 from functools import lru_cache
 from typing import Literal, get_args
 
+from minifs import metrics
 from minifs.vfs.core import VFSError, split
 
 Action = Literal["read", "write", "append"]
@@ -127,9 +128,10 @@ class Policy:
 
     def check(self, actor: str, action: Action, path: str, *, subtree: bool = False) -> None:
         """Raises EACCES (``PolicyDenied``) for ``path`` unless ``actor`` may ``action`` there (``allows``), and
-        counts the denial."""
+        counts the denial, in ``denials`` and the ``minifs.policy.denials`` metric."""
         if not self.allows(actor, action, path, subtree=subtree):
             self.denials[actor, action] += 1
+            metrics.POLICY_DENIALS.add(1, {"minifs.actor": actor, "minifs.action": action})
             _log.info("write policy denied %s %s on %s", actor, action, path)
             raise PolicyDenied(path, actor, action)
 

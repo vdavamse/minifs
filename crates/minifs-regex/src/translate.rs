@@ -67,14 +67,19 @@ pub struct Error {
     pub span: Option<(usize, usize)>,
     /// Whether regex-syntax itself rejected the pattern, so ripgrep rejects it too.
     pub syntax: bool,
+    /// What was rejected, as a short snake_case label for metrics: `look_around`, `backreference` or
+    /// `syntax` for a parse error, `newline`, `repetition_count`, ... for what ARE can't express,
+    /// `glob` for a glob.
+    pub construct: &'static str,
 }
 
 impl Error {
-    fn unsupported(message: impl Into<String>) -> Error {
+    fn unsupported(construct: &'static str, message: impl Into<String>) -> Error {
         Error {
             message: message.into(),
             span: None,
             syntax: false,
+            construct,
         }
     }
 }
@@ -90,11 +95,14 @@ impl std::error::Error for Error {}
 /// Parses `pattern` as ripgrep does and translates it into ARE.
 pub fn translate(pattern: &str, ignore_case: bool) -> Result<Translation, Error> {
     if pattern.len() > MAX_PATTERN_LEN {
-        return Err(Error::unsupported(format!(
-            "regex is too long ({} KB, the limit is {} KB); use a shorter pattern",
-            pattern.len() / 1024,
-            MAX_PATTERN_LEN / 1024
-        )));
+        return Err(Error::unsupported(
+            "pattern_length",
+            format!(
+                "regex is too long ({} KB, the limit is {} KB); use a shorter pattern",
+                pattern.len() / 1024,
+                MAX_PATTERN_LEN / 1024
+            ),
+        ));
     }
     let hir = parse(pattern, ignore_case)?;
     let line_form = translate_hir(&hir, Subject::Line)?;
@@ -115,17 +123,23 @@ pub enum Subject {
 pub fn translate_hir(hir: &Hir, subject: Subject) -> Result<String, Error> {
     let linear = atoms(hir, false);
     if linear > MAX_ATOMS {
-        return Err(Error::unsupported(format!(
-            "regex is too large for Postgres to compile ({linear} characters, classes and \
+        return Err(Error::unsupported(
+            "pattern_size",
+            format!(
+                "regex is too large for Postgres to compile ({linear} characters, classes and \
              anchors; the limit is {MAX_ATOMS}); use a shorter pattern"
-        )));
+            ),
+        ));
     }
     let extra = atoms(hir, true).saturating_sub(linear);
     if extra > MAX_EXTRA_ATOMS {
-        return Err(Error::unsupported(format!(
-            "counted repetitions expand to {extra} extra copies, more than Postgres can \
+        return Err(Error::unsupported(
+            "repetition_expansion",
+            format!(
+                "counted repetitions expand to {extra} extra copies, more than Postgres can \
              compile (the limit is {MAX_EXTRA_ATOMS}); use smaller counts or + / *"
-        )));
+            ),
+        ));
     }
     let mut out = String::new();
     emit(hir, subject, &mut out)?;
@@ -175,8 +189,23 @@ fn parse(pattern: &str, ignore_case: bool) -> Result<Hir, Error> {
             message: err.to_string(),
             span,
             syntax: true,
+            construct: syntax_construct(&err),
         }
     })
+}
+
+/// The construct label of a parse error: the two that models write most, lookaround and
+/// backreferences, by name, every other one as `syntax`.
+fn syntax_construct(err: &regex_syntax::Error) -> &'static str {
+    use regex_syntax::ast::ErrorKind;
+    match err {
+        regex_syntax::Error::Parse(e) => match e.kind() {
+            ErrorKind::UnsupportedLookAround => "look_around",
+            ErrorKind::UnsupportedBackreference => "backreference",
+            _ => "syntax",
+        },
+        _ => "syntax",
+    }
 }
 
 fn char_offset(text: &str, byte_offset: usize) -> usize {
@@ -216,11 +245,14 @@ pub(crate) fn atoms(hir: &Hir, expand: bool) -> u64 {
 fn emit(hir: &Hir, subject: Subject, out: &mut String) -> Result<(), Error> {
     emit_node(hir, subject, out)?;
     if out.len() > MAX_TRANSLATED_LEN {
-        return Err(Error::unsupported(format!(
-            "regex is too large once translated (over {} KB); \
+        return Err(Error::unsupported(
+            "translated_size",
+            format!(
+                "regex is too large once translated (over {} KB); \
              avoid repeating Unicode classes such as \\w or \\b many times",
-            MAX_TRANSLATED_LEN / 1024
-        )));
+                MAX_TRANSLATED_LEN / 1024
+            ),
+        ));
     }
     Ok(())
 }
@@ -259,6 +291,7 @@ fn emit_node(hir: &Hir, subject: Subject, out: &mut String) -> Result<(), Error>
 fn emit_literal(bytes: &[u8], subject: Subject, out: &mut String) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         Error::unsupported(
+            "non_utf8_bytes",
             "regex matches bytes that aren't valid UTF-8, which never occur in text; \
              remove the non-ASCII escapes from the (?-u) part",
         )
@@ -289,6 +322,7 @@ fn is_are_meta(c: char) -> bool {
 
 fn newline_error() -> Error {
     Error::unsupported(
+        "newline",
         "the literal \"\\n\" is not allowed in a regex: search matches one line at a time, \
          so no line contains a newline",
     )
@@ -302,6 +336,7 @@ fn unicode_class(class: &Class) -> Result<ClassUnicode, Error> {
         Class::Bytes(class) => {
             if !class.is_ascii() {
                 return Err(Error::unsupported(
+                    "non_ascii_byte_class",
                     "a byte class from (?-u) can match non-ASCII bytes, but search matches \
                      text; use a Unicode class instead (drop the (?-u))",
                 ));
@@ -373,6 +408,7 @@ fn emit_look(look: Look, out: &mut String) -> Result<(), Error> {
         }
         Look::StartCRLF | Look::EndCRLF => {
             return Err(Error::unsupported(
+                "crlf_anchor",
                 "CRLF-aware anchors from the R flag are not supported; use ^ and $ without (?R)",
             ));
         }
@@ -381,6 +417,7 @@ fn emit_look(look: Look, out: &mut String) -> Result<(), Error> {
             // ripgrep matches bytes, so this is also true between the bytes of one non-ASCII
             // character, a position ARE can't express.
             return Err(Error::unsupported(
+                "ascii_non_word_boundary",
                 "the ASCII non-word-boundary (?-u:\\B) is not supported; use \\B instead",
             ));
         }
@@ -451,10 +488,13 @@ impl WordClass {
 fn emit_repetition(rep: &Repetition, subject: Subject, out: &mut String) -> Result<(), Error> {
     for count in [Some(rep.min), rep.max].into_iter().flatten() {
         if count > MAX_REPEAT {
-            return Err(Error::unsupported(format!(
-                "repetition count {count} is too large: Postgres allows at most {MAX_REPEAT}; \
+            return Err(Error::unsupported(
+                "repetition_count",
+                format!(
+                    "repetition count {count} is too large: Postgres allows at most {MAX_REPEAT}; \
                  use a smaller count or + / *"
-            )));
+                ),
+            ));
         }
     }
     // ARE quantifies only an atom: a single character, a bracket expression or a group.
@@ -686,6 +726,29 @@ mod tests {
         assert!(rejected(&spaced).message.contains("too long"));
         // Emission stops at the limit instead of building the whole string first.
         assert!(rejected(&r"\b".repeat(1_000)).message.contains("too large"));
+    }
+
+    #[test]
+    fn rejections_name_their_construct() {
+        for (pattern, construct) in [
+            ("a(?=b)", "look_around"),
+            ("a(?<!b)", "look_around"),
+            (r"(a)\1", "backreference"),
+            ("a(", "syntax"),
+            ("a\\nb", "newline"),
+            (r"(?-u:\xFF)", "non_utf8_bytes"),
+            (r"(?-u:[\x00-\xFF])", "non_ascii_byte_class"),
+            ("(?R)^a", "crlf_anchor"),
+            (r"(?-u:\B)", "ascii_non_word_boundary"),
+            ("a{1001}", "repetition_count"),
+        ] {
+            assert_eq!(rejected(pattern).construct, construct, "{pattern}");
+        }
+        assert_eq!(rejected(&r"\w".repeat(80)).construct, "translated_size");
+        assert_eq!(
+            rejected(&"a".repeat(MAX_ATOMS as usize + 1)).construct,
+            "pattern_size"
+        );
     }
 
     #[test]

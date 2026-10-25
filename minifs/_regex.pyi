@@ -10,12 +10,15 @@ class RegexError(ValueError):
 
     ``message`` is the text to show: regex-syntax's error formatted as ripgrep prints it for parse errors, otherwise
     a one-line reason with a hint. ``span`` holds the character offsets ``(start, end)`` of the offending part when
-    known. ``syntax`` is true when regex-syntax rejected the pattern, so ripgrep rejects it too.
+    known. ``syntax`` is true when regex-syntax rejected the pattern, so ripgrep rejects it too. ``construct`` labels
+    what was rejected, for metrics: ``look_around``, ``backreference`` or ``syntax`` for a parse error, ``newline``,
+    ``repetition_count``, ``pattern_size``, ... for what has no ARE equivalent, ``glob`` for a glob.
     """
 
     message: str
     span: tuple[int, int] | None
     syntax: bool
+    construct: str
 
 def translate(pattern: str, ignore_case: bool = False) -> str:
     """Translate a Rust regex, parsed as ripgrep parses it, into PostgreSQL ARE (the line form).
