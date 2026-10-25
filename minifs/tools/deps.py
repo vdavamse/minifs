@@ -16,7 +16,8 @@ from typing import Protocol
 
 from pydantic_ai import RunContext
 
-from minifs.vfs.view import VFSView
+from minifs.vfs.glob import compile_excludes
+from minifs.vfs.view import MAX_GLOB_LIMIT, VFSView
 
 DEFAULT_WORKDIR = "/workspace"
 
@@ -38,10 +39,32 @@ class ReadSettings:
     """Output cap per call."""
 
 
+ALWAYS_EXCLUDED: tuple[str, ...] = ("**/.git/**",)
+"""Skipped by every search whatever the settings say, as ladderframe hard-codes ``-g '!**/.git/**'``."""
+
+DEFAULT_EXCLUDES: tuple[str, ...] = ("**/node_modules/**", "**/.venv/**", "**/__pycache__/**", "**/.mypy_cache/**")
+"""Skipped by default, in place of rg's ``.gitignore`` handling: unambiguous caches only (README: Differences
+from ladderframe). Patterns are rg's ``-g '!...'`` excludes, matched relative to the search root."""
+
+
 @dataclass(frozen=True)
 class GlobSettings:
     limit: int = 100
     """Paths returned at most."""
+    excludes: tuple[str, ...] = DEFAULT_EXCLUDES
+    """Skipped as well as ``ALWAYS_EXCLUDED``, which a caller can't turn off. A glob from a virtual directory
+    (``/``) restates each exclude in every mount, so avoid the forms ``VFSView.glob`` can't restate there: a
+    ``**`` segment followed by one that can match a directory at or above a mount point (``**/w*/`` or
+    ``**/workspace/**``, though not ``**/*.pyc``), a brace or class with ``/``, an escaped ``/``, a trailing
+    ``//``. They make every such glob EINVAL, which the model sees as a retry naming a pattern it never wrote."""
+
+    def __post_init__(self) -> None:
+        """A bad limit or exclude is the caller's mistake, so it fails here, not as a retry the model can't fix."""
+        if isinstance(self.limit, bool) or not isinstance(self.limit, int):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"glob limit must be an int, not {self.limit!r}")
+        if not 0 <= self.limit <= MAX_GLOB_LIMIT:
+            raise ValueError(f"glob limit must be 0 to {MAX_GLOB_LIMIT}, not {self.limit}")
+        compile_excludes(self.excludes)  # GlobError
 
 
 @dataclass(frozen=True)

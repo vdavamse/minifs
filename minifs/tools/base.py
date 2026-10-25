@@ -25,9 +25,15 @@ from minifs.tools.deps import HasVFS
 
 
 def vfs_tool(
-    function: Callable[Concatenate[RunContext[HasVFS], ...], Awaitable[Any]], name: str, description: str
+    function: Callable[Concatenate[RunContext[HasVFS], ...], Awaitable[Any]],
+    name: str,
+    description: str,
+    *,
+    sequential: bool = False,
 ) -> Tool[HasVFS]:
-    """``function`` as the tool ``name``. Every parameter must be described in its docstring."""
+    """``function`` as the tool ``name``. Every parameter must be described in its docstring. A ``sequential``
+    tool (one that writes) runs alone: pydantic-ai doesn't run other tool calls of the same response alongside it,
+    so a model's ``Write`` then ``Read`` of one file see each other in order."""
     tool: Tool[HasVFS] = Tool(
         function,
         takes_ctx=True,
@@ -35,5 +41,6 @@ def vfs_tool(
         description=description,
         docstring_format="google",
         require_parameter_descriptions=True,
+        sequential=sequential,
     )
     return tool
