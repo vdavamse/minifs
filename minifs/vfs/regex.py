@@ -9,6 +9,7 @@ exception is cost: a pattern too expensive for Postgres to compile is the model'
 from __future__ import annotations
 
 import logging
+import math
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ _VALIDATED_SIZE = 4096
 # (?:.*\b){20}, take a few hundred milliseconds before Postgres reports them as too complex. The timeout leaves
 # room for a loaded server.
 _VALIDATE_TIMEOUT = "1s"
+_VALIDATE_SECONDS = 1.0
 
 # Most recently used last.
 _translations: OrderedDict[tuple[str, bool], Translation] = OrderedDict()
@@ -109,13 +111,18 @@ def translate_fixed(text: str, ignore_case: bool = False) -> Translation:
     return translate(_regex.escape(text), ignore_case)
 
 
-async def validate(conn: AsyncConnection, translation: Translation) -> None:
+async def validate(conn: AsyncConnection, translation: Translation, timeout: float | None = None) -> None:
     """Check once that Postgres compiles both forms, under a timeout.
 
     Runs in a savepoint (or its own transaction) that is always rolled back, so the timeout doesn't outlive it.
     Raises ``RegexTooExpensive`` when Postgres finds the pattern too complex or too slow to compile, and
     ``RegexTranslationBug`` for any other rejection. Raises ``RuntimeError`` if the database isn't UTF8.
+
+    ``timeout`` (seconds) shortens the compile's own 1 s limit to the caller's; when that shorter limit is what
+    cancels the compile, ``QueryCanceled`` propagates for the caller to report as its own timeout.
     """
+    shortened = timeout is not None and timeout < _VALIDATE_SECONDS
+    limit = f"{max(1, math.ceil(timeout * 1000))}ms" if timeout is not None and shortened else _VALIDATE_TIMEOUT
     # Reported by the server at connect time, so this costs no round trip.
     encoding = conn.info.parameter_status("server_encoding")
     if encoding != "UTF8":
@@ -130,9 +137,11 @@ async def validate(conn: AsyncConnection, translation: Translation) -> None:
         raise RegexTooExpensive(message)
     try:
         async with conn.transaction(force_rollback=True):
-            await conn.execute(f"SET LOCAL statement_timeout = '{_VALIDATE_TIMEOUT}'")
+            await conn.execute("SELECT set_config('statement_timeout', %s, true)", (limit,))
             await conn.execute("SELECT '' ~ %s, '' ~ %s", (translation.line_form, translation.file_form))
     except errors.DatabaseError as e:
+        if isinstance(e, errors.QueryCanceled) and shortened:
+            raise  # the caller's timeout, shorter than ours: not a verdict on the pattern
         if (expense := compile_expense(e)) is not None:
             reason, deterministic = expense
             message = f"{reason}; use a shorter pattern or fewer, smaller counted repetitions"

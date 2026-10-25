@@ -1,5 +1,5 @@
-"""``minifs`` command line: ``db migrate`` / ``db status``, and ``ls``, ``cat``, ``put``, ``rm``, ``mv``, ``glob`` for
-humans debugging the tree."""
+"""``minifs`` command line: ``db migrate`` / ``db status``, and ``ls``, ``cat``, ``put``, ``rm``, ``mv``, ``glob``,
+``grep`` for humans debugging the tree."""
 
 from __future__ import annotations
 
@@ -13,11 +13,13 @@ from pathlib import Path
 import psycopg
 from psycopg import AsyncConnection
 
+from minifs._regex import RegexError
 from minifs.db.migrate import MigrationError, applied_versions, load_migrations, migrate
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError
+from minifs.vfs.search import DEFAULT_LIMIT, SearchRefused
 
 _CAT_CHUNK = 1 << 20
 
@@ -46,6 +48,16 @@ def main(argv: list[str] | None = None) -> int:
     glob.add_argument("pattern")
     glob.add_argument("path", nargs="?", default="/", help="directory to search (default: /)")
     glob.add_argument("--hidden", action="store_true", help="include hidden files and directories")
+    grep = _add_dsn(commands.add_parser("grep", help="print the lines matching a regex (ripgrep syntax)"))
+    grep.add_argument("pattern")
+    grep.add_argument("path", nargs="?", default="/", help="directory or file to search (default: /)")
+    grep.add_argument("-g", "--include", help="search only the files matching this glob")
+    grep.add_argument("-i", "--ignore-case", action="store_true", help="case-insensitive search")
+    grep.add_argument("-F", "--fixed-strings", action="store_true", help="the pattern is a literal string")
+    grep.add_argument("--no-hidden", action="store_true", help="skip hidden files and directories")
+    grep.add_argument(
+        "-m", "--limit", type=int, default=DEFAULT_LIMIT, help=f"at most this many hits ({DEFAULT_LIMIT})"
+    )
     mv = _add_dsn(commands.add_parser("mv", help="move or rename (fails if the destination exists)"))
     mv.add_argument("src")
     mv.add_argument("dst")
@@ -56,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "db":
             return asyncio.run(_migrate(args.dsn) if args.db_command == "migrate" else _status(args.dsn))
         return asyncio.run(_with_client(args.dsn, _VFS_COMMANDS[args.command], args))
-    except (MigrationError, VFSError, GlobError, psycopg.Error, OSError) as e:
+    except (MigrationError, VFSError, GlobError, RegexError, SearchRefused, psycopg.Error, OSError) as e:
         detail = f" ({e.detail})" if isinstance(e, VFSError) and e.detail else ""
         print(f"minifs {label}: {e}{detail}", file=sys.stderr)
         return 1
@@ -136,6 +148,24 @@ async def _glob(vfs: VFSClient, args: argparse.Namespace) -> int:
     return 0
 
 
+async def _grep(vfs: VFSClient, args: argparse.Namespace) -> int:
+    result = await vfs.grep(
+        args.pattern,
+        args.path,
+        include=args.include,
+        ignore_case=args.ignore_case,
+        fixed=args.fixed_strings,
+        hidden=not args.no_hidden,
+        limit=args.limit,
+        max_line_chars=None,
+    )
+    for hit in result.hits:
+        print(f"{hit.path}:{hit.line}:{hit.text}")
+    if result.truncated:
+        print(f"minifs grep: showing the first {args.limit} matches; there are more", file=sys.stderr)
+    return 0
+
+
 async def _mv(vfs: VFSClient, args: argparse.Namespace) -> int:
     await vfs.rename(args.src, args.dst)
     return 0
@@ -148,6 +178,7 @@ _VFS_COMMANDS: dict[str, Callable[[VFSClient, argparse.Namespace], Awaitable[int
     "rm": _rm,
     "mv": _mv,
     "glob": _glob,
+    "grep": _grep,
 }
 
 
