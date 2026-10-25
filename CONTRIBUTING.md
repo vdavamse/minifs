@@ -70,12 +70,15 @@ Extents are line-aware (migration 007): every extent starts at a line start, and
 and `vfs_nodes.lines` holds the line count. Every writer cuts content with `vfs_cut`, an append re-cuts the last
 extent when the file ends mid-line, and compaction merges whole extents, so the alignment holds. `vfs_pread_lines`
 reads by line, optionally cutting each line to a prefix (migration 011). Readers are `STABLE`, so all their statements share the caller's snapshot; `vfs_file` is their
-unlocked counterpart of `vfs_lock_file`. Raw inserts into `vfs_extents` (tests) must give both line columns.
+unlocked counterpart of `vfs_lock_file`. Raw inserts into `vfs_extents` (tests) must give both line columns, and
+can't give `utf8`, which is generated.
 
 Search (migration 008) scans those extents: `vfs_search` filters each extent with a pattern's file form, splits
 only the extents that pass into lines, and returns the matching ones with their line numbers and byte offsets,
-stopping at the limit; a file with content that isn't UTF-8 is skipped whole. The scope comes from `vfs_glob` in a
-statement of its own, so `minifs.vfs.search` can refuse it over the file and byte caps before content is read.
+stopping at the limit; a file with content that isn't UTF-8 is skipped whole. Whether an extent is UTF-8 is decided
+when it is written, by `vfs_utf8` in the generated column `vfs_extents.utf8` (migration 015), so the search reads
+flags and decodes only the extents it tests. The scope comes from `vfs_glob` in a statement of its own, so
+`minifs.vfs.search` can refuse it over the file and byte caps before content is read.
 
 Errors come in two groups (migration 009):
 

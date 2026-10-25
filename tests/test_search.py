@@ -16,6 +16,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from minifs import _regex
 from minifs.cli import main
+from minifs.db.migrate import load_migrations, migrate
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs import regex
 from minifs.vfs import search as searching
@@ -24,6 +25,7 @@ from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.regex import RegexError
 from minifs.vfs.search import GrepHit, SearchRefused
+from tests.test_lines import is_utf8
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
 Hit = tuple[str, int, int, str]  # path, line, offset, text
@@ -222,6 +224,96 @@ async def test_non_utf8_is_skipped(vfs: VFSClient, conn: AsyncConnection) -> Non
     assert hits((await vfs.grep("foo")).hits) == [("/ok", 1, 0, "foo")]
 
 
+async def utf8_flags(conn: AsyncConnection, name: str) -> list[bool]:
+    """vfs_extents.utf8 of each extent of file ``name``'s current generation, in offset order."""
+    cur = await conn.execute(
+        "SELECT e.utf8 FROM vfs_extents e JOIN vfs_nodes n ON n.id = e.node_id AND e.generation = n.generation"
+        " WHERE n.name = %s ORDER BY e.byte_offset",
+        (name,),
+    )
+    return [u for (u,) in await cur.fetchall()]
+
+
+@pytest.mark.parametrize("where", ["first", "middle", "last"])
+async def test_one_bad_extent_skips_the_file(vfs: VFSClient, conn: AsyncConnection, where: str) -> None:
+    lines = [b"foo %06d\n" % i for i in range(30_000)]  # 330 KB: 6 extents
+    bad = {"first": 0, "middle": 15_000, "last": 29_999}[where]
+    lines[bad] = b"bad \xff\n"
+    await put(vfs, "/f", b"".join(lines))
+    await put(vfs, "/ok", b"foo\n")
+    flags = await utf8_flags(conn, "f")
+    assert len(flags) > 3 and flags.count(False) == 1
+    position = flags.index(False)
+    assert {"first": position == 0, "middle": 0 < position < len(flags) - 1, "last": position == len(flags) - 1}[where]
+    assert hits((await vfs.grep("foo", limit=1)).hits) == [("/ok", 1, 0, "foo")]
+
+
+async def test_validity_follows_writes_appends_and_compaction(vfs: VFSClient, conn: AsyncConnection) -> None:
+    async def state() -> tuple[list[bool], bool]:
+        return await utf8_flags(conn, "f"), (await vfs.grep("foo")).hits != []
+
+    await put(vfs, "/f", b"foo\n", b"caf\xc3")  # the last extent ends mid-character: skipped, as when decoded
+    assert await state() == ([True, False], False)
+    await vfs.append("/f", b"\xa9\n")  # the append re-cuts the last extent, which is now whole
+    assert await state() == ([True, True], True)
+    await vfs.append("/f", b"\xff\n")
+    await vfs.append("/f", b"ok\n")
+    assert await state() == ([True, True, False, True], False)
+    await vfs.compact("/f")  # one extent, decoded again: still invalid
+    assert await state() == ([False], False)
+    await vfs.write("/f", b"foo\n")  # a new generation, valid
+    assert await state() == ([True], True)
+    for part in (b"x\n", b"y\n", b"caf\xc3"):
+        await vfs.append("/f", part)
+    await vfs.compact("/f")  # merged with a last part that ends mid-character
+    assert await state() == ([False], False)
+    await vfs.append("/f", b"\xa9\n")
+    assert await state() == ([True], True)
+    await vfs.write("/f", b"foo\x00\n")  # NUL isn't text to convert_from
+    assert await state() == ([False], False)
+
+
+@pytest.mark.parametrize(
+    ("data", "valid"),
+    [
+        (b"", True),
+        (b"plain\n", True),
+        (b"\xef\xbb\xbfbom\n", True),
+        (b"\xe2\x98\x83 caf\xc3\xa9 \xf0\x9f\x98\x80\n", True),
+        (b"caf\xc3", False),  # cut mid-character
+        (b"\xc3\xa9\xa9", False),  # a stray continuation byte
+        (b"a\x00b", False),
+        (b"\xc0\xaf", False),  # overlong
+        (b"\xed\xa0\x80", False),  # a surrogate
+        (b"\xf4\x90\x80\x80", False),  # past U+10FFFF
+        (b"\xff", False),
+        (b"\xf5\x80\x80\x80", False),  # a lead byte past F4
+        (b"\xf0\x9f", False),  # a 4-byte sequence cut after 2
+        (b"\xed\xa0\xbd\xed\xb8\x80", False),  # CESU-8: a surrogate pair
+    ],
+)
+async def test_utf8_check(conn: AsyncConnection, data: bytes, valid: bool) -> None:
+    cur = await conn.execute("SELECT vfs_utf8(%s)", (data,))
+    assert await cur.fetchone() == (valid,)
+    assert is_utf8(data) == valid  # the model check_layout holds the stored flags to
+
+
+async def test_migration_flags_existing_extents(empty_db: str) -> None:
+    migrations = load_migrations()
+    async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
+        await migrate(conn, [m for m in migrations if m.version < 15])
+        for name, data in (("ok", b"foo\n"), ("bad", b"foo\n" + b"x" * 70_000 + b"\xff\n"), ("cut", b"foo\ncaf\xc3")):
+            await conn.execute("SELECT * FROM vfs_create(NULL, %s, 'file', %s)", (name, data))
+        await migrate(conn, migrations)
+        flags = [await utf8_flags(conn, name) for name in ("ok", "bad", "cut")]
+        assert flags == [[True], [True, False], [True, False]]
+        cur = await conn.execute("SELECT array_agg(id ORDER BY name), array_agg(name ORDER BY name) FROM vfs_nodes")
+        row = await cur.fetchone()
+        assert row is not None
+        cur = await conn.execute("SELECT path, line_no FROM vfs_search(%s, %s, 'foo', 'foo', true)", row)
+        assert await cur.fetchall() == [("ok", 1)]
+
+
 async def test_sees_a_write_committed_just_before(vfs: VFSClient, db: str) -> None:
     await put(vfs, "/log", b"start\n")
     async with open_pool(Connector(db), max_size=1) as search_pool:
@@ -383,8 +475,8 @@ async def test_stops_at_the_limit(vfs: VFSClient, conn: AsyncConnection) -> None
 async def test_stops_inside_a_file(vfs: VFSClient, conn: AsyncConnection) -> None:
     # One large file in many extents, holding all of vfs_extents: with statistics that say so, the planner may sort
     # the file's extents rather than walk the index, and the search must still stop at the extent with its last
-    # hit. Measured in TOAST blocks read: every search reads each block once for the file's UTF-8 check, and a
-    # full pass reads it again; a stop at the first extents barely does.
+    # hit. Measured in TOAST blocks read: a full pass reads each block once; a stop at the first extents barely
+    # does, since the file's UTF-8 check reads the flags, not the content (migration 015).
     rng = random.Random(10)
     lines = [f"INFO request {rng.getrandbits(64):016x}\n" for _ in range(300_000)]  # random: stored out of line
     for i in range(0, 300_000, 30_000):
@@ -425,7 +517,7 @@ async def test_stops_inside_a_file(vfs: VFSClient, conn: AsyncConnection) -> Non
     for pattern, limit in (("INFO", 100), ("NEEDLE", 1), ("NEEDLE", 2)):
         found, read = await blocks_read(pattern, limit)
         assert found == limit
-        assert read < full * 0.6, (pattern, limit, read, full)  # about half: the check, plus a few extents
+        assert read < full * 0.2, (pattern, limit, read, full)  # up to the second NEEDLE, a tenth of the file
     result = await vfs.grep("NEEDLE", limit=1)
     assert hits(result.hits) == [("/app.log", 1, 0, "NEEDLE")]
 

@@ -70,11 +70,13 @@ CREATE TABLE vfs_extents (
     line_offsets int4[] NOT NULL,                -- where each of its lines starts, in data
     data         bytea  NOT NULL,                -- whole lines; only a file's last extent may end mid-line
     node_kind    text   NOT NULL DEFAULT 'file' CHECK (node_kind = 'file'),
+    utf8         boolean NOT NULL GENERATED ALWAYS AS (vfs_utf8(data)) STORED,   -- migration 015
     PRIMARY KEY (node_id, generation, byte_offset),
     UNIQUE (node_id, generation, line_start),
     FOREIGN KEY (node_id, node_kind) REFERENCES vfs_nodes (id, kind) ON DELETE CASCADE
 );
 ALTER TABLE vfs_extents ALTER COLUMN data SET COMPRESSION pglz;   -- migration 013
+CREATE INDEX vfs_extents_not_utf8_idx ON vfs_extents (node_id, generation) WHERE NOT utf8;   -- migration 015
 ```
 
 | Choice | Why | Rejected |
@@ -220,7 +222,7 @@ The tests check that results with every hint equal results with none. A smoke be
 2. **Extent filter.** Each extent holds whole lines and no split UTF-8 character, so it is decoded on its own and tested once against the pattern in newline-sensitive mode (`(?n)`: `^` and `$` match at line breaks, and classes never contain `\n`). An extent passes exactly when one of its lines matches.
 3. **Lines.** Only passing extents are split on `\n`, each line zipped with its offset from `line_offsets`. Line k of an extent is file line `line_start + k`, at byte `byte_offset + line_offsets[k]`. Files are searched in path order, each in line order, and the scan stops once it has the hits it needs.
 
-The cost grows with the bytes scanned, not the matches: a common pattern reads only the first extents, a rare one the whole scope (about 0.7 s for 45 MB on a laptop). A file that isn't valid UTF-8 is skipped whole, so results don't depend on how its bytes are cut. A UTF-8 BOM isn't part of the first line, as in rg.
+The cost grows with the bytes scanned, not the matches: a common pattern reads only the first extents, a rare one the whole scope (about 0.7 s for 45 MB on a laptop). A file that isn't valid UTF-8 is skipped whole, so results don't depend on how its bytes are cut. Validity is decided when an extent is written and stored with it (`vfs_extents.utf8`), so the search reads flags rather than decoding each file twice. That costs writes 2 to 7%, halves a full-scope scan, and makes a search that stops at its limit early about 7 times faster, since it no longer decodes the whole first file. A UTF-8 BOM isn't part of the first line, as in rg.
 
 **Options.** The tool takes `pattern`, `path` (a directory or one file) and `include`. A model gets case-insensitive search with `(?i)`. The library's `VFSClient.grep` adds `ignore_case`, `fixed` (literal strings, via `strpos`), `excludes`, `hidden`, the caps, the timeout and `keep` (the view's policy, so unreadable files are left out before content is read). Each hit carries its byte offset as well as its line number. Context lines (`-C`), `--max-count` and multiline (`-U`) aren't supported.
 
