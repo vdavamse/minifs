@@ -12,11 +12,14 @@ name = "_regex"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# The Rust `regex` crate as a differential-testing oracle. Enabled for `cargo test` and
-# the development build (`uv sync`), never in release wheels.
-oracle = ["dep:regex"]
+# The Rust `regex` crate and ripgrep's `ignore` crate as differential-testing oracles.
+# Enabled for `cargo test` and the development build (`uv sync`), never in release wheels.
+oracle = ["dep:regex", "dep:ignore"]
 
 [dependencies]
 pyo3 = { version = "0.30", features = ["abi3-py312"] }
 regex-syntax = "0.8"
+globset = { version = "0.4.18", default-features = false }
 regex = { version = "1.13", optional = true }
+# ripgrep's own `-g` matcher (overrides), the oracle for the glob translator.
+ignore = { version = "0.4.33", optional = true }

@@ -466,40 +466,56 @@ The saving is bytes on the wire, not round trips. Tailing a growing log fetches 
 
 ### Semantics
 
-| Pattern | Matches | Translated regex |
+Patterns are rg's `-g` globs, compiled by rg's own code (see Translator). In the regexes below, `[^/]` stands for the explicit ranges actually emitted.
+
+| Pattern | Matches | Regex (globset's) |
 | --- | --- | --- |
 | `*` | Any characters within one path segment | `[^/]*` |
 | `?` | One character other than `/` | `[^/]` |
-| `**/` | Zero or more directories | `(?:[^/]+/)*` |
-| `**` at the end | Everything below | `.*` |
-| `[abc]`, `[a-z]`, `[!x]` | A character class (`!` or `^` negates), never matching `/` | `[a-c]`, `[a-z]`, `[^x\u002f]` |
-| `*.{md,txt}` | Alternatives (may nest) | `(?:[^/]*\.md\|[^/]*\.txt)` |
+| `**/` | Zero or more directories | `(?:/?\|.*/)` at the start, `(?:/\|/.*/)` in the middle |
+| `dir/**` | Everything below `dir` (rg reads it as `dir/**/*`) | `dir(?:/\|/.*/)[^/]*` |
+| `**` alone | Every file | `^.*$` |
+| `**` elsewhere, e.g. `a**b` | A `*` | `a[^/]*[^/]*b` |
+| `[abc]`, `[a-z]`, `[!x]` | A character class (`!` or `^` negates), never matching `/` | `[a-c]`, `[a-z]`, `[^x/]` |
+| `*.{md,txt}` | Alternatives, which may nest; an empty one is dropped (`a{b,}` is `ab`) | `[^/]*\.(?:md\|txt)` |
 | `\*` | A literal `*` | `\*` |
-| A pattern with no `/`, e.g. `*.md` | The file name at any depth (the gitignore/rg rule) | `^(?:.*/)?[^/]*\.md$` |
-| A pattern with `/`, e.g. `src/*.py` | Anchored at the search root | `^src/[^/]*\.py$` |
+| A pattern with no `/`, e.g. `*.md` | The file name at any depth (rg prepends `**/`) | `^(?:/?\|.*/)[^/]*\.md$` |
+| A pattern with `/` anywhere, e.g. `src/*.py` | Anchored at the search root (a leading `/` only anchors) | `^src/[^/]*\.py$` |
 | `exclude=["**/node_modules/**"]` (library only) | Like rg's `-g '!...'`: matching files are dropped, matching directories not walked | `NOT path ~ ANY(...)` |
 
 The defaults follow rg. Only files are returned (directories are walked, not listed). For `Glob`, hidden directories (names starting with `.`) are never descended into, and a hidden file is returned whenever the pattern matches it, as `rg --files` does: `*.yml` finds `.foo.yml`, but `.github/**` finds nothing. `Grep` searches hidden files and directories, as ladderframe's `Grep` runs `rg --hidden`. Both skip `.git/`. `Glob` results are sorted by `mtime`, newest first (see Differences from ladderframe).
 
 ### Translator
 
-`minifs/vfs/glob.py` translates in three steps:
+Globs are compiled in the `minifs._regex` extension (`crates/minifs-regex/src/glob.rs`) by ripgrep's own code, then emitted as ARE by the regex translator (see Regex dialect and translation):
 
-1. **Expand braces that need it** into alternatives (at most 1,024): those whose alternatives contain `/`, `*` or an empty alternative (at any depth), because they can change the segments or whether a segment is a globstar (`**` is one only as a whole segment, so in `{a,}**/x` it is for the empty alternative only). Other braces, like `*.{md,txt}`, stay inline as `(?:md|txt)`, so `*{a,b}` repeated ten times is a short regex, not 1,024 alternatives.
-2. **Tokenize each alternative and split it into segments.** A segment that is exactly `**` is a globstar; `**` anywhere else is a `*`. A backslash makes the next character literal.
-3. **Emit** each alternative and join them as `(?:alt1|alt2)`. Literals escape only ARE's special characters: a backslash before a letter is a meaningful ARE escape (`\y`, `\m`), so letters stay bare.
+1. **rg's gitignore rules**, as `ignore::gitignore::GitignoreBuilder::add_line` applies them to each `-g`: trailing unescaped whitespace is dropped, a leading `/` is removed and anchors, a trailing `/` (escaped or not) means directories only, a pattern without `/` gets `**/` in front, and one ending in `/**` gets `/*` after.
+2. **`globset`** (rg's matcher, with rg's options: `literal_separator`, `backslash_escape`, no unclosed classes) parses the result and writes a Rust regex. Its errors are rg's: `GlobError` prints `error parsing glob '<pattern>': <message>` as rg does (rg echoes the pattern after dropping trailing whitespace).
+3. **Bytes to characters.** globset's regex is byte-mode (`(?-u)`) and writes every non-ASCII character as its UTF-8 bytes. They are decoded back into characters, so `?` and classes match one character and `[é-ö]` is a range of characters; each class also loses `/` (`[...]` becomes `[...&&[^/]]`, `[^...]` becomes `[^.../]`).
+4. **regex-syntax and the ARE emitter.** The rewritten regex is parsed into a HIR (with `.` matching newlines, as globset's does) and emitted as ARE, with every class spelled out as code-point ranges. Unlike for Grep, a newline is an ordinary character here (names may contain one). The emitter's size limits apply.
 
-Character classes are parsed into code-point ranges and emitted as explicit ranges, with every character except ASCII letters and digits written as `\uXXXX`. A class never matches `/`: it is removed from ranges such as `[+-0]`, and added to negated classes, so `[!x]` becomes `[^x/]`. POSIX classes such as `[[:alpha:]]` are ASCII only, as in wcmatch. Nothing relies on ARE's own classes or case folding, so a translated pattern means the same under every database locale.
+The pruning hints are computed from the same HIR (below), and `minifs.vfs.glob` only wraps the result. Besides globset's errors, `GlobError` is raised for an empty pattern, a NUL, braces nested more than 64 deep (globset builds its regex recursively, so deeper nesting could overflow a thread's stack), a glob over 4,096 characters and classes once translated (`vfs_glob` matches the regex against every path it walks; a real glob has a few dozen), a leading `!` or `#` in an include (rg would read a negation, which belongs in the excludes, or a comment, which it ignores; write `\!` or `\#`), a pattern ending in `/` (it would match only directories, and only files are listed) and a pattern over 64 KB. In excludes, a trailing `/` limits the pattern to directories without anchoring it, as in gitignore: `build/` skips every directory named `build`, and `vfs_glob` tests each directory as its path plus `/`, and an exclude regex ends in `(?<!/)/?$` so that this matches what the pattern matches on the bare directory path, as rg tests it (`{a/,b}` must not exclude the directory `a`).
 
-An unclosed `[` or `{` raises `GlobError`, as do an empty pattern, a pattern ending in `/` (it would match only directories, and only files are listed), braces nested too deeply and a translation over 16 KB, which would be slow to match against every path. In excludes, a trailing `/` limits the pattern to directories without anchoring it, as in gitignore: `build/` skips every directory named `build`, and `vfs_glob` tests each directory as its path plus `/`. `{a}` is an alternation of one, as in rg (bash would keep it literal).
+### Divergences from rg
+
+The first two are checked against the `rg` binary in `tests/test_glob.py` (`test_divergences_from_rg`), so a change in rg shows up:
+
+- **`?` and classes match one character; rg's match one byte.** `rg --files -g '?.md'` doesn't list `é.md`, minifs does; `[!a]` likewise matches `é` whole. Postgres matches characters, so this is deliberate.
+- **A class never matches `/`.** rg's classes can, even in an unanchored pattern: negated ones (`rg --files -g 'a[!x]b'` lists `a/b`), ranges spanning `/` (`-g '/a[.-0]b'`) and an explicit `/` (`[/]`, `[x/]`; in minifs `[/]` matches nothing). As in rg, a `/` inside a class still anchors the pattern. Keeping classes inside one segment keeps them consistent with `*` and `?`, and keeps the pruning hints simple.
+- **A leading `!` or `#` in an include is an error** rather than a negation or a comment: rg's `-g '#x'` is ignored, so it lists every file. In an exclude, which is what follows rg's `-g '!'`, they are ordinary characters, as in rg.
+- **An empty or whitespace-only pattern is an error**, and so is `/`. As an include, rg ignores such a pattern and lists every file. As an exclude, `-g '!'` and `-g '! '` exclude everything and `-g '!/'` changes nothing.
+- **For `Glob`, a pattern ending in `/` is an error**: in rg it matches only directories, so it lists nothing.
+- **globset version.** minifs uses globset 0.4.18 or later, which accepts nested braces (`{a,{b,c}}`) and rejects a stray `}`. rg 14.1 (what apt installs) bundles an older globset and does the reverse: it rejects nested braces (`nested alternate groups are not allowed`) and drops a stray `}` (`rg --files -g 'a}'` lists `a`, not `a}`). Both are checked against the binary when it is rg 14.
+
+POSIX classes such as `[[:alpha:]]` aren't supported, as in rg: that is a class of `[`, `:`, `a`, `l`, `p`, `h` followed by a literal `]`.
 
 ### Pruning hints
 
 | Hint | Example | Effect |
 | --- | --- | --- |
-| Literal prefix | `docs/guides/**/*.md` gives `docs/guides` | `vfs_glob` resolves that directory and walks only its subtree. If it doesn't exist or is a file, the result is empty, not an error. A prefix through a hidden directory (for `Glob`) or an excluded one also gives an empty result, as in rg. Paths stay relative to the search root, so results don't depend on the hint. For alternatives, the prefix they share. |
-| Max depth | `src/*/*.py` gives 2 below `src` | Stop the recursion at that depth. Only when no alternative has a globstar. |
-| Name filter | Last segment `*.md` gives `LIKE '%.md'`, `*.{py,md}` gives `'%.%'` | A cheap filter on the name before the full regex: a class becomes `_` and an inline group `%`. Only when the last segment translates to the same filter in every alternative. |
+| Literal prefix | `docs/guides/**/*.md` gives `docs/guides` | `vfs_glob` resolves that directory and walks only its subtree. If it doesn't exist or is a file, the result is empty, not an error. A prefix through a hidden directory (for `Glob`) or an excluded one also gives an empty result, as in rg. Paths stay relative to the search root, so results don't depend on the hint. The complete directories of the longest literal every match starts with (regex-syntax's prefix extractor), so for alternatives, the prefix they share. |
+| Max depth | `src/*/*.py` gives 2 below `src` | Stop the recursion at that depth: the most `/` a match can contain, plus one, minus the prefix. Only when that is bounded (no `**` segment; a `**` inside a segment is a `*`). |
+| Name filter | Last segment `*.md` gives `LIKE '%.md'`, `*.{py,md}` gives `'%.%'` | A cheap filter on the name before the full regex: the regex after the last place a `/` can match, with a class as `_` and a repetition or an alternation as `%` (and a `%` in front when the name can start earlier). |
 
 ### The SQL
 
@@ -521,7 +537,7 @@ It is a recursive CTE over the parent pointers (migration `006_vfs_glob.sql`). E
 
 In Python, `minifs.vfs.glob.glob(conn, root, pattern, excludes=..., hidden=..., limit=...)` compiles the pattern and excludes and calls `vfs_glob`. Excludes of the form `**/<name>/**` or `<name>/`, which covers all the defaults, become `p_prune_dirs` instead of regexes, so those directories are never walked. A smoke benchmark finds `src/**/*.py` in a 10k-node tree in about 15 ms. For trees of 100k+ nodes, the literal-prefix and depth hints keep the walk small, and an optional trigram index on `vfs_nodes.name` (`pg_trgm`) speeds up `*foo*` patterns.
 
-The tests compare the translator with `wcmatch.glob` (GLOBSTAR, BRACE and DOTGLOB) on generated patterns and paths, Postgres's matching with Python's on the same regexes in a `C` and a UTF-8 database, and `vfs_glob` with all hints against no hints.
+The tests compare the translator with rg's own matcher (the `ignore` crate's overrides, behind the extension's `oracle` feature) on generated patterns and paths, and its rejections with globset's; check that oracle against the `rg` binary on a real directory tree, and the rejection messages and the divergences above against `rg` itself; check that every path a regex matches satisfies its hints; compare Postgres's matching with Python's on the same regexes in every locale; and compare `vfs_glob` with all hints against no hints.
 
 ## Search (rg in Postgres)
 
@@ -891,7 +907,7 @@ Most of the correctness rests on four properties, and each gets a test that comp
 | Content cache (deferred) | Reads through the cache equal uncached `pread` while another client appends, overwrites and compacts | Property |
 | Directory cache | A rename or delete by another client is seen once its NOTIFY arrives; a dropped LISTEN connection clears the cache; a missing name is never cached | Integration |
 | Line-aware extents | After random appends (partial lines, a UTF-8 character split across appends, empty data, lines over 64 KB, no newline at all), overwrites and compactions: the extents tile the file, each non-final one ends with `\n`, `line_start` and `line_offsets` are exact, `lines` is right, and `vfs_pread_lines` from every line equals splitting the content in Python; concurrent appenders stay gap-free and line-aligned | Property |
-| Glob translator | Compared with `PurePath.full_match` (Python 3.13+) or `wcmatch` (GLOBSTAR and BRACE flags) on generated patterns and paths | Differential |
+| Glob translator | Compared with rg's own matcher (the `ignore` crate) on generated patterns and paths, that matcher with the `rg` binary, and the rejections and their messages with rg's | Differential |
 | Glob pruning | Results with all hints enabled equal results with none | Differential |
 | Regex translator | A corpus of real model patterns plus generated ones, compared with Rust's `regex` crate, in a `C`-locale and a UTF-8 database | Differential |
 | Regex rejections | Every pattern the translator rejects at parse time is also rejected by the `rg` binary | Differential |
