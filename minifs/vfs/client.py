@@ -302,7 +302,7 @@ class VFSClient:
                         if error[0] is not None:
                             return error, None, None  # committed, not rolled back: nothing failed on the server
                         if expect is not None and (node != expect or kind != "file"):
-                            raise VFSError("ESTALE", join(*segments), "not the expected file")
+                            return ("ESTALE", "not the expected file"), node, None
                         if kind == "file":
                             assert node is not None and size is not None
                             scope = searching.Scope((node,), (join(*segments),), size)
@@ -330,6 +330,8 @@ class VFSClient:
             if e.errno in ("ENOENT", "ENOTDIR"):
                 await self._await_eviction([ref])
             raise
+        if error[0] == "ESTALE":
+            self._checked(ref, node)  # the path resolved, to another node: drop a stale cached link
         await self._outcome(path, [ref], error)
         assert result is not None
         self._checked(ref, node)
@@ -463,7 +465,9 @@ class VFSClient:
             raise VFSError("EINVAL", join(*src_segments), "a claim needs a source directory other than the root")
         node = self._ref(src_segments)
         parent = self._dir_ref(dst_segments[:-1])
-        expect_parent = self._dir_ref(src_segments[:-1]) if claim else _Ref(_NULL, [])  # NULL: no compare-and-swap
+        # A claim, or a pinned move, compares-and-swaps the source's directory too, so a concurrent move of the node
+        # elsewhere can't be undone by this one. NULL: no compare-and-swap.
+        expect_parent = self._dir_ref(src_segments[:-1]) if claim or expect is not None else _Ref(_NULL, [])
         refs = [node, parent, expect_parent]
         pin: tuple[str, list[object]] = (
             (" AND r0.id = %s", [expect]) if expect is not None else ("", [])
@@ -478,10 +482,13 @@ class VFSClient:
             )
             if rows[0][-2] == "ESTALE":  # lost the compare-and-swap: someone else moved it first
                 self._evict(node, rows[0][0])
-                return False
+                if claim:
+                    return False
+                raise VFSError("ESTALE", join(*src_segments), "moved by someone else meanwhile")
             lookups = _lookup_errors(rows[0], len(refs))
             if expect is not None and all(err is None for err, _ in lookups) and rows[0][0] != expect:
                 # `src` is a node other than `expect`, so the gate kept vfs_rename from running: nothing moved.
+                self._checked(node, rows[0][0])
                 if claim:
                     return False  # the claimed node is gone from `src`
                 raise VFSError("ESTALE", join(*src_segments), "a different node is there now")

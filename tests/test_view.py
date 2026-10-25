@@ -1,10 +1,12 @@
 """VFSView (the chroot) and the write policy, over a real database."""
 
+import asyncio
 import itertools
 import re
 from collections.abc import AsyncIterator, Awaitable, Sequence
 from functools import cache
 from typing import Any
+from uuid import uuid4
 
 import psycopg
 import pytest
@@ -18,6 +20,7 @@ from minifs.vfs.glob import GlobError, compile_excludes, compile_glob
 from minifs.vfs.policy import DEFAULT_POLICY, Policy, Rule
 from minifs.vfs.search import SearchRefused
 from minifs.vfs.view import VFSView, _below, workspace_mounts  # pyright: ignore[reportPrivateUsage]
+from tests.test_tree import wait_until_blocked
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
 W1, W2 = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
@@ -292,6 +295,36 @@ async def test_a_move_pinned_to_a_node_refuses_another(vfs: VFSClient) -> None:
     await vfs.rename(src, dst, expect=(await vfs.stat(src)).id)
     assert (await vfs.pread(dst)).content == b"mine"
     await raises("ESTALE", vfs.grep("mine", "/", expect=other), "/")  # the root is never the expected file
+    await raises("ESTALE", vfs.grep("mine", dst, expect=other), dst)
+    directory = (await vfs.stat(f"/workspaces/{W1}")).id
+    await raises("ESTALE", vfs.grep("mine", f"/workspaces/{W1}", expect=directory), f"/workspaces/{W1}")  # not a file
+    assert [h.path for h in (await vfs.grep("mine", dst, expect=(await vfs.stat(dst)).id)).hits] == [dst]
+    assert not await vfs.claim(dst, f"/workspaces/{W1}/claimed.md", expect=uuid4())
+
+
+async def test_a_pinned_move_does_not_follow_the_node_elsewhere(db: str) -> None:
+    # Moved by someone else between this move's lookup and its lock, the node isn't at `src` any more: the pinned
+    # move is ESTALE, where a plain one moves the node from wherever it went (vfs_rename moves a node by id).
+    async with open_pool(Connector(db), max_size=1) as pool:
+        client = VFSClient(pool)
+        await client.create("/a/f.md", b"f", parents=True)
+        await client.mkdir("/locked")
+        pinned = (await client.stat("/a/f.md")).id
+        async with pool.connection() as c:
+            pid = (await (await c.execute("SELECT pg_backend_pid()")).fetchall())[0][0]
+        async with (
+            await AsyncConnection.connect(db) as other,
+            await AsyncConnection.connect(db, autocommit=True) as watcher,
+        ):
+            await other.execute(
+                "SELECT * FROM vfs_rename((SELECT id FROM vfs_lookup(ARRAY['a', 'f.md'])),"
+                " (SELECT id FROM vfs_lookup(ARRAY['locked'])), 'f.md', NULL)"
+            )  # uncommitted: holds f.md FOR UPDATE
+            task = asyncio.create_task(client.rename("/a/f.md", "/b.md", expect=pinned))
+            await wait_until_blocked(watcher, pid)
+            await other.commit()
+            await raises("ESTALE", task, "/a/f.md")
+        assert (await client.pread("/locked/f.md")).content == b"f"
 
 
 async def test_a_claim_across_mounts(vfs: VFSClient) -> None:
@@ -483,9 +516,21 @@ def test_rules() -> None:
     for bad in ("w/**", "/w/../x", "/w//x", "/w/"):
         with pytest.raises(ValueError):
             Rule(bad)
-    for literal in ("/w/{a,b}/**", "/w/[^.]*", "/w/a\\*", "/w/[[:alpha:]]*", "/w/[!/]*", "/w/[secret", "/w/[]"):
-        with pytest.raises(ValueError, match="fnmatch|matches nothing"):
+    for literal in (
+        "/w/{a,b}/**",
+        "/w/[^.]*",
+        "/w/a\\*",
+        "/w/[[:alpha:]]*",
+        "/w/[!/]*",
+        "/w/[secret",
+        "/w/[]",
+        "/w/[!]",
+        "/w/[![:alpha:]]*",
+    ):
+        with pytest.raises(ValueError, match="fnmatch"):
             Rule(literal)
+    for valid, path in (("/w/[]a]", "/w/]"), ("/w/[!]]", "/w/x"), ("/w/[!][]", "/w/a"), ("/w/[a-c]*", "/w/bx")):
+        assert Rule(valid).matches(path)
     with pytest.raises(ValueError, match="unknown"):
         Rule("/w", "delete")  # pyright: ignore[reportArgumentType]
 

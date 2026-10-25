@@ -45,12 +45,15 @@ class Rule:
         segments = tuple(pattern.split("/")[1:]) if pattern != "/" else ()
         if not pattern.startswith("/") or any(s in ("", ".", "..") for s in segments):
             raise ValueError(f"rule pattern must be a normalised absolute path: {pattern!r}")
-        if any(c in pattern for c in "{}\\") or "[^" in pattern or "[[:" in pattern:
+        if any(c in pattern for c in "{}\\") or "[^" in pattern:
             raise ValueError(
-                f"rule pattern has braces, a [^ or [[: class or a backslash, which fnmatch reads literally: {pattern!r}"
+                f"rule pattern has braces, a [^ class or a backslash, which fnmatch reads literally: {pattern!r}"
             )
-        if any(_unclosed(segment) for segment in segments):
-            raise ValueError(f"rule pattern has a [ not closed in its segment, which matches nothing: {pattern!r}")
+        if any(_bad_class(segment) for segment in segments):
+            raise ValueError(
+                f"rule pattern has a [ not closed in its segment, or a [: in a class, which fnmatch reads literally:"
+                f" {pattern!r}"
+            )
         object.__setattr__(self, "pattern", pattern)
         object.__setattr__(self, "actions", frozenset(actions))
         object.__setattr__(self, "segments", segments)
@@ -117,14 +120,25 @@ class Policy:
             raise VFSError("EACCES", path, f"{actor} may not {action} here")
 
 
-def _unclosed(segment: str) -> bool:
-    """Whether a ``[`` in ``segment`` has no ``]`` after it (``[!/]*`` is split by its ``/``)."""
-    start = segment.find("[")
-    while start != -1:
-        end = segment.find("]", start + 2)  # a ] first in the class is literal
-        if end == -1:
+def _bad_class(segment: str) -> bool:
+    """Whether ``segment`` has a ``[`` that fnmatch reads literally because no ``]`` closes it (``[!/]*`` is split
+    by its ``/``), or a class with ``[:`` in it (a POSIX class, which fnmatch doesn't know). Scans as fnmatch does:
+    a ``]`` first in a class, after any ``!``, is literal."""
+    i, n = 0, len(segment)
+    while i < n:
+        c, i = segment[i], i + 1
+        if c != "[":
+            continue
+        j = i
+        if j < n and segment[j] == "!":
+            j += 1
+        if j < n and segment[j] == "]":
+            j += 1
+        while j < n and segment[j] != "]":
+            j += 1
+        if j >= n or "[:" in segment[i:j]:
             return True
-        start = segment.find("[", end + 1)
+        i = j + 1
     return False
 
 
