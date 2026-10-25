@@ -158,7 +158,7 @@ Each column choice, and why:
 | Enforced by | The `(node_id, node_kind)` foreign key: no extents on a directory | The `(parent_id, parent_kind)` foreign key: no children under a file |
 
 - **Kind never changes.** A file can't become a directory in place; replacing one with the other is unlink plus create, as in POSIX.
-- **Resolution returns the kind.** `vfs_lookup` returns `(id, kind)` (with `err, err_detail`), so the directory cache stores the kind with the id. The operations report `ENOTDIR` and `EISDIR` themselves, and the foreign keys are the backstop.
+- **Resolution returns the kind.** `vfs_lookup` returns `(id, kind)` (with `chain, err, err_detail`), so the directory cache stores the kind with the id. The operations report `ENOTDIR` and `EISDIR` themselves, and the foreign keys are the backstop.
 - **Directory `mtime` isn't maintained.** POSIX updates it on every create, unlink and rename inside the directory. Here that would lock and update the parent row on every create: a hot spot for shared directories such as `tasks/new/`, and an extra NOTIFY each time. Watchers get those events from NOTIFY by parent id instead.
 
 **Inode numbers and handles.** If a protocol needs a 64-bit inode number, take the low 64 bits of the UUID (the random part in v7). A stateful protocol can use the 16-byte UUID itself as the file handle. Unlike TigerFS's path-encoded NFS handles, it survives renames.
@@ -186,7 +186,7 @@ Expected outcomes (`ENOENT`, `ENOTDIR`, `EISDIR`, `EEXIST`, `ESTALE`, `ENOTEMPTY
 | Overwrite | `vfs_write(node, data, expect_gen, expect_size, expect_parent, expect_name) -> (generation, size)` | `open` with `O_TRUNC`, then `write` | Inode `FOR UPDATE`; optional compare-and-swap |
 | Positional read | `vfs_pread(node, offset, limit)` | `pread` | None (MVCC snapshot) |
 | Line read | `vfs_pread_lines(node, first_line, max_lines, max_bytes)` | — | None (MVCC snapshot) |
-| Resolve path | `vfs_lookup(path) -> (id, kind, err, err_detail)` | `namei` | None |
+| Resolve path | `vfs_lookup(path) -> (id, kind, chain, err, err_detail)` | `namei` | None |
 | List directory | `vfs_readdir(dir)` | `readdir` | None |
 | Create, mkdir | `vfs_create(parent, name, kind, data DEFAULT NULL) -> (id, generation, size)` | `open` with `O_CREAT\|O_EXCL`, `mkdir` | Unique constraint |
 | Rename, move | `vfs_rename(node, new_parent, new_name, expect_parent)` | `rename` | Row lock; checks for cycles |
@@ -277,7 +277,7 @@ This is how a worker claims a file from `tasks/new/` to `tasks/cur/`. If two wor
 
 ### Path resolution
 
-`vfs_lookup(segments TEXT[]) -> (id, kind, err, err_detail)` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. The library caches `(parent_id, name) -> id` and evicts entries when NOTIFY reports a move or delete (see Caching).
+`vfs_lookup(segments TEXT[]) -> (id, kind, chain, err, err_detail)` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. `chain` is the id of every component it found, in order: the whole path on success, the prefix that resolved on `ENOENT` or `ENOTDIR` (on `ENOTDIR` it ends with the file). It is the one column an outcome sets besides `err` and `err_detail`. The library caches `(parent_id, name) -> id` for every link of the chain, and evicts entries when NOTIFY reports a move or delete (see Caching).
 
 ### Watch (inotify)
 
@@ -449,9 +449,21 @@ The caches live in each process's memory and are never shared between processes.
 
 ### Directory entries
 
+The cache fills the way the kernel's dcache does: every path the server resolves adds an entry per component. A statement that resolves a path with `vfs_lookup` gets the chain of ids it walked back in the same row (no extra round trip), and the client stores each `(parent_id, name) -> (id, kind)`: directories for the intermediate components, the returned kind for the last. That covers every operation that looks a path up: `stat`, reads, writes, unlink, the source and the destination's directory of a rename, the parent of a create, and the root of a glob or grep. The exceptions walk nothing that comes back: `mkdir_p` and a create with `parents` resolve through `vfs_mkdir_p`, which reports no chain (only the created node is stored), and a rename stores nothing under the destination name (the next use of it walks). So after `Glob` or `Grep` hands an agent a list of paths, the second `Read` or `Edit` under the same directory hits every shared component, though no directory was ever listed. Listings and creates still store what they return. A statement that used a fully cached chain stores nothing: it learned nothing new, and if a link was stale, its fallback walk is left to the next lookup.
+
+Compared with the kernel's dcache:
+
+| | Linux dcache | minifs |
+| --- | --- | --- |
+| Filled by | Each component of a path walk | Each component of a server lookup, listings, creates |
+| Negative entries | Yes (a dentry with no inode) | No: a name another client creates must be visible at once |
+| A failed walk | Caches the prefix, and the missing name as negative | Caches the prefix only |
+| Revalidation | Local filesystems trust it; network ones call `d_revalidate` | Every use checks every link against `vfs_nodes` in the same statement, falling back to a walk |
+| Invalidation | The VFS sees every rename and unlink | NOTIFY `move`/`delete`, the client's own changes, and a 2 s TTL |
+
 - Only positive entries are cached. A missing name is never cached, so a file another client creates is visible at once.
 - The cache also keeps `id -> (parent_id, name)`. A `move` or `delete` notification carries the node id, so it evicts the right entry without knowing the old name.
-- The TTL only covers what notifications can't: those lost while the LISTEN connection reconnects (after a reconnect, the whole cache is cleared), and a listing whose snapshot predates a move or delete but which is stored after that change's notification was handled.
+- The TTL only covers what notifications can't: those lost while the LISTEN connection reconnects (after a reconnect, the whole cache is cleared), and a listing or lookup whose snapshot predates a move or delete but which is stored after that change's notification was handled. Either way, a stale entry costs a slower resolution, never the wrong node.
 
 In the library this is `minifs.vfs.cache.DirEntryCache`, kept fresh by `async with cache.follow(watcher)` and passed to `VFSClient(pool, cache=cache)`. Its `stats()` gives the hit rate. Concurrent operations that find the same cached path stale share one eviction query, as long as it hasn't been sent yet. Each entry costs about 500 bytes; `max_entries` (default 10,000) caps the total.
 

@@ -358,8 +358,8 @@ async def test_eviction_without_a_fully_cached_path(pool: Pool) -> None:
     f = await vfs.create("/d/f")
     await vfs.rename("/d", "/e")  # evicts d only
     assert cache.entries == {(d, "f"): (f.id, "file")}
-    await vfs.unlink("/e/f")  # resolved on the server, still evicted
-    assert cache.entries == {}
+    await vfs.unlink("/e/f")  # resolved on the server, still evicted; the walk taught the cache /e
+    assert cache.entries == {(None, "e"): (d, "dir")}
 
 
 async def test_uncached_readdir_fills_the_cache(pool: Pool) -> None:
