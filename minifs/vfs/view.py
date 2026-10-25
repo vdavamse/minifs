@@ -27,9 +27,14 @@ What each operation needs:
   directory there, the view checks that the source is a file and moves only that node (``expect``);
 - ``append`` (or ``write``) for ``append``.
 
-An actor may learn a little about a path it can write or append to but not read: ``append`` returns the new
-size, and ``create`` is EEXIST if something is there. Moving or removing a mount point or a virtual directory is
-EBUSY. A database error other than a ``VFSError`` comes back as EIO, since its text may name real paths.
+An actor may learn a little it can't read: ``append`` returns the new size of a file it may append to, and
+``create`` is EEXIST if something is there; a glob with a ``limit`` that comes back short, when the policy hides
+more than ``_REFETCH_FACTOR - 1`` times as many matches as it lets through, tells that unreadable newer files
+exist; and an ``expect`` naming some node id outside the path tells whether that id exists (ids are random,
+and the view hands out only ids inside the mounts). Moving or removing a mount point or a virtual directory is
+EBUSY. A mount point is a directory: a file can't be created there, and creating one with ``parents`` (or by
+``mkdir_p``) also creates the real directories above it. A database error other than a ``VFSError`` comes back
+as EIO, since its text may name real paths.
 """
 
 from __future__ import annotations
@@ -46,7 +51,7 @@ import psycopg
 
 from minifs.vfs import glob as globbing
 from minifs.vfs import search as searching
-from minifs.vfs.client import DEFAULT_LINE_BYTES, DEFAULT_LINE_LIMIT, DEFAULT_READ_LIMIT, VFSClient
+from minifs.vfs.client import DEFAULT_LINE_BYTES, DEFAULT_LINE_LIMIT, DEFAULT_READ_LIMIT, MAX_TIMEOUT, VFSClient
 from minifs.vfs.core import Entry, FileVersion, LineReadResult, ReadResult, VFSError, join, split
 from minifs.vfs.policy import Action, Policy
 
@@ -249,7 +254,7 @@ class VFSView:
             raise VFSError("EINVAL", target.visible, f"invalid caps {max_files} files, {max_bytes} bytes")
         if max_line_chars is not None and not 0 <= max_line_chars <= _MAX_LIMIT:
             raise VFSError("EINVAL", target.visible, f"invalid line length {max_line_chars}")
-        if timeout <= 0:
+        if not 0 < timeout <= MAX_TIMEOUT:
             raise VFSError("EINVAL", target.visible, f"invalid timeout {timeout}")
         searching.compile_pattern(pattern, ignore_case=ignore_case, fixed=fixed)
         if include is not None:
@@ -335,6 +340,8 @@ class VFSView:
     async def create(self, path: str, data: bytes | None = None, *, parents: bool = False) -> FileVersion:
         """``VFSClient.create`` of ``path``."""
         target = self._creatable(path, parents)
+        if target.is_mount_point:  # the mount's root is missing: it can only become a directory
+            raise VFSError("EISDIR", target.visible, "a mount point")
         return await self._mapped(self._client.create(_real(target), data, parents=parents), target)
 
     async def mkdir(self, path: str, *, parents: bool = False) -> UUID:

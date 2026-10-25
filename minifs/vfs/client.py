@@ -49,7 +49,7 @@ DEFAULT_LINE_LIMIT = 2000
 DEFAULT_LINE_BYTES = 50 * 1024
 _MAX_INT = 2**31 - 1  # vfs_pread's limit, vfs_pread_lines' limits and vfs_compact's target are int
 _MAX_BIGINT = 2**63 - 1
-_MAX_TIMEOUT = _MAX_INT / 1000  # statement_timeout is an int of milliseconds
+MAX_TIMEOUT = _MAX_INT / 1000  # seconds: statement_timeout is an int of milliseconds
 _log = logging.getLogger(__name__)
 _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache links
 
@@ -279,8 +279,10 @@ class VFSClient:
             raise VFSError("EINVAL", join(*segments), f"invalid caps {max_files} files, {max_bytes} bytes")
         if max_line_chars is not None and not 0 <= max_line_chars <= _MAX_INT:
             raise VFSError("EINVAL", join(*segments), f"invalid line length {max_line_chars}")
-        if not 0 < timeout <= _MAX_TIMEOUT:
+        if not 0 < timeout <= MAX_TIMEOUT:
             raise VFSError("EINVAL", join(*segments), f"invalid timeout {timeout}")
+        if expect is not None and not segments:
+            raise VFSError("ESTALE", "/", "not the expected file")
         # Bad patterns are reported before anything about the path.
         matcher = searching.compile_pattern(pattern, ignore_case=ignore_case, fixed=fixed)
         if include is not None:

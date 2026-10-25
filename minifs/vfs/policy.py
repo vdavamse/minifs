@@ -9,8 +9,8 @@ A path no rule matches may be read but not written. Rules match the paths of the
 Patterns are absolute paths whose segments may use ``*``, ``?`` and ``[...]`` (``[!...]`` negates) within one
 segment (``fnmatch``), and ``**`` as a whole segment for zero or more segments: ``/workspace/**`` matches
 ``/workspace`` itself and everything below it. Glob syntax that ``fnmatch`` would read literally, which the Glob
-tool's globs give a meaning (``{a,b}``, ``[^...]`` and backslash escapes), is refused, so a rule can't silently
-match nothing.
+tool's globs give a meaning (``{a,b}``, ``[^...]``, ``[[:alpha:]]`` and backslash escapes), is refused, and so
+is a ``[`` not closed within its segment (``[!/]``), so a rule can't silently match nothing.
 """
 
 from __future__ import annotations
@@ -45,10 +45,12 @@ class Rule:
         segments = tuple(pattern.split("/")[1:]) if pattern != "/" else ()
         if not pattern.startswith("/") or any(s in ("", ".", "..") for s in segments):
             raise ValueError(f"rule pattern must be a normalised absolute path: {pattern!r}")
-        if any(c in pattern for c in "{}\\") or "[^" in pattern:
+        if any(c in pattern for c in "{}\\") or "[^" in pattern or "[[:" in pattern:
             raise ValueError(
-                f"rule pattern has braces, a [^ class or a backslash, which fnmatch reads literally: {pattern!r}"
+                f"rule pattern has braces, a [^ or [[: class or a backslash, which fnmatch reads literally: {pattern!r}"
             )
+        if any(_unclosed(segment) for segment in segments):
+            raise ValueError(f"rule pattern has a [ not closed in its segment, which matches nothing: {pattern!r}")
         object.__setattr__(self, "pattern", pattern)
         object.__setattr__(self, "actions", frozenset(actions))
         object.__setattr__(self, "segments", segments)
@@ -113,6 +115,17 @@ class Policy:
             self.denials[actor, action] += 1
             _log.info("write policy denied %s %s on %s", actor, action, path)
             raise VFSError("EACCES", path, f"{actor} may not {action} here")
+
+
+def _unclosed(segment: str) -> bool:
+    """Whether a ``[`` in ``segment`` has no ``]`` after it (``[!/]*`` is split by its ``/``)."""
+    start = segment.find("[")
+    while start != -1:
+        end = segment.find("]", start + 2)  # a ] first in the class is literal
+        if end == -1:
+            return True
+        start = segment.find("[", end + 1)
+    return False
 
 
 def _match(pattern: tuple[str, ...], path: tuple[str, ...]) -> bool:

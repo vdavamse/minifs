@@ -158,6 +158,8 @@ async def test_a_missing_mount_root(vfs: VFSClient, policy: Policy) -> None:
     assert [e.path for e in await fresh.readdir("/")] == ["/docs"]
     await raises("ENOENT", fresh.stat("/workspace"), "/workspace")
     await raises("ENOENT", fresh.create("/workspace/a.md"), "/workspace/a.md")
+    await raises("EISDIR", fresh.create("/workspace", b"oops"), "/workspace")  # it would wedge the workspace
+    await raises("EISDIR", fresh.create("/workspace", b"oops", parents=True), "/workspace")
     await fresh.create("/workspace/a.md", b"x", parents=True)  # bootstraps the workspace
     assert [e.path for e in await fresh.readdir("/workspace")] == ["/workspace/a.md"]
 
@@ -289,6 +291,7 @@ async def test_a_move_pinned_to_a_node_refuses_another(vfs: VFSClient) -> None:
     assert (await vfs.pread(src)).content == b"mine"
     await vfs.rename(src, dst, expect=(await vfs.stat(src)).id)
     assert (await vfs.pread(dst)).content == b"mine"
+    await raises("ESTALE", vfs.grep("mine", "/", expect=other), "/")  # the root is never the expected file
 
 
 async def test_a_claim_across_mounts(vfs: VFSClient) -> None:
@@ -415,6 +418,7 @@ async def test_grep_stops_at_its_limit(vfs: VFSClient, policy: Policy) -> None:
         await agent.grep("needle", "/", limit=2, max_files=2)
     await raises("EINVAL", agent.grep("needle", "/", max_files=-1), "/")
     await raises("EINVAL", agent.grep("needle", "/", timeout=0), "/")
+    await raises("EINVAL", agent.grep("needle", "/", timeout=1e9), "/")
 
 
 async def test_grep_skips_a_missing_mount_root(vfs: VFSClient, policy: Policy) -> None:
@@ -479,8 +483,8 @@ def test_rules() -> None:
     for bad in ("w/**", "/w/../x", "/w//x", "/w/"):
         with pytest.raises(ValueError):
             Rule(bad)
-    for literal in ("/w/{a,b}/**", "/w/[^.]*", "/w/a\\*"):  # fnmatch would read these literally
-        with pytest.raises(ValueError, match="fnmatch"):
+    for literal in ("/w/{a,b}/**", "/w/[^.]*", "/w/a\\*", "/w/[[:alpha:]]*", "/w/[!/]*", "/w/[secret", "/w/[]"):
+        with pytest.raises(ValueError, match="fnmatch|matches nothing"):
             Rule(literal)
     with pytest.raises(ValueError, match="unknown"):
         Rule("/w", "delete")  # pyright: ignore[reportArgumentType]
