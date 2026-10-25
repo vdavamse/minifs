@@ -5,7 +5,8 @@
     MINIFS_MODEL=anthropic:claude-sonnet-5-5 uv run --with 'pydantic-ai-slim[anthropic,logfire]' \\
         python examples/agent.py <workspace-id> "test_calc.py fails. Fix the bug."
 
-``MINIFS_MODEL`` is any pydantic-ai model name (``openrouter:<slug>`` with ``OPENROUTER_API_KEY``, say). Without it,
+``MINIFS_MODEL`` is this example's own variable (pydantic-ai has none for the model): any pydantic-ai model name,
+such as ``openrouter:<slug>``. The provider reads its key from its usual variable (``OPENROUTER_API_KEY``). Without it,
 the agent runs offline on pydantic-ai's ``TestModel``, which calls ``Glob`` and ``Grep`` with made-up arguments. With
 logfire installed (the ``logfire`` extra), every model and tool call is printed to the console, nothing sent.
 """
