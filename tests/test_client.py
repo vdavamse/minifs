@@ -149,6 +149,20 @@ async def test_pread_many(vfs: VFSClient) -> None:
     ]:
         assert isinstance(error, VFSError) and (error.errno, error.path) == (errno, path)
     assert await vfs.pread_many([]) == []
+    # Groups: only up to the first file of each group is read; a directory, or a missing path, doesn't count.
+    await vfs.mkdir("/a/d")
+    reads = [("/a/x", 0, 9), ("/a/f", 0, 9), ("/a/g", 0, 9), ("/a/d", 0, 9), ("/a/g", 0, 9), ("/a/f", 0, 9)]
+    found = await vfs.pread_many(reads, groups=[0, 0, 0, 1, 1, 2])
+    assert [r.errno if isinstance(r, VFSError) else r.content for r in found] == [
+        "ENOENT",
+        b"hello",
+        b"",
+        "EISDIR",
+        b"world",
+        b"hello",
+    ]
+    with pytest.raises(ValueError):
+        await vfs.pread_many(reads, groups=[0])
     await raises("EINVAL", vfs.pread_many([("/a/f", 0, -1)]))
     await raises("EINVAL", vfs.pread_many([("/a/f", 2**63, 1)]))
 

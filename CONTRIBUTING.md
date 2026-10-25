@@ -112,7 +112,7 @@ that.
 ## VFS library
 
 `minifs.vfs.client.VFSClient` takes absolute paths and wraps one SQL function per operation (`stat`, `readdir`,
-`pread`, `pread_lines`, `pread_many` (several preads, each path's outcome in its place, in one statement), `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `grep`
+`pread`, `pread_lines`, `pread_many` (several preads, each path's outcome in its place, in one statement; with `groups`, only up to the first file of each group is read), `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `grep`
 (the same, then `vfs_search`, under a 2 s `statement_timeout`; `SearchRefused` over the scope caps or on timeout), `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
 statement in its own transaction, resolving its paths on the server with `vfs_lookup` in a subquery, and calling
 the operation only if every lookup succeeded (`_gated`). It raises `minifs.vfs.core.VFSError(errno, path, message,

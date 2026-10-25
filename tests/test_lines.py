@@ -471,6 +471,24 @@ async def test_pread_lines_cap_reads_only_the_extents_it_needs(conn: AsyncConnec
     assert max_buffer_hits(plan) < 30, plan  # 185 when it reads every extent
 
 
+async def test_pread_lines_cap_on_one_big_extent_spills_nothing(conn: AsyncConnection) -> None:
+    """Long lines merged into one 8 MB extent (vfs_compact with a large target): a capped read takes the slice it
+    needs once, and sorts its pieces in memory, not every line's copy of the extent."""
+    f = await create_file(conn, "f")
+    await conn.execute(
+        "SELECT vfs_append(%s, convert_to(repeat(i::text, 200000) || E'\\n', 'UTF8')) FROM generate_series(1, 40) i",
+        (f,),
+    )
+    await compact(conn, f, 64 * 1024 * 1024)
+    content, _ = await read_all(conn, f, 64 * 1024 * 1024)
+    for first, max_lines in [(1, 2000), (1, 3), (38, 3)]:
+        query = f"SELECT * FROM vfs_pread_lines(%s, {first}, {max_lines}, 213004, 8004)"
+        (row,) = await pread_capped_many(conn, f, [(first, max_lines, 213004, 8004)])
+        assert tuple(row[2:]) == expected_capped(content, first, max_lines, 213004, 8004)
+        plan = await plans_of(conn, query, (f,))
+        assert "temp read" not in plan and "temp written" not in plan, plan
+
+
 # Concurrency
 
 

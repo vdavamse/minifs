@@ -230,31 +230,44 @@ class VFSClient:
             node, content, first_line, start, end, size, generation, lines, end >= size, frozenset(cut)
         )
 
-    async def pread_many(self, reads: Sequence[tuple[str, int, int]]) -> list[ReadResult | VFSError]:
+    async def pread_many(
+        self, reads: Sequence[tuple[str, int, int]], *, groups: Sequence[int] | None = None
+    ) -> list[ReadResult | VFSError]:
         """``pread(path, offset, limit)`` of each ``(path, offset, limit)`` in ``reads``, in one statement, so one
         round trip and one snapshot. A read that fails with an outcome (ENOENT, ENOTDIR, EISDIR) gives its
         ``VFSError`` in its place; EINVAL for a bad offset or limit fails the whole call. Paths are resolved on the
-        server, without the cache."""
+        server, without the cache.
+
+        With ``groups``, a group id per read: of the reads with the same id, in order, only up to the first file is
+        read; the later ones are looked up but read with limit 0 (``AGENTS.md``, else ``CLAUDE.md``)."""
         paths = [join(*split(path)) for path, _, _ in reads]
         for path, offset, limit in zip(paths, (r[1] for r in reads), (r[2] for r in reads), strict=True):
             if not 0 <= limit <= _MAX_INT:
                 raise VFSError("EINVAL", path, f"invalid limit {limit}")
             if not -_MAX_BIGINT - 1 <= offset <= _MAX_BIGINT:
                 raise VFSError("EINVAL", path, f"invalid offset {offset}")
-        results: list[ReadResult | VFSError] = [VFSError("EISDIR", "/")] * len(reads)
+        if groups is not None and len(groups) != len(reads):
+            raise ValueError(f"{len(groups)} groups for {len(reads)} reads")
+        results: list[ReadResult | VFSError] = [VFSError("EISDIR", "/") for _ in reads]
         asked = [i for i, path in enumerate(paths) if path != "/"]
         if not asked:
             return results
+        group_ids = [groups[i] if groups is not None else i for i in asked]
         # A path is "/" and names joined by "/", which no name contains, so the server splits it back.
         rows = await self._run(
             paths[asked[0]],
-            "SELECT q.i, l.id, l.err, l.err_detail, p.size, p.generation, p.byte_offset, p.data, p.err, p.err_detail"
-            " FROM unnest(%s::text[], %s::bigint[], %s::int[]) WITH ORDINALITY AS q(path, off, lim, i)"
-            " CROSS JOIN LATERAL vfs_lookup(string_to_array(substr(q.path, 2), '/')) l"
-            " LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(l.id, l.err), q.off, q.lim)"
-            "                     WHERE l.err IS NULL OFFSET 0) p ON true"
-            " ORDER BY q.i, p.byte_offset",
-            [[paths[i] for i in asked], [reads[i][1] for i in asked], [reads[i][2] for i in asked]],
+            "WITH q AS (SELECT q.i, q.off, q.lim, q.grp, l.id, l.kind, l.err, l.err_detail"
+            "             FROM unnest(%s::text[], %s::bigint[], %s::int[], %s::bigint[])"
+            "                  WITH ORDINALITY AS q(path, off, lim, grp, i)"
+            "            CROSS JOIN LATERAL vfs_lookup(string_to_array(substr(q.path, 2), '/')) l),"
+            " w AS (SELECT q.*, coalesce(bool_or(q.kind = 'file') OVER (PARTITION BY q.grp ORDER BY q.i"
+            "                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), false) AS shadowed FROM q)"
+            " SELECT w.i, w.id, w.err, w.err_detail, p.size, p.generation, p.byte_offset, p.data, p.err, p.err_detail"
+            " FROM w LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(w.id, w.err), w.off,"
+            "                                                   CASE WHEN w.shadowed THEN 0 ELSE w.lim END)"
+            "                           WHERE w.err IS NULL OFFSET 0) p ON true"
+            " ORDER BY w.i, p.byte_offset",
+            [[paths[i] for i in asked], [reads[i][1] for i in asked], [reads[i][2] for i in asked], group_ids],
         )
         by_read: dict[int, list[tuple[Any, ...]]] = {}
         for row in rows:

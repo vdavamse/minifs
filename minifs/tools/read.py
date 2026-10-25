@@ -136,14 +136,14 @@ async def read(
             lines, total, more, capped = page
             if total < start and not (total == 0 and start == 1):
                 raise ModelRetry(f"Offset {start} is out of range for this file ({total} lines)")
+            if isinstance(instructions, BaseException):
+                raise instructions
             break
         else:  # pragma: no cover - the last attempt never continues
             raise AssertionError("not reached")
     except VFSError as e:
         return tool_error(e, "read")
-    if isinstance(instructions, BaseException):
-        raise instructions
-    assert instructions is not None
+    assert instructions is not None and not isinstance(instructions, BaseException)
 
     output = f"<path>{path}</path>\n<type>file</type>\n<content>\n"
     output += "\n".join(f"{start + i}: {line}" for i, line in enumerate(lines))
@@ -321,7 +321,9 @@ async def _nearby_instructions(ctx: RunContext[HasVFS], path: str) -> list[str]:
     ]
     reads = [(c, 0, 0 if c == path or c in seen else _MAX_LINES) for c in candidates]
     try:
-        found = await ctx.deps.vfs.pread_many(reads)
+        # One group per directory: a CLAUDE.md behind an AGENTS.md file is looked up, not read.
+        groups = [i // len(INSTRUCTION_FILES) for i in range(len(reads))]
+        found = await ctx.deps.vfs.pread_many(reads, groups=groups)
     except VFSError:
         return []  # a failed lookup (EIO): picking another name then could attach a file ladderframe never would
     texts: list[str] = []

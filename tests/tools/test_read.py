@@ -410,17 +410,24 @@ async def test_a_page_replaced_between_batches_is_read_again(
 async def test_instructions_already_shown_are_looked_up_not_read(
     client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every candidate goes in the one ``pread_many``; an instruction file already in the conversation, or the file
-    being read, is read with limit 0, and still keeps CLAUDE.md out of its directory."""
+    """Every candidate goes in the one ``pread_many``, a group per directory, so a CLAUDE.md behind an AGENTS.md file
+    is never read; an instruction file already in the conversation, or the file being read, is read with limit 0,
+    and still keeps CLAUDE.md out of its directory."""
     await put(client, "/workspace/pkg/AGENTS.md", b"Use tabs.")
     await put(client, "/workspace/pkg/CLAUDE.md", b"not used: AGENTS.md is first")
     await put(client, "/workspace/pkg/f.py", b"x\n")
     asked: list[list[tuple[str, int, int]]] = []
+    transferred: list[list[bytes]] = []
     pread_many = view.pread_many
 
-    async def recording(reads: list[tuple[str, int, int]]) -> list[ReadResult | VFSError]:
+    async def recording(
+        reads: list[tuple[str, int, int]], *, groups: list[int] | None = None
+    ) -> list[ReadResult | VFSError]:
         asked.append(list(reads))
-        return await pread_many(reads)
+        assert groups == [0, 0]
+        found = await pread_many(reads, groups=groups)
+        transferred.append([r.content for r in found if isinstance(r, ReadResult)])
+        return found
 
     monkeypatch.setattr(view, "pread_many", recording)
     first, again = await read_twice(Deps(view), {"filePath": "pkg/f.py"}, {"filePath": "pkg/f.py"})
@@ -428,6 +435,7 @@ async def test_instructions_already_shown_are_looked_up_not_read(
     assert again.endswith("</content>")
     agents, claude = "/workspace/pkg/AGENTS.md", "/workspace/pkg/CLAUDE.md"
     assert asked == [[(agents, 0, 2**31 - 1), (claude, 0, 2**31 - 1)], [(agents, 0, 0), (claude, 0, 2**31 - 1)]]
+    assert transferred == [[b"Use tabs.", b""], [b"", b""]]
     asked.clear()
     assert "<system-reminder>" not in await run_tool(Read, Deps(view), filePath="pkg/AGENTS.md")
     assert asked == [[(agents, 0, 0), (claude, 0, 2**31 - 1)]]
@@ -666,7 +674,9 @@ async def test_instruction_lookups_that_fail_or_find_a_directory(
         "Instructions from: /workspace/a/CLAUDE.md\nfrom a\n</system-reminder>"
     )
 
-    async def failing(reads: list[tuple[str, int, int]]) -> list[ReadResult | VFSError]:
+    async def failing(
+        reads: list[tuple[str, int, int]], *, groups: list[int] | None = None
+    ) -> list[ReadResult | VFSError]:
         raise VFSError("EIO", reads[0][0], "database error")
 
     monkeypatch.setattr(view, "pread_many", failing)

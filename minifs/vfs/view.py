@@ -159,12 +159,15 @@ class VFSView:
         call = self._client.pread_lines(_real(target), first_line, max_lines, max_bytes, max_line_bytes=max_line_bytes)
         return await self._mapped(call, target)
 
-    async def pread_many(self, reads: Sequence[tuple[str, int, int]]) -> list[ReadResult | VFSError]:
+    async def pread_many(
+        self, reads: Sequence[tuple[str, int, int]], *, groups: Sequence[int] | None = None
+    ) -> list[ReadResult | VFSError]:
         """``VFSClient.pread_many`` of ``reads``: each read's error in its place, a policy denial (EACCES), a path
-        outside every mount (ENOENT) and a virtual directory (EISDIR) among them."""
+        outside every mount (ENOENT) and a virtual directory (EISDIR) among them. Those aren't sent, so in a group
+        they never stand in for a file."""
         results: list[ReadResult | VFSError] = []
-        asked: list[tuple[int, _Target, int, int]] = []  # (index in results, target, offset, limit)
-        for path, offset, limit in reads:
+        asked: list[tuple[int, _Target, int, int, int]] = []  # (index in results, target, offset, limit, group)
+        for n, (path, offset, limit) in enumerate(reads):
             try:
                 target = self._target(path, "read")
             except VFSError as e:
@@ -172,11 +175,13 @@ class VFSView:
                 continue
             results.append(VFSError("EISDIR", target.visible))  # replaced below unless virtual
             if target.real is not None:
-                asked.append((len(results) - 1, target, offset, limit))
+                asked.append((len(results) - 1, target, offset, limit, groups[n] if groups is not None else n))
         if asked:
-            targets = [target for _, target, _, _ in asked]
-            call = self._client.pread_many([(_real(t), offset, limit) for _, t, offset, limit in asked])
-            for (i, target, _, _), read in zip(asked, await self._mapped(call, *targets), strict=True):
+            targets = [a[1] for a in asked]
+            call = self._client.pread_many(
+                [(_real(t), offset, limit) for _, t, offset, limit, _ in asked], groups=[a[4] for a in asked]
+            )
+            for (i, target, *_), read in zip(asked, await self._mapped(call, *targets), strict=True):
                 results[i] = VFSError(read.errno, target.visible, read.message) if isinstance(read, VFSError) else read
         return results
 
