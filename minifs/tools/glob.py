@@ -35,6 +35,8 @@ async def glob(ctx: RunContext[HasVFS], pattern: str, path: str | None = None) -
     except GlobError as e:
         raise ModelRetry(str(e)) from None
     except (VFSError, SearchRefused) as e:
+        # ENOTDIR is both "path is a file" and "a parent is a file"; a stat tells them apart. It runs in a
+        # snapshot of its own, so a concurrent change can only pick the other of these two retry messages.
         if isinstance(e, VFSError) and e.errno == "ENOTDIR" and await _is_file(ctx, search):
             raise ModelRetry(f"glob path must be a directory: {search}") from None
         # A missing path, one below a file, and one outside the view all look alike, as on disk.

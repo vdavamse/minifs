@@ -8,9 +8,10 @@ from psycopg import AsyncConnection
 from minifs.tools import Glob
 from minifs.tools.deps import ALWAYS_EXCLUDED, GlobSettings, ToolSettings
 from minifs.vfs.client import VFSClient
+from minifs.vfs.core import GlobResult, VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.policy import Policy, Rule
-from minifs.vfs.view import VFSView, workspace_mounts
+from minifs.vfs.view import MAX_GLOB_LIMIT, VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
 
 WS = f"/workspaces/{W1}"
@@ -25,6 +26,14 @@ async def make(client: VFSClient, *paths: str) -> None:
         await client.create(f"{WS}/{path}", b"", parents=True)
 
 
+async def age(client: VFSClient, conn: AsyncConnection, *paths: str) -> None:
+    """Gives ``paths`` mtimes on consecutive days of January 2026, oldest first (so older than the fixture's)."""
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for days, path in enumerate(paths):
+        entry = await client.stat(f"{WS}/{path}")
+        await conn.execute("UPDATE vfs_nodes SET mtime = %s WHERE id = %s", (base + timedelta(days=days), entry.id))
+
+
 # ladderframe's tests
 
 
@@ -36,13 +45,14 @@ async def test_glob(client: VFSClient, deps: Deps) -> None:
     assert message == "glob path must be a directory: /workspace/data/sample.txt"
 
 
-async def test_glob_truncates_at_limit(client: VFSClient, deps: Deps) -> None:
+async def test_glob_truncates_at_limit(client: VFSClient, deps: Deps, conn: AsyncConnection) -> None:
     await make(client, "a.py", "b.py", "c.py")
+    await age(client, conn, "b.py", "c.py", "a.py")
     out = await run_tool(Glob, limited(deps, 2), pattern="*.py")
-    assert out.endswith(
-        "\n\n(Results are truncated: showing first 2 results. Consider using a more specific path or pattern.)"
+    assert out == (
+        "/workspace/a.py\n/workspace/c.py\n\n"
+        "(Results are truncated: showing first 2 results. Consider using a more specific path or pattern.)"
     )
-    assert len(out.split("\n")) == 4
 
 
 async def test_glob_at_exactly_the_limit_is_not_truncated(client: VFSClient, deps: Deps) -> None:
@@ -67,10 +77,7 @@ async def test_schema_is_ladderframes(deps: Deps) -> None:
 
 async def test_newest_first(client: VFSClient, deps: Deps, conn: AsyncConnection) -> None:
     await make(client, "a.md", "b.md", "c.md")
-    base = datetime(2026, 1, 1, tzinfo=UTC)
-    for days, name in enumerate(["b.md", "c.md", "a.md"]):
-        entry = await client.stat(f"{WS}/{name}")
-        await conn.execute("UPDATE vfs_nodes SET mtime = %s WHERE id = %s", (base + timedelta(days=days), entry.id))
+    await age(client, conn, "b.md", "c.md", "a.md")
     out = await run_tool(Glob, deps, pattern="*.md")
     assert out == "/workspace/notes.md\n/workspace/a.md\n/workspace/c.md\n/workspace/b.md"  # notes.md is from now
 
@@ -187,8 +194,29 @@ async def test_unreadable_files_are_left_out(client: VFSClient, private_view: VF
 def test_bad_settings_fail_at_construction() -> None:
     with pytest.raises(ValueError, match="glob limit"):
         GlobSettings(limit=-1)
+    with pytest.raises(ValueError, match="glob limit"):
+        GlobSettings(limit=MAX_GLOB_LIMIT + 1)
+    for bad in (1.5, True):
+        with pytest.raises(TypeError, match="glob limit must be an int"):
+            GlobSettings(limit=bad)  # pyright: ignore[reportArgumentType]
     with pytest.raises(GlobError, match="error parsing glob 'a\\['"):
         GlobSettings(excludes=("a[",))
+
+
+@pytest.mark.parametrize(
+    ("path", "message"), [("missing", "error parsing glob 'a['"), ("/nope", "No such directory: /nope")]
+)
+async def test_error_order(deps: Deps, path: str, message: str) -> None:
+    """A bad pattern is reported before a bad path inside the view; a path outside it is refused first."""
+    assert (await retry_message(Glob, deps, pattern="a[", path=path)).startswith(message)
+
+
+async def test_internal_error_names_only_the_visible_path(deps: Deps, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def broken(*args: object, **kwargs: object) -> GlobResult:
+        raise VFSError("EIO", "/workspace", "database error")
+
+    monkeypatch.setattr(deps.vfs, "glob", broken)
+    assert await retry_message(Glob, deps, pattern="*") == "Internal error reading /workspace"
 
 
 async def test_pattern_across_mount_points_is_a_retry(deps: Deps) -> None:
