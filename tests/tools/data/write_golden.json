@@ -1,0 +1,240 @@
+[
+ {
+  "name": "new",
+  "old": null,
+  "content": "a\nb\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": false,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -0,0 +1,2 @@\n+a\n+b\n",
+   "additions": 2,
+   "deletions": 0
+  },
+  "written": "YQpiCg=="
+ },
+ {
+  "name": "overwrite",
+  "old": "YQpiCg==",
+  "content": "a\nc\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "YQpjCg=="
+ },
+ {
+  "name": "bom_kept",
+  "old": "77u/b2xk",
+  "content": "new",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "77u/bmV3"
+ },
+ {
+  "name": "bom_in_content",
+  "old": null,
+  "content": "\ufeffx\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": false,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -0,0 +1 @@\n+x\n",
+   "additions": 1,
+   "deletions": 0
+  },
+  "written": "77u/eAo="
+ },
+ {
+  "name": "bom_both",
+  "old": "77u/b2xkCg==",
+  "content": "\ufeffnew\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-old\n+new\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "77u/bmV3Cg=="
+ },
+ {
+  "name": "no_final_newline",
+  "old": "eA==",
+  "content": "y",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-x\n\\ No newline at end of file\n+y\n\\ No newline at end of file\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "eQ=="
+ },
+ {
+  "name": "add_final_newline",
+  "old": "eA==",
+  "content": "x\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-x\n\\ No newline at end of file\n+x\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "eAo="
+ },
+ {
+  "name": "indented",
+  "old": "ICAgIGEgPSAxCiAgICBiID0gMgo=",
+  "content": "    a = 1\n    b = 3\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n a = 1\n-b = 2\n+b = 3\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "ICAgIGEgPSAxCiAgICBiID0gMwo="
+ },
+ {
+  "name": "crlf",
+  "old": "b25lDQp0d28NCg==",
+  "content": "one\r\nTWO\r\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n one\r\n-two\r\n+TWO\r\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "b25lDQpUV08NCg=="
+ },
+ {
+  "name": "non_utf8",
+  "old": "Y2Fm6Qo=",
+  "content": "cafe\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-caf\ufffd\n+cafe\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "Y2FmZQo="
+ },
+ {
+  "name": "empty_to_empty",
+  "old": "",
+  "content": "",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n",
+   "additions": 0,
+   "deletions": 0
+  },
+  "written": ""
+ },
+ {
+  "name": "unchanged",
+  "old": "c2FtZQo=",
+  "content": "same\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n",
+   "additions": 0,
+   "deletions": 0
+  },
+  "written": "c2FtZQo="
+ },
+ {
+  "name": "form_feed",
+  "old": "YQxiCmMK",
+  "content": "a\fb\nd\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n a\fb\n-c\n+d\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "YQxiCmQK"
+ },
+ {
+  "name": "unicode",
+  "old": "aMOpbGxvCg==",
+  "content": "hallo \ud83c\udf0d\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-h\u00e9llo\n+hallo \ud83c\udf0d\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "aGFsbG8g8J+MjQo="
+ },
+ {
+  "name": "truncate",
+  "old": "YQpiCmMK",
+  "content": "",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,3 +0,0 @@\n-a\n-b\n-c\n",
+   "additions": 0,
+   "deletions": 3
+  },
+  "written": ""
+ },
+ {
+  "name": "headers_lookalike",
+  "old": "eAo=",
+  "content": "+++y\n--- z\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1,2 @@\n-x\n++++y\n+--- z\n",
+   "additions": 2,
+   "deletions": 1
+  },
+  "written": "KysreQotLS0gego="
+ },
+ {
+  "name": "multi_hunk",
+  "old": "bGluZSAwCmxpbmUgMQpsaW5lIDIKbGluZSAzCmxpbmUgNApsaW5lIDUKbGluZSA2CmxpbmUgNwpsaW5lIDgKbGluZSA5CmxpbmUgMTAKbGluZSAxMQpsaW5lIDEyCmxpbmUgMTMKbGluZSAxNApsaW5lIDE1CmxpbmUgMTYKbGluZSAxNwpsaW5lIDE4CmxpbmUgMTkKbGluZSAyMApsaW5lIDIxCmxpbmUgMjIKbGluZSAyMwpsaW5lIDI0CmxpbmUgMjUKbGluZSAyNgpsaW5lIDI3CmxpbmUgMjgKbGluZSAyOQpsaW5lIDMwCmxpbmUgMzEKbGluZSAzMgpsaW5lIDMzCmxpbmUgMzQKbGluZSAzNQpsaW5lIDM2CmxpbmUgMzcKbGluZSAzOApsaW5lIDM5Cg==",
+  "content": "line 0\nline 1\nline 2\nLINE 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\nline 25\nline 26\nline 27\nline 28\nline 29\nLINE 30\nline 31\nline 32\nline 33\nline 34\nline 35\nline 36\nline 37\nline 38\nline 39\ntail\n",
+  "result": "Wrote file successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "exists": true,
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,7 +1,7 @@\n line 0\n line 1\n line 2\n-line 3\n+LINE 3\n line 4\n line 5\n line 6\n@@ -28,7 +28,7 @@\n line 27\n line 28\n line 29\n-line 30\n+LINE 30\n line 31\n line 32\n line 33\n@@ -38,3 +38,4 @@\n line 37\n line 38\n line 39\n+tail\n",
+   "additions": 3,
+   "deletions": 2
+  },
+  "written": "bGluZSAwCmxpbmUgMQpsaW5lIDIKTElORSAzCmxpbmUgNApsaW5lIDUKbGluZSA2CmxpbmUgNwpsaW5lIDgKbGluZSA5CmxpbmUgMTAKbGluZSAxMQpsaW5lIDEyCmxpbmUgMTMKbGluZSAxNApsaW5lIDE1CmxpbmUgMTYKbGluZSAxNwpsaW5lIDE4CmxpbmUgMTkKbGluZSAyMApsaW5lIDIxCmxpbmUgMjIKbGluZSAyMwpsaW5lIDI0CmxpbmUgMjUKbGluZSAyNgpsaW5lIDI3CmxpbmUgMjgKbGluZSAyOQpMSU5FIDMwCmxpbmUgMzEKbGluZSAzMgpsaW5lIDMzCmxpbmUgMzQKbGluZSAzNQpsaW5lIDM2CmxpbmUgMzcKbGluZSAzOApsaW5lIDM5CnRhaWwK"
+ }
+]
