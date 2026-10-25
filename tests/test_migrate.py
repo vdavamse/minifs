@@ -199,13 +199,14 @@ def test_migrations_need_no_superuser(pg_server: PgServer) -> None:
                     assert await migrate(conn)
                     cur = await conn.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
                     assert await cur.fetchone() == (False,)
-                    await conn.execute("SELECT vfs_mkdir_p(ARRAY['tasks', 'new'])")
-                    cur = await conn.execute("SELECT id FROM vfs_resolve(ARRAY['tasks', 'new'])")
+                    await conn.execute("SELECT * FROM vfs_mkdir_p(ARRAY['tasks', 'new'])")
+                    cur = await conn.execute("SELECT id FROM vfs_lookup(ARRAY['tasks', 'new'])")
                     row = await cur.fetchone()
                     assert row is not None
                     # A directory move takes the ancestor-walk locks; unlink takes FOR UPDATE.
-                    await conn.execute("SELECT vfs_rename(%s, NULL, 'new')", (row[0],))
-                    await conn.execute("SELECT vfs_unlink(%s)", (row[0],))
+                    for call in ("vfs_rename(%s, NULL, 'new')", "vfs_unlink(%s)"):
+                        cur = await conn.execute(f"SELECT err FROM {call}".encode(), (row[0],))
+                        assert await cur.fetchone() == (None,)
                     cur = await conn.execute("SELECT name FROM vfs_readdir(NULL)")
                     assert await cur.fetchall() == [("tasks",)]
 

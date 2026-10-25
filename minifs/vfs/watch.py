@@ -36,6 +36,7 @@ from psycopg import AsyncConnection, sql
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import ConnectionFactory
+from minifs.vfs.core import VFSError
 
 logger = logging.getLogger(__name__)
 
@@ -211,9 +212,11 @@ class PathWatch(Subscription):
 
     async def _open(self) -> None:
         async with self._watcher._query() as conn:  # pyright: ignore[reportPrivateUsage]
-            cur = await conn.execute("SELECT id, kind FROM vfs_resolve(%s)", (self._segments,))
+            cur = await conn.execute("SELECT id, kind, err, err_detail FROM vfs_lookup(%s)", (self._segments,))
             row = await cur.fetchone()
         assert row is not None
+        if row[2] is not None:
+            raise VFSError(row[2], "/" + "/".join(self._segments), detail=row[3] or "")
         self.node, self.kind = row[0], row[1]
         self._resolved = True
         self._events = deque(e for e in self._events if self.matches(e))
@@ -375,8 +378,7 @@ class Watcher:
         Subscribes before resolving the path, so a change committed after this returns is delivered, or covered by
         a later ``rescan`` if the connection drops. A change committed just before the call may be delivered too,
         if its notification was still on its way: events err towards repeating a change, never towards missing one.
-        Raises the psycopg error from ``vfs_resolve`` (``errno_name`` gives ENOENT or ENOTDIR) if the path
-        doesn't resolve.
+        Raises ``VFSError`` ENOENT or ENOTDIR if the path doesn't resolve.
         """
         watch = self._add(PathWatch(self, [s for s in path.split("/") if s], self._maxsize))
         try:

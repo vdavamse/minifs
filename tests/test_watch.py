@@ -14,8 +14,9 @@ from psycopg import AsyncConnection
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 
+from minifs.vfs.core import VFSError
 from minifs.vfs.watch import RESCAN, ConnectionFactory, Event, Subscription, Watcher
-from tests.test_tree import create, mkdir_p, raises_errno, rename, unlink
+from tests.test_tree import create, mkdir_p, rename, unlink
 
 
 def factory(db: str) -> ConnectionFactory:
@@ -148,8 +149,8 @@ async def test_compaction_emits_nothing(conn: AsyncConnection, listener: AsyncCo
     for _ in range(5):
         await append(conn, f, 10)
     await payloads(listener, 6)
-    cur = await conn.execute("SELECT vfs_compact(%s)", (f,))
-    assert await cur.fetchone() == (4,)  # five extents merged into one
+    cur = await conn.execute("SELECT removed, err FROM vfs_compact(%s)", (f,))
+    assert await cur.fetchone() == (4, None)  # five extents merged into one
     marker = await create(conn, None, "marker")
     [event] = await payloads(listener, 1)
     assert event["id"] == str(marker)
@@ -254,12 +255,11 @@ async def test_watch_follows_its_node_through_a_rename(conn: AsyncConnection, wa
 
 async def test_watch_missing_path(conn: AsyncConnection, watcher: Watcher) -> None:
     await create(conn, None, "f")
-    with raises_errno("ENOENT"):
-        async with watcher.watch("missing"):
-            pass
-    with raises_errno("ENOTDIR"):
-        async with watcher.watch("f/x"):
-            pass
+    for path, errno in [("missing", "ENOENT"), ("f/x", "ENOTDIR")]:
+        with pytest.raises(VFSError) as info:
+            async with watcher.watch(path):
+                pass
+        assert (info.value.errno, info.value.path, info.value.db_error) == (errno, "/" + path, None)
 
 
 async def test_terminated_listener_reconnects_with_rescan(conn: AsyncConnection, db: str) -> None:

@@ -1,8 +1,10 @@
-"""Errors raised by the minifs SQL functions, and by the schema's constraints.
+"""Errors reported by the minifs SQL functions, and by the schema's constraints.
 
-Each function raises SQLSTATE ``MFnnn``, where ``nnn`` is the Linux errno number, with the errno name as the
-message and the context in DETAIL (see ``vfs_raise`` in migration 003). The codes don't depend on the client
-platform's errno numbering.
+The functions return the expected outcomes (``OUTCOMES``: a missing path, a taken name, a lost compare-and-swap,
+...) in their ``err`` and ``err_detail`` columns (migration 009), and raise the faults (EINVAL, ENAMETOOLONG) as
+SQLSTATE ``MFnnn``, where ``nnn`` is the Linux errno number, with the errno name as the message and the context in
+DETAIL (see ``vfs_raise`` in migration 003). The codes don't depend on the client platform's errno numbering;
+every errno has one, so ``vfs_raise`` can raise any of them.
 
 The constraints on ``vfs_nodes`` and ``vfs_extents`` are the backstop for raw SQL and for the rare races the
 functions don't pre-check; their violations map to errnos too, on a best-effort basis: a foreign-key error can't
@@ -24,6 +26,9 @@ SQLSTATE_BY_ERRNO: dict[str, str] = {
     "ENOTEMPTY": "MF039",
     "ESTALE": "MF116",
 }
+
+# The errnos the functions return rather than raise.
+OUTCOMES: frozenset[str] = frozenset({"ENOENT", "ENOTDIR", "EISDIR", "EEXIST", "ESTALE", "ENOTEMPTY"})
 
 ERRNO_BY_SQLSTATE: dict[str, str] = {code: name for name, code in SQLSTATE_BY_ERRNO.items()}
 

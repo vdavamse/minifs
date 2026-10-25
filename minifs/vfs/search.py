@@ -22,6 +22,7 @@ from uuid import UUID
 from psycopg import AsyncConnection
 
 from minifs.vfs import regex
+from minifs.vfs.core import VFSError
 from minifs.vfs.glob import compile_excludes, compile_glob
 
 DEFAULT_LIMIT = 100  # hits, as ladderframe's Grep
@@ -118,12 +119,13 @@ async def find_scope(
     walks them without the files and directories ``excludes`` match (``minifs.vfs.glob.compile_excludes``), each
     reported as ``prefix`` plus its path relative to ``root``. Reads only ``vfs_nodes``. At most ``max_files + 1``
     files are listed, so ``check_scope`` can tell the cap was passed. ``.git`` is never walked. Raises GlobError
-    for a bad ``include`` or exclude."""
+    for a bad ``include`` or exclude, ``VFSError`` ENOENT / ENOTDIR (for ``prefix``) for a bad ``root``."""
     plan = compile_glob(include or _ALL_FILES)
     ex = compile_excludes(excludes)
     cur = await conn.execute(
-        "SELECT coalesce(array_agg(id ORDER BY path), '{}'), coalesce(array_agg(%s || path ORDER BY path), '{}'),"
-        " coalesce(sum(size), 0)"
+        "SELECT coalesce(array_agg(id ORDER BY path) FILTER (WHERE err IS NULL), '{}'),"
+        " coalesce(array_agg(%s || path ORDER BY path) FILTER (WHERE err IS NULL), '{}'),"
+        " coalesce(sum(size), 0), min(err), min(err_detail)"
         " FROM vfs_glob(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             prefix,
@@ -140,7 +142,9 @@ async def find_scope(
     )
     row = await cur.fetchone()
     assert row is not None
-    ids, paths, size = row
+    ids, paths, size, err, detail = row
+    if err is not None:
+        raise VFSError(err, prefix.removesuffix("/") or "/", detail=detail or "")
     return Scope(tuple(ids), tuple(paths), int(size))
 
 

@@ -83,12 +83,14 @@ async def pread_lines_many(
     """vfs_pread_lines for each ``(first_line, max_lines, max_bytes)``, in one statement (so one snapshot)."""
     firsts, maxes, caps = zip(*queries, strict=True)
     cur = await conn.execute(
-        "SELECT r.size, r.generation, r.lines, r.first_line, r.byte_offset, r.data"
+        "SELECT r.size, r.generation, r.lines, r.first_line, r.byte_offset, r.data, r.err"
         " FROM unnest(%s::bigint[], %s::int[], %s::int[]) WITH ORDINALITY AS q(f, m, b, i),"
         " vfs_pread_lines(%s, q.f, q.m, q.b) r ORDER BY q.i",
         (list(firsts), list(maxes), list(caps), node),
     )
-    return [(s, g, n, fl, o, bytes(d)) for s, g, n, fl, o, d in await cur.fetchall()]
+    rows = await cur.fetchall()
+    assert all(row[6] is None for row in rows)
+    return [(s, g, n, fl, o, bytes(d)) for s, g, n, fl, o, d, _ in rows]
 
 
 async def check_reads(conn: AsyncConnection, node: UUID, content: bytes, rng: random.Random) -> None:
@@ -285,20 +287,20 @@ async def test_append_to_a_partial_line_rewrites_only_the_last_extent(conn: Asyn
 async def test_pread_lines_examples(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f", b"ab\ncd\n\nlast")
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 2, 2, 100)", (f,))
-    assert await cur.fetchall() == [(11, 0, 4, 2, 3, b"cd\n\n")]
+    assert await cur.fetchall() == [(11, 0, 4, 2, 3, b"cd\n\n", None, None)]
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 4, 10, 100)", (f,))
-    assert await cur.fetchall() == [(11, 0, 4, 4, 7, b"last")]
+    assert await cur.fetchall() == [(11, 0, 4, 4, 7, b"last", None, None)]
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 1, 10, 4)", (f,))  # the byte cap cuts a line
-    assert await cur.fetchall() == [(11, 0, 4, 1, 0, b"ab\nc")]
+    assert await cur.fetchall() == [(11, 0, 4, 1, 0, b"ab\nc", None, None)]
     # Past the end: no bytes, and the line count for the message.
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 5, 10, 100)", (f,))
-    assert await cur.fetchall() == [(11, 0, 4, 5, 11, b"")]
+    assert await cur.fetchall() == [(11, 0, 4, 5, 11, b"", None, None)]
 
 
 async def test_pread_lines_of_an_empty_file(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 1, 10, 100)", (f,))
-    assert await cur.fetchall() == [(0, 0, 0, 1, 0, b"")]
+    assert await cur.fetchall() == [(0, 0, 0, 1, 0, b"", None, None)]
 
 
 async def test_pread_lines_across_many_extents(conn: AsyncConnection) -> None:
@@ -397,15 +399,17 @@ async def test_migration_cuts_existing_content(empty_db: str) -> None:
     before = [m for m in migrations if m.version < 7]
     async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
         await migrate(conn, before)
-        # Content written the 004 way: one extent per append, ending anywhere.
-        a = await create_file(conn, "a")
+        # Content written the 004 way: one extent per append, ending anywhere. (The functions as they were then,
+        # before migration 009 gave them err columns.)
+        a = (await one(conn, "SELECT id FROM vfs_create(NULL, 'a', 'file')"))[0]
         for part in [b"ab", b"c\nd", b"", b"e\n", b"\n", b"tail"]:
-            await append(conn, a, part)
-        b = await create_file(conn, "b", b"old")
-        await write(conn, b, b"x\n" * 40_000)  # generation 1, one extent of 80 KB
-        empty = await create_file(conn, "empty")
+            await conn.execute("SELECT vfs_append(%s, %s)", (a, part))
+        b = (await one(conn, "SELECT id FROM vfs_create(NULL, 'b', 'file', 'old')"))[0]
+        await conn.execute("SELECT * FROM vfs_write(%s, %s)", (b, b"x\n" * 40_000))  # generation 1, one extent of 80 KB
+        empty = (await one(conn, "SELECT id FROM vfs_create(NULL, 'empty', 'file')"))[0]
         d = await one(conn, "SELECT id FROM vfs_create(NULL, 'd', 'dir')")
         await migrate(conn, migrations)
+        assert isinstance(a, UUID) and isinstance(b, UUID) and isinstance(empty, UUID)
         await check_layout(conn, a, b"abc\nde\n\ntail")
         await check_layout(conn, b, b"x\n" * 40_000)
         assert len(await extent_rows(conn, b)) == 2

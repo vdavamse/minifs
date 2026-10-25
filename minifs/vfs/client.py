@@ -2,17 +2,19 @@
 
 Every operation takes absolute paths, normalises them (``minifs.vfs.core.normalize``), and runs as one statement
 in its own transaction on a connection from the write pool, retried on a serialization failure or a deadlock.
-Errors from the SQL layer come back as ``VFSError`` with the errno the function raised; any other database error
-propagates unchanged.
+Errors from the SQL layer come back as ``VFSError`` with the errno the function reported: an outcome (ENOENT,
+EEXIST, ESTALE, ...) that it returned in its ``err`` column, or a fault (EINVAL, ENAMETOOLONG) that it raised
+(migration 009). Any other database error propagates unchanged.
 
-Path resolution: a statement resolves its own paths on the server (``vfs_resolve`` in a subquery), so an
-operation costs one round trip. A ``DirCache`` (the directory-entry cache of #19) saves the walk: when every
-component of a path is cached, the statement checks the cached chain instead, every ``(parent, name) -> id`` link
-in one index lookup each, and falls back to ``vfs_resolve`` when any link no longer holds. So a stale cache costs
-a slower resolution, never the wrong node. Each statement returns the id it resolved: the client stores what it
-learns (listings, creates), evicts what it renames or removes, and evicts a cached id that turned out stale.
-Keeping the cache fresh against other clients (NOTIFY, TTL) is the cache's job. Without a cache, every path is
-resolved on the server.
+Path resolution: a statement resolves its own paths on the server (``vfs_lookup`` in a subquery), so an
+operation costs one round trip. The function is called only if every lookup succeeded, so it never sees the NULL
+id of a failed one, which for a directory would mean the root. A ``DirCache`` (the directory-entry cache of #19)
+saves the walk: when every component of a path is cached, the statement checks the cached chain instead, every
+``(parent, name) -> id`` link in one index lookup each, and falls back to ``vfs_lookup`` when any link no longer
+holds. So a stale cache costs a slower resolution, never the wrong node. Each statement returns the id it
+resolved: the client stores what it learns (listings, creates), evicts what it renames or removes, and evicts a
+cached id that turned out stale. Keeping the cache fresh against other clients (NOTIFY, TTL) is the cache's job.
+Without a cache, every path is resolved on the server.
 """
 
 from __future__ import annotations
@@ -51,13 +53,18 @@ _MAX_TIMEOUT = _MAX_INT / 1000  # statement_timeout is an int of milliseconds
 _log = logging.getLogger(__name__)
 _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache links
 
-_RESOLVE = "(SELECT id FROM vfs_resolve(%s))"
-# The last cached id if every cached link (id, parent, name) still holds, else the server's resolution.
-_RESOLVE_CACHED = """(SELECT CASE WHEN v.ok THEN v.last ELSE (SELECT id FROM vfs_resolve(%s)) END
+# A node argument is a FROM item of one row (id, err, err_detail): the node's id, or the errno of a failed lookup.
+_LOOKUP = "(SELECT id, err, err_detail FROM vfs_lookup(%s))"
+# The last cached id if every cached link (id, parent, name) still holds, else the server's lookup.
+_LOOKUP_CACHED = """(SELECT l.id, l.err, l.err_detail
    FROM (SELECT bool_and(n.id IS NOT NULL) AS ok, (array_agg(c.id ORDER BY c.i DESC))[1] AS last
            FROM unnest(%s::uuid[], %s::uuid[], %s::text[]) WITH ORDINALITY AS c(id, parent, name, i)
            LEFT JOIN vfs_nodes n
-                  ON n.id = c.id AND n.parent_id IS NOT DISTINCT FROM c.parent AND n.name = c.name) v)"""
+                  ON n.id = c.id AND n.parent_id IS NOT DISTINCT FROM c.parent AND n.name = c.name) v
+  CROSS JOIN LATERAL (SELECT v.last AS id, NULL::text AS err, NULL::text AS err_detail WHERE v.ok
+                      UNION ALL
+                      SELECT r.id, r.err, r.err_detail FROM vfs_lookup(%s) r WHERE NOT v.ok) l)"""
+_NULL = "(SELECT NULL::uuid AS id, NULL::text AS err, NULL::text AS err_detail)"
 
 
 class DirCache(Protocol):
@@ -75,7 +82,8 @@ type _Link = tuple[UUID, UUID | None, str]  # a cached (id, parent id, name)
 
 
 class _Ref:
-    """A node argument of a statement: SQL that yields the node's id (NULL for the root), and its parameters.
+    """A node argument of a statement: a FROM item that yields the node's id (NULL for the root) or a lookup error
+    (``_LOOKUP``), and its parameters.
     ``links`` is the cached ``(id, parent id, name)`` of every component, if the cache held the whole path;
     ``cached`` the last id."""
 
@@ -86,7 +94,7 @@ class _Ref:
         self.cached = self.links[-1][0] if self.links else None
 
 
-_ROOT = _Ref("%s::uuid", [None])
+_ROOT = _Ref(_NULL, [])
 
 
 class VFSClient:
@@ -118,9 +126,14 @@ class VFSClient:
             return Entry("/", None, "dir", 0, None)
         ref = self._ref(segments)
         rows = await self._run(
-            path, f"SELECT id, kind, size, mtime, generation FROM vfs_nodes WHERE id = {ref.sql}", ref.params, [ref]
+            path,
+            f"SELECT r.id, r.err, r.err_detail, n.kind, n.size, n.mtime, n.generation"
+            f" FROM {ref.sql} r LEFT JOIN LATERAL (SELECT * FROM vfs_nodes n WHERE n.id = r.id) n ON true",
+            ref.params,
+            [ref],
         )
-        node, kind, size, mtime, generation = rows[0]
+        node, err, detail, kind, size, mtime, generation = rows[0]
+        await self._outcome(path, [ref], (err, detail))
         self._checked(ref, node)
         return Entry(join(*segments), node, kind, size, mtime, generation)
 
@@ -128,17 +141,11 @@ class VFSClient:
         """The entries of directory ``path``, in byte order of name. ENOENT, ENOTDIR."""
         segments = split(path)
         ref = self._dir_ref(segments)
-        rows = await self._run(
-            path,
-            f"SELECT r.id, d.id, d.name, d.kind, d.size, d.mtime FROM (SELECT {ref.sql} AS id) r"
-            " LEFT JOIN LATERAL vfs_readdir(r.id) d ON true",
-            ref.params,
-            [ref],
-        )
+        rows = await self._call(path, [ref], "vfs_readdir({0})", [])
         parent = rows[0][0]
         self._checked(ref, parent)
         entries: list[Entry] = []
-        for _, node, name, kind, size, mtime in rows:
+        for node, name, kind, size, mtime in (row[3:8] for row in rows):
             if name is None:  # an empty directory
                 continue
             if self.cache is not None:
@@ -158,16 +165,10 @@ class VFSClient:
         if not -_MAX_BIGINT - 1 <= offset <= _MAX_BIGINT:
             raise VFSError("EINVAL", join(*segments), f"invalid offset {offset}")
         ref = self._ref(segments)
-        rows = await self._run(
-            path,
-            f"SELECT r.id, p.size, p.generation, p.byte_offset, p.data"
-            f" FROM (SELECT {ref.sql} AS id) r, vfs_pread(r.id, %s::bigint, %s::int) p",
-            [*ref.params, offset, limit],
-            [ref],
-        )
-        node, size, generation, start = rows[0][:4]
+        rows = await self._call(path, [ref], "vfs_pread({0}, %s::bigint, %s::int)", [offset, limit])
+        node, size, generation, start = rows[0][0], *rows[0][3:6]
         self._checked(ref, node)
-        content = b"".join(row[4] for row in rows if row[4] is not None)
+        content = b"".join(row[6] for row in rows if row[6] is not None)
         end = start + len(content)
         return ReadResult(node, content, start, end, size, generation, end >= size)
 
@@ -190,14 +191,11 @@ class VFSClient:
         if not (0 <= max_lines <= _MAX_INT and 0 <= max_bytes <= _MAX_INT):
             raise VFSError("EINVAL", join(*segments), f"invalid limits {max_lines} lines, {max_bytes} bytes")
         ref = self._ref(segments)
-        rows = await self._run(
-            path,
-            f"SELECT r.id, p.size, p.generation, p.lines, p.byte_offset, p.data"
-            f" FROM (SELECT {ref.sql} AS id) r, vfs_pread_lines(r.id, %s::bigint, %s::int, %s::int) p",
-            [*ref.params, first_line, max_lines, max_bytes],
-            [ref],
+        rows = await self._call(
+            path, [ref], "vfs_pread_lines({0}, %s::bigint, %s::int, %s::int)", [first_line, max_lines, max_bytes]
         )
-        node, size, generation, lines, start, content = rows[0]
+        node = rows[0][0]
+        size, generation, lines, _, start, content = rows[0][3:9]
         self._checked(ref, node)
         end = start + len(content)
         return LineReadResult(node, content, first_line, start, end, size, generation, lines, end >= size)
@@ -222,27 +220,27 @@ class VFSClient:
         globbing.compile_excludes(excludes)
         ref = self._dir_ref(segments)
 
-        async def attempt() -> tuple[UUID | None, list[globbing.GlobMatch]]:
+        async def attempt() -> tuple[_Error, UUID | None, list[globbing.GlobMatch]]:
             async with self.search_pool.connection() as conn, conn.transaction():
                 await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # one snapshot for both
                 root: UUID | None = None
                 if segments:
-                    query = f"SELECT id, kind FROM vfs_nodes WHERE id = {ref.sql}"
-                    cur = await conn.execute(cast(Any, query), ref.params)
-                    row = await cur.fetchone()
-                    assert row is not None  # vfs_resolve raised otherwise
-                    if row[1] != "dir":
-                        raise VFSError("ENOTDIR", join(*segments))
-                    root = row[0]
+                    node, error, kind, _ = await _lookup(conn, ref)
+                    if error[0] is None and kind != "dir":
+                        error = ("ENOTDIR", "")
+                    if error[0] is not None:
+                        return error, None, []  # committed, not rolled back: nothing failed on the server
+                    root = node
                 matches = await globbing.glob(conn, root, pattern, excludes=excludes, hidden=hidden, limit=limit)
-                return root, matches
+                return (None, None), root, matches
 
         try:
-            root, matches = await _mapped(path, attempt)
+            error, root, matches = await _mapped(path, attempt)
         except VFSError as e:
             if e.errno in ("ENOENT", "ENOTDIR"):
                 await self._await_eviction([ref])
             raise
+        await self._outcome(path, [ref], error)
         self._checked(ref, root)
         return [Entry(join(*segments, m.path), m.id, "file", m.size, m.mtime) for m in matches]
 
@@ -288,7 +286,7 @@ class VFSClient:
         globbing.compile_excludes(excludes)
         ref = self._dir_ref(segments)
 
-        async def attempt() -> tuple[UUID | None, searching.GrepResult]:
+        async def attempt() -> tuple[_Error, UUID | None, searching.GrepResult | None]:
             async with self.search_pool.connection() as conn, conn.transaction():
                 await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # one snapshot for both
                 await searching.set_timeout(conn, timeout)
@@ -296,13 +294,12 @@ class VFSClient:
                     node: UUID | None = None
                     scope: searching.Scope | None = None
                     if segments:
-                        query = f"SELECT id, kind, size FROM vfs_nodes WHERE id = {ref.sql}"
-                        cur = await conn.execute(cast(Any, query), ref.params)
-                        row = await cur.fetchone()
-                        assert row is not None  # vfs_resolve raised otherwise
-                        node = row[0]
-                        if row[1] == "file":
-                            scope = searching.Scope((row[0],), (join(*segments),), row[2])
+                        node, error, kind, size = await _lookup(conn, ref)
+                        if error[0] is not None:
+                            return error, None, None  # committed, not rolled back: nothing failed on the server
+                        if kind == "file":
+                            assert node is not None and size is not None
+                            scope = searching.Scope((node,), (join(*segments),), size)
                     if scope is None:
                         scope = await searching.find_scope(
                             conn,
@@ -319,14 +316,16 @@ class VFSClient:
                     )
                 except psycopg.errors.QueryCanceled:
                     raise searching.timed_out() from None
-                return node, result
+                return (None, None), node, result
 
         try:
-            node, result = await _mapped(path, attempt)
+            error, node, result = await _mapped(path, attempt)
         except VFSError as e:
             if e.errno in ("ENOENT", "ENOTDIR"):
                 await self._await_eviction([ref])
             raise
+        await self._outcome(path, [ref], error)
+        assert result is not None
         self._checked(ref, node)
         return result
 
@@ -346,8 +345,10 @@ class VFSClient:
         """Like ``mkdir -p``: creates every missing directory of ``path`` and returns the last one's id (None for
         the root). ENOTDIR if a non-final component is a file, EEXIST if the final one is."""
         segments = split(path)
-        rows = await self._run(path, "SELECT vfs_mkdir_p(%s)", [list(segments)])
-        return rows[0][0]
+        rows = await self._run(path, "SELECT id, err, err_detail FROM vfs_mkdir_p(%s)", [list(segments)])
+        node, err, detail = rows[0]
+        await self._outcome(path, [], (err, detail))
+        return node
 
     async def append(self, path: str, data: bytes) -> int:
         """Appends ``data`` to file ``path``, like write(2) with O_APPEND, and returns the offset it landed at.
@@ -356,14 +357,9 @@ class VFSClient:
         if not segments:
             raise VFSError("EISDIR", "/")
         ref = self._ref(segments)
-        rows = await self._run(
-            path,
-            f"WITH r AS (SELECT {ref.sql} AS id) SELECT r.id, vfs_append(r.id, %s) FROM r",
-            [*ref.params, data],
-            [ref],
-        )
+        rows = await self._call(path, [ref], "vfs_append({0}, %s)", [data])
         self._checked(ref, rows[0][0])
-        return rows[0][1]
+        return rows[0][3]
 
     async def write(self, path: str, data: bytes, *, expect: FileVersion | None = None) -> FileVersion:
         """Replaces the content of file ``path`` with ``data`` as a new generation, like open(O_TRUNC) + write(2).
@@ -376,22 +372,17 @@ class VFSClient:
             raise VFSError("EISDIR", "/")
         if expect is None:
             ref = self._ref(segments)
-            rows = await self._run(
-                path,
-                f"SELECT r.id, w.generation, w.size FROM (SELECT {ref.sql} AS id) r, vfs_write(r.id, %s) w",
-                [*ref.params, data],
-                [ref],
-            )
+            rows = await self._call(path, [ref], "vfs_write({0}, %s)", [data])
             self._checked(ref, rows[0][0])
-            return FileVersion(*rows[0])
+            return FileVersion(rows[0][0], *rows[0][3:5])
         parent = self._dir_ref(segments[:-1])
-        rows = await self._run(
+        rows = await self._call(
             path,
-            f"SELECT generation, size FROM vfs_write(%s, %s, %s, %s, {parent.sql}, %s)",
-            [expect.id, data, expect.generation, expect.size, *parent.params, segments[-1]],
             [parent],
+            "vfs_write(%s, %s, %s, %s, {0}, %s)",
+            [expect.id, data, expect.generation, expect.size, segments[-1]],
         )
-        return FileVersion(expect.id, *rows[0])
+        return FileVersion(expect.id, *rows[0][3:5])
 
     async def rename(self, src: str, dst: str) -> None:
         """Moves ``src`` to ``dst``, like rename(2) with RENAME_NOREPLACE. ENOENT, ENOTDIR (on ``src`` or ``dst``,
@@ -413,9 +404,7 @@ class VFSClient:
         if not segments:
             raise VFSError("EINVAL", "/", "cannot remove the root")
         ref = self._ref(segments)
-        rows = await self._run(
-            path, f"WITH r AS (SELECT {ref.sql} AS id) SELECT r.id, vfs_unlink(r.id) FROM r", ref.params, [ref]
-        )
+        rows = await self._call(path, [ref], "vfs_unlink({0})", [])
         self._evict(ref, rows[0][0])
 
     async def compact(self, path: str, target: int = 65536) -> int:
@@ -427,14 +416,9 @@ class VFSClient:
         if not 0 < target <= _MAX_INT:
             raise VFSError("EINVAL", join(*segments), f"invalid target size {target}")
         ref = self._ref(segments)
-        rows = await self._run(
-            path,
-            f"WITH r AS (SELECT {ref.sql} AS id) SELECT r.id, vfs_compact(r.id, %s::int) FROM r",
-            [*ref.params, target],
-            [ref],
-        )
+        rows = await self._call(path, [ref], "vfs_compact({0}, %s::int)", [target])
         self._checked(ref, rows[0][0])
-        return rows[0][1]
+        return rows[0][3]
 
     # Internals
 
@@ -444,13 +428,7 @@ class VFSClient:
             raise VFSError("EEXIST", "/")
         parent = _Ref("vfs_mkdir_p(%s)", [list(segments[:-1])]) if parents else self._dir_ref(segments[:-1])
         try:
-            rows = await self._run(
-                path,
-                f"SELECT p.id, c.id, c.generation, c.size FROM (SELECT {parent.sql} AS id) p,"
-                " vfs_create(p.id, %s, %s, %s) c",
-                [*parent.params, segments[-1], kind, data],
-                [parent],
-            )
+            rows = await self._call(path, [parent], "vfs_create({0}, %s, %s, %s)", [segments[-1], kind, data])
         except VFSError as e:
             # vfs_mkdir_p reports a file at its last component, our parent, as EEXIST: for us it is ENOTDIR.
             if (
@@ -463,7 +441,7 @@ class VFSClient:
             raise
         parent_id = rows[0][0]
         self._checked(parent, parent_id)
-        version = FileVersion(*rows[0][1:])
+        version = FileVersion(*rows[0][3:6])
         if self.cache is not None:
             self.cache.store(parent_id, segments[-1], version.id, kind)
         return version
@@ -478,15 +456,20 @@ class VFSClient:
             raise VFSError("EINVAL", join(*src_segments), "a claim needs a source directory other than the root")
         node = self._ref(src_segments)
         parent = self._dir_ref(dst_segments[:-1])
-        expect = self._dir_ref(src_segments[:-1]) if claim else _Ref("NULL", [])
+        expect = self._dir_ref(src_segments[:-1]) if claim else _Ref(_NULL, [])  # NULL: no compare-and-swap
+        refs = [node, parent, expect]
         try:
+            # Raised errors too (a create that commits during the move raises EEXIST), so both get the same paths.
             rows = await self._run(
                 src,
-                f"WITH r AS (SELECT {node.sql} AS id)"
-                f" SELECT r.id, vfs_rename(r.id, {parent.sql}, %s, {expect.sql}) FROM r",
-                [*node.params, *parent.params, dst_segments[-1], *expect.params],
-                [node, parent, expect],
+                _gated(refs, "vfs_rename({0}, {1}, %s, {2})"),
+                [*node.params, *parent.params, *expect.params, dst_segments[-1]],
+                refs,
             )
+            if rows[0][-2] == "ESTALE":  # lost the compare-and-swap: someone else moved it first
+                self._evict(node, rows[0][0])
+                return False
+            await self._outcome(src, refs, *_lookup_errors(rows[0], len(refs)), (rows[0][-2], rows[0][-1]))
         except VFSError as e:
             if e.errno == "EEXIST":
                 raise e.at(join(*dst_segments)) from None
@@ -504,7 +487,7 @@ class VFSClient:
                 raise src_error from None
             raise e.at(join(*dst_segments)) from None
         self._evict(node, rows[0][0])
-        return rows[0][1]
+        return True
 
     async def _check_destination(self, segments: tuple[str, ...]) -> None:
         """Raises what a move to ``segments`` would: a missing or file parent directory, an invalid name."""
@@ -522,11 +505,11 @@ class VFSClient:
     def _ref(self, segments: tuple[str, ...]) -> _Ref:
         chain = self._cached_chain(segments)
         if chain is None:
-            return _Ref(_RESOLVE, [list(segments)])
+            return _Ref(_LOOKUP, [list(segments)])
         ids = [node for node, _ in chain]
         parents = [parent for _, parent in chain]
         links = list(zip(ids, parents, segments, strict=True))
-        return _Ref(_RESOLVE_CACHED, [list(segments), ids, parents, list(segments)], links)
+        return _Ref(_LOOKUP_CACHED, [ids, parents, list(segments), list(segments)], links)
 
     def _dir_ref(self, segments: tuple[str, ...]) -> _Ref:
         """Like ``_ref``, for a directory argument, where the root is NULL (and needs no subquery)."""
@@ -632,11 +615,32 @@ class VFSClient:
             self._checked(ref, resolved)
             self.cache.evict(resolved)
 
+    async def _call(
+        self, path: str, refs: Sequence[_Ref], call: str, params: Sequence[object]
+    ) -> list[tuple[Any, ...]]:
+        """Runs ``_gated(refs, call)`` with ``params`` (the call's own) and raises the error it returned, if any:
+        the first failed lookup's, else the call's. Returns the rows (see ``_gated``)."""
+        rows = await self._run(path, _gated(refs, call), [*(p for ref in refs for p in ref.params), *params], refs)
+        await self._outcome(path, refs, *_lookup_errors(rows[0], len(refs)), (rows[0][-2], rows[0][-1]))
+        return rows
+
+    async def _outcome(self, path: str, refs: Sequence[_Ref], *errors: _Error) -> None:
+        """Raises the first of ``errors``, the ``(err, err_detail)`` pairs a statement returned, as a ``VFSError``
+        for ``path``: the one place a returned outcome becomes an exception, with the same errno and detail a raised
+        one had (and no ``db_error``). ENOENT and ENOTDIR first evict the links of ``refs`` that went stale, as
+        ``_run`` does for raised errors, so a retry doesn't reuse them."""
+        for err, detail in errors:
+            if err is not None:
+                if err in ("ENOENT", "ENOTDIR"):
+                    await self._await_eviction(refs)
+                raise VFSError(err, normalize(path), detail=detail or "")
+
     async def _run(
         self, path: str, query: str, params: Sequence[object], refs: Sequence[_Ref] = ()
     ) -> list[tuple[Any, ...]]:
-        """Runs ``query`` in its own transaction, retrying serialization failures; maps SQL errors to VFSError.
-        A path that no longer resolves evicts the links of ``refs`` that went stale."""
+        """Runs ``query`` in its own transaction, retrying serialization failures; maps raised SQL errors (faults,
+        and the constraints' backstop) to VFSError. A path that no longer resolves evicts the links of ``refs``
+        that went stale. Returned errors are the caller's to check (``_outcome``)."""
 
         async def attempt() -> list[tuple[Any, ...]]:
             async with self.pool.connection() as conn, conn.transaction():
@@ -649,6 +653,45 @@ class VFSClient:
             if e.errno in ("ENOENT", "ENOTDIR"):
                 await self._await_eviction(refs)
             raise
+
+
+type _Error = tuple[str | None, str | None]  # a returned (err, err_detail); (None, None) for success
+
+
+def _gated(refs: Sequence[_Ref], call: str) -> str:
+    """A query that looks up ``refs`` (as ``r0``, ``r1``, ...) and runs ``call``, a set-returning function call over
+    their ids, only if every lookup succeeded. Each row has every ref's id, err and err_detail, then
+    the call's columns, ending with its err and err_detail; there is always at least one row, with the call's
+    columns NULL when it didn't run or returned no rows.
+
+    ``call`` names the ids ``{0}``, ``{1}``, ...: each is the ref's id through ``vfs_gate``. The call is in a
+    subquery whose WHERE refers only to the lookups, so the planner makes it a one-time filter, checked before the
+    call runs (OFFSET 0 keeps the subquery from being merged into the join). Were it ever not, ``vfs_gate`` would
+    raise EINVAL rather than pass on a failed lookup's NULL, which for a directory would mean the root."""
+    call = call.format(*(f"vfs_gate(r{i}.id, r{i}.err)" for i in range(len(refs))))
+    lookups = " CROSS JOIN ".join(f"{ref.sql} r{i}" for i, ref in enumerate(refs))
+    columns = "".join(f"r{i}.id, r{i}.err, r{i}.err_detail, " for i in range(len(refs)))
+    gate = " AND ".join(f"r{i}.err IS NULL" for i in range(len(refs)))
+    return (
+        f"SELECT {columns}f.* FROM {lookups} LEFT JOIN LATERAL (SELECT * FROM {call} WHERE {gate} OFFSET 0) f ON true"
+    )
+
+
+def _lookup_errors(row: Sequence[Any], count: int) -> list[_Error]:
+    """The lookup errors of the first ``count`` refs in a row of ``_gated``."""
+    return [(row[3 * i + 1], row[3 * i + 2]) for i in range(count)]
+
+
+async def _lookup(conn: AsyncConnection[Any], ref: _Ref) -> tuple[UUID | None, _Error, Kind | None, int | None]:
+    """The id, lookup error, kind and size of the node ``ref`` names, on ``conn``."""
+    query = (
+        f"SELECT r.id, r.err, r.err_detail, n.kind, n.size"
+        f" FROM {ref.sql} r LEFT JOIN LATERAL (SELECT * FROM vfs_nodes n WHERE n.id = r.id) n ON true"
+    )
+    cur = await conn.execute(cast(Any, query), ref.params)
+    row = await cur.fetchone()
+    assert row is not None
+    return row[0], (row[1], row[2]), row[3], row[4]
 
 
 async def _mapped[T](path: str, call: Callable[[], Awaitable[T]]) -> T:

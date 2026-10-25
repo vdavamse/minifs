@@ -1,4 +1,4 @@
-"""vfs_nodes and the tree operations: vfs_resolve, vfs_readdir, vfs_create, vfs_mkdir_p, vfs_rename, vfs_unlink."""
+"""vfs_nodes and the tree operations: vfs_lookup, vfs_readdir, vfs_create, vfs_mkdir_p, vfs_rename, vfs_unlink."""
 
 import asyncio
 import time
@@ -12,13 +12,43 @@ import psycopg
 import pytest
 from psycopg import AsyncConnection
 
-from minifs.db.errors import SQLSTATE_BY_ERRNO, errno_name
+from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO, errno_name
 
 Kind = str
 
 
+class Returned(Exception):
+    """An outcome a SQL function returned in its err column, raised by the helpers here."""
+
+    def __init__(self, errno: str, detail: str | None) -> None:
+        super().__init__(f"{errno}: {detail}")
+        self.errno = errno
+        self.detail = detail
+
+
+def check(err: object, detail: object) -> None:
+    """Raises ``Returned`` if a function returned an error."""
+    if err is not None:
+        assert isinstance(err, str) and (detail is None or isinstance(detail, str))
+        raise Returned(err, detail)
+
+
 @contextmanager
 def raises_errno(name: str) -> Generator[None]:
+    """Expects errno ``name`` from a SQL function: returned (``Returned``, from the helpers) for an outcome, raised by
+    the server for a fault, so every use also checks which group the errno is in."""
+    with pytest.raises((Returned, psycopg.Error)) as info:
+        yield
+    if name in OUTCOMES:
+        assert isinstance(info.value, Returned) and info.value.errno == name, info.value
+        assert info.value.detail
+    else:
+        assert isinstance(info.value, psycopg.Error) and errno_name(info.value) == name, info.value
+
+
+@contextmanager
+def raises_db_errno(name: str) -> Generator[None]:
+    """Expects the server to raise errno ``name``: a fault, or a constraint's backstop for raw SQL and races."""
     with pytest.raises(psycopg.Error) as info:
         yield
     assert errno_name(info.value) == name, info.value
@@ -32,25 +62,31 @@ async def _one(conn: AsyncConnection, query: str, params: tuple[object, ...] = (
 
 
 async def create(conn: AsyncConnection, parent: UUID | None, name: str, kind: Kind = "file") -> UUID:
-    row = await _one(conn, "SELECT id FROM vfs_create(%s, %s, %s)", (parent, name, kind))
+    row = await _one(conn, "SELECT id, err, err_detail FROM vfs_create(%s, %s, %s)", (parent, name, kind))
+    check(*row[1:])
     assert isinstance(row[0], UUID)
     return row[0]
 
 
 async def resolve(conn: AsyncConnection, *segments: str) -> tuple[UUID | None, Kind]:
-    row = await _one(conn, "SELECT id, kind FROM vfs_resolve(%s)", (list(segments),))
+    row = await _one(conn, "SELECT id, kind, err, err_detail FROM vfs_lookup(%s)", (list(segments),))
+    check(*row[2:])
     assert row[0] is None or isinstance(row[0], UUID)
     assert isinstance(row[1], str)
     return row[0], row[1]
 
 
 async def readdir(conn: AsyncConnection, directory: UUID | None) -> list[tuple[str, Kind]]:
-    cur = await conn.execute("SELECT name, kind FROM vfs_readdir(%s)", (directory,))
-    return [(name, kind) for name, kind in await cur.fetchall()]
+    cur = await conn.execute("SELECT name, kind, err, err_detail FROM vfs_readdir(%s)", (directory,))
+    rows = await cur.fetchall()
+    if rows:
+        check(*rows[0][2:])
+    return [(name, kind) for name, kind, _, _ in rows]
 
 
 async def mkdir_p(conn: AsyncConnection, *segments: str) -> UUID | None:
-    row = await _one(conn, "SELECT vfs_mkdir_p(%s)", (list(segments),))
+    row = await _one(conn, "SELECT id, err, err_detail FROM vfs_mkdir_p(%s)", (list(segments),))
+    check(*row[1:])
     assert row[0] is None or isinstance(row[0], UUID)
     return row[0]
 
@@ -58,13 +94,18 @@ async def mkdir_p(conn: AsyncConnection, *segments: str) -> UUID | None:
 async def rename(
     conn: AsyncConnection, node: UUID, new_parent: UUID | None, new_name: str, expect_parent: UUID | None = None
 ) -> bool:
-    row = await _one(conn, "SELECT vfs_rename(%s, %s, %s, %s)", (node, new_parent, new_name, expect_parent))
-    assert isinstance(row[0], bool)
-    return row[0]
+    """Whether it moved: False for a lost compare-and-swap (ESTALE)."""
+    row = await _one(
+        conn, "SELECT err, err_detail FROM vfs_rename(%s, %s, %s, %s)", (node, new_parent, new_name, expect_parent)
+    )
+    if row[0] == "ESTALE" and expect_parent is not None:
+        return False
+    check(*row)
+    return True
 
 
 async def unlink(conn: AsyncConnection, node: UUID) -> None:
-    await conn.execute("SELECT vfs_unlink(%s)", (node,))
+    check(*await _one(conn, "SELECT err, err_detail FROM vfs_unlink(%s)", (node,)))
 
 
 async def wait_until_blocked(conn: AsyncConnection, pid: int) -> None:
@@ -108,20 +149,20 @@ async def test_duplicate_root_names_are_rejected(conn: AsyncConnection) -> None:
     await create(conn, None, "docs", "dir")
     with raises_errno("EEXIST"):
         await create(conn, None, "docs", "dir")
-    with raises_errno("EEXIST"):
+    with raises_db_errno("EEXIST"):
         await conn.execute("INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (NULL, 'docs', 'file')")
 
 
 async def test_raw_insert_under_a_file_violates_the_foreign_key(conn: AsyncConnection) -> None:
     file = await create(conn, None, "f")
-    with raises_errno("ENOTDIR"):
+    with raises_db_errno("ENOTDIR"):
         await conn.execute("INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (%s, 'x', 'file')", (file,))
 
 
 async def test_raw_move_under_a_file_violates_the_foreign_key(conn: AsyncConnection) -> None:
     file = await create(conn, None, "f")
     other = await create(conn, None, "g")
-    with raises_errno("ENOTDIR"):
+    with raises_db_errno("ENOTDIR"):
         await conn.execute("UPDATE vfs_nodes SET parent_id = %s WHERE id = %s", (file, other))
 
 
@@ -129,7 +170,7 @@ async def test_raw_delete_of_non_empty_directory_is_restricted(conn: AsyncConnec
     directory = await create(conn, None, "d", "dir")
     await create(conn, directory, "f")
     # PostgreSQL 18 reports RESTRICT as restrict_violation (23001), earlier versions as foreign_key_violation.
-    with raises_errno("ENOTEMPTY"):
+    with raises_db_errno("ENOTEMPTY"):
         await conn.execute("DELETE FROM vfs_nodes WHERE id = %s", (directory,))
 
 
@@ -192,7 +233,7 @@ async def test_append_style_updates_are_hot(conn: AsyncConnection) -> None:
     assert 0.0 not in await _page_after_updates(conn, "nodes_ff100", node, 1)
 
 
-# vfs_resolve
+# vfs_lookup
 
 
 async def test_resolve_returns_id_and_kind(conn: AsyncConnection) -> None:
@@ -242,11 +283,12 @@ async def test_readdir_lists_entries_in_byte_order(conn: AsyncConnection) -> Non
 async def test_readdir_returns_size_and_mtime(conn: AsyncConnection) -> None:
     directory = await create(conn, None, "d", "dir")
     file = await create(conn, directory, "f")
-    cur = await conn.execute("SELECT id, name, kind, size, mtime FROM vfs_readdir(%s)", (directory,))
+    cur = await conn.execute("SELECT id, name, kind, size, mtime, err, err_detail FROM vfs_readdir(%s)", (directory,))
     rows = await cur.fetchall()
     assert len(rows) == 1
     assert rows[0][:4] == (file, "f", "file", 0)
     assert isinstance(rows[0][4], datetime)
+    assert rows[0][5:] == (None, None)
 
 
 async def test_readdir_errors(conn: AsyncConnection) -> None:
@@ -261,8 +303,8 @@ async def test_readdir_errors(conn: AsyncConnection) -> None:
 
 
 async def test_create_returns_id_generation_and_size(conn: AsyncConnection) -> None:
-    row = await _one(conn, "SELECT id, generation, size FROM vfs_create(NULL, 'f', 'file')")
-    assert row[1:] == (0, 0)
+    row = await _one(conn, "SELECT id, generation, size, err, err_detail FROM vfs_create(NULL, 'f', 'file')")
+    assert row[1:] == (0, 0, None, None)
     assert await resolve(conn, "f") == (row[0], "file")
 
 
@@ -534,7 +576,7 @@ async def test_rename_racing_a_create_of_the_same_name(conn: AsyncConnection, db
         task = asyncio.create_task(rename(conn, file, d, "b"))
         await wait_until_blocked(other, conn.info.backend_pid)
         await other.commit()
-    with raises_errno("EEXIST"):
+    with raises_db_errno("EEXIST"):  # the unique constraint: the create committed after vfs_rename's check
         await task
 
 
@@ -562,10 +604,9 @@ async def test_unlink_waits_for_a_concurrent_create(conn: AsyncConnection, db: s
         task = asyncio.create_task(unlink(conn, d))
         await wait_until_blocked(other, conn.info.backend_pid)
         await other.commit()
-    with pytest.raises(psycopg.Error) as info:
+    # Returned by vfs_unlink's own check, not raised by the foreign-key backstop.
+    with raises_errno("ENOTEMPTY"):
         await task
-    # Raised by vfs_unlink's own check, not by the foreign-key backstop.
-    assert info.value.sqlstate == SQLSTATE_BY_ERRNO["ENOTEMPTY"]
 
 
 # Errors
@@ -603,3 +644,100 @@ async def test_enotdir_does_not_wait_for_a_file_lock(conn: AsyncConnection, db: 
         with raises_errno("ENOTDIR"):
             await rename(conn, d, file, "d")
         await appender.rollback()
+
+
+# Returned errors (migration 009)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "vfs_unlink(NULL)",
+        "vfs_rename(NULL, NULL, 'x')",
+        "vfs_append(NULL, 'x')",
+        "vfs_write(NULL, 'x')",
+        "vfs_compact(NULL)",
+        "vfs_pread(NULL, 0, 10)",
+        "vfs_pread_lines(NULL, 1, 10, 100)",
+        "vfs_create(vfs_gate(NULL, 'ENOENT'), 'x2', 'file')",  # a directory argument, where NULL is the root
+    ],
+)
+async def test_a_null_node_id_raises(conn: AsyncConnection, call: str) -> None:
+    # What an unchecked failed lookup gives: it must fail loudly, not act on the root or on nothing.
+    await create(conn, None, "x")
+    with raises_errno("EINVAL"):
+        await conn.execute(f"SELECT * FROM {call}".encode())
+    assert await readdir(conn, None) == [("x", "file")]
+
+
+async def test_outcomes_leave_the_transaction_usable(conn: AsyncConnection) -> None:
+    # Every outcome in one transaction: had any been raised, the transaction would be aborted.
+    d = await mkdir_p(conn, "d")
+    new = await mkdir_p(conn, "tasks", "new")
+    cur_dir = await mkdir_p(conn, "tasks", "cur")
+    f = await create(conn, d, "f")
+    task = await create(conn, new, "t1")
+    await rename(conn, task, cur_dir, "t1")
+    async with conn.transaction():
+        calls = {
+            "ENOENT": "SELECT err, err_detail FROM vfs_lookup(ARRAY['missing'])",
+            "ENOTDIR": "SELECT err, err_detail FROM vfs_lookup(ARRAY['d', 'f', 'x'])",
+            "EEXIST": f"SELECT err, err_detail FROM vfs_create('{d}', 'f', 'file')",
+            "EISDIR": f"SELECT err, err_detail FROM vfs_pread('{d}', 0, 10)",
+            "ENOTEMPTY": f"SELECT err, err_detail FROM vfs_unlink('{d}')",
+            "ESTALE": f"SELECT err, err_detail FROM vfs_write('{f}', 'x', 5, 0, '{d}', 'f')",
+        }
+        for errno, query in calls.items():
+            row = await _one(conn, query)
+            assert row[0] == errno and row[1], (errno, row)
+        assert not await rename(conn, task, cur_dir, "t1-again", expect_parent=new)  # a lost claim
+        with raises_errno("ENOENT"):
+            await readdir(conn, uuid.uuid4())
+        assert await _one(conn, "SELECT 1") == (1,)
+    # Nothing changed.
+    assert await readdir(conn, d) == [("f", "file")]
+    assert await resolve(conn, "tasks", "cur", "t1") == (task, "file")
+
+
+async def test_an_outcome_keeps_a_repeatable_read_snapshot(conn: AsyncConnection, db: str) -> None:
+    f = await create(conn, None, "f")
+    await conn.execute("SELECT * FROM vfs_append(%s, 'hello')", (f,))
+    async with await AsyncConnection.connect(db) as reader:
+        await reader.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
+        with raises_errno("ENOENT"):
+            await resolve(reader, "missing")
+        await conn.execute("SELECT * FROM vfs_append(%s, ' world')", (f,))  # after the snapshot
+        row = await _one(reader, "SELECT data, err FROM vfs_pread(%s, 0, 100)", (f,))
+        assert row == (b"hello", None)
+        await reader.commit()
+
+
+async def test_an_outcome_returns_one_row_and_runs_nothing_else(conn: AsyncConnection) -> None:
+    file = await create(conn, None, "f")
+    cur = await conn.execute("SELECT * FROM vfs_readdir(%s)", (file,))
+    rows = await cur.fetchall()
+    assert len(rows) == 1 and rows[0][:5] == (None,) * 5 and rows[0][5] == "ENOTDIR"
+    cur = await conn.execute("SELECT * FROM vfs_create(%s, 'x', 'file', 'data')", (file,))
+    rows = await cur.fetchall()
+    assert len(rows) == 1 and rows[0][:3] == (None,) * 3 and rows[0][3] == "ENOTDIR"
+    assert await _one(conn, "SELECT count(*) FROM vfs_nodes") == (1,)
+
+
+async def test_a_lookup_joins_as_an_index_lookup(conn: AsyncConnection) -> None:
+    # vfs_lookup is declared ROWS 1: with the default estimate of 1000 rows, a join on its id hashes vfs_nodes.
+    d = await create(conn, None, "d", "dir")
+    await conn.execute(
+        "INSERT INTO vfs_nodes (parent_id, name, kind) SELECT %s, 'f' || i, 'file' FROM generate_series(1, 5000) i",
+        (d,),
+    )
+    await conn.execute("ANALYZE vfs_nodes")
+    for lookup in ("vfs_lookup(ARRAY['d', 'f7'])", "vfs_mkdir_p(ARRAY['d'])"):
+        cur = await conn.execute(f"EXPLAIN SELECT n.size FROM {lookup} r LEFT JOIN vfs_nodes n ON n.id = r.id".encode())
+        plan = "\n".join(line for (line,) in await cur.fetchall())
+        assert "Seq Scan on vfs_nodes" not in plan and "Hash" not in plan, plan
+    # The control: at the default estimate, the same join hashes the table.
+    await conn.execute("ALTER FUNCTION vfs_lookup(text[]) ROWS 1000")
+    cur = await conn.execute(
+        "EXPLAIN SELECT n.size FROM vfs_lookup(ARRAY['d', 'f7']) r LEFT JOIN vfs_nodes n ON n.id = r.id"
+    )
+    assert "Seq Scan on vfs_nodes" in "\n".join(line for (line,) in await cur.fetchall())
