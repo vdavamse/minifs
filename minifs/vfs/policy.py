@@ -80,10 +80,15 @@ class Rule:
 
 
 class Policy:
-    """Ordered rules per actor. ``denials`` counts the refused operations (``check``) by ``(actor, action)``, for
-    the write-policy denials metric; entries a view leaves out of a listing aren't refusals and aren't counted.
-    The counter belongs to the policy object, so ``DEFAULT_POLICY``'s is process-wide: build a ``Policy`` of its
-    ``rules`` for a counter of your own."""
+    """Ordered rules per actor. ``denials`` counts by ``(actor, action)`` the operations the policy refused that
+    the caller asked for (``check``), for the write-policy denials metric: one per refused tool call or view
+    operation.
+
+    Lookups a caller makes on its own account, where a refusal only means "skip it", pass
+    ``count_denials=False`` and aren't counted (logged at DEBUG instead): Read's instruction files, its
+    suggestions for a missing path, and its page read alongside the sample that decides. Nor are entries a view
+    leaves out of a listing, which aren't refusals. The counter belongs to the policy object, so
+    ``DEFAULT_POLICY``'s is process-wide: build a ``Policy`` of its ``rules`` for a counter of your own."""
 
     def __init__(self, rules: Mapping[str, Sequence[Rule]]) -> None:
         self.rules: dict[str, tuple[Rule, ...]] = {actor: tuple(r) for actor, r in rules.items()}
@@ -125,12 +130,17 @@ class Policy:
                 return False
         return action == "read"
 
-    def check(self, actor: str, action: Action, path: str, *, subtree: bool = False) -> None:
+    def check(
+        self, actor: str, action: Action, path: str, *, subtree: bool = False, count_denials: bool = True
+    ) -> None:
         """Raises EACCES (``PolicyDenied``) for ``path`` unless ``actor`` may ``action`` there (``allows``), and
-        counts the denial."""
+        counts the denial unless ``count_denials`` is False (a speculative lookup)."""
         if not self.allows(actor, action, path, subtree=subtree):
-            self.denials[actor, action] += 1
-            _log.info("write policy denied %s %s on %s", actor, action, path)
+            if count_denials:
+                self.denials[actor, action] += 1
+                _log.info("write policy denied %s %s on %s", actor, action, path)
+            else:
+                _log.debug("write policy refused the lookup %s %s on %s", actor, action, path)
             raise PolicyDenied(path, actor, action)
 
 

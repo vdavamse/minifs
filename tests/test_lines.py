@@ -451,6 +451,8 @@ async def test_pread_lines_cap_across_many_extents(conn: AsyncConnection) -> Non
     await check_capped_reads(conn, f, content, rng)
     await compact(conn, f, 256)
     await check_capped_reads(conn, f, content, rng)
+    await compact(conn, f, 64 * 1024 * 1024)  # one big extent: step 3b stops inside it
+    await check_capped_reads(conn, f, content, rng)
     for tail in (b"", b"\n", b"x" * 80_000, b"y" * 80_000 + b"\n"):
         await write(conn, f, content + tail)
         await check_capped_reads(conn, f, content + tail, rng)
@@ -487,6 +489,59 @@ async def test_pread_lines_cap_on_one_big_extent_spills_nothing(conn: AsyncConne
         assert tuple(row[2:]) == expected_capped(content, first, max_lines, 213004, 8004)
         plan = await plans_of(conn, query, (f,))
         assert "temp read" not in plan and "temp written" not in plan, plan
+
+
+async def toast_blocks_fetched(conn: AsyncConnection, query: str, params: tuple[object, ...]) -> int:
+    """The blocks of vfs_extents' TOAST table that ``query`` fetches, counted in the transaction it runs in."""
+    counter = "SELECT pg_stat_get_xact_blocks_fetched(reltoastrelid) FROM pg_class WHERE oid = 'vfs_extents'::regclass"
+    async with conn.transaction():
+        (before,) = await one(conn, counter)
+        await conn.execute(query.encode(), params)
+        (after,) = await one(conn, counter)
+    assert isinstance(before, int) and isinstance(after, int)
+    return after - before
+
+
+async def test_pread_lines_cap_on_a_64_mb_extent_reads_the_budget_plus_one_line(conn: AsyncConnection) -> None:
+    """A 64 MB extent of 4 KB lines (vfs_compact with a large target), stored uncompressed so a slice fetches only
+    the TOAST chunks it covers: a page of Read's size (2,000 lines, Read's raw batch cap) reads the cap's worth
+    of lines plus the one that crosses it, not 2,000 lines (8 MB)."""
+    await conn.execute("ALTER TABLE vfs_extents ALTER COLUMN data SET STORAGE EXTERNAL")
+    width, count, budget, cap = 4096, 16_000, 213_004, 8004
+    content = b"".join(f"{i:07}:".encode() + b"x" * (width - 9) + b"\n" for i in range(count))
+    f = await create_file(conn, "f", content)
+    await compact(conn, f, 64 * 1024 * 1024)
+    (extents,) = await one(conn, "SELECT count(*) FROM vfs_extents WHERE node_id = %s", (f,))
+    assert extents == 1
+    query = "SELECT * FROM vfs_pread_lines(%s, %s, %s, %s, %s)"
+    for first in [1, 9_000]:
+        (row,) = await pread_capped_many(conn, f, [(first, 2000, budget, cap)])
+        assert tuple(row[2:]) == expected_capped(content, first, 2000, budget, cap)
+        page = await toast_blocks_fetched(conn, query, (f, first, 2000, budget, cap))
+        # A one-line read detoasts line_offsets as often as the page does, so the difference is the page's data.
+        baseline = await toast_blocks_fetched(conn, query, (f, first, 1, 1, cap))
+        chunk = 1996  # TOAST_MAX_CHUNK_SIZE with 8 KB pages: 4 chunks a block
+        assert (page - baseline) * 4 * chunk <= budget + width + 2 * 4 * chunk, (page, baseline)
+
+
+async def test_extents_are_pglz_so_a_page_of_a_long_line_fetches_only_its_prefix(conn: AsyncConnection) -> None:
+    """vfs_extents.data is pglz whatever the session's default (migration 013): a capped page of a compressible 4 MB
+    line, an extent of its own, fetches the TOAST chunks of its prefix, where lz4 would fetch the whole value."""
+    (has_lz4,) = await one(
+        conn, "SELECT 'lz4' = ANY(enumvals) FROM pg_settings WHERE name = 'default_toast_compression'"
+    )
+    if not has_lz4:
+        pytest.skip("the server has no lz4")
+    await conn.execute("SET default_toast_compression = lz4")
+    words = [f"name{i}" for i in range(500)]
+    line = " ".join(words[(i * 7919) % 500] for i in range(800_000)).encode()[: 4 << 20] + b"\n"
+    f = await create_file(conn, "min.js", line)
+    (method, stored) = await one(
+        conn, "SELECT pg_column_compression(data), pg_column_size(data) FROM vfs_extents WHERE node_id = %s", (f,)
+    )
+    assert method == "pglz" and isinstance(stored, int) and stored < len(line) // 2
+    blocks = await toast_blocks_fetched(conn, "SELECT * FROM vfs_pread_lines(%s, 1, 2000, 213004, 8004)", (f,))
+    assert blocks < 10, blocks  # about 4 MB / 2 / 8 KB = 256 for the whole value
 
 
 # Concurrency
