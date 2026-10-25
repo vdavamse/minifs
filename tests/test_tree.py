@@ -224,11 +224,18 @@ async def test_append_style_updates_are_hot(conn: AsyncConnection) -> None:
     # still has room, and pruning reclaims the dead versions between transactions.
     row = await _one(conn, "SELECT reloptions FROM pg_class WHERE oid = 'vfs_nodes'::regclass")
     assert row[0] == ["fillfactor=80"]
+    # Pruning only removes versions that no snapshot in the database still needs. Filling the page passes the
+    # autoanalyze threshold, and an ANALYZE overlapping the updates keeps their dead versions while it runs: ~15 of
+    # them fill the page's free space (#52). So autovacuum is off for the tables this test updates.
+    await conn.execute("ALTER TABLE vfs_nodes SET (autovacuum_enabled = false)")
     node = await _fill_first_page(conn, "vfs_nodes")
     assert await _page_after_updates(conn, "vfs_nodes", node, 50) == {0.0}
 
     # The control: the same table at the default fillfactor 100 moves the first update off the full page.
-    await conn.execute("CREATE TABLE nodes_ff100 (LIKE vfs_nodes INCLUDING DEFAULTS INCLUDING INDEXES)")
+    await conn.execute(
+        "CREATE TABLE nodes_ff100 (LIKE vfs_nodes INCLUDING DEFAULTS INCLUDING INDEXES)"
+        " WITH (autovacuum_enabled = false)"
+    )
     node = await _fill_first_page(conn, "nodes_ff100")
     assert 0.0 not in await _page_after_updates(conn, "nodes_ff100", node, 1)
 
