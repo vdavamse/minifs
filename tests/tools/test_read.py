@@ -1,6 +1,7 @@
 """``Read``: ladderframe's Read tests over the view, VFS cases (policy, chroot, virtual root), and its output checked
 against a copy of ladderframe's line reader."""
 
+import asyncio
 import io
 import random
 from typing import Any
@@ -23,7 +24,7 @@ from minifs.tools import TOOLS, Read
 from minifs.tools.deps import ReadSettings, ToolSettings
 from minifs.tools.read import DESCRIPTION, MAX_ATTACHMENT_BYTES
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import Entry, LineReadResult
+from minifs.vfs.core import Entry, LineReadResult, ReadResult
 from minifs.vfs.policy import Policy, Rule
 from minifs.vfs.view import VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
@@ -308,6 +309,8 @@ SMALL = [
     ReadSettings(default_limit=7, max_line_length=10, max_bytes=1024 + 40),
     ReadSettings(default_limit=50, max_line_length=3, max_bytes=1024),
     ReadSettings(max_line_length=100, max_bytes=2048),
+    ReadSettings(max_line_length=60, max_bytes=100),  # a batch is bigger than the output cap
+    ReadSettings(max_line_length=5, max_bytes=40),
 ]
 
 
@@ -325,7 +328,8 @@ async def test_output_is_ladderframes(client: VFSClient, view: VFSView, seed: in
         args: dict[str, Any] = {"filePath": path, "offset": offset, "limit": limit}
         call = await call_tool(Read, deps, **args)
         if 0 in data[:4096] or (data and sum(1 for b in data[:4096] if b < 9 or 13 < b < 32) / len(data[:4096]) > 0.3):
-            continue  # binary by ladderframe's rules too
+            assert call.retry == f"Cannot read binary file: {path}"  # by ladderframe's rules too
+            continue
         got = call.retry if call.retried else call.result
         assert got == ladderframe_output(path, data, offset, limit, settings), (data, args, settings)
 
@@ -413,3 +417,118 @@ async def test_directory_paging_edges(deps: Deps) -> None:
         "<path>/</path>\n<type>directory</type>\n<entries>\n\n\n"
         "(Showing 0 of 2 entries. Use 'offset' parameter to read beyond entry 1)\n</entries>"
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "data", "mime"),
+    [
+        ("p.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 8, "image/jpeg"),
+        ("p", b"GIF89a" + b"\x00" * 8, "image/gif"),
+        ("p.bin", b"RIFF\x00\x00\x00\x00WEBPVP8 ", "image/webp"),  # the magic bytes win over the extension
+        ("text.png", b"not a png\n", "image/png"),  # the extension alone, as ladderframe
+    ],
+)
+async def test_attachment_types(client: VFSClient, deps: Deps, name: str, data: bytes, mime: str) -> None:
+    await put(client, f"/workspace/{name}", data)
+    seen: list[BinaryContent] = []
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        last = messages[-1]
+        assert isinstance(last, ModelRequest)
+        for part in last.parts:
+            if isinstance(part, UserPromptPart) and not isinstance(part.content, str):
+                seen.extend(c for c in part.content if isinstance(c, BinaryContent))
+        if any(isinstance(p, ToolReturnPart) for p in last.parts):
+            return ModelResponse(parts=[TextPart("done")])
+        return ModelResponse(parts=[ToolCallPart("Read", {"filePath": name})])
+
+    await Agent(FunctionModel(model), deps_type=Deps, tools=[Read]).run("go", deps=deps)
+    assert [(c.media_type, c.data) for c in seen] == [(mime, data)]
+
+
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [
+        ("x.bin", b"plain text\n"),  # a binary extension
+        ("..bin", b"plain text\n"),  # PurePath.suffix is .bin, as in ladderframe
+        ("CACHE.PYC", b"plain text\n"),
+        ("ctl.txt", b"\x01\x02\x03ab\n"),  # over 30% non-printable, no NUL
+    ],
+)
+async def test_binary_files_are_refused(client: VFSClient, deps: Deps, name: str, data: bytes) -> None:
+    await put(client, f"/workspace/{name}", data)
+    assert await retry_message(Read, deps, filePath=name) == f"Cannot read binary file: /workspace/{name}"
+
+
+async def test_limit_zero(client: VFSClient, deps: Deps) -> None:
+    await put(client, "/workspace/a.txt", b"a\nb\n")
+    assert await run_tool(Read, deps, filePath="a.txt", limit=0) == (
+        "<path>/workspace/a.txt</path>\n<type>file</type>\n<content>\n"
+        "\n\n(Showing lines 1-0 of 2. Use offset=1 to continue.)\n</content>"
+    )
+
+
+async def test_an_attachment_that_grew_past_the_limit(
+    client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await put(client, "/workspace/a.png", PNG + b"\x00" * 5000)
+    pread = view.pread
+
+    async def growing(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        result = await pread(path, offset, limit)
+        if limit == 4096:
+            await view.append(path, b"\x00" * MAX_ATTACHMENT_BYTES)
+        return result
+
+    monkeypatch.setattr(view, "pread", growing)
+    message = await retry_message(Read, Deps(view), filePath="a.png")
+    assert message == (
+        f"/workspace/a.png is too large to attach ({len(PNG) + 5000 + MAX_ATTACHMENT_BYTES} bytes, "
+        f"the limit is {MAX_ATTACHMENT_BYTES})"
+    )
+
+
+async def test_a_page_from_another_file_than_the_sample(
+    client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file becomes binary between the sample and the page: the tool samples again, and refuses it."""
+    await put(client, "/workspace/f.txt", b"text\n")
+    replaced = asyncio.Event()
+    pread, pread_lines = view.pread, view.pread_lines
+
+    async def sampling(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        result = await pread(path, offset, limit)
+        if not replaced.is_set():
+            await view.unlink(path)
+            await view.create(path, b"\x00binary\n")
+            replaced.set()
+        return result
+
+    async def paging(*args: Any) -> LineReadResult:
+        await replaced.wait()
+        return await pread_lines(*args)
+
+    monkeypatch.setattr(view, "pread", sampling)
+    monkeypatch.setattr(view, "pread_lines", paging)
+    assert await retry_message(Read, Deps(view), filePath="f.txt") == "Cannot read binary file: /workspace/f.txt"
+
+
+async def test_a_page_that_never_settles(client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The file changes after every batch: after three attempts the tool returns the last one's page."""
+    settings = ReadSettings(max_line_length=100, max_bytes=1024)  # one long line per batch
+    data = b"".join(b"a" * 1000 + b"\n" for _ in range(10))
+    await put(client, "/workspace/f.txt", data)
+    calls = 0
+    pread_lines = view.pread_lines
+
+    async def rewriting(*args: Any) -> LineReadResult:
+        nonlocal calls
+        calls += 1
+        result = await pread_lines(*args)
+        await view.write("/workspace/f.txt", data)  # same bytes, a new generation
+        return result
+
+    monkeypatch.setattr(view, "pread_lines", rewriting)
+    out = await run_tool(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="f.txt")
+    assert out == ladderframe_output("/workspace/f.txt", data, None, None, settings)
+    assert calls < 20
