@@ -75,7 +75,8 @@ async def read(
         for attempt in range(_PAGE_ATTEMPTS):
             settle = attempt + 1 == _PAGE_ATTEMPTS
             # The sample, the page's first batch and, once, the instruction files at once: one round trip for most
-            # reads, on at most three connections.
+            # reads, on at most three connections. The sample decides, so only its denial counts in
+            # ``policy.denials``: one per denied Read, none for the instruction files a Read looks up on its own.
             calls: list[Awaitable[Any]] = [
                 vfs.pread(path, 0, SAMPLE_BYTES),
                 vfs.pread_lines(
@@ -84,6 +85,7 @@ async def read(
                     min(count, _MAX_LINES),
                     _fetch(config),
                     max_line_bytes=_line_cap(config),
+                    count_denials=False,
                 ),
             ]
             if instructions is None:
@@ -174,7 +176,8 @@ async def _not_found(ctx: RunContext[HasVFS], path: str) -> str:
     parent = join(*segments[:-1])
     base = basename(path).lower()
     try:
-        entries = sorted(e.name for e in await ctx.deps.vfs.readdir(parent)) if segments else []
+        listing = await ctx.deps.vfs.readdir(parent, count_denials=False) if segments else []
+        entries = sorted(e.name for e in listing)
     except VFSError:
         entries = []
     similar = [join(*segments[:-1], e) for e in entries if base in e.lower() or e.lower() in base][:3]
@@ -323,7 +326,7 @@ async def _nearby_instructions(ctx: RunContext[HasVFS], path: str) -> list[str]:
     try:
         # One group per directory: a CLAUDE.md behind an AGENTS.md file is looked up, not read.
         groups = [i // len(INSTRUCTION_FILES) for i in range(len(reads))]
-        found = await ctx.deps.vfs.pread_many(reads, groups=groups)
+        found = await ctx.deps.vfs.pread_many(reads, groups=groups, count_denials=False)
     except VFSError:
         return []  # a failed lookup (EIO): picking another name then could attach a file ladderframe never would
     texts: list[str] = []
