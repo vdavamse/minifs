@@ -13,3 +13,8 @@ minifs/_regex*.pyd
 
 # Rust
 target/
+
+# Editor backups and swap files
+*.swp
+*.swo
+*~

@@ -32,9 +32,9 @@ async def provision(dsn: str) -> UUID:
         await conn.set_autocommit(True)
         await migrate(conn)
     workspace_id = uuid4()
-    async with open_vfs(connector, min_size=0) as client:
+    async with open_vfs(connector, min_size=0) as vfs:
         for name, text in FILES.items():
-            await client.create(f"/workspaces/{workspace_id}/{name}", text.encode(), parents=True)
+            await vfs.client.create(f"/workspaces/{workspace_id}/{name}", text.encode(), parents=True)
     return workspace_id
 
 

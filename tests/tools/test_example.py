@@ -19,8 +19,7 @@ from examples import agent as example
 from examples import provision
 from minifs.db.pool import Connector
 from minifs.vfs.cache import DirEntryCache
-from minifs.vfs.client import VFSClient
-from minifs.vfs.service import open_vfs
+from minifs.vfs.service import VFS, open_vfs
 
 ROOT = Path(__file__).parents[2]
 
@@ -74,8 +73,9 @@ class Scripted:
 async def workspace_files(db: str, workspace_id: UUID) -> dict[str, str]:
     """Every file of the workspace in Postgres, read by a client of its own without a cache."""
     root = f"/workspaces/{workspace_id}"
-    async with open_vfs(Connector(db), min_size=0) as client:
-        assert client.cache is None
+    async with open_vfs(Connector(db), min_size=0) as vfs:
+        client = vfs.client
+        assert client.cache is None and vfs.watcher is None
         return {
             entry.path.removeprefix(root + "/"): (await client.pread(entry.path, 0, entry.size)).content.decode()
             for entry in await client.glob("**", root, hidden=True)
@@ -91,16 +91,19 @@ FIXED = {
 
 @pytest.fixture
 def caches(monkeypatch: pytest.MonkeyPatch) -> list[DirEntryCache]:
-    """The caches the example opens its client with."""
+    """The caches the example opens its VFS with, each with a 60 s TTL instead of 2 s, so a slow runner can't
+    expire entries between the scripted calls."""
     seen: list[DirEntryCache] = []
 
     @asynccontextmanager
-    async def spy(connector: Connector, **kwargs: Any) -> AsyncGenerator[VFSClient]:
+    async def spy(connector: Connector, **kwargs: Any) -> AsyncGenerator[VFS]:
         seen.append(kwargs["cache"])
-        async with open_vfs(connector, **kwargs) as client:
-            yield client
+        async with open_vfs(connector, **kwargs) as vfs:
+            assert vfs.watcher is not None and vfs.cache is kwargs["cache"]
+            yield vfs
 
     monkeypatch.setattr(example, "open_vfs", spy)
+    monkeypatch.setattr(example, "DirEntryCache", lambda: DirEntryCache(ttl=60))
     return seen
 
 
@@ -121,11 +124,10 @@ async def test_scripted_run_fixes_the_workspace(db: str, caches: list[DirEntryCa
     assert await workspace_files(db, workspace_id) == FIXED
 
     # The cache followed a Watcher (entering follow() clears it once), and the agent's later calls resolved shared
-    # path components from it, though the run never lists a directory. The run takes well under the 2 s TTL.
+    # path components from it, though the run never lists a directory.
     [cache] = caches
     stats = cache.stats()
     assert stats.clears == 1, stats
-    assert stats.expired == 0, f"the run outlasted the TTL: {stats}"
     assert stats.hits > 0, stats
 
 

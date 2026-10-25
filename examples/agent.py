@@ -57,14 +57,14 @@ async def show(ctx: RunContext[Deps], events: AsyncIterable[AgentStreamEvent]) -
         elif isinstance(event, FunctionToolCallEvent):
             logging.info("call %s(%s)", event.part.tool_name, event.part.args_as_json_str())
         elif isinstance(event, FunctionToolResultEvent):
-            logging.info("%s returned:\n%s", event.part.tool_name, event.part.content)
+            logging.info("%s %s:\n%s", event.part.tool_name, event.part.outcome, event.part.model_response_str())
 
 
 async def main(dsn: str, workspace_id: str, prompt: str, model: Model | str) -> str:
     # On Lakebase: Connector(conninfo, password=fetch_token), called for each new connection.
     cache = DirEntryCache()  # one client and cache per process, shared by every run
-    async with open_vfs(Connector(dsn), cache=cache) as client:
-        view = VFSView(client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")  # one view per run
+    async with open_vfs(Connector(dsn), cache=cache) as vfs:
+        view = VFSView(vfs.client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")  # one view per run
         result = await agent.run(prompt, deps=Deps(vfs=view), model=model, event_stream_handler=show)
     logging.info("directory cache: %s", cache.stats())
     return result.output
