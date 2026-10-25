@@ -91,8 +91,8 @@ FIXED = {
 
 @pytest.fixture
 def caches(monkeypatch: pytest.MonkeyPatch) -> list[DirEntryCache]:
-    """The caches the example opens its VFS with, each with a 60 s TTL instead of 2 s, so a slow runner can't
-    expire entries between the scripted calls."""
+    """The caches the example opens its VFS with. Their default TTL (60 s) outlasts the scripted run, even on a slow
+    runner."""
     seen: list[DirEntryCache] = []
 
     @asynccontextmanager
@@ -103,7 +103,6 @@ def caches(monkeypatch: pytest.MonkeyPatch) -> list[DirEntryCache]:
             yield vfs
 
     monkeypatch.setattr(example, "open_vfs", spy)
-    monkeypatch.setattr(example, "DirEntryCache", lambda: DirEntryCache(ttl=60))
     return seen
 
 

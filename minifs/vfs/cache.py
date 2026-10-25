@@ -3,9 +3,10 @@
 ``DirEntryCache`` implements ``minifs.vfs.client.DirCache``. The client fills it the way the kernel fills its
 dcache on a path walk: an operation's lookup (``vfs_lookup``) returns the chain of ids it walked in the same row,
 and the client stores each component, a directory but for the last, which has the kind the lookup returned. A
-failed lookup stores the prefix that resolved. Listings (``readdir``) and creates store what they return. A
-statement that used a fully cached chain stores nothing new, nor does ``vfs_mkdir_p`` (``mkdir_p``, a create with
-``parents``), which reports no chain.
+failed lookup stores the prefix that resolved. ``vfs_mkdir_p`` (``mkdir_p``, a create with ``parents``) returns
+its chain the same way. Listings (``readdir``) and creates store what they return, and a rename the moved node's
+new name. A statement that used a fully cached chain stores nothing new, unless a link was stale: its fallback
+walk stores what it walked.
 
 Unlike the dcache, it is revalidated on every use: the client checks every cached chain against ``vfs_nodes`` in
 the statement that uses it, and walks the path instead when a link no longer holds. So a stale entry costs a slower
@@ -17,10 +18,12 @@ resolution, never the wrong node; this cache only has to keep stale entries rare
   the reverse map ``id -> (parent, name)``), and so does a ``move``, unless the node is already cached under its new
   name (the client stored it after the move, and the event arrived late). A ``rescan`` (after the LISTEN connection
   reconnects, when the subscription overflows, or on a TRUNCATE) clears everything.
-- Every entry expires ``ttl`` seconds (2 by default) after it was stored, whatever its use. The TTL is the fallback
-  for what notifications can't cover: events lost while the LISTEN connection is down (the ``rescan`` only comes
-  once it is back), and a listing or lookup whose snapshot predates a move or delete but which is stored after that
-  change's notification was handled.
+- Every entry expires ``ttl`` seconds (60 by default) after it was stored, whatever its use. The TTL is the
+  fallback for what notifications can't cover: events lost while the LISTEN connection is down (the ``rescan`` only
+  comes once it is back), and a listing or lookup whose snapshot predates a move or delete but which is stored after
+  that change's notification was handled. Since every use is checked, and evicts what it finds stale, the TTL can
+  be long: an agent's calls are seconds of inference apart, and each expiry costs the next use a walk (README:
+  *Using the tools with pydantic-ai* has the measurements).
 
 ``evict`` removes whatever name the node has now. When the client evicts links it found stale, a fresher name
 stored meanwhile can go too: that costs a miss, never a wrong answer.
@@ -47,7 +50,7 @@ from minifs.vfs.watch import Event, Subscription, Watcher
 
 _log = logging.getLogger(__name__)
 
-DEFAULT_TTL = 2.0
+DEFAULT_TTL = 60.0
 DEFAULT_MAX_ENTRIES = 10_000  # about 500 bytes each, so about 5 MB per process
 
 
@@ -59,9 +62,9 @@ class CacheStats:
     ``follow``); entries dropped by the TTL or the size cap count as neither.
 
     ``hit_rate`` counts path components, not paths: a path resolves from the cache only if all its components hit.
-    A path is cached once this process looked it up, listed its directory or created it (``mkdir_p`` and a create
-    with ``parents`` store only the created node): the first use of a path is a
-    miss (one per path, as the walk stops at the first missing component), and later ones hit. So a low rate with
+    A path is cached once this process looked it up, listed its directory, created it or moved something to it: the
+    first use of a path is a miss (one per path, as the walk stops at the first missing component), and later ones
+    hit. So a low rate with
     few ``expired`` means paths used once, and with many, the TTL is short for the access pattern."""
 
     lookups: int
@@ -92,7 +95,8 @@ class DirEntryCache:
     """Positive directory entries with a reverse map by node id, a TTL and a size cap (see the module docstring).
 
     ``max_entries`` bounds memory under a burst of stores: past it, the oldest entries go first. An entry costs about
-    500 bytes, so the default of 10,000 is about 5 MB; within a 2 s TTL, that is more than a process's agents list.
+    500 bytes, so the default of 10,000 is about 5 MB. Past it the oldest entries go, which costs their next use a
+    walk, never a wrong answer.
     ``clock`` (seconds, monotonic) is for tests.
     """
 

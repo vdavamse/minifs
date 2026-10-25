@@ -232,6 +232,13 @@ async def test_validate_accepts_translations_and_restores_the_timeout(conn: Asyn
         assert row == ("5s",)
 
 
+async def test_validate_remembers_a_compiled_pattern(conn: AsyncConnection) -> None:
+    # The next test breaks the translation of this same pattern: it passes only because tests/conftest.py forgets
+    # Postgres's verdicts between tests (#55).
+    await regex.validate(conn, regex.translate("x"))
+    assert ("x", False) in regex._validated  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_validate_reports_an_emitter_bug(conn: AsyncConnection, caplog: pytest.LogCaptureFixture) -> None:
     broken = Translation("x", False, "a{2,256}")
     with caplog.at_level(logging.ERROR, logger="minifs.vfs.regex"), pytest.raises(RegexTranslationBug):

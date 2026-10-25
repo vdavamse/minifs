@@ -281,6 +281,46 @@ async def test_lookup_returns_the_chain_it_walked(conn: AsyncConnection) -> None
     assert await chain("a", "b", "f", "x", "y") == ([a, b, f], "ENOTDIR", None)  # up to the file
 
 
+async def test_lookup_below_a_cached_prefix(conn: AsyncConnection) -> None:
+    a = await create(conn, None, "a", "dir")
+    b = await create(conn, a, "b", "dir")
+    f = await create(conn, b, "f")
+    other = await create(conn, None, "other", "dir")
+
+    async def below(segments: list[str], cached: list[UUID | None] | None) -> tuple[object, ...]:
+        return await _one(
+            conn, "SELECT chain, id, kind, err, err_detail FROM vfs_lookup(%s, %s::uuid[])", (segments, cached)
+        )
+
+    # By design the walk below a prefix gives the walk from the root's answer, so results can't show which one ran:
+    # test_cache checks that the client sends the prefix.
+    path = ["a", "b", "f"]
+    walked = await below(path, None)
+    assert walked == ([a, b, f], f, "file", None, None)
+    # A prefix that holds gives the same row as the walk from the root, whatever its length.
+    assert await below(path, [a]) == walked
+    assert await below(path, [a, b]) == walked
+    # The same for outcomes, numbered from the root.
+    missing = await below(["a", "b", "missing"], None)
+    assert missing[3] == "ENOENT" and missing[0] == [a, b]
+    assert await below(["a", "b", "missing"], [a, b]) == missing
+    assert await below(["a", "b", "f", "x"], [a, b]) == await below(["a", "b", "f", "x"], None)
+    # A prefix that doesn't hold is ignored: the walk starts from the root.
+    stale: list[list[UUID | None]] = [
+        [other],  # another node of the root
+        [b],  # a node that isn't in the root
+        [a, other],  # a link whose parent is wrong
+        [None, b],
+        [a, b, f],  # as long as the path: only the cached-chain check (client) may take the last component
+        [a, b, f, f],
+    ]
+    for cached in stale:
+        assert await below(path, cached) == walked, cached
+    # A file in the prefix: walking on below it would report ENOENT, not ENOTDIR.
+    assert await below(["a", "b", "f", "x"], [a, b, f]) == await below(["a", "b", "f", "x"], None)
+    assert await below(["other"], [a]) == ([other], other, "dir", None, None)  # another path's prefix
+
+
 async def test_resolve_does_not_confuse_root_entries_with_children(conn: AsyncConnection) -> None:
     docs = await create(conn, None, "docs", "dir")
     await create(conn, docs, "inner", "dir")
@@ -382,6 +422,23 @@ async def test_mkdir_p_errors(conn: AsyncConnection) -> None:
         await mkdir_p(conn, "root-file", "x")
     with raises_errno("EEXIST"):
         await mkdir_p(conn, "root-file")
+
+
+async def test_mkdir_p_returns_its_chain(conn: AsyncConnection) -> None:
+    async def chain(*segments: str) -> tuple[object, ...]:
+        return await _one(conn, "SELECT chain, id, err FROM vfs_mkdir_p(%s)", (list(segments),))
+
+    made = await chain("a", "b")
+    a, b = await resolve(conn, "a"), await resolve(conn, "a", "b")
+    assert made == ([a[0], b[0]], b[0], None) and a[1] == b[1] == "dir"
+    a, b = a[0], b[0]
+    found_and_made = await chain("a", "b", "c")
+    assert isinstance(found_and_made[0], list) and found_and_made[0][:2] == [a, b]
+    assert found_and_made[1] == found_and_made[0][2]
+    assert await chain() == ([], None, None)
+    await create(conn, b, "f")
+    assert await chain("a", "b", "f", "x") == ([a, b], None, "ENOTDIR")  # the directories before the file
+    assert await chain("a", "b", "f") == ([a, b], None, "EEXIST")
 
 
 async def test_concurrent_mkdir_p_agree(conn: AsyncConnection, db: str) -> None:
@@ -762,7 +819,7 @@ async def test_a_lookup_joins_as_an_index_lookup(conn: AsyncConnection) -> None:
         plan = "\n".join(line for (line,) in await cur.fetchall())
         assert "Seq Scan on vfs_nodes" not in plan and "Hash" not in plan, plan
     # The control: at the default estimate, the same join hashes the table.
-    await conn.execute("ALTER FUNCTION vfs_lookup(text[]) ROWS 1000")
+    await conn.execute("ALTER FUNCTION vfs_lookup(text[], uuid[]) ROWS 1000")
     cur = await conn.execute(
         "EXPLAIN SELECT n.size FROM vfs_lookup(ARRAY['d', 'f7']) r LEFT JOIN vfs_nodes n ON n.id = r.id"
     )
