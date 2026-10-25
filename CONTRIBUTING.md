@@ -122,7 +122,7 @@ paths (the chroot) translates `path` and never shows `detail`. Paths go through
 `minifs.vfs.core.normalize` first. With a `DirCache` (the hook for #19's directory-entry cache), a fully cached
 path is checked link by link in the same statement instead of walked, and falls back to `vfs_lookup` if any link
 went stale, so a stale cache never reaches the wrong node. A server lookup (`vfs_lookup`, and `vfs_mkdir_p`) returns the ids it walked
-(`chain`, migrations 010 and 012) in the same row, and the client stores each component, as the kernel's dcache does
+(`chain`, migrations 010 and 014) in the same row, and the client stores each component, as the kernel's dcache does
 on a path walk; a partly cached path is walked from its deepest cached directory (`vfs_lookup(segments, cached)`). A query that `_run` runs with refs starts with their `_walks` columns, which it cuts from the rows. `minifs.vfs.cache.DirEntryCache` is that cache: positive
 entries with a 60 s TTL, kept fresh by `follow(watcher)` (evict by id on `move` and `delete`, clear on `rescan`).
 

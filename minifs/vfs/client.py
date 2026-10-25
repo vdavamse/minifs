@@ -60,7 +60,7 @@ _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache lin
 # of a failed lookup. chain is what the server walked (vfs_lookup), for the cache to store; NULL when nothing was
 # walked. kind, when not NULL, is also the kind of chain's last element.
 _LOOKUP = "(SELECT id, kind, chain, err, err_detail FROM vfs_lookup(%s))"
-# A path whose first components are cached: the server checks them and walks the rest (migration 012).
+# A path whose first components are cached: the server checks them and walks the rest (migration 014).
 _LOOKUP_BELOW = "(SELECT id, kind, chain, err, err_detail FROM vfs_lookup(%s, %s::uuid[]))"
 # The last cached id if every cached link (id, parent, name) still holds, else the server's lookup. The first stores
 # nothing (chain NULL): every link was cached already. The fallback's chain replaces the stale links.

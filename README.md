@@ -277,7 +277,7 @@ This is how a worker claims a file from `tasks/new/` to `tasks/cur/`. If two wor
 
 ### Path resolution
 
-`vfs_lookup(segments TEXT[], cached UUID[] DEFAULT NULL) -> (id, kind, chain, err, err_detail)` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. `chain` is the id of every component it found, in order: the whole path on success, the prefix that resolved on `ENOENT` or `ENOTDIR` (on `ENOTDIR` it ends with the file). It is the one column an outcome sets besides `err` and `err_detail`. `cached` is the ids of the path's first components as a client's cache has them: if every one still holds, checked in one statement, the walk starts below the last (migration 012). The library caches `(parent_id, name) -> id` for every link of the chain, and evicts entries when NOTIFY reports a move or delete (see Caching).
+`vfs_lookup(segments TEXT[], cached UUID[] DEFAULT NULL) -> (id, kind, chain, err, err_detail)` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. `chain` is the id of every component it found, in order: the whole path on success, the prefix that resolved on `ENOENT` or `ENOTDIR` (on `ENOTDIR` it ends with the file). It is the one column an outcome sets besides `err` and `err_detail`. `cached` is the ids of the path's first components as a client's cache has them: if every one still holds, checked in one statement, the walk starts below the last (migration 014). The library caches `(parent_id, name) -> id` for every link of the chain, and evicts entries when NOTIFY reports a move or delete (see Caching).
 
 ### Watch (inotify)
 
