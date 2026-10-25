@@ -32,12 +32,11 @@ An actor may learn a little it can't read: ``append`` returns the new size of a 
 is not ``truncated``, while a glob without a limit finds more readable files, tells that unreadable newer files
 fill its refetch window; a grep refused over the file cap, which counts unreadable files, or timed out while
 its walk lists them (or, from a virtual directory, ``truncated`` set by a later mount refused either way), tells
-that unreadable files are there;
-and an ``expect`` naming some node id outside the path tells whether that id exists (ids
-are random, and the view hands out only ids inside the mounts). Moving or removing a mount point or a virtual
-directory is EBUSY. A mount point is a directory: a file can't be created there, and creating one with ``parents``
-(or by ``mkdir_p``) also creates the real directories above it. A database error other than a ``VFSError`` comes
-back as EIO, since its text may name real paths.
+that unreadable files are there; and an ``expect`` naming some node id outside the path tells whether that id
+exists (ids are random, and the view hands out only ids inside the mounts). Moving or removing a mount point or a
+virtual directory is EBUSY. A mount point is a directory: a file can't be created there, and creating one with
+``parents`` (or by ``mkdir_p``) also creates the real directories above it. A database error other than a
+``VFSError`` comes back as EIO, since its text may name real paths.
 """
 
 from __future__ import annotations
@@ -237,7 +236,8 @@ class VFSView:
         """``VFSClient.grep`` of ``path``, with hits in visible paths.
 
         Files the actor may not read are left out of the scope before it is searched, so they never match, count
-        toward ``limit`` or the byte cap, or show in ``files`` and ``bytes``; they do count toward the file cap.
+        toward ``limit`` or the byte cap, or show in ``files`` and ``bytes``; they do count toward the file cap and
+        the walk's timeout.
         A ``path`` the actor may not read is EACCES. Mounts the actor can read nothing in are not searched.
 
         Below a virtual directory, the grep runs in each mount in turn, in path order, until ``limit`` hits, with

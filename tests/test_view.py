@@ -595,7 +595,8 @@ async def test_grep_from_a_virtual_directory_checks_a_file_mount(vfs: VFSClient)
     await vfs.unlink("/docs")
     await vfs.create("/docs", b"TOPSECRET\n")
     await raises("EACCES", agent.grep("TOPSECRET", "/docs"), "/docs")
-    assert (await agent.grep("TOPSECRET", "/")).hits == []
+    result = await agent.grep("TOPSECRET", "/")
+    assert (result.hits, result.files, result.bytes) == ([], 2, 8)  # /workspace's notes.md and log.md only
 
 
 def test_rules() -> None:

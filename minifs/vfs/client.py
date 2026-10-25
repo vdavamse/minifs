@@ -267,9 +267,8 @@ class VFSClient:
         (bytewise), then line, at most ``limit`` (``minifs.vfs.search``). Unlike ``glob``, hidden files are searched
         unless ``hidden`` is false, as ladderframe's Grep does; ``.git`` never is. Files that aren't UTF-8 are
         skipped. ``keep`` (a view's policy), given each file's path, a file ``path`` too, leaves out the files it
-        rejects: they
-        count toward the file cap (the walk stops past it, before they can be filtered) but not the byte cap, the
-        hits or the result's totals.
+        rejects: they count toward the file cap (the walk stops past it, before they can be filtered) but not the
+        byte cap, the hits or the result's totals.
 
         One snapshot on a search-pool connection, each statement under ``timeout`` seconds: the scope is read from
         the tree first, and refused over ``max_files`` files or ``max_bytes`` bytes before any content is read.
