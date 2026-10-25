@@ -12,7 +12,7 @@ from __future__ import annotations
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ToolReturn
 
-from minifs.tools._text import diff_metadata, encode_text, read_file, split_bom
+from minifs.tools._text import create_file, diff_metadata, encode_text, read_file, split_bom
 from minifs.tools.base import vfs_tool
 from minifs.tools.deps import HasVFS, resolve
 from minifs.tools.errors import tool_error
@@ -69,7 +69,7 @@ async def _write(vfs: VFSView, path: str, content: str) -> tuple[bool, str, str]
         # counts as a denial.)
         vfs.policy.check(vfs.actor, "write", path)
         try:
-            await _create(vfs, path, encode_text(content_new, next_bom))
+            await create_file(vfs, path, encode_text(content_new, next_bom))
         except VFSError as e:
             if e.errno == "EEXIST":
                 vfs.policy.check(vfs.actor, "read", path)
@@ -81,7 +81,7 @@ async def _write(vfs: VFSView, path: str, content: str) -> tuple[bool, str, str]
         if e.errno != "ENOENT":
             raise
         try:
-            await _create(vfs, path, encode_text(content_new, next_bom))
+            await create_file(vfs, path, encode_text(content_new, next_bom))
         except VFSError as c:
             if c.errno == "EEXIST":  # created meanwhile
                 raise _Lost from None
@@ -102,18 +102,6 @@ async def _write(vfs: VFSView, path: str, content: str) -> tuple[bool, str, str]
             raise _Lost from None
         raise
     return True, content_old, content_new
-
-
-async def _create(vfs: VFSView, path: str, data: bytes) -> None:
-    """Creates file ``path``, with its missing parent directories. ``parents`` only when the parent is missing (the
-    create without it is ENOENT), since the view checks ``write`` on every directory a ``parents`` create could
-    make, existing or not."""
-    try:
-        await vfs.create(path, data)
-    except VFSError as e:
-        if e.errno != "ENOENT":
-            raise
-        await vfs.create(path, data, parents=True)
 
 
 Write = vfs_tool(write, "Write", DESCRIPTION, sequential=True)

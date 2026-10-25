@@ -21,12 +21,13 @@ except ImportError as e:  # pragma: no cover - exercised by test_import_without_
     raise ImportError("minifs.tools needs the pydantic-ai extra: pip install 'minifs[pydantic-ai]'") from e
 
 from minifs.tools.deps import HasVFS, ToolSettings
+from minifs.tools.edit import Edit
 from minifs.tools.glob import Glob
 from minifs.tools.grep import Grep
 from minifs.tools.read import Read
 from minifs.tools.write import Write
 
-TOOLS: tuple[Tool[HasVFS], ...] = (Read, Write, Glob, Grep)
+TOOLS: tuple[Tool[HasVFS], ...] = (Read, Write, Edit, Glob, Grep)
 """Every tool, in the order the model sees them."""
 
 
@@ -35,4 +36,4 @@ def toolset() -> FunctionToolset[HasVFS]:
     return FunctionToolset(list(TOOLS))
 
 
-__all__ = ["TOOLS", "Glob", "Grep", "HasVFS", "Read", "ToolSettings", "Write", "toolset"]
+__all__ = ["TOOLS", "Edit", "Glob", "Grep", "HasVFS", "Read", "ToolSettings", "Write", "toolset"]

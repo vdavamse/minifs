@@ -1,5 +1,6 @@
 """What ``Write`` and ``Edit`` share: ladderframe's text helpers (BOM, line endings, and the jsdiff-style patch with
-its change counts and trimming, from ``ladderframe.tools.edit``), and reading a whole file with its version.
+its change counts and trimming, from ``ladderframe.tools.edit``), reading a whole file with its version, and
+creating one.
 """
 
 from __future__ import annotations
@@ -16,10 +17,21 @@ PAGE = 1024 * 1024
 """Bytes per ``pread`` when reading a whole file."""
 
 
-async def read_file(vfs: VFSView, path: str) -> tuple[bytes, FileVersion]:
+class TooLarge(Exception):
+    """The file is over ``read_file``'s ``max_size``: ``size`` bytes."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__(size)
+        self.size = size
+
+
+async def read_file(vfs: VFSView, path: str, max_size: int | None = None) -> tuple[bytes, FileVersion]:
     """The whole content of file ``path`` and the version it is, read in pages: what a compare-and-swap write
-    expects. ESTALE if the file changed between pages (the content would mix two versions)."""
+    expects. ESTALE if the file changed between pages (the content would mix two versions). ``TooLarge``, after
+    the first page, for a file over ``max_size`` bytes."""
     first = await vfs.pread(path, 0, PAGE)
+    if max_size is not None and first.size > max_size:
+        raise TooLarge(first.size)
     version = FileVersion(first.id, first.generation, first.size)
     chunks = [first.content]
     page = first
@@ -29,6 +41,18 @@ async def read_file(vfs: VFSView, path: str) -> tuple[bytes, FileVersion]:
             raise VFSError("ESTALE", path, "changed while it was read")
         chunks.append(page.content)
     return b"".join(chunks), version
+
+
+async def create_file(vfs: VFSView, path: str, data: bytes) -> None:
+    """Creates file ``path``, with its missing parent directories. ``parents`` only when the parent is missing (the
+    create without it is ENOENT), since the view checks ``write`` on every directory a ``parents`` create could
+    make, existing or not."""
+    try:
+        await vfs.create(path, data)
+    except VFSError as e:
+        if e.errno != "ENOENT":
+            raise
+        await vfs.create(path, data, parents=True)
 
 
 def split_bom(text: str) -> tuple[bool, str]:
