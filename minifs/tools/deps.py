@@ -74,8 +74,9 @@ def workdir(ctx: RunContext[HasVFS]) -> str:
 
 
 def settings(ctx: RunContext[HasVFS]) -> ToolSettings:
-    """The deps' ``vfs_settings``, ladderframe's defaults by default."""
-    return getattr(ctx.deps, "vfs_settings", DEFAULT_SETTINGS)
+    """The deps' ``vfs_settings``, ladderframe's defaults by default (or if it isn't a ``ToolSettings``)."""
+    value = getattr(ctx.deps, "vfs_settings", DEFAULT_SETTINGS)
+    return value if isinstance(value, ToolSettings) else DEFAULT_SETTINGS
 
 
 def resolve(ctx: RunContext[HasVFS], path: str) -> str:

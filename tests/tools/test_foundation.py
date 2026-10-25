@@ -128,13 +128,16 @@ def test_settings_from_deps(deps: Deps) -> None:
 # Paths
 
 
-def test_workdir_that_isnt_a_string_is_the_default(deps: Deps) -> None:
+def test_optional_attributes_of_the_wrong_type_are_the_defaults(deps: Deps) -> None:
     @dataclass
     class Broken:
         vfs: VFSView
         vfs_workdir: object = None
+        vfs_settings: object = None
 
-    assert resolve(context(Broken(deps.vfs)), "a") == "/workspace/a"
+    ctx = context(Broken(deps.vfs))
+    assert resolve(ctx, "a") == "/workspace/a"
+    assert settings(ctx) is DEFAULT_SETTINGS
 
 
 @pytest.mark.parametrize(
@@ -214,7 +217,7 @@ def test_retry_messages(error: VFSError | SearchRefused, message: str) -> None:
 def test_message_override() -> None:
     with pytest.raises(ModelRetry, match=r"^No such directory: /workspace/x$"):
         tool_error(VFSError("ENOENT", "/workspace/x"), "read", ENOENT="No such directory: {path}")
-    with pytest.raises(AssertionError, match="ENOENTT"):
+    with pytest.raises(TypeError, match="ENOENTT"):
         tool_error(VFSError("ENOENT", "/workspace/x"), "read", ENOENTT="No such directory: {path}")
 
 

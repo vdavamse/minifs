@@ -46,8 +46,8 @@ def tool_error(error: VFSError | SearchRefused, action: Action, **messages: str)
     """What the tool returns for ``error``: the denial for EACCES, naming the action the policy refused (``action``,
     what the call needs, for an EACCES that doesn't say); otherwise raises ``ModelRetry``. ``messages`` override
     ``MESSAGES`` by errno. A ``SearchRefused``'s text is already written for the model."""
-    unknown = messages.keys() - _OVERRIDABLE
-    assert not unknown, f"no such errno to override: {sorted(unknown)}"
+    if unknown := messages.keys() - _OVERRIDABLE:
+        raise TypeError(f"no such errno to override: {sorted(unknown)}")
     if isinstance(error, SearchRefused):
         raise ModelRetry(str(error)) from None
     if error.errno == "EACCES":

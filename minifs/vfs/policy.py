@@ -31,7 +31,8 @@ _log = logging.getLogger(__name__)
 
 
 class PolicyDenied(VFSError):
-    """EACCES from the policy: ``actor`` may not ``action`` at ``path``."""
+    """EACCES from the policy: ``actor`` may not ``action`` at ``path``. ``VFSError.at()`` and the view's
+    ``_mapped`` report a plain ``VFSError``, so policy checks stay outside them, where the tools see ``action``."""
 
     def __init__(self, path: str, actor: str, action: Action) -> None:
         super().__init__("EACCES", path, f"{actor} may not {action} here")

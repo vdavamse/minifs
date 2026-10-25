@@ -2,6 +2,7 @@
 
 import asyncio
 import itertools
+import pickle
 import re
 from collections.abc import AsyncIterator, Awaitable, Sequence
 from functools import cache
@@ -17,7 +18,7 @@ from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import Entry, VFSError
 from minifs.vfs.glob import GlobError, compile_excludes, compile_glob
-from minifs.vfs.policy import DEFAULT_POLICY, Policy, Rule
+from minifs.vfs.policy import DEFAULT_POLICY, Policy, PolicyDenied, Rule
 from minifs.vfs.search import SearchRefused
 from minifs.vfs.view import VFSView, _below, workspace_mounts  # pyright: ignore[reportPrivateUsage]
 from tests.test_tree import wait_until_blocked
@@ -513,6 +514,15 @@ def test_rules() -> None:
     with pytest.raises(VFSError) as info:
         p.check("a", "write", "/w/keep.md")
     assert info.value.errno == "EACCES" and p.denials == {("a", "write"): 1}
+    denial = info.value
+    assert isinstance(denial, PolicyDenied) and (denial.actor, denial.action) == ("a", "write")
+    copy = pickle.loads(pickle.dumps(denial))
+    assert type(copy) is PolicyDenied and (copy.path, copy.actor, copy.action, str(copy)) == (
+        denial.path,
+        denial.actor,
+        denial.action,
+        str(denial),
+    )
     for bad in ("w/**", "/w/../x", "/w//x", "/w/"):
         with pytest.raises(ValueError):
             Rule(bad)
