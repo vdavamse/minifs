@@ -144,13 +144,41 @@ class VFSView:
         return await self._mapped(self._client.pread(_real(target), offset, limit), target)
 
     async def pread_lines(
-        self, path: str, first_line: int = 1, max_lines: int = DEFAULT_LINE_LIMIT, max_bytes: int = DEFAULT_LINE_BYTES
+        self,
+        path: str,
+        first_line: int = 1,
+        max_lines: int = DEFAULT_LINE_LIMIT,
+        max_bytes: int = DEFAULT_LINE_BYTES,
+        *,
+        max_line_bytes: int | None = None,
     ) -> LineReadResult:
         """``VFSClient.pread_lines`` of ``path``."""
         target = self._target(path, "read")
         if target.real is None:
             raise VFSError("EISDIR", target.visible)
-        return await self._mapped(self._client.pread_lines(_real(target), first_line, max_lines, max_bytes), target)
+        call = self._client.pread_lines(_real(target), first_line, max_lines, max_bytes, max_line_bytes=max_line_bytes)
+        return await self._mapped(call, target)
+
+    async def pread_many(self, reads: Sequence[tuple[str, int, int]]) -> list[ReadResult | VFSError]:
+        """``VFSClient.pread_many`` of ``reads``: each read's error in its place, a policy denial (EACCES), a path
+        outside every mount (ENOENT) and a virtual directory (EISDIR) among them."""
+        results: list[ReadResult | VFSError] = []
+        asked: list[tuple[int, _Target, int, int]] = []  # (index in results, target, offset, limit)
+        for path, offset, limit in reads:
+            try:
+                target = self._target(path, "read")
+            except VFSError as e:
+                results.append(e)
+                continue
+            results.append(VFSError("EISDIR", target.visible))  # replaced below unless virtual
+            if target.real is not None:
+                asked.append((len(results) - 1, target, offset, limit))
+        if asked:
+            targets = [target for _, target, _, _ in asked]
+            call = self._client.pread_many([(_real(t), offset, limit) for _, t, offset, limit in asked])
+            for (i, target, _, _), read in zip(asked, await self._mapped(call, *targets), strict=True):
+                results[i] = VFSError(read.errno, target.visible, read.message) if isinstance(read, VFSError) else read
+        return results
 
     async def glob(
         self,

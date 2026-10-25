@@ -16,7 +16,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import Entry, GlobResult, VFSError
+from minifs.vfs.core import Entry, GlobResult, ReadResult, VFSError
 from minifs.vfs.glob import GlobError, compile_excludes, compile_glob
 from minifs.vfs.policy import DEFAULT_POLICY, Policy, PolicyDenied, Rule
 from minifs.vfs.search import GrepResult, SearchRefused
@@ -458,6 +458,36 @@ async def test_pread_lines(vfs: VFSClient, policy: Policy) -> None:
     await raises("ENOENT", agent.pread_lines(f"/workspaces/{W2}/secret.md"))
     ingestion = view(vfs, policy, "ingestion")
     await raises("EACCES", ingestion.pread_lines("/workspace/notes.md"), "/workspace/notes.md")
+    page = await agent.pread_lines("/workspace/notes.md", max_line_bytes=2)
+    assert (page.content, page.cut) == (b"on\ntw\nth\n", frozenset({1, 2, 3}))
+
+
+async def test_pread_many(vfs: VFSClient, policy: Policy) -> None:
+    agent = view(vfs, policy)
+    await vfs.write(f"/workspaces/{W1}/notes.md", b"mine\n")
+    reads = [
+        ("/workspace/notes.md", 0, 100),
+        ("/workspace/none.md", 0, 1),
+        (f"/workspaces/{W2}/secret.md", 0, 1),
+        ("/", 0, 1),
+        ("/workspace", 0, 1),
+    ]
+    notes, *errors = await agent.pread_many(reads)
+    assert isinstance(notes, ReadResult) and notes.content == b"mine\n"
+    expected = [
+        ("ENOENT", "/workspace/none.md"),
+        ("ENOENT", f"/workspaces/{W2}/secret.md"),
+        ("EISDIR", "/"),
+        ("EISDIR", "/workspace"),
+    ]
+    for error, (errno, path) in zip(errors, expected, strict=True):
+        assert isinstance(error, VFSError) and (error.errno, error.path, error.detail) == (errno, path, "")
+    ingestion = view(vfs, policy, "ingestion")
+    denied, guide = await ingestion.pread_many([("/workspace/notes.md", 0, 1), ("/docs/guide.md", 0, 100)])
+    assert isinstance(denied, VFSError) and (denied.errno, denied.path) == ("EACCES", "/workspace/notes.md")
+    assert isinstance(guide, ReadResult)
+    (only,) = await agent.pread_many([("/", 0, 1)])  # nothing to send
+    assert isinstance(only, VFSError) and only.errno == "EISDIR"
 
 
 async def test_grep_in_visible_paths(vfs: VFSClient, policy: Policy) -> None:

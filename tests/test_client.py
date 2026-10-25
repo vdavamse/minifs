@@ -19,7 +19,7 @@ from minifs import cli
 from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO
 from minifs.db.pool import Connector, Pools, open_pool, retry_serializable
 from minifs.vfs.client import VFSClient, _gated  # pyright: ignore[reportPrivateUsage]
-from minifs.vfs.core import FileVersion, Kind, VFSError
+from minifs.vfs.core import FileVersion, Kind, ReadResult, VFSError
 from minifs.vfs.glob import GlobError
 from tests.test_tree import wait_until_blocked
 
@@ -111,6 +111,46 @@ async def test_pread_lines(vfs: VFSClient) -> None:
     await vfs.mkdir("/d")
     await raises("EISDIR", vfs.pread_lines("/d"), "/d")
     await raises("ENOENT", vfs.pread_lines("/missing"), "/missing")
+
+
+async def test_pread_lines_with_a_line_cap(vfs: VFSClient) -> None:
+    await vfs.create("/f", b"one\nthree\r\nfour")
+    r = await vfs.pread_lines("/f", max_line_bytes=3)
+    assert (r.content, r.next_offset, r.cut, r.eof) == (b"one\nthr\nfou\n", 15, frozenset({2, 3}), True)
+    r = await vfs.pread_lines("/f", 1, 10, 6, max_line_bytes=3)
+    assert (r.content, r.next_offset, r.cut, r.eof) == (b"one\nth", 6, frozenset({2}), False)
+    assert (await vfs.pread_lines("/f")).cut == frozenset()
+    await raises("EINVAL", vfs.pread_lines("/f", max_line_bytes=-1))
+    await raises("EINVAL", vfs.pread_lines("/f", max_line_bytes=2**31))
+
+
+async def test_pread_many(vfs: VFSClient) -> None:
+    await vfs.create("/a/f", b"hello", parents=True)
+    await vfs.create("/a/g", b"world")
+    f, g, missing, through, directory, root, tail = await vfs.pread_many(
+        [
+            ("/a/f", 0, 100),
+            ("/a//g/", 1, 2),
+            ("/a/x", 0, 1),
+            ("/a/f/x", 0, 1),
+            ("/a", 0, 1),
+            ("/", 0, 1),
+            ("/a/f", -2, 0),
+        ]
+    )
+    assert isinstance(f, ReadResult) and (f.content, f.offset, f.size, f.eof) == (b"hello", 0, 5, True)
+    assert isinstance(g, ReadResult) and (g.content, g.offset, g.next_offset, g.eof) == (b"or", 1, 3, False)
+    assert isinstance(tail, ReadResult) and (tail.content, tail.offset, tail.id) == (b"", 3, f.id)
+    for error, errno, path in [
+        (missing, "ENOENT", "/a/x"),
+        (through, "ENOTDIR", "/a/f/x"),
+        (directory, "EISDIR", "/a"),
+        (root, "EISDIR", "/"),
+    ]:
+        assert isinstance(error, VFSError) and (error.errno, error.path) == (errno, path)
+    assert await vfs.pread_many([]) == []
+    await raises("EINVAL", vfs.pread_many([("/a/f", 0, -1)]))
+    await raises("EINVAL", vfs.pread_many([("/a/f", 2**63, 1)]))
 
 
 async def test_write_and_compare_and_swap(vfs: VFSClient) -> None:

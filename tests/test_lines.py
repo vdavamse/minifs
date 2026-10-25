@@ -287,20 +287,20 @@ async def test_append_to_a_partial_line_rewrites_only_the_last_extent(conn: Asyn
 async def test_pread_lines_examples(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f", b"ab\ncd\n\nlast")
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 2, 2, 100)", (f,))
-    assert await cur.fetchall() == [(11, 0, 4, 2, 3, b"cd\n\n", None, None)]
+    assert await cur.fetchall() == [(11, 0, 4, 2, 3, b"cd\n\n", 7, [], None, None)]
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 4, 10, 100)", (f,))
-    assert await cur.fetchall() == [(11, 0, 4, 4, 7, b"last", None, None)]
+    assert await cur.fetchall() == [(11, 0, 4, 4, 7, b"last", 11, [], None, None)]
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 1, 10, 4)", (f,))  # the byte cap cuts a line
-    assert await cur.fetchall() == [(11, 0, 4, 1, 0, b"ab\nc", None, None)]
+    assert await cur.fetchall() == [(11, 0, 4, 1, 0, b"ab\nc", 4, [], None, None)]
     # Past the end: no bytes, and the line count for the message.
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 5, 10, 100)", (f,))
-    assert await cur.fetchall() == [(11, 0, 4, 5, 11, b"", None, None)]
+    assert await cur.fetchall() == [(11, 0, 4, 5, 11, b"", 11, [], None, None)]
 
 
 async def test_pread_lines_of_an_empty_file(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
     cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 1, 10, 100)", (f,))
-    assert await cur.fetchall() == [(0, 0, 0, 1, 0, b"", None, None)]
+    assert await cur.fetchall() == [(0, 0, 0, 1, 0, b"", 0, [], None, None)]
 
 
 async def test_pread_lines_across_many_extents(conn: AsyncConnection) -> None:
@@ -362,6 +362,113 @@ async def test_line_reads_of_many_extents_use_index_steps(conn: AsyncConnection)
         conds = [line for line in plan.splitlines() if "Index Cond:" in line and "byte_offset >= " in line]
         assert len(conds) == 1 and "byte_offset < " in conds[0], plan
         assert max_buffer_hits(plan) < 30, plan
+
+
+# vfs_pread_lines with a line cap (migration 011)
+
+
+def expected_capped(
+    content: bytes, first: int, max_lines: int, max_bytes: int, cap: int
+) -> tuple[int, bytes, int, list[int]]:
+    """What vfs_pread_lines with line cap ``cap`` returns for ``content``: the byte offset of line ``first``, the
+    bytes, next_offset and the numbers of the cut lines."""
+    lines = split_lines(content)
+    if first > len(lines):
+        return len(content), b"", len(content), []
+    start = pos = following = sum(len(line) for line in lines[: first - 1])
+    data = b""
+    cut: list[int] = []
+    for number, line in enumerate(lines[first - 1 : first - 1 + max_lines], first):
+        if len(data) >= max_bytes:
+            break
+        body = line.removesuffix(b"\n")
+        piece = body[:cap] + b"\n" if len(body) > cap else line
+        if len(body) > cap:
+            cut.append(number)
+        taken = piece[: max_bytes - len(data)]
+        data += taken
+        following = pos + len(line) if taken == piece else pos + len(taken)
+        pos += len(line)
+    return start, data, following, cut
+
+
+async def pread_capped_many(
+    conn: AsyncConnection, node: UUID, queries: list[tuple[int, int, int, int]]
+) -> list[tuple[int, int, int, bytes, int, list[int]]]:
+    """(size, lines, byte_offset, data, next_offset, cut) of vfs_pread_lines for each ``(first_line, max_lines,
+    max_bytes, max_line_bytes)``, in one statement."""
+    columns = [list(column) for column in zip(*queries, strict=True)]
+    cur = await conn.execute(
+        "SELECT r.size, r.lines, r.byte_offset, r.data, r.next_offset, r.cut, r.err"
+        " FROM unnest(%s::bigint[], %s::int[], %s::int[], %s::int[]) WITH ORDINALITY AS q(f, m, b, c, i),"
+        " vfs_pread_lines(%s, q.f, q.m, q.b, q.c) r ORDER BY q.i",
+        (*columns, node),
+    )
+    rows = await cur.fetchall()
+    assert all(row[6] is None for row in rows)
+    return [(s, n, o, bytes(d), nxt, list(c)) for s, n, o, d, nxt, c, _ in rows]
+
+
+async def check_capped_reads(conn: AsyncConnection, node: UUID, content: bytes, rng: random.Random) -> None:
+    total = len(split_lines(content))
+    caps = [0, 1, 3, 10, 100, 70_000, 2**31 - 1]
+    limits = [0, 1, 2, 7, total + 1, 2**31 - 1]
+    budgets = [0, 1, 5, 64, 1000, 200_000, 2**31 - 1]
+    queries = [(f, rng.choice(limits), rng.choice(budgets), rng.choice(caps)) for f in range(1, total + 3)]
+    queries += [(1, 2**31 - 1, 2**31 - 1, 0), (max(total, 1), 1, 2**31 - 1, 5), (2**62, 1, 1, 1)]
+    for query, row in zip(queries, await pread_capped_many(conn, node, queries), strict=True):
+        size, lines, *got = row
+        assert (size, lines) == (len(content), total)
+        assert tuple(got) == expected_capped(content, *query), query
+
+
+async def test_pread_lines_cap_examples(conn: AsyncConnection) -> None:
+    f = await create_file(conn, "f", b"ab\ncdef\n\nlong\r\nlastline")
+    cur = await conn.execute("SELECT * FROM vfs_pread_lines(%s, 1, 10, 100, 3)", (f,))
+    assert await cur.fetchall() == [(23, 0, 5, 1, 0, b"ab\ncde\n\nlon\nlas\n", 23, [2, 4, 5], None, None)]
+    # The byte cap cuts the second line's prefix: next_offset is past the bytes returned.
+    cur = await conn.execute("SELECT data, next_offset, cut FROM vfs_pread_lines(%s, 1, 10, 5, 3)", (f,))
+    assert await cur.fetchall() == [(b"ab\ncd", 5, [2])]
+    # A line exactly at the cap isn't cut, with or without its \n.
+    cur = await conn.execute("SELECT data, next_offset, cut FROM vfs_pread_lines(%s, 2, 1, 100, 4)", (f,))
+    assert await cur.fetchall() == [(b"cdef\n", 8, [])]
+    cur = await conn.execute("SELECT data, next_offset, cut FROM vfs_pread_lines(%s, 5, 1, 100, 8)", (f,))
+    assert await cur.fetchall() == [(b"lastline", 23, [])]
+    with raises_errno("EINVAL"):
+        await conn.execute("SELECT * FROM vfs_pread_lines(%s, 1, 10, 100, -1)", (f,))
+
+
+async def test_pread_lines_cap_across_many_extents(conn: AsyncConnection) -> None:
+    rng = random.Random(5)
+    f = await create_file(conn, "f")
+    content = b""
+    for i in range(300):
+        width = rng.choice([0, 3, 40, 200, 70_000]) if i % 50 else 150_000
+        part = f"{i}:{'w' * rng.randrange(0, width + 1)}".encode() + rng.choice([b"\n", b"\n\n", b"", b"\r\nmore"])
+        await append(conn, f, part)
+        content += part
+    await check_layout(conn, f, content)
+    await check_capped_reads(conn, f, content, rng)
+    await compact(conn, f, 256)
+    await check_capped_reads(conn, f, content, rng)
+    for tail in (b"", b"\n", b"x" * 80_000, b"y" * 80_000 + b"\n"):
+        await write(conn, f, content + tail)
+        await check_capped_reads(conn, f, content + tail, rng)
+
+
+async def test_pread_lines_cap_reads_only_the_extents_it_needs(conn: AsyncConnection) -> None:
+    """Long lines, each an extent of its own: a read capped at 3 lines' worth of bytes reads about 3 extents, and
+    each one's prefix, not 100."""
+    f = await create_file(conn, "f")
+    await conn.execute(
+        "SELECT vfs_append(%s, convert_to(repeat(i::text, 100000) || E'\\n', 'UTF8')) FROM generate_series(1, 100) i",
+        (f,),
+    )
+    await conn.execute("ANALYZE vfs_extents")
+    cur = await conn.execute("SELECT data, cut FROM vfs_pread_lines(%s, 1, 2000, 30, 9)", (f,))
+    assert await cur.fetchall() == [(b"111111111\n222222222\n333333333\n", [1, 2, 3])]
+    plan = await plans_of(conn, "SELECT * FROM vfs_pread_lines(%s, 1, 2000, 30, 9)", (f,))
+    assert max_buffer_hits(plan) < 30, plan  # 185 when it reads every extent
 
 
 # Concurrency
