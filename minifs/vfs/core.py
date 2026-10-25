@@ -98,8 +98,8 @@ class FileVersion:
 
 @dataclass(frozen=True)
 class GlobResult:
-    """The files a glob matched, newest first; ``truncated`` if it saw at least one more match past them (one the
-    actor may read, for ``VFSView.glob``, which says how far it looks)."""
+    """What ``VFSView.glob`` returns: the readable files it matched, newest first; ``truncated`` if it saw at least
+    one more readable match past them (``VFSView.glob`` says when it can't tell)."""
 
     entries: list[Entry]
     truncated: bool

@@ -364,6 +364,17 @@ async def test_glob_looks_past_hidden_matches_a_bounded_distance(vfs: VFSClient)
     assert await hiding.glob("**", "/workspace", limit=1) == GlobResult([], False)
 
 
+async def test_glob_looks_past_hidden_matches_across_mounts(vfs: VFSClient) -> None:
+    hiding = view(vfs, Policy({"agent": [Rule("/docs/hid/**"), Rule("/**", "read")]}))
+    for i in range(7):  # newer than every readable file; the match past the limit, log.md, is in /workspace
+        await vfs.create(f"/docs/hid/{i}.md", b"", parents=True)
+    result = await hiding.glob("**", "/", limit=1)
+    assert ([e.path for e in result.entries], result.truncated) == (["/docs/guide.md"], True)
+    for i in range(7, 9):  # the window, applied after the merge, is all hidden
+        await vfs.create(f"/docs/hid/{i}.md", b"")
+    assert await hiding.glob("**", "/", limit=1) == GlobResult([], False)
+
+
 async def test_glob_is_truncated_only_past_its_limit(vfs: VFSClient, policy: Policy) -> None:
     agent = view(vfs, policy)
 
@@ -390,6 +401,8 @@ async def test_glob_is_truncated_only_past_its_limit(vfs: VFSClient, policy: Pol
     assert await glob_from_root("workspace/*.md", 1) == (workspace[:1], True)
     assert (await agent.glob("*.md", "/")).truncated is False  # no limit
     assert await agent.glob("*.txt", "/", limit=0) == GlobResult([], False)
+    assert (await agent.glob("*.md", "/", limit=2**31 - 2)).truncated is False  # the largest: it asks for one more
+    await raises("EINVAL", agent.glob("*.md", "/", limit=2**31 - 1), "/")
 
 
 async def test_hidden_files_never_make_a_glob_truncated(vfs: VFSClient) -> None:

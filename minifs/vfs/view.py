@@ -26,14 +26,15 @@ What each operation needs:
   an unreadable file where it can be read. A file has nothing below it: when the policy would refuse a
   directory there, the view checks that the source is a file and moves only that node (``expect``);
 - ``append`` (or ``write``) for ``append``.
- An actor may learn a little it can't read: ``append`` returns the new size of a file it may append to, and
-``create`` is EEXIST if something is there; a glob with a ``limit`` that comes back short, or not ``truncated``
-while a glob without one finds more, tells that unreadable newer files fill its refetch window; and an ``expect``
-naming some node id outside the path tells whether that id exists (ids are random, and the view hands out only ids
-inside the mounts). Moving or removing a mount point or a virtual directory is EBUSY. A mount point is a
-directory: a file can't be created there, and creating one with ``parents`` (or by ``mkdir_p``) also creates the
-real directories above it. A database error other than a ``VFSError`` comes back
-as EIO, since its text may name real paths.
+
+An actor may learn a little it can't read: ``append`` returns the new size of a file it may append to, and
+``create`` is EEXIST if something is there; a glob with a ``limit`` that returns fewer than ``limit`` entries, or
+is not ``truncated``, while a glob without a limit finds more readable files, tells that unreadable newer files
+fill its refetch window; and an ``expect`` naming some node id outside the path tells whether that id exists (ids
+are random, and the view hands out only ids inside the mounts). Moving or removing a mount point or a virtual
+directory is EBUSY. A mount point is a directory: a file can't be created there, and creating one with ``parents``
+(or by ``mkdir_p``) also creates the real directories above it. A database error other than a ``VFSError`` comes
+back as EIO, since its text may name real paths.
 """
 
 from __future__ import annotations
@@ -160,12 +161,12 @@ class VFSView:
         there is at least one more (``truncated``).
 
         Mounts the actor can't read anything in are not searched. The glob asks for ``limit + 1`` matches, so
-        exactly ``limit`` readable ones are not ``truncated``. When the policy hides some of those, it looks
-        further, at ``_REFETCH_FACTOR * max(limit, 1) + 1`` matches, so a policy that hides most of the matches can
-        return fewer than ``limit``. Files the actor can't read never count toward ``limit`` and never make the
-        result ``truncated``: when hidden files fill that window, the glob can't tell whether a readable match
-        follows, and reports ``truncated`` only for one it has seen. So a result can be not ``truncated`` though
-        readable files lie past the window.
+        exactly ``limit`` readable ones are not ``truncated``. When all ``limit + 1`` came back and the policy hid
+        some of them, it looks further, at ``min(_REFETCH_FACTOR * max(limit, 1) + 1, 2**31 - 1)`` matches, so a
+        policy that hides most of the matches can return fewer than ``limit``. Files the actor can't read never
+        count toward ``limit`` and never make the result ``truncated``: when hidden files fill that window, the
+        glob can't tell whether a readable match follows, and reports ``truncated`` only for one it has seen. So a
+        result can be not ``truncated`` though readable files lie past the window.
 
         Below a virtual directory, the glob runs in each mount and the results are merged, newest first. The
         pattern and excludes still match paths relative to ``path``, restated relative to each mount point. Where
