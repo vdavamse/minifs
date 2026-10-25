@@ -132,6 +132,10 @@ class LineReadResult:
 
     A ``first_line`` past the last line returns no content, ``offset == size`` and ``eof``; ``eof`` says the read
     reached the end of the file.
+
+    With a line cap, ``cut`` holds the numbers of the lines that came back cut: each is the line's first
+    ``max_line_bytes`` bytes and a ``\\n`` (added if the line had none). ``content`` is then shorter than
+    ``[offset, next_offset)``, which still spans the lines read.
     """
 
     id: UUID
@@ -143,6 +147,7 @@ class LineReadResult:
     generation: int
     lines: int
     eof: bool
+    cut: frozenset[int] = frozenset()
 
 
 def normalize(path: str) -> str:

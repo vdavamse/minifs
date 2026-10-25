@@ -194,27 +194,94 @@ class VFSClient:
         first_line: int = 1,
         max_lines: int = DEFAULT_LINE_LIMIT,
         max_bytes: int = DEFAULT_LINE_BYTES,
+        *,
+        max_line_bytes: int | None = None,
     ) -> LineReadResult:
         """Up to ``max_lines`` whole lines of file ``path`` from line ``first_line`` (1-based), capped at
-        ``max_bytes`` bytes, so the last line may come back cut. Lines split on ``\\n`` only. Reading past the last
-        line returns no bytes and ``eof``, with the line count. ENOENT, EISDIR; EINVAL for a ``first_line`` below 1
-        or a negative limit."""
+        ``max_bytes`` bytes, so the last line may come back cut. Lines split on ``\\n`` only. With
+        ``max_line_bytes``, a line longer than that (not counting its ``\\n``) comes back as its first
+        ``max_line_bytes`` bytes and a ``\\n``, its number in ``cut``, before the byte cap applies. Reading past the
+        last line returns no bytes and ``eof``, with the line count. ENOENT, EISDIR; EINVAL for a ``first_line``
+        below 1 or a negative limit."""
         segments = split(path)
         if not segments:
             raise VFSError("EISDIR", "/")
         if not 1 <= first_line <= _MAX_BIGINT:
             raise VFSError("EINVAL", join(*segments), f"invalid first line {first_line}")
-        if not (0 <= max_lines <= _MAX_INT and 0 <= max_bytes <= _MAX_INT):
-            raise VFSError("EINVAL", join(*segments), f"invalid limits {max_lines} lines, {max_bytes} bytes")
+        if not (0 <= max_lines <= _MAX_INT and 0 <= max_bytes <= _MAX_INT) or not (
+            max_line_bytes is None or 0 <= max_line_bytes <= _MAX_INT
+        ):
+            raise VFSError(
+                "EINVAL",
+                join(*segments),
+                f"invalid limits {max_lines} lines, {max_bytes} bytes, {max_line_bytes} bytes a line",
+            )
         ref = self._ref(segments)
         rows = await self._call(
-            path, [ref], "vfs_pread_lines({0}, %s::bigint, %s::int, %s::int)", [first_line, max_lines, max_bytes]
+            path,
+            [ref],
+            "vfs_pread_lines({0}, %s::bigint, %s::int, %s::int, %s::int)",
+            [first_line, max_lines, max_bytes, max_line_bytes],
         )
         node = rows[0][0]
-        size, generation, lines, _, start, content = rows[0][3:9]
+        size, generation, lines, _, start, content, end, cut = rows[0][3:11]
         self._checked(ref, node)
-        end = start + len(content)
-        return LineReadResult(node, content, first_line, start, end, size, generation, lines, end >= size)
+        return LineReadResult(
+            node, content, first_line, start, end, size, generation, lines, end >= size, frozenset(cut)
+        )
+
+    async def pread_many(
+        self, reads: Sequence[tuple[str, int, int]], *, groups: Sequence[int] | None = None
+    ) -> list[ReadResult | VFSError]:
+        """``pread(path, offset, limit)`` of each ``(path, offset, limit)`` in ``reads``, in one statement, so one
+        round trip and one snapshot. A read that fails with an outcome (ENOENT, ENOTDIR, EISDIR) gives its
+        ``VFSError`` in its place; EINVAL for a bad offset or limit fails the whole call. Paths are resolved on the
+        server, without the cache.
+
+        With ``groups``, a group id per read: of the reads with the same id, in order, only up to the first file is
+        read; the later ones are looked up but read with limit 0 (``AGENTS.md``, else ``CLAUDE.md``)."""
+        paths = [join(*split(path)) for path, _, _ in reads]
+        for path, offset, limit in zip(paths, (r[1] for r in reads), (r[2] for r in reads), strict=True):
+            if not 0 <= limit <= _MAX_INT:
+                raise VFSError("EINVAL", path, f"invalid limit {limit}")
+            if not -_MAX_BIGINT - 1 <= offset <= _MAX_BIGINT:
+                raise VFSError("EINVAL", path, f"invalid offset {offset}")
+        if groups is not None and len(groups) != len(reads):
+            raise ValueError(f"{len(groups)} groups for {len(reads)} reads")
+        results: list[ReadResult | VFSError] = [VFSError("EISDIR", "/") for _ in reads]
+        asked = [i for i, path in enumerate(paths) if path != "/"]
+        if not asked:
+            return results
+        group_ids = [groups[i] if groups is not None else i for i in asked]
+        # A path is "/" and names joined by "/", which no name contains, so the server splits it back.
+        rows = await self._run(
+            paths[asked[0]],
+            "WITH q AS (SELECT q.i, q.off, q.lim, q.grp, l.id, l.kind, l.err, l.err_detail"
+            "             FROM unnest(%s::text[], %s::bigint[], %s::int[], %s::bigint[])"
+            "                  WITH ORDINALITY AS q(path, off, lim, grp, i)"
+            "            CROSS JOIN LATERAL vfs_lookup(string_to_array(substr(q.path, 2), '/')) l),"
+            " w AS (SELECT q.*, coalesce(bool_or(q.kind = 'file') OVER (PARTITION BY q.grp ORDER BY q.i"
+            "                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), false) AS shadowed FROM q)"
+            " SELECT w.i, w.id, w.err, w.err_detail, p.size, p.generation, p.byte_offset, p.data, p.err, p.err_detail"
+            " FROM w LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(w.id, w.err), w.off,"
+            "                                                   CASE WHEN w.shadowed THEN 0 ELSE w.lim END)"
+            "                           WHERE w.err IS NULL OFFSET 0) p ON true"
+            " ORDER BY w.i, p.byte_offset",
+            [[paths[i] for i in asked], [reads[i][1] for i in asked], [reads[i][2] for i in asked], group_ids],
+        )
+        by_read: dict[int, list[tuple[Any, ...]]] = {}
+        for row in rows:
+            by_read.setdefault(row[0], []).append(row)
+        for n, i in enumerate(asked, 1):
+            node, lookup_err, lookup_detail, size, generation, start, _, err, detail = by_read[n][0][1:]
+            if lookup_err is not None or err is not None:
+                failed = lookup_err or err
+                results[i] = VFSError(failed, paths[i], detail=(lookup_detail if lookup_err else detail) or "")
+                continue
+            content = b"".join(row[7] for row in by_read[n] if row[7] is not None)
+            end = start + len(content)
+            results[i] = ReadResult(node, content, start, end, size, generation, end >= size)
+        return results
 
     async def glob(
         self,

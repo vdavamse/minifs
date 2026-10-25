@@ -69,7 +69,7 @@ Extents are line-aware (migration 007): every extent starts at a line start, and
 `\n`. Each carries `line_start` (the number of `\n` before it) and `line_offsets` (where each of its lines starts),
 and `vfs_nodes.lines` holds the line count. Every writer cuts content with `vfs_cut`, an append re-cuts the last
 extent when the file ends mid-line, and compaction merges whole extents, so the alignment holds. `vfs_pread_lines`
-reads by line. Readers are `STABLE`, so all their statements share the caller's snapshot; `vfs_file` is their
+reads by line, optionally cutting each line to a prefix (migration 011). Readers are `STABLE`, so all their statements share the caller's snapshot; `vfs_file` is their
 unlocked counterpart of `vfs_lock_file`. Raw inserts into `vfs_extents` (tests) must give both line columns.
 
 Search (migration 008) scans those extents: `vfs_search` filters each extent with a pattern's file form, splits
@@ -112,7 +112,7 @@ that.
 ## VFS library
 
 `minifs.vfs.client.VFSClient` takes absolute paths and wraps one SQL function per operation (`stat`, `readdir`,
-`pread`, `pread_lines`, `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `grep`
+`pread`, `pread_lines`, `pread_many` (several preads, each path's outcome in its place, in one statement; with `groups`, only up to the first file of each group is read), `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `grep`
 (the same, then `vfs_search`, under a 2 s `statement_timeout`; `SearchRefused` over the scope caps or on timeout), `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
 statement in its own transaction, resolving its paths on the server with `vfs_lookup` in a subquery, and calling
 the operation only if every lookup succeeded (`_gated`). It raises `minifs.vfs.core.VFSError(errno, path, message,
