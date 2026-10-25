@@ -96,6 +96,18 @@ class GrepSettings:
 
 
 @dataclass(frozen=True)
+class EditSettings:
+    max_bytes: int = 10 * 1024 * 1024
+    """Largest file ``Edit`` takes, since it holds the whole file in memory; ``Write`` replaces larger ones."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_bytes, bool) or not isinstance(self.max_bytes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"edit max_bytes must be an int, not {self.max_bytes!r}")
+        if self.max_bytes < 0:
+            raise ValueError(f"edit max_bytes must be at least 0, not {self.max_bytes}")
+
+
+@dataclass(frozen=True)
 class ToolSettings:
     """The tools' limits, one object per tool, with ladderframe's defaults. Set ``vfs_settings`` on the deps to
     change them."""
@@ -103,6 +115,7 @@ class ToolSettings:
     read: ReadSettings = field(default_factory=ReadSettings)
     glob: GlobSettings = field(default_factory=GlobSettings)
     grep: GrepSettings = field(default_factory=GrepSettings)
+    edit: EditSettings = field(default_factory=EditSettings)
 
 
 DEFAULT_SETTINGS = ToolSettings()

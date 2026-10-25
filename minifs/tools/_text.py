@@ -1,5 +1,6 @@
 """What ``Write`` and ``Edit`` share: ladderframe's text helpers (BOM, line endings, and the jsdiff-style patch with
-its change counts and trimming, from ``ladderframe.tools.edit``), and reading a whole file with its version.
+its change counts and trimming, from ``ladderframe.tools.edit``), reading a whole file with its version, and
+creating one.
 """
 
 from __future__ import annotations
@@ -29,6 +30,18 @@ async def read_file(vfs: VFSView, path: str) -> tuple[bytes, FileVersion]:
             raise VFSError("ESTALE", path, "changed while it was read")
         chunks.append(page.content)
     return b"".join(chunks), version
+
+
+async def create_file(vfs: VFSView, path: str, data: bytes) -> None:
+    """Creates file ``path``, with its missing parent directories. ``parents`` only when the parent is missing (the
+    create without it is ENOENT), since the view checks ``write`` on every directory a ``parents`` create could
+    make, existing or not."""
+    try:
+        await vfs.create(path, data)
+    except VFSError as e:
+        if e.errno != "ENOENT":
+            raise
+        await vfs.create(path, data, parents=True)
 
 
 def split_bom(text: str) -> tuple[bool, str]:

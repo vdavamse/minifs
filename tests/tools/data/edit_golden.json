@@ -1,0 +1,317 @@
+[
+ {
+  "name": "unique",
+  "old": "ZGVmIGYoKToKICAgIHJldHVybiAxCg==",
+  "oldString": "return 1",
+  "newString": "return 2",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n def f():\n-    return 1\n+    return 2\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "ZGVmIGYoKToKICAgIHJldHVybiAyCg=="
+ },
+ {
+  "name": "indented",
+  "old": "ICAgIGEgPSAxCiAgICBiID0gMgo=",
+  "oldString": "b = 2",
+  "newString": "b = 3",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n a = 1\n-b = 2\n+b = 3\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "ICAgIGEgPSAxCiAgICBiID0gMwo="
+ },
+ {
+  "name": "replace_all",
+  "old": "eCA9IDEKeCA9IDEK",
+  "oldString": "x = 1",
+  "newString": "x = 2",
+  "replaceAll": true,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n-x = 1\n-x = 1\n+x = 2\n+x = 2\n",
+   "additions": 2,
+   "deletions": 2
+  },
+  "written": "eCA9IDIKeCA9IDIK"
+ },
+ {
+  "name": "multiple",
+  "old": "eCA9IDEKeCA9IDEK",
+  "oldString": "x = 1",
+  "newString": "x = 2",
+  "replaceAll": null,
+  "retry": "Found multiple matches for oldString. Provide more surrounding context to make the match unique.",
+  "written": "eCA9IDEKeCA9IDEK"
+ },
+ {
+  "name": "not_found",
+  "old": "eCA9IDEK",
+  "oldString": "y = 1",
+  "newString": "y = 2",
+  "replaceAll": null,
+  "retry": "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.",
+  "written": "eCA9IDEK"
+ },
+ {
+  "name": "empty_old_existing",
+  "old": "eAo=",
+  "oldString": "",
+  "newString": "y",
+  "replaceAll": null,
+  "retry": "oldString cannot be empty when editing an existing file. Provide the exact text to replace, or use write for an intentional full-file replacement.",
+  "written": "eAo="
+ },
+ {
+  "name": "create",
+  "old": null,
+  "oldString": "",
+  "newString": "hello\n",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -0,0 +1 @@\n+hello\n",
+   "additions": 1,
+   "deletions": 0
+  },
+  "written": "aGVsbG8K"
+ },
+ {
+  "name": "create_bom",
+  "old": null,
+  "oldString": "",
+  "newString": "\ufeffhello\n",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -0,0 +1 @@\n+hello\n",
+   "additions": 1,
+   "deletions": 0
+  },
+  "written": "77u/aGVsbG8K"
+ },
+ {
+  "name": "crlf_bom",
+  "old": "77u/b25lDQp0d28NCnRocmVlDQo=",
+  "oldString": "one\ntwo",
+  "newString": "uno\ndos",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,3 +1,3 @@\n-one\n-two\n+uno\n+dos\n three\n",
+   "additions": 2,
+   "deletions": 2
+  },
+  "written": "77u/dW5vDQpkb3MNCnRocmVlDQo="
+ },
+ {
+  "name": "crlf_given_crlf",
+  "old": "b25lDQp0d28NCg==",
+  "oldString": "one\r\ntwo",
+  "newString": "uno\r\ndos",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n-one\n-two\n+uno\n+dos\n",
+   "additions": 2,
+   "deletions": 2
+  },
+  "written": "dW5vDQpkb3MNCg=="
+ },
+ {
+  "name": "lf_given_crlf",
+  "old": "b25lCnR3bwo=",
+  "oldString": "one\r\ntwo",
+  "newString": "uno\r\ndos",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n-one\n-two\n+uno\n+dos\n",
+   "additions": 2,
+   "deletions": 2
+  },
+  "written": "dW5vCmRvcwo="
+ },
+ {
+  "name": "bom_in_new",
+  "old": "YQpiCg==",
+  "oldString": "a",
+  "newString": "\ufeffz",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n-a\n+z\n b\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "77u/egpiCg=="
+ },
+ {
+  "name": "non_utf8",
+  "old": "Y2Fm6Qo=",
+  "oldString": "caf",
+  "newString": "bar",
+  "replaceAll": null,
+  "retry": "Cannot edit {path}: it is not a UTF-8 text file",
+  "written": "Y2Fm6Qo="
+ },
+ {
+  "name": "line_trimmed",
+  "old": "ZGVmIGYoKToKICAgIGlmIHg6CiAgICAgICAgcmV0dXJuIDEKICAgIHJldHVybiAyCg==",
+  "oldString": "if x:\n    return 1",
+  "newString": "    if y:\n        return 3",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,4 +1,4 @@\n def f():\n-    if x:\n-        return 1\n+    if y:\n+        return 3\n     return 2\n",
+   "additions": 2,
+   "deletions": 2
+  },
+  "written": "ZGVmIGYoKToKICAgIGlmIHk6CiAgICAgICAgcmV0dXJuIDMKICAgIHJldHVybiAyCg=="
+ },
+ {
+  "name": "whitespace",
+  "old": "YSAgPSAgIDEK",
+  "oldString": "a = 1",
+  "newString": "a = 2",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-a  =   1\n+a = 2\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "YSA9IDIK"
+ },
+ {
+  "name": "escaped",
+  "old": "cyA9ICJ4Igp5Cg==",
+  "oldString": "s = \\\"x\\\"",
+  "newString": "s = \"z\"",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n-s = \"x\"\n+s = \"z\"\n y\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "cyA9ICJ6Igp5Cg=="
+ },
+ {
+  "name": "block_anchor",
+  "old": "c3RhcnQgewogICAgYWxwaGFfdmFsdWUgPSAxCn0K",
+  "oldString": "start {\n    alpha_valu = 1\n}",
+  "newString": "start {}",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,3 +1 @@\n-start {\n-    alpha_value = 1\n-}\n+start {}\n",
+   "additions": 1,
+   "deletions": 3
+  },
+  "written": "c3RhcnQge30K"
+ },
+ {
+  "name": "literal_dollar",
+  "old": "YQo=",
+  "oldString": "a",
+  "newString": "$&",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-a\n+$&\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "JCYK"
+ },
+ {
+  "name": "disproportionate",
+  "old": "Zmlyc3QKbTEKbTIKenp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6egpsYXN0Cg==",
+  "oldString": "first\nm1\nm2\nlast",
+  "newString": "x",
+  "replaceAll": null,
+  "retry": "Refusing replacement because the matched span is much larger than oldString. Re-read the file and provide the full exact oldString for the intended replacement.",
+  "written": "Zmlyc3QKbTEKbTIKenp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6egpsYXN0Cg=="
+ },
+ {
+  "name": "no_final_newline",
+  "old": "YQpi",
+  "oldString": "b",
+  "newString": "c",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+c\n\\ No newline at end of file\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "YQpj"
+ },
+ {
+  "name": "delete_line",
+  "old": "YQpiCmMK",
+  "oldString": "b\n",
+  "newString": "",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,3 +1,2 @@\n a\n-b\n c\n",
+   "additions": 0,
+   "deletions": 1
+  },
+  "written": "YQpjCg=="
+ },
+ {
+  "name": "unicode",
+  "old": "aMOpbGxvIHfDtnJsZAo=",
+  "oldString": "w\u00f6rld",
+  "newString": "\ud83c\udf0d",
+  "replaceAll": null,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-h\u00e9llo w\u00f6rld\n+h\u00e9llo \ud83c\udf0d\n",
+   "additions": 1,
+   "deletions": 1
+  },
+  "written": "aMOpbGxvIPCfjI0K"
+ },
+ {
+  "name": "multi_hunk_all",
+  "old": "bGluZSAwCmxpbmUgMQpsaW5lIDIKbGluZSAzCmxpbmUgNApsaW5lIDUKbGluZSA2CmxpbmUgMApsaW5lIDEKbGluZSAyCmxpbmUgMwpsaW5lIDQKbGluZSA1CmxpbmUgNgpsaW5lIDAKbGluZSAxCmxpbmUgMgpsaW5lIDMKbGluZSA0CmxpbmUgNQpsaW5lIDYKbGluZSAwCmxpbmUgMQpsaW5lIDIKbGluZSAzCmxpbmUgNApsaW5lIDUKbGluZSA2CmxpbmUgMApsaW5lIDEKbGluZSAyCmxpbmUgMwpsaW5lIDQKbGluZSA1CmxpbmUgNgpsaW5lIDAKbGluZSAxCmxpbmUgMgpsaW5lIDMKbGluZSA0Cg==",
+  "oldString": "line 3\n",
+  "newString": "LINE 3\n",
+  "replaceAll": true,
+  "result": "Edit applied successfully.",
+  "metadata": {
+   "filepath": "{path}",
+   "diff": "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1,40 +1,40 @@\n line 0\n line 1\n line 2\n-line 3\n+LINE 3\n line 4\n line 5\n line 6\n line 0\n line 1\n line 2\n-line 3\n+LINE 3\n line 4\n line 5\n line 6\n line 0\n line 1\n line 2\n-line 3\n+LINE 3\n line 4\n line 5\n line 6\n line 0\n line 1\n line 2\n-line 3\n+LINE 3\n line 4\n line 5\n line 6\n line 0\n line 1\n line 2\n-line 3\n+LINE 3\n line 4\n line 5\n line 6\n line 0\n line 1\n line 2\n-line 3\n+LINE 3\n line 4\n",
+   "additions": 6,
+   "deletions": 6
+  },
+  "written": "bGluZSAwCmxpbmUgMQpsaW5lIDIKTElORSAzCmxpbmUgNApsaW5lIDUKbGluZSA2CmxpbmUgMApsaW5lIDEKbGluZSAyCkxJTkUgMwpsaW5lIDQKbGluZSA1CmxpbmUgNgpsaW5lIDAKbGluZSAxCmxpbmUgMgpMSU5FIDMKbGluZSA0CmxpbmUgNQpsaW5lIDYKbGluZSAwCmxpbmUgMQpsaW5lIDIKTElORSAzCmxpbmUgNApsaW5lIDUKbGluZSA2CmxpbmUgMApsaW5lIDEKbGluZSAyCkxJTkUgMwpsaW5lIDQKbGluZSA1CmxpbmUgNgpsaW5lIDAKbGluZSAxCmxpbmUgMgpMSU5FIDMKbGluZSA0Cg=="
+ }
+]
