@@ -56,6 +56,8 @@ from minifs.vfs.core import Entry, FileVersion, GlobResult, LineReadResult, Read
 from minifs.vfs.policy import Action, Policy
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
+MAX_GLOB_LIMIT = _MAX_LIMIT - 1
+"""The largest ``limit`` ``VFSView.glob`` takes (it asks for ``limit + 1``)."""
 _REFETCH_FACTOR = 8
 _NO_NODE = UUID(int=0)  # never a node id: a pin that nothing matches
 _log = logging.getLogger(__name__)
