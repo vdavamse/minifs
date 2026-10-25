@@ -19,7 +19,8 @@
 -- Deploying: adding a stored column rewrites vfs_extents (every extent read, decoded and written again, and the
 -- indexes rebuilt) under an ACCESS EXCLUSIVE lock, so reads and writes of file content wait until the migration
 -- commits, and it needs room for a second copy of the table. Plan a pause that grows with the bytes stored
--- (about 0.3 s for 20 MB).
+-- (about 0.3 s for 20 MB). The ALTER first waits for every open transaction that has read or written vfs_extents,
+-- and new content reads and writes queue behind it, so run it when no long transactions are open.
 
 
 -- Whether p_data is valid UTF-8, as convert_from(p_data, 'UTF8') decides: NUL bytes and a sequence cut at the end
