@@ -108,14 +108,29 @@ class EditSettings:
 
 
 @dataclass(frozen=True)
+class WriteSettings:
+    max_diff_bytes: int = 1024 * 1024
+    """Largest existing file ``Write`` reads to diff against its new text. A larger one is overwritten without
+    reading it (ladderframe has no such limit), and the metadata has no diff. Only the old file counts: new content
+    of any size is diffed against an old file under the cap."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_diff_bytes, bool) or not isinstance(self.max_diff_bytes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"write max_diff_bytes must be an int, not {self.max_diff_bytes!r}")
+        if self.max_diff_bytes < 0:
+            raise ValueError(f"write max_diff_bytes must be at least 0, not {self.max_diff_bytes}")
+
+
+@dataclass(frozen=True)
 class ToolSettings:
-    """The tools' limits, one object per tool, with ladderframe's defaults. Set ``vfs_settings`` on the deps to
-    change them."""
+    """The tools' limits, one object per tool: ladderframe's defaults, and minifs's own caps for ``Edit`` and
+    ``Write``. Set ``vfs_settings`` on the deps to change them."""
 
     read: ReadSettings = field(default_factory=ReadSettings)
     glob: GlobSettings = field(default_factory=GlobSettings)
     grep: GrepSettings = field(default_factory=GrepSettings)
     edit: EditSettings = field(default_factory=EditSettings)
+    write: WriteSettings = field(default_factory=WriteSettings)
 
 
 DEFAULT_SETTINGS = ToolSettings()
