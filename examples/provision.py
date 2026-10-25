@@ -4,7 +4,7 @@ whose ``add`` subtracts into a new workspace, and prints the workspace's id.
     MINIFS_DSN=postgresql://... uv run python examples/provision.py
 
 Seeding is ingestion's job, not the agent's, so it writes through the client, not an agent view. It is one-shot, so
-it opens no directory cache (README: Using the tools with pydantic-ai).
+it opens no directory cache (README: Configuration).
 """
 
 from __future__ import annotations

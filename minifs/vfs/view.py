@@ -1,4 +1,5 @@
-"""``VFSView``: an actor's view of the tree (a chroot) with the write policy enforced (README: *The agent's view*).
+"""``VFSView``: an actor's view of the tree (a chroot) with the write policy enforced (README: *Workspaces and
+permissions*).
 
 Mounts map visible prefixes to real ones, like bind mounts: ``/workspace`` to ``/workspaces/<workspace_id>``,
 ``/docs`` to ``/docs``. A path is normalised before it is mapped, so ``..`` can't climb out of a mount, and the

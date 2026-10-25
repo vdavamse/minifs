@@ -1,4 +1,4 @@
-"""Glob patterns for ``vfs_glob``: the translator to anchored Postgres AREs and the pruning hints (README: Glob).
+"""Glob patterns for ``vfs_glob``: the translator to anchored Postgres AREs and the pruning hints (docs/design.md).
 
 Patterns are ripgrep's ``-g`` globs, compiled by the same code: the ``minifs._regex`` extension applies the
 gitignore rules of rg's ``ignore`` crate (a pattern with no ``/`` matches the file name at any depth; one with a
@@ -6,7 +6,7 @@ gitignore rules of rg's ``ignore`` crate (a pattern with no ``/`` matches the fi
 emits its regex as ARE. ``*`` and ``?`` stay within one path segment, ``**`` as a whole segment spans
 directories, ``[...]`` is a class (``!`` or ``^`` negates), ``{a,b}`` alternates and may nest, and a backslash
 makes the next character literal. Unlike rg, ``?`` and classes match one character, not one byte, and a class
-never matches ``/`` (README: Glob, Divergences from rg). Paths are relative to the search root.
+never matches ``/`` (docs/design.md: Glob). Paths are relative to the search root.
 
 The translation uses no ARE classes, word boundaries or case folding, only literal characters and explicit
 ranges, so a regex means the same under every database locale.

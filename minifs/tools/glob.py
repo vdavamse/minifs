@@ -1,6 +1,6 @@
 """``Glob``: file paths matching a glob pattern, newest first, with ladderframe's contract over ``VFSView.glob``
-(README: Agent tools). Hidden directories aren't descended into, ``.git`` and the settings' excludes are skipped,
-and a pattern is parsed as rg parses ``-g`` (README: Glob, Divergences from rg)."""
+(README: The tools). Hidden directories aren't descended into, ``.git`` and the settings' excludes are skipped,
+and a pattern is parsed as rg parses ``-g`` (docs/design.md: Glob)."""
 
 from __future__ import annotations
 
