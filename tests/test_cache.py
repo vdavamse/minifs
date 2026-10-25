@@ -601,7 +601,7 @@ async def test_a_stale_chain_to_the_same_node_is_replaced(pool: Pool, monkeypatc
     lookups, hits, stores = walk_stats(cache)
     assert (await vfs.stat("/a/b/f")).id == f.id
     assert walk_stats(cache) == (lookups + 3, hits + 3, stores)  # all cached, and every link holds
-    assert len(statements) == 1 and "vfs_lookup" in statements[0][0]
+    assert len(statements) == 1 and "unnest(%s::uuid[], %s::uuid[], %s::text[])" in statements[0][0]  # the chain
     new_b = (await other.stat("/a/b")).id
     assert new_b is not None and cache.lookup(new_b, "f") == (f.id, "file")
 

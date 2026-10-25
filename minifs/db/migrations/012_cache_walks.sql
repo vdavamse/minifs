@@ -38,15 +38,18 @@ DECLARE
     v_i int := 0;
 BEGIN
     chain := '{}';
-    -- p_cached[0] is NULL: the first component's parent is the root. A NULL id matches no row.
-    IF v_k > 0 AND v_k < v_n AND (SELECT count(*)
-                                    FROM unnest(p_cached) WITH ORDINALITY AS c(id, i)
-                                    JOIN vfs_nodes n ON n.id = c.id
-                                   WHERE n.name = p_segments[c.i] AND n.kind = 'dir'
-                                     AND n.parent_id IS NOT DISTINCT FROM p_cached[c.i - 1]) = v_k THEN
-        v_i := v_k;
-        v_id := p_cached[v_k];
-        chain := p_cached;
+    -- Nested, so a call without p_cached tests a simple expression and runs no query. p_cached[0] is NULL: the
+    -- first component's parent is the root. A NULL id matches no row.
+    IF v_k > 0 AND v_k < v_n THEN
+        IF (SELECT count(*)
+              FROM unnest(p_cached) WITH ORDINALITY AS c(id, i)
+              JOIN vfs_nodes n ON n.id = c.id
+             WHERE n.name = p_segments[c.i] AND n.kind = 'dir'
+               AND n.parent_id IS NOT DISTINCT FROM p_cached[c.i - 1]) = v_k THEN
+            v_i := v_k;
+            v_id := p_cached[v_k];
+            chain := p_cached;
+        END IF;
     END IF;
     WHILE v_i < v_n LOOP
         v_i := v_i + 1;

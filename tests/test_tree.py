@@ -321,6 +321,33 @@ async def test_lookup_below_a_cached_prefix(conn: AsyncConnection) -> None:
     assert await below(["other"], [a]) == ([other], other, "dir", None, None)  # another path's prefix
 
 
+async def test_a_lookup_below_a_prefix_walks_only_the_rest(conn: AsyncConnection) -> None:
+    # The answers are the same either way (above), so count the walk's probes of the (parent, name) index; the
+    # prefix check goes through the primary key.
+    a = await create(conn, None, "a", "dir")
+    b = await create(conn, a, "b", "dir")
+    await create(conn, b, "f")
+
+    async def probes(cached: list[UUID] | None) -> int:
+        async def scans() -> int:
+            await conn.execute("SELECT pg_stat_force_next_flush()")
+            await conn.execute("SELECT 1")  # the flush happens at the end of the statement that asked for it
+            await conn.execute("SELECT pg_stat_clear_snapshot()")
+            row = await _one(
+                conn, "SELECT idx_scan FROM pg_stat_user_indexes WHERE indexrelname = 'vfs_nodes_parent_name_key'"
+            )
+            assert isinstance(row[0], int)
+            return row[0]
+
+        before = await scans()
+        await conn.execute("SELECT * FROM vfs_lookup(%s, %s::uuid[])", (["a", "b", "f"], cached))
+        return await scans() - before
+
+    assert await probes(None) == 3
+    assert await probes([a, b]) == 1
+    assert await probes([a, a]) == 3  # a prefix that doesn't hold: from the root
+
+
 async def test_resolve_does_not_confuse_root_entries_with_children(conn: AsyncConnection) -> None:
     docs = await create(conn, None, "docs", "dir")
     await create(conn, docs, "inner", "dir")
