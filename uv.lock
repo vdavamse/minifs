@@ -339,7 +339,7 @@ requires-dist = [
     { name = "psycopg", specifier = ">=3.3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'binary'", specifier = ">=3.3" },
     { name = "psycopg-pool", specifier = ">=3.3" },
-    { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.51" },
+    { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.61" },
 ]
 provides-extras = ["binary", "pydantic-ai"]
 

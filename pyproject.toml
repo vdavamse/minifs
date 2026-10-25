@@ -42,7 +42,7 @@ Issues = "https://github.com/vdavamse/minifs/issues"
 # Bundled libpq; without it psycopg needs a system libpq.
 binary = ["psycopg[binary]>=3.3"]
 # The agent tools (minifs.tools). minifs.vfs and minifs.db work without it.
-pydantic-ai = ["pydantic-ai-slim>=2.51"]
+pydantic-ai = ["pydantic-ai-slim>=2.61"]  # examples/agent.py uses 2.61 event types; the floor matches the dev group
 
 [project.scripts]
 minifs = "minifs.cli:main"
