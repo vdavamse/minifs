@@ -13,7 +13,7 @@ An agent sees one filesystem tree, stored entirely in Postgres, and works on it 
 - Incremental reads: a reader can tail a growing file and get only what is new since its last read, by byte offset in the library and by line number in the tools.
 - Search and glob run inside Postgres, so there's no local mirror, no sync and no `rg` binary.
 - PostgreSQL is the single source of truth, and every read reflects the latest committed write.
-- Low latency: a tool call is one or two SQL round trips.
+- Low latency: a tool call is one or two SQL round trips (`Read` adds about one per directory below `/workspace` for its instruction-file lookups, until they become one query).
 
 **Non-goals**
 
@@ -397,7 +397,7 @@ A library caller that tails files (a harness, an ingestion job, a watcher) keeps
 ### Tool contract: numbered lines
 
 ```
-Read(filePath, offset=None, limit=None) -> str
+Read(filePath, offset=None, limit=None) -> str | ToolReturn
 ```
 
 The tool takes ladderframe's `Read` parameters and returns its output format.
@@ -408,7 +408,7 @@ The tool takes ladderframe's `Read` parameters and returns its output format.
 | A negative `offset` or `limit` | `ModelRetry: offset and limit must be non-negative integers` |
 | `limit = K` (default 2000) | At most K lines |
 | `offset` past the last line | `ModelRetry`: `Offset 120 is out of range for this file (80 lines)` |
-| `filePath` is a directory | Its entries, hidden ones included, one per line and with `/` after subdirectories, inside an `<entries>` block after `<type>directory</type>`, with the footer last inside the block. Sorted case-insensitively. `offset` and `limit` page through the entries; the footer is `(N entries)` or `(Showing X of Y entries. Use 'offset' parameter to read beyond entry Z)` |
+| `filePath` is a directory | Its entries the actor may read, hidden ones included, one per line and with `/` after subdirectories, inside an `<entries>` block after `<type>directory</type>`, with the footer last inside the block. Sorted case-insensitively. `offset` and `limit` page through the entries; the footer is `(N entries)` or `(Showing X of Y entries. Use 'offset' parameter to read beyond entry Z)` |
 
 ```
 <path>/workspace/src/config.py</path>
@@ -421,10 +421,11 @@ The tool takes ladderframe's `Read` parameters and returns its output format.
 </content>
 ```
 
-- **Lines come from Postgres.** One `vfs_pread_lines(node, N, K, 50 KB)` call returns lines N to N+K-1, the total line count and the snapshot's generation, with no full-file read. The 50 KB cap applies to the raw bytes, before the tool cuts each line to 2,000 characters, so when a long line came back cut, the tool calls again from the line after it to fill the page as ladderframe does. Lines split on `\n` only, and the tool drops a trailing `\r`, so line numbers agree with `Grep` hits.
+- **One round trip for most reads.** The 4 KB sample that decides whether the file is binary (below) and the page's first `vfs_pread_lines` call go out together, so a Read of a file directly in `/workspace` or outside it holds two connections for one round trip; for an image or other binary, the page's bytes are fetched and dropped. The read starts again, for up to three attempts, when the sample, the page or the attachment come from different versions of the file, or the path vanishes between them.
+- **Lines come from Postgres.** One `vfs_pread_lines(node, N, K, 50 KB)` call returns lines N to N+K-1, the total line count and the snapshot's generation, with no full-file read. The 50 KB cap applies to the raw bytes, before the tool cuts each line to 2,000 characters, so a page of long lines can need more than one call: a line the cap cut is used as is when it's the first of its batch (the batch holds more than 2,000 characters of it, so it's truncated to the same text), and is otherwise read again as the first line of the next call, until the page is full as ladderframe fills it. A page whose file changes between its calls (a new generation, or another file renamed over it) is read again, up to three times. Lines split on `\n` only, and the tool drops a trailing `\r`, so line numbers agree with `Grep` hits.
 - **Bounded output, as in ladderframe.** A line longer than 2,000 characters is cut and gets `... (line truncated to 2000 chars)`, and output stops at 50 KB with `(Output capped at 50 KB. Showing lines a-b. Use offset=b+1 to continue.)`. The last page ends with `(End of file - total n lines)`.
-- **Text only.** Bytes are decoded as UTF-8 with replacement characters. A file that looks binary (PNG, JPEG, GIF, WEBP or `%PDF-` magic bytes, a `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.pdf` extension, which ladderframe would attach, or another known binary extension, a NUL byte in the first 4 KB, or more than 30% non-printable bytes there) gets `ModelRetry: Cannot read binary file: <path>`. ladderframe's `Read` attaches images and PDFs; minifs's `Read` doesn't, so they get the same binary-file error (see Differences from ladderframe).
-- **Nearby instructions.** As in ladderframe: for a file below `/workspace`, each directory from the file's parent up to, but not including, `/workspace` is checked for `AGENTS.md`, then `CLAUDE.md`, taking the first that exists, with no fallback. That file is then omitted if it's the file being read, was already shown in this conversation, or is blank. Each remaining instruction file is appended, headed `Instructions from: <path>`, in one `<system-reminder>` block. Files outside `/workspace`, such as `/docs/**`, get none. The ancestor ids are already known from path resolution, so one query finds every candidate (`WHERE parent_id = ANY($ancestors) AND kind = 'file' AND name IN ('AGENTS.md', 'CLAUDE.md')`, returning each candidate's content), sent in the same round trip as the read. The client applies the per-directory choice and the omissions above.
+- **Images and PDFs are attached, other binaries refused.** The first 4 KB (`vfs.pread(path, 0, 4096)`) decide, as in ladderframe. PNG, JPEG, GIF, WEBP or `%PDF-` magic bytes, or an extension `mimetypes` maps to one of those types (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.pdf` and the like), return `Image read successfully` or `PDF read successfully` with the file as a `BinaryContent` attachment, up to 3.75 MB (`ModelRetry: <path> is too large to attach (N bytes, the limit is 3750000)` above). Another known binary extension, a NUL byte in the sample, or more than 30% non-printable bytes there gets `ModelRetry: Cannot read binary file: <path>`. Anything else is text, decoded as UTF-8 with replacement characters.
+- **Nearby instructions.** As in ladderframe: for a file below `/workspace`, each directory from the file's parent up to, but not including, `/workspace` is checked for `AGENTS.md`, then `CLAUDE.md`, taking the first that is a file the actor may read, with no fallback. That file is then omitted if it's the file being read, was already shown in this conversation, or is blank. Each remaining instruction file is appended, headed `Instructions from: <path>`, in one `<system-reminder>` block. Files outside `/workspace`, such as `/docs/**`, get none. Once the sample shows a text file, the tool stats the candidates through the view while the rest of the page is read, two at a time so a Read holds at most three connections, then reads the chosen files, so a file below `/workspace` costs a round trip per directory or so. A lookup that fails otherwise than missing or denied (EIO) skips that directory rather than fall back to `CLAUDE.md`. (One query for every candidate, sent with the read, would save those round trips.)
 - **Stateless.** There is no `offset=None` auto-continue and no per-agent cursor in the tool. To tail a log, the agent calls `Read` again with the `offset` its last footer gave. Generation-aware tailing is a library feature.
 
 ### Line numbers in the tools, byte offsets in the library
@@ -746,7 +747,7 @@ minifs ships pydantic-ai tools with ladderframe's (opencode's) contracts, in `mi
 
 | Tool | Signature | Backed by |
 | --- | --- | --- |
-| Read | `Read(filePath, offset, limit)`: numbered lines of a file, or the entries of a directory | `vfs_pread_lines`; `vfs_readdir` for a directory |
+| Read | `Read(filePath, offset, limit)`: numbered lines of a file, or the entries of a directory | `vfs_pread_lines`, `vfs_pread` (the binary sample, attachments); `vfs_readdir` for a directory; a stat (`vfs_nodes`) for instruction files |
 | Glob | `Glob(pattern, path)`: absolute paths, at most 100 | `vfs_glob` over `vfs_nodes` |
 | Grep | `Grep(pattern, path, include)`: hits grouped by file, at most 100 | `vfs_glob` and a scan of `vfs_extents` |
 | Write | `Write(content, filePath)` | `vfs_create`, or `vfs_pread` and a compare-and-swap `vfs_write`, subject to the write policy |
@@ -779,8 +780,8 @@ ladderframe's tools run over a disk, `Glob` and `Grep` through ripgrep; minifs i
 - **No `.gitignore`.** ladderframe's `Glob` and `Grep` both honour `.gitignore`, `.ignore` and git's excludes, as rg does by default. minifs has no ignore files. In their place, `Glob` and `Grep` apply a default exclude list limited to unambiguous caches (`**/node_modules/**`, `**/.venv/**`, `**/__pycache__/**`, `**/.mypy_cache/**`), configurable per workspace. As in rg, excludes match each path relative to the search root: a `path` inside an excluded directory is searched, and excluded directories below `path` are still skipped. Excluded directories are pruned from the walk (see Glob), so they cost nothing. `**/.git/**` is always excluded, outside the configurable list, as ladderframe hard-codes it. Hidden files follow ladderframe (see Glob). Honouring `.gitignore` files stored in the tree can come later.
 - **ARE underneath.** Patterns are parsed as rg parses them and translated to Postgres ARE (see Regex dialect). A few constructs rg accepts are refused with a `ModelRetry` that names them: byte classes outside ASCII, repetition counts above 255, and patterns whose translation exceeds the size cap.
 - **mtime order.** `Glob` returns paths newest first, as opencode does; ladderframe's `Glob` and `Grep` return them in rg's walk order, which varies between runs because rg searches in parallel. `Grep` orders hits by path, then line. Above the result limit, minifs returns the first 100 in its order, where ladderframe returns an arbitrary 100.
-- **No attachments.** `Read` doesn't attach images or PDFs (see Read contract).
 - **Non-UTF-8 files aren't searched.** rg searches them and ladderframe decodes hits with replacement characters; minifs's `Grep` skips them (see Search).
+- **Read sees the view.** A path the policy refuses is `Permission denied: read <path>` whether or not anything is there, so a denial doesn't tell what exists. Directory listings, `Did you mean` suggestions and instruction files leave out what the actor may not read (an unreadable `AGENTS.md` falls back to `CLAUDE.md`). ladderframe also carries already-shown instruction files across a Temporal activity; minifs has no Temporal integration, so a run context without `messages` repeats them on every `Read`.
 - **Guard rails.** minifs refuses searches over the file cap or byte cap, and stops each of a search's two statements after 2 seconds. ladderframe's `Grep` has no such limits.
 
 ### Package layout
@@ -846,7 +847,7 @@ async def read(ctx: RunContext[HasVFS], filePath: str, offset: int | None = None
 Read = vfs_tool(read, "Read", DESCRIPTION)
 ```
 
-The tool descriptions start from ladderframe's text, so a model sees the same instructions on disk and in minifs. minifs drops the lines that point to tools or features it doesn't have (Bash with `rg`, the Agent tool, image and PDF attachments, "the local filesystem"). It adds one line to `Grep`'s description: use `(?i)` for case-insensitive search; lookaround and backreferences aren't supported.
+The tool descriptions start from ladderframe's text, so a model sees the same instructions on disk and in minifs. minifs drops the lines that point to tools or features it doesn't have (Bash with `rg`, the Agent tool, "the local filesystem"). It adds one line to `Grep`'s description: use `(?i)` for case-insensitive search; lookaround and backreferences aren't supported.
 
 **Errors follow ladderframe.** A mistake the model can fix by calling again raises `ModelRetry`, with a message that says what to change: a missing path (`File not found: /workspace/notes.md`, with up to three similar names), an offset past the end, a binary file, a `Glob` path that isn't a directory (`glob path must be a directory: ...`, `No such directory: ...`), a missing `Grep` path (`No such file or directory: ...`) or empty pattern (`pattern is required`), a pattern the translator rejects (ripgrep's message and position), a search scope over the cap, or a timeout. A path outside the agent's view gets each tool's not-found error (`File not found` for `Read` and `Write`, `No such directory` for `Glob`, `No such file or directory` for `Grep`), and `Read` never suggests similar names from outside the view, so errors don't reveal what exists beyond the chroot. A permission denial (the write policy) is returned as a string, as ladderframe's permission guard does: retrying won't help, and the model reads the refusal and moves on. Each tool maps `VFSError` to one of the two at its boundary with `minifs.tools.errors.tool_error`, and nothing else escapes: `EACCES` becomes the result `Permission denied: <action> <path>`, `ESTALE` the retry `<path> was modified since it was read. Read it again before writing.`, a database error `Internal error reading <path>`, and a refused search its own message.
 
