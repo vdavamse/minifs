@@ -158,7 +158,7 @@ Each column choice, and why:
 | Enforced by | The `(node_id, node_kind)` foreign key: no extents on a directory | The `(parent_id, parent_kind)` foreign key: no children under a file |
 
 - **Kind never changes.** A file can't become a directory in place; replacing one with the other is unlink plus create, as in POSIX.
-- **Resolution returns the kind.** `vfs_resolve` returns `(id, kind)`, so the library reports `ENOTDIR` and `EISDIR` before calling an operation, and the directory cache stores the kind with the id. The foreign keys are the backstop.
+- **Resolution returns the kind.** `vfs_lookup` returns `(id, kind)`, so the library reports `ENOTDIR` and `EISDIR` before calling an operation, and the directory cache stores the kind with the id. The foreign keys are the backstop.
 - **Directory `mtime` isn't maintained.** POSIX updates it on every create, unlink and rename inside the directory. Here that would lock and update the parent row on every create: a hot spot for shared directories such as `tasks/new/`, and an extra NOTIFY each time. Watchers get those events from NOTIFY by parent id instead.
 
 **Inode numbers and handles.** If a protocol needs a 64-bit inode number, take the low 64 bits of the UUID (the random part in v7). A stateful protocol can use the 16-byte UUID itself as the file handle. Unlike TigerFS's path-encoded NFS handles, it survives renames.
@@ -178,13 +178,15 @@ Each column choice, and why:
 
 Every operation is a SQL function, so every client (agent tools, ingestion, a future TigerFS front end) gets the same semantics from the database. The Python library is a thin wrapper.
 
+Expected outcomes (`ENOENT`, `ENOTDIR`, `EISDIR`, `EEXIST`, `ESTALE`, `ENOTEMPTY`) are returned, not raised: each function has `err` and `err_detail` result columns, and on an outcome changes nothing and returns one row carrying the error. Only faults (`EINVAL`, `ENAMETOOLONG`, broken invariants) raise, so a missing path an agent guessed costs no server log entry and doesn't abort the caller's transaction (migration 009, CONTRIBUTING: SQL functions and errors). The sketches below raise for brevity.
+
 | Operation | Function | POSIX analogue | Locking |
 | --- | --- | --- | --- |
 | Append | `vfs_append(node, data) -> offset` | `write` with `O_APPEND` | Inode `FOR UPDATE` until commit |
 | Overwrite | `vfs_write(node, data, expect_gen, expect_size, expect_parent, expect_name) -> (generation, size)` | `open` with `O_TRUNC`, then `write` | Inode `FOR UPDATE`; optional compare-and-swap |
 | Positional read | `vfs_pread(node, offset, limit)` | `pread` | None (MVCC snapshot) |
 | Line read | `vfs_pread_lines(node, first_line, max_lines, max_bytes)` | — | None (MVCC snapshot) |
-| Resolve path | `vfs_resolve(path) -> id` | `namei` | None |
+| Resolve path | `vfs_lookup(path) -> (id, kind)` | `namei` | None |
 | List directory | `vfs_readdir(dir)` | `readdir` | None |
 | Create, mkdir | `vfs_create(parent, name, kind, data DEFAULT NULL) -> (id, generation, size)` | `open` with `O_CREAT\|O_EXCL`, `mkdir` | Unique constraint |
 | Rename, move | `vfs_rename(node, new_parent, new_name, expect_parent)` | `rename` | Row lock; checks for cycles |
@@ -273,7 +275,7 @@ This is how a worker claims a file from `tasks/new/` to `tasks/cur/`. If two wor
 
 ### Path resolution
 
-`vfs_resolve(segments TEXT[]) -> (id, kind)` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. The library caches `(parent_id, name) -> id` and evicts entries when NOTIFY reports a move or delete (see Caching).
+`vfs_lookup(segments TEXT[]) -> (id, kind, err, err_detail)` walks parent pointers on the server in one round trip, the same idea as TigerFS's `resolve_path`. The library caches `(parent_id, name) -> id` and evicts entries when NOTIFY reports a move or delete (see Caching).
 
 ### Watch (inotify)
 

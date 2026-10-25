@@ -23,6 +23,7 @@ from uuid import UUID
 from psycopg import AsyncConnection
 
 from minifs import _regex
+from minifs.vfs.core import VFSError
 
 
 class GlobError(ValueError):
@@ -122,7 +123,8 @@ async def glob(
     """The files below directory ``root`` (None: ``/``) that match ``pattern``, newest first, as ``vfs_glob``
     returns them. ``.git`` directories are never walked. Without ``hints`` it walks the whole tree (for tests).
 
-    Raises GlobError for a bad pattern, and ENOENT / ENOTDIR (see ``minifs.db.errors``) for a bad ``root``.
+    Raises GlobError for a bad pattern, and ``VFSError`` ENOENT / ENOTDIR for a bad ``root`` (with the root's id
+    as its path).
     """
     if limit is not None and limit < 0:
         raise ValueError(f"limit must not be negative, got {limit}")
@@ -131,7 +133,7 @@ async def glob(
     if not hints:
         plan = GlobPlan(plan.regex)
     cur = await conn.execute(
-        "SELECT id, path, size, mtime FROM vfs_glob(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "SELECT id, path, size, mtime, err, err_detail FROM vfs_glob(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             root,
             plan.regex,
@@ -144,7 +146,10 @@ async def glob(
             list(ex.prune_dirs),
         ),
     )
-    return [GlobMatch(*row) for row in await cur.fetchall()]
+    rows = await cur.fetchall()
+    if rows and rows[0][4] is not None:  # the only row, then
+        raise VFSError(rows[0][4], str(root), detail=rows[0][5] or "")
+    return [GlobMatch(*row[:4]) for row in rows]
 
 
 def _pruned_dir_name(pattern: str) -> str | None:

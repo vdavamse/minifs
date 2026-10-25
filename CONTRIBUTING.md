@@ -56,9 +56,9 @@ and versions the database has but this checkout doesn't as `unknown`.
 
 ## SQL functions and errors
 
-The tree lives in `vfs_nodes` (migration 003). Every operation is a SQL function (`vfs_resolve`, `vfs_readdir`,
-`vfs_create`, `vfs_mkdir_p`, `vfs_rename`, `vfs_unlink`); the header comment of each says what it does and
-raises. A NULL directory id stands for the virtual root `/`.
+The tree lives in `vfs_nodes` (migration 003). Every operation is a SQL function (`vfs_lookup`, `vfs_readdir`,
+`vfs_create`, `vfs_mkdir_p`, `vfs_rename`, `vfs_unlink`); the header comment of each says what it does, returns
+and raises. A NULL directory id stands for the virtual root `/`.
 
 File bytes live in `vfs_extents` (migration 004): `vfs_append`, `vfs_write`, `vfs_pread` and `vfs_compact`, and
 `vfs_create` takes optional initial content. The extents of a file's current generation tile `[0, size)` with no
@@ -77,9 +77,33 @@ only the extents that pass into lines, and returns the matching ones with their 
 stopping at the limit; a file with content that isn't UTF-8 is skipped whole. The scope comes from `vfs_glob` in a
 statement of its own, so `minifs.vfs.search` can refuse it over the file and byte caps before content is read.
 
-Functions report errors with `PERFORM vfs_raise('ENOENT', detail)`, which raises SQLSTATE `MFnnn` (`nnn` = the
-Linux errno number) with the errno name as the message. `minifs.db.errors.errno_name(exc)` maps it back. Add a
-new errno to both `vfs_raise` and `SQLSTATE_BY_ERRNO`.
+Errors come in two groups (migration 009):
+
+| Group | Errnos | How the function reports it |
+| --- | --- | --- |
+| **Outcomes**: the answer is "no" | ENOENT, ENOTDIR, EISDIR, EEXIST, ESTALE, ENOTEMPTY | **Returned** in two result columns, `err` (the errno name, or NULL) and `err_detail` |
+| **Faults**: bad input or a broken invariant | EINVAL, ENAMETOOLONG, and anything not errno-coded (`data_corrupted`, ...) | **Raised** with `PERFORM vfs_raise('EINVAL', detail)` |
+
+An outcome is something a correct caller meets in normal use: a path an agent guessed, a name already taken, a
+lost Maildir claim or compare-and-swap, a non-empty directory. Raising it would cost a server log entry each time
+(an ERROR with DETAIL, CONTEXT and the statement, which name real paths, and which a non-superuser can't silence
+on Lakebase), an ERROR rate that can't tell guesses from faults, and the caller's transaction, which a raise
+aborts (a REPEATABLE READ snapshot, say). So:
+
+- A function that can produce an outcome has `err text, err_detail text` as its last result columns. On an outcome
+  it changes nothing and returns one row with `err` set and every other column NULL. One that returns nothing else
+  (`vfs_rename`, `vfs_unlink`) returns one row on success too, with `err` NULL. Assign the OUT variables and
+  `RETURN NEXT; RETURN;`. A helper that finds an outcome (`vfs_lock_dir`, `vfs_lock_file`, `vfs_file`) returns it
+  the same way, for its caller to pass on.
+- A new outcome errno is returned, never raised: add it to `OUTCOMES` in `minifs.db.errors` too. A new errno of
+  either group goes in `vfs_raise` and `SQLSTATE_BY_ERRNO`, which the constraints' backstop also uses.
+- A node id (not a directory id, where NULL is the root) that is NULL raises EINVAL (`vfs_check_node`): it is what
+  an unchecked failed lookup gives, and must fail loudly.
+- Raw SQL and the rare races the functions don't pre-check still hit the constraints, which raise (a create
+  committing between `vfs_rename`'s check and its update raises `unique_violation`); `errno_name(exc)` maps those
+  and the faults back to errnos.
+- Tests: `tests.test_tree.raises_errno` checks both the errno and its group (returned for an outcome, raised for a
+  fault); `raises_db_errno` expects a raise, for the constraints.
 
 Production runs on Databricks Lakebase (PostgreSQL 16 to 18, no superuser, no `pg_uuidv7`, default collation
 `C.UTF-8`), so SQL must work as a plain role that owns its database; `test_migrations_need_no_superuser` checks
@@ -90,12 +114,13 @@ that.
 `minifs.vfs.client.VFSClient` takes absolute paths and wraps one SQL function per operation (`stat`, `readdir`,
 `pread`, `pread_lines`, `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `grep`
 (the same, then `vfs_search`, under a 2 s `statement_timeout`; `SearchRefused` over the scope caps or on timeout), `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
-statement in its own transaction, resolving its paths on the server with `vfs_resolve` in a subquery, and raises
-`minifs.vfs.core.VFSError(errno, path, message, detail)` for every errno the SQL layer reports. `detail` (the
+statement in its own transaction, resolving its paths on the server with `vfs_lookup` in a subquery, and calling
+the operation only if every lookup succeeded (`_gated`). It raises `minifs.vfs.core.VFSError(errno, path, message,
+detail)` for every errno the SQL layer reports, returned (through `_outcome`, with `db_error` None) or raised. `detail` (the
 server's DETAIL, with node ids and real path components) and `db_error` are for logs only: a view that rewrites
 paths (the chroot) translates `path` and never shows `detail`. Paths go through
 `minifs.vfs.core.normalize` first. With a `DirCache` (the hook for #19's directory-entry cache), a fully cached
-path is checked link by link in the same statement instead of walked, and falls back to `vfs_resolve` if any link
+path is checked link by link in the same statement instead of walked, and falls back to `vfs_lookup` if any link
 went stale, so a stale cache never reaches the wrong node. `minifs.vfs.cache.DirEntryCache` is that cache: positive
 entries with a 2 s TTL, kept fresh by `follow(watcher)` (evict by id on `move` and `delete`, clear on `rescan`).
 

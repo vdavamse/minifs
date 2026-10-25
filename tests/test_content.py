@@ -9,7 +9,7 @@ import psycopg
 import pytest
 from psycopg import AsyncConnection
 
-from tests.test_tree import create, mkdir_p, raises_errno, wait_until_blocked
+from tests.test_tree import check, create, mkdir_p, raises_db_errno, raises_errno, unlink, wait_until_blocked
 
 
 async def _one(conn: AsyncConnection, query: str, params: tuple[object, ...] = ()) -> tuple[object, ...]:
@@ -20,20 +20,23 @@ async def _one(conn: AsyncConnection, query: str, params: tuple[object, ...] = (
 
 
 async def create_file(conn: AsyncConnection, name: str, data: bytes | None = None) -> UUID:
-    row = await _one(conn, "SELECT id FROM vfs_create(NULL, %s, 'file', %s)", (name, data))
+    row = await _one(conn, "SELECT id, err, err_detail FROM vfs_create(NULL, %s, 'file', %s)", (name, data))
+    check(*row[1:])
     assert isinstance(row[0], UUID)
     return row[0]
 
 
 async def append(conn: AsyncConnection, node: UUID, data: bytes) -> int:
-    row = await _one(conn, "SELECT vfs_append(%s, %s)", (node, data))
+    row = await _one(conn, "SELECT byte_offset, err, err_detail FROM vfs_append(%s, %s)", (node, data))
+    check(*row[1:])
     assert isinstance(row[0], int)
     return row[0]
 
 
 async def write(conn: AsyncConnection, node: UUID, data: bytes, *expect: object) -> tuple[int, int]:
     params = ", ".join(["%s"] * (2 + len(expect)))
-    row = await _one(conn, f"SELECT generation, size FROM vfs_write({params})", (node, data, *expect))
+    row = await _one(conn, f"SELECT generation, size, err, err_detail FROM vfs_write({params})", (node, data, *expect))
+    check(*row[2:])
     assert isinstance(row[0], int) and isinstance(row[1], int)
     return row[0], row[1]
 
@@ -41,10 +44,12 @@ async def write(conn: AsyncConnection, node: UUID, data: bytes, *expect: object)
 async def pread(conn: AsyncConnection, node: UUID, offset: int, limit: int) -> tuple[bytes, int, int]:
     """The bytes read, joined, with the file's size and generation."""
     cur = await conn.execute(
-        "SELECT size, generation, byte_offset, data FROM vfs_pread(%s, %s, %s)", (node, offset, limit)
+        "SELECT size, generation, byte_offset, data, err, err_detail FROM vfs_pread(%s, %s, %s)", (node, offset, limit)
     )
     rows = await cur.fetchall()
     assert rows
+    check(*rows[0][4:])
+    rows = [row[:4] for row in rows]
     sizes = {(size, gen) for size, gen, _, _ in rows}
     assert len(sizes) == 1, "every row carries the same size and generation"
     size, gen = sizes.pop()
@@ -71,9 +76,10 @@ async def extents(conn: AsyncConnection, node: UUID) -> list[tuple[int, int, int
 
 async def compact(conn: AsyncConnection, node: UUID, target: int | None = None) -> int:
     if target is None:
-        row = await _one(conn, "SELECT vfs_compact(%s)", (node,))
+        row = await _one(conn, "SELECT removed, err, err_detail FROM vfs_compact(%s)", (node,))
     else:
-        row = await _one(conn, "SELECT vfs_compact(%s, %s)", (node, target))
+        row = await _one(conn, "SELECT removed, err, err_detail FROM vfs_compact(%s, %s)", (node, target))
+    check(*row[1:])
     assert isinstance(row[0], int)
     return row[0]
 
@@ -107,13 +113,13 @@ async def test_extent_storage_is_compressed(conn: AsyncConnection) -> None:
 
 async def test_extent_on_a_directory_is_rejected(conn: AsyncConnection) -> None:
     d = await mkdir_p(conn, "d")
-    with raises_errno("EISDIR"):
+    with raises_db_errno("EISDIR"):
         await conn.execute(
             "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
             " VALUES (%s, 0, 0, 0, 'x', '{0}')",
             (d,),
         )
-    with raises_errno("EISDIR"):
+    with raises_db_errno("EISDIR"):
         await conn.execute(
             "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets, node_kind)"
             " VALUES (%s, 0, 0, 0, 'x', '{0}', 'dir')",
@@ -124,7 +130,7 @@ async def test_extent_on_a_directory_is_rejected(conn: AsyncConnection) -> None:
 async def test_extents_go_with_their_file(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f", b"hello")
     await append(conn, f, b" world")
-    await conn.execute("SELECT vfs_unlink(%s)", (f,))
+    await unlink(conn, f)
     row = await _one(conn, "SELECT count(*) FROM vfs_extents")
     assert row[0] == 0
 
@@ -135,19 +141,21 @@ async def test_extents_go_with_their_file(conn: AsyncConnection) -> None:
 @pytest.mark.parametrize(
     "call",
     [
-        "SELECT vfs_append(%s, 'x')",
-        "SELECT vfs_write(%s, 'x')",
-        "SELECT * FROM vfs_pread(%s, 0, 10)",
-        "SELECT * FROM vfs_pread_lines(%s, 1, 10, 100)",
-        "SELECT vfs_compact(%s)",
+        "vfs_append(%s, 'x')",
+        "vfs_write(%s, 'x')",
+        "vfs_pread(%s, 0, 10)",
+        "vfs_pread_lines(%s, 1, 10, 100)",
+        "vfs_compact(%s)",
     ],
 )
 async def test_content_operations_on_a_directory_or_missing_node(conn: AsyncConnection, call: str) -> None:
     d = await mkdir_p(conn, "d")
-    with raises_errno("EISDIR"):
-        await conn.execute(call.encode(), (d,))
-    with raises_errno("ENOENT"):
-        await conn.execute(call.encode(), (UUID(int=1),))
+    for node, errno in [(d, "EISDIR"), (UUID(int=1), "ENOENT")]:
+        cur = await conn.execute(f"SELECT * FROM {call}".encode(), (node,))
+        rows = await cur.fetchall()
+        assert len(rows) == 1 and all(v is None for v in rows[0][:-2])  # one row, nothing but the error
+        with raises_errno(errno):
+            check(*rows[0][-2:])
 
 
 @pytest.mark.parametrize(
@@ -299,7 +307,7 @@ async def test_many_concurrent_appenders_are_gap_free(conn: AsyncConnection, db:
 async def test_append_waiting_on_an_unlink_gets_enoent(conn: AsyncConnection, db: str) -> None:
     f = await create_file(conn, "log", b"x")
     async with await AsyncConnection.connect(db) as remover, await AsyncConnection.connect(db) as appender:
-        await remover.execute("SELECT vfs_unlink(%s)", (f,))
+        await unlink(remover, f)
         task = asyncio.create_task(append(appender, f, b"y"))
         await wait_until_blocked(conn, appender.info.backend_pid)
         await remover.commit()
@@ -440,12 +448,12 @@ async def test_pread_edge_offsets(conn: AsyncConnection) -> None:
 async def test_pread_returns_size_and_generation_when_nothing_is_read(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
     cur = await conn.execute("SELECT * FROM vfs_pread(%s, 0, 10)", (f,))
-    assert await cur.fetchall() == [(0, 0, 0, None)]
+    assert await cur.fetchall() == [(0, 0, 0, None, None, None)]
     await write(conn, f, b"abc")
     # byte_offset is where the read started: past EOF and negative offsets come back resolved.
     for offset, start in [(3, 3), (99, 3), (-1, 2), (-99, 0)]:
         cur = await conn.execute("SELECT * FROM vfs_pread(%s, %s, 0)", (f, offset))
-        assert await cur.fetchall() == [(3, 1, start, None)]
+        assert await cur.fetchall() == [(3, 1, start, None, None, None)]
 
 
 async def test_pread_of_one_extent_larger_than_the_limit(conn: AsyncConnection) -> None:

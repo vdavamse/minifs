@@ -124,13 +124,21 @@ async def _cat(vfs: VFSClient, args: argparse.Namespace) -> int:
 
 async def _put(vfs: VFSClient, args: argparse.Namespace) -> int:
     data = Path(args.source).read_bytes() if args.source else sys.stdin.buffer.read()
+    # Look first, so a new file costs no failed write (the server returns ENOENT rather than raising it).
+    try:
+        await vfs.stat(args.path)
+    except VFSError as e:
+        if e.errno != "ENOENT":
+            raise
+        await vfs.create(args.path, data, parents=args.parents)
+        return 0
     try:
         if args.append:
             await vfs.append(args.path, data)
         else:
             await vfs.write(args.path, data)
     except VFSError as e:
-        if e.errno != "ENOENT":
+        if e.errno != "ENOENT":  # removed since the stat
             raise
         await vfs.create(args.path, data, parents=args.parents)
     return 0

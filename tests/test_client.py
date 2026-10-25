@@ -1,9 +1,12 @@
 """VFSClient over a real database, and the pools of minifs.db.pool: credentials, reconnects, retries."""
 
+import argparse
 import asyncio
+import contextlib
 import pickle
-from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from pathlib import Path
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import psycopg
@@ -12,7 +15,8 @@ from psycopg import AsyncConnection
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
-from minifs.db.errors import SQLSTATE_BY_ERRNO
+from minifs import cli
+from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO
 from minifs.db.pool import Connector, Pools, open_pool, retry_serializable
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import FileVersion, Kind, VFSError
@@ -198,7 +202,8 @@ async def test_rename_errors_name_the_path_they_concern(vfs: VFSClient) -> None:
     await raises("ENOTDIR", vfs.rename("/n.md/x", "/b"), "/n.md/x")
 
 
-# Every errno the SQL layer raises comes back as a VFSError with that errno and the normalised path.
+# Every errno the SQL layer reports comes back as a VFSError with that errno and the normalised path: the outcomes
+# it returns (migration 009) with no database error, the faults it raises with theirs.
 
 
 async def _enoent(vfs: VFSClient) -> Awaitable[object]:
@@ -260,11 +265,14 @@ def test_errno_cases_cover_the_sql_layer() -> None:
 async def test_errno_round_trip(vfs: VFSClient, errno: str) -> None:
     setup, path = ERRNO_CASES[errno]
     error = await raises(errno, await setup(vfs), path)
-    assert isinstance(error.db_error, psycopg.Error)
-    assert error.db_error.sqlstate == SQLSTATE_BY_ERRNO[errno]
-    assert error.__cause__ is None and error.__suppress_context__  # no DETAIL in tracebacks
-    if errno in ("EEXIST", "ENOTDIR"):  # re-reported for another path, still with its database error
-        assert error.at("/x").db_error is error.db_error
+    if errno in OUTCOMES:
+        assert error.db_error is None
+        assert error.__cause__ is None and error.__context__ is None
+    else:
+        assert isinstance(error.db_error, psycopg.Error)
+        assert error.db_error.sqlstate == SQLSTATE_BY_ERRNO[errno]
+        assert error.__cause__ is None and error.__suppress_context__  # no DETAIL in tracebacks
+        assert error.at("/x").db_error is error.db_error  # re-reported for another path, with its database error
     copy = pickle.loads(pickle.dumps(error))
     assert (copy.errno, copy.path, copy.detail, str(copy)) == (error.errno, error.path, error.detail, str(error))
     assert error.detail  # the server's DETAIL is kept for logs
@@ -484,7 +492,9 @@ async def test_retry_real_repeatable_read_conflict(db: str, pool: Pool) -> None:
                 if attempts == 1:
                     started.set()
                     await proceed.wait()
-                cur = await c.execute("SELECT vfs_append(id, 'w') FROM vfs_nodes WHERE name = 'f'")
+                cur = await c.execute(
+                    "SELECT a.byte_offset FROM vfs_nodes n, vfs_append(n.id, 'w') a WHERE n.name = 'f'"
+                )
                 row = await cur.fetchone()
                 assert row is not None
                 return row[0]
@@ -546,13 +556,13 @@ async def test_lost_claim_keeps_valid_cache_entries(pool: Pool) -> None:
     assert "t2" in {name for _, name in cache.entries}
 
 
-async def test_rewrapped_errors_keep_the_database_error(vfs: VFSClient) -> None:
+async def test_rewrapped_errors_keep_the_detail(vfs: VFSClient) -> None:
     await vfs.create("/a")
     await vfs.create("/b")
     error = await raises("EEXIST", vfs.rename("/a", "/b"), "/b")
-    assert error.db_error is not None and error.detail
+    assert error.db_error is None and error.detail
     error = await raises("ENOTDIR", vfs.create("/a/x", parents=True), "/a/x")
-    assert error.db_error is not None
+    assert error.db_error is None and error.detail
 
 
 async def test_no_await_after_commit(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -729,3 +739,142 @@ async def test_error_path_callers_keep_their_error_whatever_the_eviction_does(
     await vfs.settle()
     assert not vfs._evicting  # pyright: ignore[reportPrivateUsage]
     assert any(v[0] == old.id for v in cache.entries.values())  # nothing evicted it
+
+
+# Returned outcomes (migration 009): no server errors on the expected paths
+
+
+class _NoTransaction:
+    """A connection whose ``transaction()`` does nothing, so every statement runs in the caller's transaction."""
+
+    def __init__(self, conn: AsyncConnection[Any]) -> None:
+        self._conn = conn
+
+    def transaction(self) -> contextlib.nullcontext[None]:
+        return contextlib.nullcontext()
+
+    async def execute(self, *args: Any, **kwargs: Any) -> Any:
+        return await self._conn.execute(*args, **kwargs)
+
+
+class _OneTransaction:
+    """A stand-in pool that hands out one connection, inside one open transaction: had the server raised an error
+    for any call, that transaction would be aborted, and every later statement would fail."""
+
+    def __init__(self, conn: AsyncConnection[Any]) -> None:
+        self._conn = _NoTransaction(conn)
+
+    @contextlib.asynccontextmanager
+    async def connection(self, timeout: float | None = None) -> AsyncGenerator[_NoTransaction]:
+        yield self._conn
+
+
+async def test_outcomes_raise_nothing_on_the_server(conn: AsyncConnection, tmp_path: Path) -> None:
+    vfs = VFSClient(cast(Any, _OneTransaction(conn)))
+    errors: list[VFSError] = []
+
+    async def outcome(errno: str, call: Awaitable[object]) -> None:
+        errors.append(await raises(errno, call))
+
+    async with conn.transaction():
+        await vfs.create("/d/f", b"v1", parents=True)
+        await vfs.mkdir_p("/tasks/new")
+        await vfs.mkdir_p("/tasks/cur")
+        await vfs.create("/tasks/new/t1")
+        # A missing file, whatever reads or writes it.
+        for call in (
+            vfs.stat("/missing"),
+            vfs.pread("/missing"),
+            vfs.pread_lines("/missing"),
+            vfs.readdir("/missing"),
+            vfs.append("/missing", b"x"),
+            vfs.write("/missing", b"x"),
+            vfs.unlink("/missing"),
+            vfs.rename("/missing", "/x"),
+            vfs.create("/missing/x"),
+        ):
+            await outcome("ENOENT", call)
+        await outcome("ENOTDIR", vfs.stat("/d/f/x"))
+        await outcome("ENOTDIR", vfs.create("/d/f/x", parents=True))
+        await outcome("EISDIR", vfs.pread("/d"))
+        await outcome("EEXIST", vfs.create("/d/f"))
+        await outcome("EEXIST", vfs.rename("/tasks/new/t1", "/d/f"))
+        version = await vfs.stat("/d/f")
+        assert version.version is not None
+        await vfs.append("/d/f", b"+")
+        await outcome("ESTALE", vfs.write("/d/f", b"lost", expect=version.version))  # a compare-and-swap conflict
+        await outcome("ENOTEMPTY", vfs.unlink("/d"))  # rmdir of a non-empty directory
+        assert await vfs.claim("/tasks/new/t1", "/tasks/cur/t1")
+        assert not await vfs.claim("/tasks/new/t1", "/tasks/cur/t1-again")  # a lost claim race: the source is gone
+        # put of a new file and of an existing one.
+        source = tmp_path / "data"
+        source.write_bytes(b"put")
+        for path in ("/new/file", "/d/f"):
+            await cli._put(vfs, argparse.Namespace(path=path, source=str(source), append=False, parents=True))  # pyright: ignore[reportPrivateUsage]
+        assert all(e.db_error is None and e.detail for e in errors), errors
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS  # not INERROR
+        cur = await conn.execute("SELECT 1")
+        assert await cur.fetchone() == (1,)
+    vfs = VFSClient(cast(Any, _OneTransaction(conn)))
+    assert (await vfs.pread("/new/file")).content == b"put"
+    assert (await vfs.pread("/d/f")).content == b"put"
+
+
+async def test_a_lost_compare_and_swap_claim_raises_nothing(conn: AsyncConnection) -> None:
+    vfs = VFSClient(cast(Any, _OneTransaction(conn)))
+    await vfs.mkdir_p("/tasks/new")
+    await vfs.mkdir_p("/tasks/cur")
+    await vfs.create("/tasks/new/t1")
+    t1 = (await vfs.stat("/tasks/new/t1")).id
+    async with conn.transaction():
+        # The race lost inside vfs_rename: the node moved after the lookup found it in tasks/new.
+        cur = await conn.execute(
+            "SELECT err, err_detail FROM vfs_rename(%s, (SELECT id FROM vfs_lookup(ARRAY['tasks', 'cur'])), 'x',"
+            " (SELECT id FROM vfs_lookup(ARRAY['tasks', 'cur'])))",
+            (t1,),
+        )
+        row = await cur.fetchone()
+        assert row is not None and row[0] == "ESTALE" and row[1]
+        cur = await conn.execute("SELECT 1")
+        assert await cur.fetchone() == (1,)
+
+
+async def test_grep_and_glob_of_a_missing_path_return_the_error(vfs: VFSClient) -> None:
+    await vfs.create("/f")
+    for call, errno in [
+        (vfs.grep("x", "/missing"), "ENOENT"),
+        (vfs.glob("*", "/missing"), "ENOENT"),
+        (vfs.glob("*", "/f"), "ENOTDIR"),
+        (vfs.grep("x", "/f/x"), "ENOTDIR"),
+    ]:
+        error = await raises(errno, call)
+        assert error.db_error is None
+
+
+async def test_a_failed_lookup_never_reaches_the_root(vfs: VFSClient) -> None:
+    # A NULL directory id is the root: an operation called with a failed lookup's id would act there.
+    await vfs.create("/a")
+    await raises("ENOENT", vfs.create("/nope/f"), "/nope/f")
+    await raises("ENOENT", vfs.mkdir("/nope/d"), "/nope/d")
+    await raises("ENOENT", vfs.rename("/a", "/nope/a"), "/nope/a")
+    await raises("ENOENT", vfs.readdir("/nope"), "/nope")
+    assert [e.path for e in await vfs.readdir("/")] == ["/a"]
+
+
+async def test_rename_racing_a_create_reports_the_destination(vfs: VFSClient, db: str) -> None:
+    # The create commits between vfs_rename's EEXIST check and its update: the unique constraint raises.
+    await vfs.create("/a")
+    await vfs.mkdir("/d")
+    async with await AsyncConnection.connect(db) as other:
+        await other.execute("SELECT * FROM vfs_create((SELECT id FROM vfs_lookup(ARRAY['d'])), 'b', 'file')")
+        task = asyncio.create_task(vfs.rename("/a", "/d/b"))
+        for _ in range(200):
+            cur = await other.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()"
+            )
+            if (await cur.fetchone()) == (1,):
+                break
+            await asyncio.sleep(0.02)
+        await other.commit()
+    error = await raises("EEXIST", task, "/d/b")
+    assert error.db_error is not None  # raised, by the constraint

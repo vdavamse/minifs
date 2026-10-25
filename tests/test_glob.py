@@ -14,8 +14,9 @@ import pytest
 from psycopg import AsyncConnection
 
 from minifs import _regex
+from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError, GlobPlan, compile_excludes, compile_glob, glob, glob_to_regex
-from tests.test_tree import create, mkdir_p, raises_errno
+from tests.test_tree import create, mkdir_p
 
 # The oracle exists only in development builds; test_regex_extension.py fails without it.
 _needs_oracle = pytest.mark.skipif(not _regex.HAS_ORACLE, reason="minifs._regex was built without the oracle feature")
@@ -610,10 +611,13 @@ async def test_newest_first_and_limit(conn: AsyncConnection) -> None:
 
 async def test_bad_root(conn: AsyncConnection) -> None:
     file = await create(conn, None, "f")
-    with raises_errno("ENOTDIR"):
-        await glob(conn, file, "*")
-    with raises_errno("ENOENT"):
-        await glob(conn, uuid.uuid4(), "*")
+    missing = uuid.uuid4()
+    for root, errno in [(file, "ENOTDIR"), (missing, "ENOENT")]:
+        with pytest.raises(VFSError) as info:
+            await glob(conn, root, "*")
+        # Returned by vfs_glob, not raised.
+        assert (info.value.errno, info.value.path, info.value.db_error) == (errno, str(root), None)
+        assert info.value.detail
 
 
 async def test_classes_on_non_ascii_names(db_any_locale: str) -> None:
