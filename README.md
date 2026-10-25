@@ -813,7 +813,7 @@ crates/
 
 The tools take `RunContext[HasVFS]`, where `HasVFS` is a protocol whose only member is `vfs: VFSView`, so the caller's own deps dataclass works as long as it has a `vfs`. Two optional attributes are read with defaults: `vfs_workdir` (`/workspace`) and `vfs_settings` (a `ToolSettings`, with ladderframe's limits: `Read` 2,000 lines of at most 2,000 characters and 50 KB, `Glob` and `Grep` 100 results, `Grep` lines cut at 2,000 characters and a 2 s timeout).
 
-The foundation (`minifs.tools.deps`, `minifs.tools.errors`, `vfs_tool`, `toolset()`) and `Write` (#39) are in place; the other tools land with #11 (`Read`), #12 (`Glob`), #13 (`Grep`) and #40 (`Edit`).
+The foundation (`minifs.tools.deps`, `minifs.tools.errors`, `vfs_tool`, `toolset()`), `Write` (#39) and `Glob` (#12) are in place; the other tools land with #11 (`Read`), #13 (`Grep`) and #40 (`Edit`).
 
 ```python
 from minifs.tools import Read, Write, Edit, Glob, Grep, toolset
