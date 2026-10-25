@@ -121,7 +121,9 @@ server's DETAIL, with node ids and real path components) and `db_error` are for 
 paths (the chroot) translates `path` and never shows `detail`. Paths go through
 `minifs.vfs.core.normalize` first. With a `DirCache` (the hook for #19's directory-entry cache), a fully cached
 path is checked link by link in the same statement instead of walked, and falls back to `vfs_lookup` if any link
-went stale, so a stale cache never reaches the wrong node. `minifs.vfs.cache.DirEntryCache` is that cache: positive
+went stale, so a stale cache never reaches the wrong node. A server lookup (`vfs_lookup`) returns the ids it walked
+(`chain`, migration 010) in the same row, and the client stores each component, as the kernel's dcache does on a
+path walk. A query that `_run` runs with refs starts with their `_walks` columns, which it cuts from the rows. `minifs.vfs.cache.DirEntryCache` is that cache: positive
 entries with a 2 s TTL, kept fresh by `follow(watcher)` (evict by id on `move` and `delete`, clear on `rescan`).
 
 `minifs.vfs.view.VFSView(client, mounts, policy, actor)` is what the agent tools call: the same operations in

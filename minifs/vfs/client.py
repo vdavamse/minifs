@@ -12,8 +12,9 @@ id of a failed one, which for a directory would mean the root. A ``DirCache`` (t
 saves the walk: when every component of a path is cached, the statement checks the cached chain instead, every
 ``(parent, name) -> id`` link in one index lookup each, and falls back to ``vfs_lookup`` when any link no longer
 holds. So a stale cache costs a slower resolution, never the wrong node. Each statement returns the id it
-resolved: the client stores what it learns (listings, creates), evicts what it renames or removes, and evicts a
-cached id that turned out stale. Keeping the cache fresh against other clients (NOTIFY, TTL) is the cache's job.
+resolved, and a ``vfs_lookup`` the chain of ids it walked, in the same row: the client stores what it learns (every
+component of a walk, listings, creates), evicts what it renames or removes, and evicts a cached id that turned out
+stale. Keeping the cache fresh against other clients (NOTIFY, TTL) is the cache's job.
 Without a cache, every path is resolved on the server.
 """
 
@@ -53,10 +54,13 @@ MAX_TIMEOUT = _MAX_INT / 1000  # seconds: statement_timeout is an int of millise
 _log = logging.getLogger(__name__)
 _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache links
 
-# A node argument is a FROM item of one row (id, err, err_detail): the node's id, or the errno of a failed lookup.
-_LOOKUP = "(SELECT id, err, err_detail FROM vfs_lookup(%s))"
-# The last cached id if every cached link (id, parent, name) still holds, else the server's lookup.
-_LOOKUP_CACHED = """(SELECT l.id, l.err, l.err_detail
+# A node argument is a FROM item of one row (id, kind, chain, err, err_detail): the node's id, or the errno of a
+# failed lookup. chain is what the server walked (vfs_lookup), for the cache to store; NULL when nothing was walked.
+_LOOKUP = "(SELECT id, kind, chain, err, err_detail FROM vfs_lookup(%s))"
+# The last cached id if every cached link (id, parent, name) still holds, else the server's lookup. Either way it
+# stores nothing (chain NULL): every link was cached already, and after a stale one the client only evicts; the
+# next lookup of the path walks it and stores it.
+_LOOKUP_CACHED = """(SELECT l.id, NULL::text AS kind, NULL::uuid[] AS chain, l.err, l.err_detail
    FROM (SELECT bool_and(n.id IS NOT NULL) AS ok, (array_agg(c.id ORDER BY c.i DESC))[1] AS last
            FROM unnest(%s::uuid[], %s::uuid[], %s::text[]) WITH ORDINALITY AS c(id, parent, name, i)
            LEFT JOIN vfs_nodes n
@@ -64,7 +68,11 @@ _LOOKUP_CACHED = """(SELECT l.id, l.err, l.err_detail
   CROSS JOIN LATERAL (SELECT v.last AS id, NULL::text AS err, NULL::text AS err_detail WHERE v.ok
                       UNION ALL
                       SELECT r.id, r.err, r.err_detail FROM vfs_lookup(%s) r WHERE NOT v.ok) l)"""
-_NULL = "(SELECT NULL::uuid AS id, NULL::text AS err, NULL::text AS err_detail)"
+_NULL = (
+    "(SELECT NULL::uuid AS id, NULL::text AS kind, NULL::uuid[] AS chain, NULL::text AS err, NULL::text AS err_detail)"
+)
+# The parent of a create with parents: the directories vfs_mkdir_p found or made. It reports no chain.
+_MKDIR_P = "(SELECT id, NULL::text AS kind, NULL::uuid[] AS chain, err, err_detail FROM vfs_mkdir_p(%s))"
 
 
 class DirCache(Protocol):
@@ -79,22 +87,30 @@ class DirCache(Protocol):
 
 
 type _Link = tuple[UUID, UUID | None, str]  # a cached (id, parent id, name)
+type _Walk = tuple[list[UUID] | None, Kind | None, str | None]  # a lookup's (chain, kind, err)
 
 
 class _Ref:
     """A node argument of a statement: a FROM item that yields the node's id (NULL for the root) or a lookup error
     (``_LOOKUP``), and its parameters.
     ``links`` is the cached ``(id, parent id, name)`` of every component, if the cache held the whole path;
-    ``cached`` the last id."""
+    ``cached`` the last id. ``segments`` is the path a server lookup walks, and ``walk`` what that lookup returned
+    once the statement ran (``_run``, ``_lookup``), for ``VFSClient._learn``."""
 
-    def __init__(self, sql: str, params: Sequence[object], links: Sequence[_Link] = ()) -> None:
+    def __init__(
+        self, sql: str, params: Sequence[object], links: Sequence[_Link] = (), segments: Sequence[str] = ()
+    ) -> None:
         self.sql = sql
         self.params = list(params)
         self.links = list(links)
         self.cached = self.links[-1][0] if self.links else None
+        self.segments = tuple(segments)
+        self.walk: _Walk | None = None
 
 
-_ROOT = _Ref(_NULL, [])
+def _root() -> _Ref:
+    """The root as a directory argument: NULL, with no subquery and nothing to learn."""
+    return _Ref(_NULL, [])
 
 
 class VFSClient:
@@ -127,8 +143,8 @@ class VFSClient:
         ref = self._ref(segments)
         rows = await self._run(
             path,
-            f"SELECT r.id, r.err, r.err_detail, n.kind, n.size, n.mtime, n.generation"
-            f" FROM {ref.sql} r LEFT JOIN LATERAL (SELECT * FROM vfs_nodes n WHERE n.id = r.id) n ON true",
+            f"SELECT {_walks([ref])}r0.id, r0.err, r0.err_detail, n.kind, n.size, n.mtime, n.generation"
+            f" FROM {ref.sql} r0 LEFT JOIN LATERAL (SELECT * FROM vfs_nodes n WHERE n.id = r0.id) n ON true",
             ref.params,
             [ref],
         )
@@ -240,6 +256,8 @@ class VFSClient:
             if e.errno in ("ENOENT", "ENOTDIR"):
                 await self._await_eviction([ref])
             raise
+        finally:
+            self._learn([ref])
         await self._outcome(path, [ref], error)
         self._checked(ref, root)
         return [Entry(join(*segments, m.path), m.id, "file", m.size, m.mtime) for m in matches]
@@ -331,6 +349,8 @@ class VFSClient:
             if e.errno in ("ENOENT", "ENOTDIR"):
                 await self._await_eviction([ref])
             raise
+        finally:
+            self._learn([ref])
         await self._outcome(path, [ref], error)
         assert result is not None
         self._checked(ref, node)
@@ -434,7 +454,7 @@ class VFSClient:
         segments = split(path)
         if not segments:
             raise VFSError("EEXIST", "/")
-        parent = _Ref("vfs_mkdir_p(%s)", [list(segments[:-1])]) if parents else self._dir_ref(segments[:-1])
+        parent = _Ref(_MKDIR_P, [list(segments[:-1])]) if parents else self._dir_ref(segments[:-1])
         try:
             rows = await self._call(path, [parent], "vfs_create({0}, %s, %s, %s)", [segments[-1], kind, data])
         except VFSError as e:
@@ -466,7 +486,7 @@ class VFSClient:
         parent = self._dir_ref(dst_segments[:-1])
         # A claim, or a pinned move, compares-and-swaps the source's directory too, so a concurrent move of the node
         # elsewhere can't be undone by this one. NULL: no compare-and-swap.
-        expect_parent = self._dir_ref(src_segments[:-1]) if claim or expect is not None else _Ref(_NULL, [])
+        expect_parent = self._dir_ref(src_segments[:-1]) if claim or expect is not None else _root()
         refs = [node, parent, expect_parent]
         pin: tuple[str, list[object]] = (
             (" AND r0.id = %s", [expect]) if expect is not None else ("", [])
@@ -485,6 +505,7 @@ class VFSClient:
                     return False
                 raise VFSError("ESTALE", join(*src_segments), "moved by someone else meanwhile")
             lookups = _lookup_errors(rows[0], len(refs))
+            self._vanished(rows[0], lookups, rows[0][-2])
             if expect is not None and all(err is None for err, _ in lookups) and rows[0][0] != expect:
                 # `src` is a node other than `expect`, so the gate kept vfs_rename from running: nothing moved.
                 self._checked(node, rows[0][0])
@@ -527,7 +548,7 @@ class VFSClient:
     def _ref(self, segments: tuple[str, ...]) -> _Ref:
         chain = self._cached_chain(segments)
         if chain is None:
-            return _Ref(_LOOKUP, [list(segments)])
+            return _Ref(_LOOKUP, [list(segments)], segments=segments)
         ids = [node for node, _ in chain]
         parents = [parent for _, parent in chain]
         links = list(zip(ids, parents, segments, strict=True))
@@ -535,7 +556,7 @@ class VFSClient:
 
     def _dir_ref(self, segments: tuple[str, ...]) -> _Ref:
         """Like ``_ref``, for a directory argument, where the root is NULL (and needs no subquery)."""
-        return self._ref(segments) if segments else _ROOT
+        return self._ref(segments) if segments else _root()
 
     def _cached_chain(self, segments: tuple[str, ...]) -> list[tuple[UUID, UUID | None]] | None:
         """``(id, parent id)`` of every component of ``segments`` if the cache holds them all, else None."""
@@ -550,6 +571,23 @@ class VFSClient:
             chain.append((hit[0], parent))
             parent = hit[0]
         return chain
+
+    def _learn(self, refs: Sequence[_Ref]) -> None:
+        """Stores every link the server walked for ``refs``, as the kernel adds a dentry for each component of a
+        path walk: each component's ``(parent, name) -> id``, a directory but for the last, which has the kind the
+        lookup returned (a file on ENOTDIR, a directory on ENOENT). A failed lookup stores the prefix it resolved,
+        never the missing name. This runs after the statement, so the entries race a concurrent move as a listing's
+        do; the in-statement check of cached chains, NOTIFY and the TTL cover it (``minifs.vfs.cache``)."""
+        for ref in refs:
+            chain, kind, err = ref.walk or (None, None, None)
+            ref.walk = None  # learned once
+            if self.cache is None or not chain:
+                continue
+            last: Kind = (kind or "dir") if err is None else "file" if err == "ENOTDIR" else "dir"
+            parent: UUID | None = None
+            for i, (node, name) in enumerate(zip(chain, ref.segments, strict=False)):
+                self.cache.store(parent, name, node, last if i == len(chain) - 1 else "dir")
+                parent = node
 
     def _checked(self, ref: _Ref, resolved: UUID | None) -> None:
         """Evicts the stale links of ``ref`` if the server resolved the path to another node.
@@ -643,8 +681,19 @@ class VFSClient:
         """Runs ``_gated(refs, call)`` with ``params`` (the call's own) and raises the error it returned, if any:
         the first failed lookup's, else the call's. Returns the rows (see ``_gated``)."""
         rows = await self._run(path, _gated(refs, call), [*(p for ref in refs for p in ref.params), *params], refs)
-        await self._outcome(path, refs, *_lookup_errors(rows[0], len(refs)), (rows[0][-2], rows[0][-1]))
+        lookups = _lookup_errors(rows[0], len(refs))
+        self._vanished(rows[0], lookups, rows[0][-2])
+        await self._outcome(path, refs, *lookups, (rows[0][-2], rows[0][-1]))
         return rows
+
+    def _vanished(self, row: Sequence[Any], lookups: Sequence[_Error], err: str | None) -> None:
+        """Evicts the nodes of a ``_gated`` row when every lookup succeeded but the call found one gone (ENOENT):
+        it was removed between the lookup and the call's lock, so what ``_run`` just stored for it is stale. Which
+        node went isn't reported, so all of them are evicted; that costs at most a miss each."""
+        if self.cache is not None and err == "ENOENT" and all(e is None for e, _ in lookups):
+            for i in range(len(lookups)):
+                if row[3 * i] is not None:
+                    self.cache.evict(row[3 * i])
 
     async def _outcome(self, path: str, refs: Sequence[_Ref], *errors: _Error) -> None:
         """Raises the first of ``errors``, the ``(err, err_detail)`` pairs a statement returned, as a ``VFSError``
@@ -662,19 +711,31 @@ class VFSClient:
     ) -> list[tuple[Any, ...]]:
         """Runs ``query`` in its own transaction, retrying serialization failures; maps raised SQL errors (faults,
         and the constraints' backstop) to VFSError. A path that no longer resolves evicts the links of ``refs``
-        that went stale. Returned errors are the caller's to check (``_outcome``)."""
+        that went stale. Returned errors are the caller's to check (``_outcome``).
+
+        A query with ``refs`` starts with their ``_walks`` columns: they go to the cache (``_learn``) and are cut
+        from the rows returned, which begin with the columns after them."""
 
         async def attempt() -> list[tuple[Any, ...]]:
             async with self.pool.connection() as conn, conn.transaction():
                 cur = await conn.execute(cast(Any, query), params)
+                if refs:  # a query that forgot the prefix would shift every column the caller reads
+                    names = [column.name for column in cur.description or ()]
+                    assert names[: 3 * len(refs)] == ["chain", "kind", "err"] * len(refs), names
                 return await cur.fetchall()
 
         try:
-            return await _mapped(path, attempt)
+            rows = await _mapped(path, attempt)
         except VFSError as e:
             if e.errno in ("ENOENT", "ENOTDIR"):
                 await self._await_eviction(refs)
             raise
+        if not refs:
+            return rows
+        for i, ref in enumerate(refs):
+            ref.walk = cast(_Walk, tuple(rows[0][3 * i : 3 * i + 3]))
+        self._learn(refs)
+        return [row[3 * len(refs) :] for row in rows]
 
 
 type _Error = tuple[str | None, str | None]  # a returned (err, err_detail); (None, None) for success
@@ -682,7 +743,8 @@ type _Error = tuple[str | None, str | None]  # a returned (err, err_detail); (No
 
 def _gated(refs: Sequence[_Ref], call: str, condition: str = "") -> str:
     """A query that looks up ``refs`` (as ``r0``, ``r1``, ...) and runs ``call``, a set-returning function call over
-    their ids, only if every lookup succeeded. Each row has every ref's id, err and err_detail, then
+    their ids, only if every lookup succeeded. Each row has the refs' ``_walks`` columns (which ``_run`` cuts), then
+    every ref's id, err and err_detail, then
     the call's columns, ending with its err and err_detail; there is always at least one row, with the call's
     columns NULL when it didn't run or returned no rows.
 
@@ -693,10 +755,27 @@ def _gated(refs: Sequence[_Ref], call: str, condition: str = "") -> str:
     ``condition`` (`` AND ...`` over the lookups, with parameters after the call's) gates the call further."""
     call = call.format(*(f"vfs_gate(r{i}.id, r{i}.err)" for i in range(len(refs))))
     lookups = " CROSS JOIN ".join(f"{ref.sql} r{i}" for i, ref in enumerate(refs))
-    columns = "".join(f"r{i}.id, r{i}.err, r{i}.err_detail, " for i in range(len(refs)))
+    columns = _walks(refs, first_row=True) + "".join(f"r{i}.id, r{i}.err, r{i}.err_detail, " for i in range(len(refs)))
     gate = " AND ".join(f"r{i}.err IS NULL" for i in range(len(refs))) + condition
     return (
         f"SELECT {columns}f.* FROM {lookups} LEFT JOIN LATERAL (SELECT * FROM {call} WHERE {gate} OFFSET 0) f ON true"
+    )
+
+
+def _walks(refs: Sequence[_Ref], *, first_row: bool = False) -> str:
+    """The leading columns of a query over ``refs`` (as ``r0``, ``r1``, ...): each one's chain, kind and err, which
+    ``_run`` stores in the cache. They come back in the statement's own rows, so learning a walk costs no round
+    trip. ``first_row``: NULL past the first row (``_run`` reads only that one), so a long listing doesn't repeat
+    the chain on every row. ``row_number() OVER ()`` numbers the rows in the order they are returned only because
+    the query has no ORDER BY, DISTINCT or LIMIT (they apply after window functions): keep ``_gated`` unordered, and
+    let the called function order its rows."""
+    if not first_row:
+        return "".join(f"r{i}.chain, r{i}.kind, r{i}.err, " for i in range(len(refs)))
+    first = "row_number() OVER () = 1"
+    return "".join(
+        f"CASE WHEN {first} THEN r{i}.chain END AS chain, CASE WHEN {first} THEN r{i}.kind END AS kind,"
+        f" CASE WHEN {first} THEN r{i}.err END AS err, "
+        for i in range(len(refs))
     )
 
 
@@ -706,14 +785,16 @@ def _lookup_errors(row: Sequence[Any], count: int) -> list[_Error]:
 
 
 async def _lookup(conn: AsyncConnection[Any], ref: _Ref) -> tuple[UUID | None, _Error, Kind | None, int | None]:
-    """The id, lookup error, kind and size of the node ``ref`` names, on ``conn``."""
+    """The id, lookup error, kind and size of the node ``ref`` names, on ``conn``. Keeps the walk in ``ref.walk``:
+    the caller passes ``ref`` to ``VFSClient._learn`` once the transaction is over."""
     query = (
-        f"SELECT r.id, r.err, r.err_detail, n.kind, n.size"
+        f"SELECT r.id, r.err, r.err_detail, n.kind, n.size, r.chain, r.kind"
         f" FROM {ref.sql} r LEFT JOIN LATERAL (SELECT * FROM vfs_nodes n WHERE n.id = r.id) n ON true"
     )
     cur = await conn.execute(cast(Any, query), ref.params)
     row = await cur.fetchone()
     assert row is not None
+    ref.walk = (row[5], row[6], row[1])
     return row[0], (row[1], row[2]), row[3], row[4]
 
 

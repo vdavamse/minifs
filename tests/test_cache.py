@@ -1,6 +1,7 @@
 """The directory-entry cache (minifs.vfs.cache): unit behaviour, and freshness through a real Watcher."""
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -14,7 +15,9 @@ from minifs.db.pool import Connector, open_pool
 from minifs.vfs.cache import CacheStats, DirEntryCache
 from minifs.vfs.client import DirCache, VFSClient
 from minifs.vfs.core import VFSError
+from minifs.vfs.search import SearchRefused
 from minifs.vfs.watch import RESCAN, Event, Watcher
+from tests.test_tree import wait_until_blocked
 from tests.test_watch import catch_up, factory, terminate
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
@@ -271,3 +274,197 @@ async def test_hit_rate_through_the_client(pool: Pool, db: str) -> None:
         stats = cache.stats()
         assert stats.hits == stats.lookups == 9  # /d for the create, then two links per read
         assert stats.hit_rate == 1.0
+
+
+# Filled from every lookup (#46)
+
+
+def walk_stats(cache: DirEntryCache) -> tuple[int, int, int]:
+    stats = cache.stats()
+    return stats.lookups, stats.hits, stats.stores
+
+
+async def test_a_cold_stat_stores_every_component(pool: Pool) -> None:
+    other = VFSClient(pool)
+    f = await other.create("/a/b/c/f", b"f", parents=True)
+    g = await other.create("/a/b/c/g", b"g")
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    assert (await vfs.stat("/a/b/c/f")).id == f.id
+    assert walk_stats(cache) == (1, 0, 4)  # one miss at /a, then the walk stored a, b, c and f
+    assert (await vfs.stat("/a/b/c/f")).id == f.id
+    assert walk_stats(cache) == (1 + 4, 4, 4)  # every component hit
+    assert (await vfs.stat("/a/b/c/g")).id == g.id
+    assert walk_stats(cache) == (5 + 4, 4 + 3, 4 + 4)  # a, b and c hit, g missed; the walk refreshed all four
+    stats = cache.stats()
+    assert stats.size == 5 and stats.misses == 2
+
+
+async def test_enoent_stores_the_resolved_prefix(pool: Pool) -> None:
+    other = VFSClient(pool)
+    b = await other.mkdir("/a/b", parents=True)
+    a = (await other.stat("/a")).id
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    with pytest.raises(VFSError) as error:
+        await vfs.stat("/a/b/missing")
+    assert error.value.errno == "ENOENT"
+    assert cached_ids(cache) == {a, b}  # /a and /a/b, nothing for missing
+    assert cache.lookup(None, "a") == (a, "dir") and cache.lookup(a, "b") == (b, "dir")
+    created = await other.create("/a/b/missing", b"x")
+    assert (await vfs.stat("/a/b/missing")).id == created.id  # at once: missing names are never cached
+
+
+async def test_enotdir_stores_the_file(pool: Pool) -> None:
+    f = await VFSClient(pool).create("/d/f", parents=True)
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    with pytest.raises(VFSError) as error:
+        await vfs.stat("/d/f/x")
+    assert error.value.errno == "ENOTDIR"
+    d = (await vfs.stat("/d")).id
+    assert cache.lookup(d, "f") == (f.id, "file")
+
+
+@pytest.mark.parametrize("follow", [True, False], ids=["follow", "no-notify"])
+async def test_a_rename_after_the_store_still_resolves(
+    pool: Pool, db: str, conn: AsyncConnection, follow: bool
+) -> None:
+    other = VFSClient(pool)
+    old = await other.create("/a/b/f", b"old", parents=True)
+    a, old_b = (await other.stat("/a")).id, (await other.stat("/a/b")).id
+    assert old_b is not None
+    async with Watcher(factory(db)) as watcher:
+        cache = DirEntryCache(ttl=60)
+        async with contextlib.AsyncExitStack() as stack:
+            if follow:
+                await stack.enter_async_context(cache.follow(watcher))
+            vfs = VFSClient(pool, cache=cache)
+            assert (await vfs.stat("/a/b/f")).id == old.id  # stores a, b and f
+            assert len(cache) == 3
+            # Another client moves b away and puts a new b, with a new f, in its place.
+            await other.rename("/a/b", "/a/moved")
+            await other.mkdir("/a/b")
+            new = await other.create("/a/b/f", b"new")
+            await catch_up(watcher, conn)  # with follow, the move's notification has evicted b by now
+            # The race the notification can't cover: a walk whose snapshot predates the move, stored after it.
+            cache.store(a, "b", old_b, "dir")
+            evictions = cache.stats().evictions
+            assert (await vfs.pread("/a/b/f")).content == b"new"  # the stale chain is caught in the statement
+            await vfs.settle()
+            assert cache.stats().evictions > evictions  # and its stale link evicted
+            assert cache.lookup(a, "b") != (old_b, "dir")
+            assert (await vfs.stat("/a/b/f")).id == new.id
+            assert (await vfs.stat("/a/moved/f")).id == old.id
+            assert (await vfs.pread("/a/b/f")).content == b"new"
+
+
+async def test_a_cached_chain_stores_nothing(pool: Pool) -> None:
+    await VFSClient(pool).create("/d/f", parents=True)
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    await vfs.stat("/d/f")
+    stores = cache.stats().stores
+    for _ in range(3):
+        await vfs.stat("/d/f")
+        await vfs.pread("/d/f")
+    assert cache.stats().stores == stores
+
+
+async def test_mutations_learn_their_paths(pool: Pool) -> None:
+    other = VFSClient(pool)
+    await other.mkdir("/src/x", parents=True)
+    await other.mkdir("/dst/y", parents=True)
+    f = await other.create("/src/x/f")
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    await vfs.rename("/src/x/f", "/dst/y/g")  # both sides walked; the moved node isn't kept under its old name
+    src, dst = (await other.stat("/src/x")).id, (await other.stat("/dst/y")).id
+    assert cached_ids(cache) == {(await other.stat("/src")).id, src, (await other.stat("/dst")).id, dst}
+    assert cache.lookup(src, "f") is None
+    created = await vfs.create("/dst/y/h")  # its parent hits every component
+    assert cache.lookup(dst, "h") == (created.id, "file")
+    await vfs.unlink("/dst/y/g")
+    assert f.id not in cached_ids(cache)
+
+
+async def test_glob_and_grep_learn_their_root(pool: Pool) -> None:
+    f = await VFSClient(pool).create("/w/src/a.py", b"x = 1\n", parents=True)
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    assert [e.id for e in await vfs.glob("*.py", "/w/src")] == [f.id]
+    assert len(cache) == 2  # w and src
+    assert [h.path for h in (await vfs.grep("x = 1", "/w/src/a.py")).hits] == ["/w/src/a.py"]
+    assert f.id in cached_ids(cache)
+    other = await VFSClient(pool).mkdir("/w/other")
+    with pytest.raises(VFSError):
+        await vfs.glob("*.py", "/w/other/missing")  # the error path learns the prefix too
+    assert other in cached_ids(cache)
+    cache.clear()
+    with pytest.raises(SearchRefused):
+        await vfs.grep("x = 1", "/w/src", max_files=0)  # raised inside the snapshot, after the lookup
+    assert len(cache) == 2  # w and src
+
+
+async def test_a_node_gone_after_its_lookup_is_not_kept(pool: Pool, db: str, conn: AsyncConnection) -> None:
+    f = await VFSClient(pool).create("/d/f", b"f", parents=True)
+    cache = DirEntryCache(ttl=60)
+    vfs = VFSClient(pool, cache=cache)
+    async with await AsyncConnection.connect(db) as remover:
+        async with remover.transaction():
+            await remover.execute("DELETE FROM vfs_nodes WHERE id = %s", (f.id,))  # not committed: still found
+            unlink = asyncio.create_task(vfs.unlink("/d/f"))  # walks to f, then waits on its row lock
+            await wait_until_blocked(conn, (await _backend(pool, unlink)))
+        with pytest.raises(VFSError) as error:
+            await unlink  # the call found f gone after the lookup found it
+    assert error.value.errno == "ENOENT"
+    assert f.id not in cached_ids(cache) and (await VFSClient(pool).stat("/d")).id in cached_ids(cache)
+
+
+async def _backend(pool: Pool, task: asyncio.Task[None]) -> int:
+    """The pid of the one backend of ``pool`` running a query other than this one, once ``task`` has sent it."""
+    for _ in range(200):
+        async with pool.connection() as probe:
+            cur = await probe.execute(
+                "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()"
+                " AND state = 'active' AND query LIKE '%%vfs_unlink%%'"
+            )
+            row = await cur.fetchone()
+        if row is not None:
+            return row[0]
+        assert not task.done(), task
+        await asyncio.sleep(0.02)
+    raise AssertionError("the unlink never started")
+
+
+async def test_each_operation_is_one_statement(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    other = VFSClient(pool)
+    await other.create("/a/b/c/f", b"f", parents=True)
+    statements: list[str] = []
+    execute = AsyncConnection.execute
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        if str(query).strip():  # the pool's check at checkout is an empty query
+            statements.append(str(query))
+        return await execute(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    vfs = VFSClient(pool, cache=DirEntryCache(ttl=60))
+    operations = [
+        vfs.stat("/a/b/c/f"),  # cold: the walk comes back in the same row
+        vfs.stat("/a/b/c/f"),  # warm
+        vfs.pread("/a/b/c/f"),
+        vfs.create("/a/b/c/g", b"g"),
+        vfs.rename("/a/b/c/g", "/a/b/h"),
+        vfs.unlink("/a/b/h"),
+        vfs.readdir("/a/b"),
+    ]
+    for operation in operations:
+        statements.clear()
+        await operation
+        await vfs.settle()
+        assert len(statements) == 1, statements
+    statements.clear()
+    with pytest.raises(VFSError):
+        await vfs.stat("/a/b/missing")
+    assert len(statements) == 1

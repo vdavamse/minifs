@@ -22,6 +22,7 @@ from pydantic_ai.tools import ToolDefinition
 
 from minifs.db.pool import Connector, open_pool
 from minifs.tools.deps import HasVFS, ToolSettings
+from minifs.vfs.cache import DirEntryCache
 from minifs.vfs.client import VFSClient
 from minifs.vfs.policy import DEFAULT_POLICY, Policy
 from minifs.vfs.view import VFSView, workspace_mounts
@@ -39,16 +40,20 @@ class Deps:
     vfs_settings: ToolSettings = field(default_factory=ToolSettings)
 
 
-@pytest.fixture
-async def client(db: str) -> AsyncIterator[VFSClient]:
+@pytest.fixture(params=[False, True], ids=["uncached", "cached"])
+async def client(db: str, request: pytest.FixtureRequest) -> AsyncIterator[VFSClient]:
     """A client over a tree with ``notes.md`` in the agent's workspace, ``secret.md`` in the other one and
-    ``/docs/guide.md``."""
+    ``/docs/guide.md``. Every tool test runs twice: without a directory cache and with one, warmed by a stat of each
+    seeded file, so the cached run resolves those paths from the cache."""
     async with open_pool(Connector(db), max_size=3) as pool:
-        client = VFSClient(pool)
+        client = VFSClient(pool, cache=DirEntryCache(ttl=60) if request.param else None)
         await client.create(f"/workspaces/{W1}/notes.md", b"mine\n", parents=True)
         await client.create(f"/workspaces/{W2}/secret.md", b"theirs\n", parents=True)
         await client.create("/docs/guide.md", b"guide\n", parents=True)
+        for path in (f"/workspaces/{W1}/notes.md", f"/workspaces/{W2}/secret.md", "/docs/guide.md"):
+            await client.stat(path)
         yield client
+        await client.settle()
 
 
 @pytest.fixture

@@ -262,6 +262,25 @@ async def test_resolve_errors(conn: AsyncConnection) -> None:
         await resolve(conn, "docs", "guide.md", "x")
 
 
+async def test_lookup_returns_the_chain_it_walked(conn: AsyncConnection) -> None:
+    a = await create(conn, None, "a", "dir")
+    b = await create(conn, a, "b", "dir")
+    f = await create(conn, b, "f")
+
+    async def chain(*segments: str) -> tuple[object, object, object]:
+        row = await _one(conn, "SELECT chain, id, kind, err FROM vfs_lookup(%s)", (list(segments),))
+        if row[3] is not None:
+            assert row[1] is None and row[2] is None  # an outcome sets only chain and the error
+        return row[0], row[3], row[1]
+
+    assert await chain() == ([], None, None)
+    assert await chain("a", "b", "f") == ([a, b, f], None, f)
+    assert await chain("a", "b") == ([a, b], None, b)
+    assert await chain("a", "b", "missing", "deeper") == ([a, b], "ENOENT", None)  # the prefix that resolved
+    assert await chain("missing") == ([], "ENOENT", None)
+    assert await chain("a", "b", "f", "x", "y") == ([a, b, f], "ENOTDIR", None)  # up to the file
+
+
 async def test_resolve_does_not_confuse_root_entries_with_children(conn: AsyncConnection) -> None:
     docs = await create(conn, None, "docs", "dir")
     await create(conn, docs, "inner", "dir")

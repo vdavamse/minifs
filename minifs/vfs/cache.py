@@ -1,19 +1,26 @@
 """The directory-entry cache: ``(parent id, name) -> (id, kind)``, per process and in memory (README: *Caching*).
 
-``DirEntryCache`` implements ``minifs.vfs.client.DirCache``. The client checks every cached chain against
-``vfs_nodes`` in the statement that uses it, so a stale entry costs a slower resolution, never the wrong node; this
-cache only has to keep stale entries rare:
+``DirEntryCache`` implements ``minifs.vfs.client.DirCache``. The client fills it the way the kernel fills its
+dcache on a path walk: an operation's lookup (``vfs_lookup``) returns the chain of ids it walked in the same row,
+and the client stores each component, a directory but for the last, which has the kind the lookup returned. A
+failed lookup stores the prefix that resolved. Listings (``readdir``) and creates store what they return. A
+statement that used a fully cached chain stores nothing new, nor does ``vfs_mkdir_p`` (``mkdir_p``, a create with
+``parents``), which reports no chain.
 
-- Only positive entries are cached. A missing name is never cached, so a name another client creates is visible at
-  once.
+Unlike the dcache, it is revalidated on every use: the client checks every cached chain against ``vfs_nodes`` in
+the statement that uses it, and walks the path instead when a link no longer holds. So a stale entry costs a slower
+resolution, never the wrong node; this cache only has to keep stale entries rare:
+
+- Only positive entries are cached (the dcache also keeps negative ones). A missing name is never cached, so a
+  name another client creates is visible at once.
 - ``follow(watcher)`` keeps it fresh from the ``vfs`` NOTIFY channel: a ``delete`` evicts the node by id (through
   the reverse map ``id -> (parent, name)``), and so does a ``move``, unless the node is already cached under its new
   name (the client stored it after the move, and the event arrived late). A ``rescan`` (after the LISTEN connection
   reconnects, when the subscription overflows, or on a TRUNCATE) clears everything.
 - Every entry expires ``ttl`` seconds (2 by default) after it was stored, whatever its use. The TTL is the fallback
   for what notifications can't cover: events lost while the LISTEN connection is down (the ``rescan`` only comes
-  once it is back), and a listing whose snapshot predates a move or delete but which is stored after that change's
-  notification was handled.
+  once it is back), and a listing or lookup whose snapshot predates a move or delete but which is stored after that
+  change's notification was handled.
 
 ``evict`` removes whatever name the node has now. When the client evicts links it found stale, a fresher name
 stored meanwhile can go too: that costs a miss, never a wrong answer.
@@ -52,8 +59,10 @@ class CacheStats:
     ``follow``); entries dropped by the TTL or the size cap count as neither.
 
     ``hit_rate`` counts path components, not paths: a path resolves from the cache only if all its components hit.
-    A path is cached when a listing of its directory or its creation went through this process, so a low rate with
-    few ``expired`` means paths that were never cached, and with many, the TTL is short for the access pattern."""
+    A path is cached once this process looked it up, listed its directory or created it (``mkdir_p`` and a create
+    with ``parents`` store only the created node): the first use of a path is a
+    miss (one per path, as the walk stops at the first missing component), and later ones hit. So a low rate with
+    few ``expired`` means paths used once, and with many, the TTL is short for the access pattern."""
 
     lookups: int
     hits: int
