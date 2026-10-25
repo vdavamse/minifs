@@ -1,4 +1,4 @@
-"""The directory-entry cache: ``(parent id, name) -> (id, kind)``, per process and in memory (README: *Caching*).
+"""The directory-entry cache: ``(parent id, name) -> (id, kind)``, per process and in memory (docs/design.md).
 
 ``DirEntryCache`` implements ``minifs.vfs.client.DirCache``. The client fills it the way the kernel fills its
 dcache on a path walk: an operation's lookup (``vfs_lookup``) returns the chain of ids it walked in the same row,
@@ -22,8 +22,8 @@ resolution, never the wrong node; this cache only has to keep stale entries rare
   fallback for what notifications can't cover: events lost while the LISTEN connection is down (the ``rescan`` only
   comes once it is back), and a listing or lookup whose snapshot predates a move or delete but which is stored after
   that change's notification was handled. Since every use is checked, and evicts what it finds stale, the TTL can
-  be long: an agent's calls are seconds of inference apart, and each expiry costs the next use a walk (README:
-  *Using the tools with pydantic-ai* has the measurements).
+  be long: an agent's calls are seconds of inference apart, and each expiry costs the next use a walk (docs/design.md:
+  *Path resolution and the directory cache* has the measurements).
 
 ``evict`` removes whatever name the node has now. When the client evicts links it found stale, a fresher name
 stored meanwhile can go too: that costs a miss, never a wrong answer.

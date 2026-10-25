@@ -5,8 +5,8 @@
         ...  # one VFS per process; a VFSView over vfs.client per agent run
     log.info("directory cache: %s", cache.stats())
 
-With a ``cache``, the process's ``Watcher`` (its one LISTEN connection) keeps it fresh from NOTIFY (README:
-Caching), and the same watcher serves ``vfs.watcher.watch(path)``. Without a cache or ``watch``, as for a one-shot
+With a ``cache``, the process's ``Watcher`` (its one LISTEN connection) keeps it fresh from NOTIFY (docs/design.md),
+and the same watcher serves ``vfs.watcher.watch(path)``. Without a cache or ``watch``, as for a one-shot
 script, nothing but the pools is opened.
 """
 

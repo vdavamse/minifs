@@ -1,6 +1,6 @@
 """``Grep``: lines matching a regular expression, grouped by file, with ladderframe's contract over ``VFSView.grep``
-(README: Agent tools). The pattern is parsed as rg parses it and searched in Postgres (README: Search, Regex
-dialect); hidden files are searched, ``.git`` and the settings' excludes skipped, and hits come in order of path,
+(README: The tools). The pattern is parsed as rg parses it and searched in Postgres (docs/design.md: Search, Regex
+translation); hidden files are searched, ``.git`` and the settings' excludes skipped, and hits come in order of path,
 then line."""
 
 from __future__ import annotations

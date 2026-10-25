@@ -1,4 +1,4 @@
-"""A minimal pydantic-ai agent over a minifs workspace (README: Using the tools with pydantic-ai).
+"""A minimal pydantic-ai agent over a minifs workspace (README: Quickstart).
 
     export MINIFS_DSN=postgresql://...
     uv run python examples/provision.py                  # migrates, seeds a workspace, prints its id

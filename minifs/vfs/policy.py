@@ -1,4 +1,4 @@
-"""The write policy: what each actor may do where (README: *Write policy, per actor*).
+"""The write policy: what each actor may do where (README: *Workspaces and permissions*).
 
 Each actor has an ordered list of path rules, like mount options; the first rule whose pattern matches a path
 decides, so specific rules go before general ones. A rule grants any of ``read``, ``write`` and ``append``, and

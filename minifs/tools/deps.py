@@ -44,8 +44,8 @@ ALWAYS_EXCLUDED: tuple[str, ...] = ("**/.git/**",)
 """Skipped by every search whatever the settings say, as ladderframe hard-codes ``-g '!**/.git/**'``."""
 
 DEFAULT_EXCLUDES: tuple[str, ...] = ("**/node_modules/**", "**/.venv/**", "**/__pycache__/**", "**/.mypy_cache/**")
-"""Skipped by default, in place of rg's ``.gitignore`` handling: unambiguous caches only (README: Differences
-from ladderframe). Patterns are rg's ``-g '!...'`` excludes, matched relative to the search root."""
+"""Skipped by default, in place of rg's ``.gitignore`` handling: unambiguous caches only (docs/design.md: The agent
+tools in detail). Patterns are rg's ``-g '!...'`` excludes, matched relative to the search root."""
 
 
 @dataclass(frozen=True)

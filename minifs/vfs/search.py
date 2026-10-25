@@ -1,4 +1,4 @@
-"""Search: ripgrep's line search, run in Postgres over the current bytes of the files in scope (README: Search).
+"""Search: ripgrep's line search, run in Postgres over the current bytes of the files in scope (docs/design.md: Search).
 
 A search runs in one REPEATABLE READ transaction under ``SET LOCAL statement_timeout``, which applies to each of
 its statements (resolving the path, the scope, the search; ``regex.validate`` uses its own, shorter one):

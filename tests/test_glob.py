@@ -124,7 +124,7 @@ def test_bad_patterns(pattern: str, message: str) -> None:
     assert str(info.value) == f"error parsing glob '{pattern}': {message}"
 
 
-# rg 14.1 (what apt installs) bundles an older globset, which drops a stray '}' (README: Divergences).
+# rg 14.1 (what apt installs) bundles an older globset, which drops a stray '}' (docs/design.md: Glob).
 @pytest.mark.parametrize(("pattern", "message"), [e for e in SYNTAX_ERRORS if e[0] != "a}"])
 def test_rejections_match_rg(pattern: str, message: str, rg_path: str, tmp_path: Path) -> None:
     result = subprocess.run([rg_path, "--files", "-g", pattern], cwd=tmp_path, capture_output=True, text=True)
