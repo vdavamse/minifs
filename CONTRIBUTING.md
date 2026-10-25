@@ -129,7 +129,7 @@ the paths of an actor's chroot (`workspace_mounts(workspace_id)` gives the agent
 ordered rules of `minifs.vfs.policy.Policy` first. Paths outside every mount are ENOENT, a denial is EACCES and
 moving a mount point is EBUSY; errors come back with the visible path and no `detail`, other database errors
 as EIO. `glob` returns a `GlobResult(entries, truncated)`, leaving out the files the actor may not read, and
-`grep` a `GrepResult` (it needs `read` on everything it searches, or it's EACCES). `truncated` says at least one
+`grep` a `GrepResult`, searching only those files (passed to `VFSClient.grep` as `keep`). `truncated` says at least one
 more readable match exists, so exactly `limit` matches is not truncated, with two exceptions: glob reports False when
 hidden files fill its refetch window, and a grep from a virtual directory reports True when a later mount's
 search is refused after the limit is reached. A new client operation reaches the tools by a view method that
