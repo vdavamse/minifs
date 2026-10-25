@@ -800,7 +800,7 @@ ladderframe's tools run over a disk, `Glob` and `Grep` through ripgrep; minifs i
 **Every tool**
 
 - **No ladderframe imports, so none of its machinery.** The tools are plain pydantic-ai `Tool`s: no `@tool` metadata, `HarnessDeps`, YAML `tool_settings` or entry points. Settings come from the deps' `vfs_settings`, the working directory from `vfs_workdir`.
-- **The policy is the only permission gate.** ladderframe asks its permission guard per call; minifs checks the view's write policy (see Actor and policy), and a denial is the returned string `Permission denied: <action> <path>`, as ladderframe's guard returns one.
+- **The policy is the only permission gate.** ladderframe asks its permission guard per call; minifs checks the view's write policy (see Actor and policy). A denial is the tool's result, not a retry, as with ladderframe's guard, but worded differently: `Permission denied: <action> <path>`, where ladderframe says `Permission denied: <Tool> for '<path>' is not allowed by the agent's permission rules.`
 - **Paths are the view's.** A path outside the chroot is each tool's not-found error, `..` stops at `/`, `/` is a virtual directory listing the mounts, and there is no `~` expansion.
 - **Descriptions.** ladderframe's text, less what minifs doesn't have: "the local filesystem" becomes "the filesystem", and the lines about Bash with `rg` and the Agent tool are dropped. `Grep`'s adds one line: use `(?i)` for case-insensitive search; lookaround and backreferences aren't supported.
 
@@ -835,6 +835,7 @@ minifs/
     regex.py     thin wrapper over minifs._regex, with the translation cache
     watch.py     LISTEN vfs and async iterators per path
     cache.py     directory-entry cache, content and line-map cache, NOTIFY eviction
+    service.py   open_vfs: a process's pools, Watcher and directory cache, opened and closed in order
     cursor.py    Cursor and read_from: generation-aware tailing for library callers
   tools/         pydantic-ai tools (the pydantic-ai extra), with ladderframe's contracts
     deps.py      HasVFS (the deps protocol), ToolSettings, resolve
@@ -852,85 +853,66 @@ crates/
 
 **Install.** `pip install 'minifs[pydantic-ai]'` adds `pydantic-ai-slim`, which `minifs.tools` needs (`minifs.vfs` and `minifs.db` work without it, and importing `minifs.tools` without it raises an `ImportError` that names the extra). Add `minifs[binary]` for a bundled libpq, and your model provider's extra (`pydantic-ai-slim[anthropic]`, say). Run `minifs db migrate` once per database.
 
+**A minimal agent.** This is `examples/agent.py` below its docstring, which `tests/tools/test_example.py` runs, and the snippet runs as pasted. `examples/provision.py` migrates a database and seeds a demo workspace for it.
+
+<!-- examples/agent.py -->
+```python
+import logging
+from dataclasses import dataclass
+
+from pydantic_ai import Agent
+from pydantic_ai.models import Model
+
+from minifs.db.pool import Connector
+from minifs.tools import Edit, Glob, Grep, Read, Write
+from minifs.vfs.cache import DirEntryCache
+from minifs.vfs.policy import DEFAULT_POLICY
+from minifs.vfs.service import open_vfs
+from minifs.vfs.view import VFSView, workspace_mounts
+
+
+@dataclass
+class Deps:
+    vfs: VFSView  # all the tools need; vfs_workdir and vfs_settings are optional
+
+
+# One agent per process, for every run and workspace: the workspace is in the deps.
+agent = Agent(deps_type=Deps, tools=[Read, Write, Edit, Glob, Grep], retries=3)
+
+
+async def main(dsn: str, workspace_id: str, prompt: str, model: Model | str) -> str:
+    # On Lakebase: Connector(conninfo, password=fetch_token), called for each new connection.
+    cache = DirEntryCache()  # one client and cache per process, shared by every run
+    async with open_vfs(Connector(dsn), cache=cache) as client:
+        view = VFSView(client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")  # one view per run
+        result = await agent.run(prompt, deps=Deps(vfs=view), model=model)
+    logging.info("directory cache: %s", cache.stats())
+    return result.output
+```
+
+- **One agent, one client and cache per process, a view per run.** The `Agent` holds no workspace: each run's deps carry a `VFSView` of its own, over the process's one client, and the model can be given per run. `open_vfs` opens the write and search pools (see Operations) and, given a cache, the process's `Watcher` (its one LISTEN connection) that the cache follows, and closes them in order on exit.
+- **Lakebase.** `Connector(conninfo, password=fetch_token)` calls `fetch_token` (sync or async) for every new connection, the pools' and the watcher's reconnects alike, since its OAuth tokens expire after an hour. LISTEN needs a direct connection: if `conninfo` goes through a transaction-mode pooler, pass a direct `listen=Connector(...)` to `open_vfs`, or notifications stop without an error and the cache falls back to its TTL. A following cache keeps that connection open, and its keepalive probe keeps the compute awake; `open_vfs(..., min_size=0)` lets idle pools hold no connections.
+- **Running it.** `uv run python examples/agent.py <workspace-id> "<prompt>"` uses `$MINIFS_MODEL` (any pydantic-ai model name, `openrouter:<slug>` with `OPENROUTER_API_KEY` for instance), and otherwise pydantic-ai's `TestModel`, offline. It logs `cache.stats()` at the end, and with logfire installed (`--with 'pydantic-ai-slim[logfire]'`) prints every model and tool call to the console (`logfire.configure(send_to_logfire=False)`, `logfire.instrument_pydantic_ai()`).
+
 **Deps.** The tools take `RunContext[HasVFS]`, where `HasVFS` is a protocol whose only member is `vfs: VFSView`, so the caller's own deps dataclass works as long as it has a `vfs`. Two optional attributes are read with defaults: `vfs_workdir` (`/workspace`), where relative paths resolve, and `vfs_settings`, a `ToolSettings` with ladderframe's limits (`Read` 2,000 lines of at most 2,000 characters and 50 KB, `Glob` and `Grep` 100 results, `Grep` lines cut at 2,000 characters and a 2 s timeout, `Edit` files up to 10 MB):
 
 ```python
 @dataclass
 class Deps:
     vfs: VFSView
-    vfs_workdir: str = "/workspace"                                                      # optional
-    vfs_settings: ToolSettings = ToolSettings(grep=GrepSettings(timeout=5.0))           # optional
+    vfs_workdir: str = "/workspace"                                             # optional
+    vfs_settings: ToolSettings = ToolSettings(grep=GrepSettings(timeout=5.0))  # optional
 ```
 
 **Tools or a toolset.** Pass the tools, `Agent(model, deps_type=Deps, tools=[Read, Write, Edit, Glob, Grep])` (`minifs.tools.TOOLS` is the same tuple), or the toolset, `Agent(model, deps_type=Deps, toolsets=[toolset()])`. `retries=3` matches ladderframe's `tool_retries`.
 
-**A service: one agent and one cache per process, a view per run.** A server for many workspaces builds the `Agent` once, at module level, with no workspace in it: the workspace is in the deps, so each run gets a `VFSView` of its own over the process's one `VFSClient`, and the model can be chosen per run. The client holds the two pools (writes and searches, see Operations) and the directory cache, which follows the process's one LISTEN connection. This is the core of `examples/agent.py`, which `tests/tools/test_example.py` runs, and copy-paste runnable:
+**The directory cache: on in a service, off for one-shot scripts.** The cache maps `(parent_id, name) -> (id, kind)` (see Caching). A path this process has already looked up, listed or created resolves from it on its next use, every link checked against `vfs_nodes` in the statement that uses it, so a stale entry costs a slower lookup, never the wrong file. A path seen for the first time, from a `Glob` or `Grep` result say, is one server walk, which then caches every component. NOTIFY evicts another process's renames and deletes as they commit, and a 2 s TTL covers what notifications can't. Leave it off (`open_vfs(connector)` with no `cache`) where nothing lives long enough to reuse it: a one-shot script such as `examples/provision.py`, a test, the `minifs` CLI. There the Watcher's extra connection, and the clear on entering `follow`, buy nothing.
 
-<!-- examples/agent.py -->
-```python
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from uuid import UUID
+`CacheStats` counts path components, not paths, and a path skips its walk only when all of its components hit. With a real model an agent's calls are seconds apart, one inference each, so entries also expire between calls: a run of the example on a hosted model hit 17 of 32 component lookups, with 4 misses expired, where a scripted run with no inference between calls hits 40 of 42. A longer `ttl` (`DirEntryCache(ttl=...)`) keeps more without risking correctness, since every use is checked.
 
-from pydantic_ai import Agent, AgentRunResult
-from pydantic_ai.models import Model
+**Actor and policy: agents vs. ingestion.** The view's `actor` picks its rules in the policy (see Filesystem tree and conventions). Under `DEFAULT_POLICY`, `"agent"` reads and writes its own `/workspace`, except `log.md`, which it may read and append but not overwrite (the tools never append; the harness appends the agent's log entries with `vfs.append`, acting as the agent), and only reads `/docs`. Ingestion jobs run as `"ingestion"`, which writes `/docs` and has no access to any workspace. The policy is the tools' only permission gate: a denied call returns `Permission denied: <action> <path>` as the tool's result rather than a retry. For other rules, build a `Policy({"agent": [Rule("/workspace/**/.env"), Rule("/workspace/**", "read", "write"), ...]})`: rules are ordered, the first match wins, and a rule with no actions hides the path. Seeding a workspace, as `examples/provision.py` does, is an operator's job, through the client or an `"operator"` view, not through the agent's.
 
-from minifs.db.pool import Connector, Pools
-from minifs.tools import Edit, Glob, Grep, Read, Write
-from minifs.vfs.cache import DirEntryCache
-from minifs.vfs.client import VFSClient
-from minifs.vfs.policy import DEFAULT_POLICY
-from minifs.vfs.view import VFSView, workspace_mounts
-from minifs.vfs.watch import Watcher
-
-
-@dataclass
-class Deps:
-    vfs: VFSView  # all the tools need; vfs_workdir ("/workspace") and vfs_settings are optional
-
-
-# One agent per process, shared by every run and every workspace: the deps carry the workspace, and the model can
-# be given per run. retries=3 is ladderframe's tool_retries.
-agent = Agent(deps_type=Deps, tools=[Read, Write, Edit, Glob, Grep], retries=3)
-
-
-@asynccontextmanager
-async def open_client(connector: Connector) -> AsyncGenerator[tuple[VFSClient, DirEntryCache]]:
-    """The process's client and directory cache. The cache follows the process's one LISTEN connection (the
-    ``Watcher``), so another process's rename or delete evicts what it changed; every use of an entry is checked in
-    the statement that uses it anyway, so a stale one costs a slower lookup, never the wrong file."""
-    cache = DirEntryCache()
-    async with Pools(connector) as pools, Watcher(connector) as watcher, cache.follow(watcher):
-        client = VFSClient(pools.write, search_pool=pools.search, cache=cache)
-        try:
-            yield client, cache
-        finally:
-            await client.settle()
-
-
-async def run_task(client: VFSClient, workspace_id: UUID, prompt: str, model: Model | str) -> AgentRunResult[str]:
-    """One agent run in one workspace: a view per run, over the shared client."""
-    view = VFSView(client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")
-    return await agent.run(prompt, deps=Deps(vfs=view), model=model)
-```
-
-Used like this (the example adds the seeding, an offline model and the output):
-
-```python
-connector = Connector(os.environ["MINIFS_DSN"])  # Lakebase: Connector(conninfo, password=fetch_token)
-async with open_client(connector) as (client, cache):
-    result = await run_task(client, workspace_id, "fix the failing test", "anthropic:claude-sonnet-5-5")
-    log.info("directory cache: %s", cache.stats())
-```
-
-On Databricks Lakebase, `Connector(conninfo, password=fetch_token)` calls `fetch_token` (sync or async) for every new connection, the pools' and the watcher's reconnects alike, since its OAuth tokens expire after an hour. `uv run python examples/agent.py` runs the example against `$MINIFS_DSN`: with `$MINIFS_MODEL` (a pydantic-ai model name) or `ANTHROPIC_API_KEY` set it uses that model, and otherwise a `FunctionModel` plays the task offline (Glob, Read, Grep, Edit the fix, Write `CHANGES.md`, Read it back). It logs `cache.stats()` at the end.
-
-**The directory cache: on in a service, off for one-shot scripts.** The cache maps `(parent_id, name) -> (id, kind)` (see Caching), so an agent's second call in a directory resolves the shared components without walking them, whether its paths came from a listing, a `Glob` or a `Grep`. It can't serve a wrong file: every use of a cached chain is checked against `vfs_nodes` in the same statement that uses it, falling back to a walk. NOTIFY (`cache.follow(watcher)`) evicts another process's renames and deletes as they commit, and the 2 s TTL covers what notifications can't. Leave it off (`VFSClient(pool)`, no `cache`) where nothing lives long enough to reuse it: a one-shot script, a test, the `minifs` CLI. There the Watcher's extra connection, and the `rescan` that clears the cache on entering `follow`, buy nothing. A cache without `follow` still works, with the TTL alone keeping it fresh. With a real model, an agent's calls are seconds apart (one inference each), so entries also expire between calls: the example's run on a hosted model hit 17 of 32 lookups, 4 of the misses expired, where the scripted run hits 40 of 42. A longer `ttl` keeps more, and costs no correctness, since every use is checked; it only lets a stale entry cost a slower lookup for longer.
-
-**Actor and policy: agents vs. ingestion.** The view's `actor` picks its rules in the policy (see Filesystem tree and conventions): `VFSView(client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")` reads and writes its own `/workspace` (but only reads `log.md`, which the harness appends), and only reads `/docs`. Ingestion jobs run as `"ingestion"`, which writes `/docs` and has no access to any workspace; a harness appending the agent's log entries acts as the agent with `vfs.append`. The policy is the tools' only permission gate: a denied call returns `Permission denied: <action> <path>` as the tool's result rather than a retry. For other rules, build a `Policy({"agent": [Rule("/workspace/**/.env"), Rule("/workspace/**", "read", "write"), ...]})`: rules are ordered, the first match wins, and a rule with no actions hides the path. Seeding a workspace, as the example does, is an operator's job, through the client or an `"operator"` view, not through the agent's.
-
-**Multi-workspace servers.** `workspace_mounts(workspace_id)` mounts one workspace at `/workspace` and the shared `/docs`; a view never reaches another workspace (`..` stops at `/`, another workspace's real path is `File not found`). The views of concurrent runs share the client, its pools and its cache, so the cost per run is a `VFSView` object; size the pools for the runs a process serves at once (each tool call holds one to three connections while it runs).
+**Multi-workspace servers.** `workspace_mounts(workspace_id)` mounts one workspace at `/workspace` and the shared `/docs`; a view never reaches another workspace (`..` stops at `/`, another workspace's real path is `File not found`). The views of concurrent runs share the client, its pools and its cache, so the cost per run is a `VFSView` object; size the pools (`open_vfs(..., write_size=, search_size=)`) for the runs a process serves at once, since a tool call holds one to three connections while it runs.
 
 Each tool is a plain function and a prebuilt `Tool` carrying ladderframe's description:
 
