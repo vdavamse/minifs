@@ -49,6 +49,21 @@ jobs:
           uv pip install --python /tmp/smoke/bin/python "$GITHUB_WORKSPACE"/dist/*.whl "psycopg[binary]"
           /tmp/smoke/bin/python -c "import minifs._regex as r; assert not r.HAS_ORACLE; from minifs.db.migrate import load_migrations; assert load_migrations()"
           /tmp/smoke/bin/minifs db --help
+      - name: Install the pydantic-ai extra from the wheel
+        run: |
+          cd "$RUNNER_TEMP"
+          # Without the extra, importing minifs.tools names it (whatever the distribution is called).
+          /tmp/smoke/bin/python -c "
+          try:
+              import minifs.tools
+          except ImportError as e:
+              assert '[pydantic-ai]' in str(e), e
+          else:
+              raise AssertionError('minifs.tools imported without pydantic-ai')
+          "
+          wheel=$(ls "$GITHUB_WORKSPACE"/dist/*.whl)
+          uv pip install --python /tmp/smoke/bin/python "${wheel}[pydantic-ai]"
+          /tmp/smoke/bin/python -c "import minifs.tools as t; assert [x.name for x in t.TOOLS] == ['Read', 'Write', 'Edit', 'Glob', 'Grep']; t.toolset()"
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}

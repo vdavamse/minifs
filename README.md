@@ -797,13 +797,32 @@ Paths are absolute in the agent's chroot view; a relative path resolves against 
 
 ### Differences from ladderframe
 
-ladderframe's tools run over a disk, `Glob` and `Grep` through ripgrep; minifs implements the same contracts in Postgres. These differences remain, by design:
+ladderframe's tools run over a disk, `Glob` and `Grep` through ripgrep; minifs implements the same contracts in Postgres. Each tool's differences, by design, gathered here (the tool subsections above and the Read contract give the details):
+
+**Every tool**
+
+- **No ladderframe imports, so none of its machinery.** The tools are plain pydantic-ai `Tool`s: no `@tool` metadata, `HarnessDeps`, YAML `tool_settings` or entry points. Settings come from the deps' `vfs_settings`, the working directory from `vfs_workdir`.
+- **The policy is the only permission gate.** ladderframe asks its permission guard per call; minifs checks the view's write policy (see Actor and policy). A denial is the tool's result, not a retry, as with ladderframe's guard, but worded differently: `Permission denied: <action> <path>`, where ladderframe says `Permission denied: <Tool> for '<path>' is not allowed by the agent's permission rules.`
+- **Paths are the view's.** A path outside the chroot is each tool's not-found error, `..` stops at `/`, `/` is a virtual directory listing the mounts, and there is no `~` expansion.
+- **Descriptions.** ladderframe's text, less what minifs doesn't have: "the local filesystem" becomes "the filesystem", and the lines about Bash with `rg` and the Agent tool are dropped. `Grep`'s adds one line: use `(?i)` for case-insensitive search; lookaround and backreferences aren't supported.
+
+**Read**
+
+- **Read sees the view.** A path the policy refuses is `Permission denied: read <path>` whether or not anything is there, so a denial doesn't tell what exists. Directory listings, `Did you mean` suggestions and instruction files leave out what the actor may not read (an unreadable `AGENTS.md` falls back to `CLAUDE.md`). ladderframe also carries already-shown instruction files across a Temporal activity; minifs has no Temporal integration, so a run context without `messages` repeats them on every `Read`.
+
+**Write and Edit**
+
+- **A compare-and-swap, not a lock.** ladderframe serialises writers of a path with a per-path thread lock, which doesn't reach other processes. minifs writes with `VFSView.write(expect=<the version read>)`, checked under the inode lock, so a writer anywhere is detected; a lost race is redone once from the stat, and a second loss is the retry `<path> was modified since it was read. Read it again before writing.` ladderframe never sees that message.
+- **`Edit` has a size cap.** A file over `EditSettings.max_bytes` (10 MB) is refused with a retry pointing at `Write`, since `Edit` holds the whole file in memory. ladderframe has no cap.
+- **`Write` skips the diff of a large old file.** An existing file over `WriteSettings.max_diff_bytes` (1 MB) isn't read or diffed (see Write, Diff cap); ladderframe always diffs.
+- Neither checks that the model read a file before overwriting it, as ladderframe doesn't.
+
+**Glob and Grep**
 
 - **No `.gitignore`.** ladderframe's `Glob` and `Grep` both honour `.gitignore`, `.ignore` and git's excludes, as rg does by default. minifs has no ignore files. In their place, `Glob` and `Grep` apply a default exclude list limited to unambiguous caches (`**/node_modules/**`, `**/.venv/**`, `**/__pycache__/**`, `**/.mypy_cache/**`), configurable per workspace. As in rg, excludes match each path relative to the search root: a `path` inside an excluded directory is searched, and excluded directories below `path` are still skipped. Excluded directories are pruned from the walk (see Glob), so they cost nothing. `**/.git/**` is always excluded, outside the configurable list, as ladderframe hard-codes it. Hidden files follow ladderframe (see Glob). Honouring `.gitignore` files stored in the tree can come later.
 - **ARE underneath.** Patterns are parsed as rg parses them and translated to Postgres ARE (see Regex dialect). A few constructs rg accepts are refused with a `ModelRetry` that names them: byte classes outside ASCII, repetition counts above 255, and patterns whose translation exceeds the size cap.
 - **mtime order.** `Glob` returns paths newest first, as opencode does; ladderframe's `Glob` and `Grep` return them in rg's walk order, which varies between runs because rg searches in parallel. `Grep` orders hits by path, then line. Above the result limit, minifs returns the first 100 in its order, where ladderframe returns an arbitrary 100.
 - **Non-UTF-8 files aren't searched.** rg searches them and ladderframe decodes hits with replacement characters; minifs's `Grep` skips them (see Search).
-- **Read sees the view.** A path the policy refuses is `Permission denied: read <path>` whether or not anything is there, so a denial doesn't tell what exists. Directory listings, `Did you mean` suggestions and instruction files leave out what the actor may not read (an unreadable `AGENTS.md` falls back to `CLAUDE.md`). ladderframe also carries already-shown instruction files across a Temporal activity; minifs has no Temporal integration, so a run context without `messages` repeats them on every `Read`.
 - **Guard rails.** minifs refuses searches over the file cap or byte cap, and stops each of a search's two statements after 2 seconds. ladderframe's `Grep` has no such limits.
 
 ### Package layout
@@ -819,6 +838,7 @@ minifs/
     regex.py     thin wrapper over minifs._regex, with the translation cache
     watch.py     LISTEN vfs and async iterators per path
     cache.py     directory-entry cache, content and line-map cache, NOTIFY eviction
+    service.py   open_vfs: a process's pools, Watcher and directory cache, opened and closed in order
     cursor.py    Cursor and read_from: generation-aware tailing for library callers
   tools/         pydantic-ai tools (the pydantic-ai extra), with ladderframe's contracts
     deps.py      HasVFS (the deps protocol), ToolSettings, resolve
@@ -832,26 +852,90 @@ crates/
   minifs-regex/  Rust: regex-syntax HIR to ARE, built as minifs._regex (PyO3, maturin)
 ```
 
-### Deps and tools
+### Using the tools with pydantic-ai
 
-The tools take `RunContext[HasVFS]`, where `HasVFS` is a protocol whose only member is `vfs: VFSView`, so the caller's own deps dataclass works as long as it has a `vfs`. Two optional attributes are read with defaults: `vfs_workdir` (`/workspace`) and `vfs_settings` (a `ToolSettings`, with ladderframe's limits: `Read` 2,000 lines of at most 2,000 characters and 50 KB, `Glob` and `Grep` 100 results, `Grep` lines cut at 2,000 characters and a 2 s timeout; plus minifs's own caps: `Edit` takes files of at most 10 MB, and `Write` diffs old files of at most 1 MB).
+**Install.** `pip install "minifs-pg[pydantic-ai]"` (the distribution is `minifs-pg`; the package is still `import minifs`) adds `pydantic-ai-slim`, which `minifs.tools` needs (`minifs.vfs` and `minifs.db` work without it, and importing `minifs.tools` without it raises an `ImportError` that names the extra). Add `minifs-pg[binary]` for a bundled libpq, and your model provider's extra (`pydantic-ai-slim[anthropic]`, say). Run `minifs db migrate` once per database.
 
-The foundation (`minifs.tools.deps`, `minifs.tools.errors`, `vfs_tool`, `toolset()`), `Read` (#11), `Write` (#39), `Edit` (#40), `Glob` (#12) and `Grep` (#13) are in place.
+**A minimal agent.** This is `examples/agent.py` below its docstring, which `tests/tools/test_example.py` runs, and the snippet runs as pasted. `examples/provision.py` migrates a database and seeds a demo workspace for it.
 
+<!-- examples/agent.py -->
 ```python
-from minifs.tools import Read, Write, Edit, Glob, Grep, toolset
+import logging
+from collections.abc import AsyncIterable
+from dataclasses import dataclass
+
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import (
+    AgentStreamEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartEndEvent,
+    TextPart,
+    ThinkingPart,
+)
+from pydantic_ai.models import Model
+
+from minifs.db.pool import Connector
+from minifs.tools import Edit, Glob, Grep, Read, Write
+from minifs.vfs.cache import DirEntryCache
+from minifs.vfs.policy import DEFAULT_POLICY
+from minifs.vfs.service import open_vfs
+from minifs.vfs.view import VFSView, workspace_mounts
+
 
 @dataclass
 class Deps:
-    vfs: VFSView
-    vfs_workdir: str = "/workspace"   # optional
+    vfs: VFSView  # all the tools need; vfs_workdir and vfs_settings are optional
 
-agent = Agent("<model>", deps_type=Deps, tools=[Read, Write, Edit, Glob, Grep], retries=3)  # ladderframe's tool_retries
-# or: Agent("<model>", deps_type=Deps, toolsets=[toolset()])
 
-view = VFSView(client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")
-await agent.run("fix the failing test", deps=Deps(vfs=view))
+# One agent per process, for every run and workspace: the workspace is in the deps.
+agent = Agent(deps_type=Deps, tools=[Read, Write, Edit, Glob, Grep], retries=3)
+
+
+async def show(ctx: RunContext[Deps], events: AsyncIterable[AgentStreamEvent]) -> None:
+    """Logs the model's text and each tool call and result, in full, as they happen."""
+    async for event in events:
+        if isinstance(event, PartEndEvent) and isinstance(event.part, TextPart | ThinkingPart):
+            logging.info("%s: %s", event.part.part_kind, event.part.content)
+        elif isinstance(event, FunctionToolCallEvent):
+            logging.info("call %s(%s)", event.part.tool_name, event.part.args_as_json_str())
+        elif isinstance(event, FunctionToolResultEvent):
+            logging.info("%s %s:\n%s", event.part.tool_name, event.part.outcome, event.part.model_response_str())
+
+
+async def main(dsn: str, workspace_id: str, prompt: str, model: Model | str) -> str:
+    # On Lakebase: Connector(conninfo, password=fetch_token), called for each new connection.
+    cache = DirEntryCache()  # one client and cache per process, shared by every run
+    async with open_vfs(Connector(dsn), cache=cache) as vfs:
+        view = VFSView(vfs.client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")  # one view per run
+        result = await agent.run(prompt, deps=Deps(vfs=view), model=model, event_stream_handler=show)
+    logging.info("directory cache: %s", cache.stats())
+    return result.output
 ```
+
+- **One agent, one client and cache per process, a view per run.** The `Agent` holds no workspace: each run's deps carry a `VFSView` of its own, over the process's one client, and the model can be given per run. `open_vfs` opens the write and search pools (see Operations) and, given a cache (or `watch=True`), the process's `Watcher`, its one LISTEN connection, which the cache follows. It yields a `VFS` handle: `vfs.client`, `vfs.pools` (for a health check or a query of your own), `vfs.watcher` (for `vfs.watcher.watch(path)`, so file watches share the cache's connection) and `vfs.cache`. On exit it closes them in order.
+- **Lakebase.** `Connector(conninfo, password=fetch_token)` calls `fetch_token` (sync or async) for every new connection, the pools' and the watcher's reconnects alike, since its OAuth tokens expire after an hour. LISTEN needs a direct connection: if `conninfo` goes through a transaction-mode pooler, pass a direct `listen=Connector(...)` to `open_vfs` (a `ValueError` without a cache or `watch=True`, since nothing would listen), or notifications stop without an error and the cache falls back to its TTL. A following cache keeps that connection open, and its keepalive probe keeps the compute awake; `open_vfs(..., min_size=0)` lets idle pools hold no connections.
+- **Running it.** `uv run python examples/agent.py <workspace-id> "<prompt>"` uses `$MINIFS_MODEL` (any pydantic-ai model name, `openrouter:<slug>` with `OPENROUTER_API_KEY` for instance), and otherwise pydantic-ai's `TestModel`, offline. It logs the model's text and every tool call and its result as they happen, each result with its outcome (`success`, or `retried` for a `ModelRetry`) and the text the model sees (`show`, pydantic-ai's `event_stream_handler`, whose event types need pydantic-ai 2.61 or later). A handler makes every run a streamed one, so a custom model must support `request_stream` (a `FunctionModel` needs a `stream_function`). Then it logs `cache.stats()`; with logfire installed (`--with 'pydantic-ai-slim[logfire]'`) prints every model and tool call to the console (`logfire.configure(send_to_logfire=False)`, `logfire.instrument_pydantic_ai()`).
+
+**Deps.** The tools take `RunContext[HasVFS]`, where `HasVFS` is a protocol whose only member is `vfs: VFSView`, so the caller's own deps dataclass works as long as it has a `vfs`. Two optional attributes are read with defaults: `vfs_workdir` (`/workspace`), where relative paths resolve, and `vfs_settings`, a `ToolSettings` with ladderframe's limits (`Read` 2,000 lines of at most 2,000 characters and 50 KB, `Glob` and `Grep` 100 results, `Grep` lines cut at 2,000 characters and a 2 s timeout; plus minifs's own caps: `Edit` takes files of at most 10 MB, and `Write` diffs old files of at most 1 MB):
+
+```python
+@dataclass
+class Deps:
+    vfs: VFSView
+    vfs_workdir: str = "/workspace"                                             # optional
+    vfs_settings: ToolSettings = ToolSettings(grep=GrepSettings(timeout=5.0))  # optional
+```
+
+**Tools or a toolset.** Pass the tools, `Agent(model, deps_type=Deps, tools=[Read, Write, Edit, Glob, Grep])` (`minifs.tools.TOOLS` is the same tuple), or the toolset, `Agent(model, deps_type=Deps, toolsets=[toolset()])`. `retries=3` matches ladderframe's `tool_retries`.
+
+**The directory cache: on in a service, off for one-shot scripts.** The cache maps `(parent_id, name) -> (id, kind)` (see Caching). A path this process has already looked up, listed or created resolves from it on its next use, every link checked against `vfs_nodes` in the statement that uses it, so a stale entry costs a slower lookup, never the wrong file. A path seen for the first time, from a `Glob` or `Grep` result say, is one server walk, which then caches every component. NOTIFY evicts another process's renames and deletes as they commit, and a 2 s TTL covers what notifications can't. Leave it off (`open_vfs(connector)` with no `cache`) where nothing lives long enough to reuse it: a one-shot script such as `examples/provision.py`, a test, the `minifs` CLI. There the Watcher's extra connection, and the clear on entering `follow`, buy nothing.
+
+`CacheStats` counts path components, not paths, and a path skips its walk only when all of its components hit. With a real model an agent's calls are seconds apart, one inference each, so entries also expire between calls: a run of the example on a hosted model hit 17 of 32 component lookups, with 4 misses expired, where a scripted run with no inference between calls hits 40 of 42. A longer `ttl` (`DirEntryCache(ttl=...)`) keeps more without risking correctness, since every use is checked.
+
+**Actor and policy: agents vs. ingestion.** The view's `actor` picks its rules in the policy (see Filesystem tree and conventions). Under `DEFAULT_POLICY`, `"agent"` reads and writes its own `/workspace`, except `log.md`, which it may read and append but not overwrite (the tools never append; the harness appends the agent's log entries with `vfs.append`, acting as the agent), and only reads `/docs`. Ingestion jobs run as `"ingestion"`, which writes `/docs` and has no access to any workspace. The policy is the tools' only permission gate: a denied call returns `Permission denied: <action> <path>` as the tool's result rather than a retry. For other rules, build a `Policy({"agent": [Rule("/workspace/**/.env"), Rule("/workspace/**", "read", "write"), ...]})`: rules are ordered, the first match wins, and a rule with no actions hides the path. Seeding a workspace, as `examples/provision.py` does, is an operator's job, through the client or an `"operator"` view, not through the agent's.
+
+**Multi-workspace servers.** `workspace_mounts(workspace_id)` mounts one workspace at `/workspace` and the shared `/docs`; a view never reaches another workspace (`..` stops at `/`, another workspace's real path is `File not found`). The views of concurrent runs share the client, its pools and its cache, so the cost per run is a `VFSView` object; size the pools (`open_vfs(..., write_size=, search_size=)`) for the runs a process serves at once, since a tool call holds one to three connections while it runs.
 
 Each tool is a plain function and a prebuilt `Tool` carrying ladderframe's description:
 
@@ -959,7 +1043,7 @@ Most of the correctness rests on four properties, and each gets a test that comp
 
 The tool-based VFS ships first. A TigerFS front end follows once the tree and tools are stable.
 
-**What stays frozen.** The ladderframe-style tools: `Read`, `Write`, `Glob` and `Grep`, with ladderframe's signatures, output formats and error handling. The TigerFS work can then replace the VFS client with a thin MCP client, and prompts, tools and evals carry over unchanged.
+**What stays frozen.** The ladderframe-style tools: `Read`, `Write`, `Edit`, `Glob` and `Grep`, with ladderframe's signatures, output formats and error handling. The TigerFS work can then replace the VFS client with a thin MCP client, and prompts, tools and evals carry over unchanged.
 
 **What the TigerFS integration adds.** Three pieces of work in the TigerFS repo:
 
