@@ -21,6 +21,7 @@ from minifs.db.pool import Connector, Pools, open_pool, retry_serializable
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import FileVersion, Kind, VFSError
 from minifs.vfs.glob import GlobError
+from tests.test_tree import wait_until_blocked
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
 
@@ -905,7 +906,10 @@ async def test_a_claim_lost_inside_vfs_rename_raises_nothing(conn: AsyncConnecti
     await vfs.mkdir_p("/tasks/new")
     await vfs.mkdir_p("/tasks/cur")
     await vfs.create("/tasks/new/t1")
-    async with await AsyncConnection.connect(db) as other:
+    async with (
+        await AsyncConnection.connect(db) as other,
+        await AsyncConnection.connect(db, autocommit=True) as watcher,
+    ):
         await other.execute(
             "SELECT * FROM vfs_rename((SELECT id FROM vfs_lookup(ARRAY['tasks', 'new', 't1'])),"
             " (SELECT id FROM vfs_lookup(ARRAY['tasks', 'cur'])), 't1-other',"
@@ -913,15 +917,8 @@ async def test_a_claim_lost_inside_vfs_rename_raises_nothing(conn: AsyncConnecti
         )  # uncommitted: holds t1 FOR UPDATE
         async with conn.transaction():
             task = asyncio.create_task(vfs.claim("/tasks/new/t1", "/tasks/cur/t1-mine"))
-            for _ in range(200):
-                cur = await other.execute(
-                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (conn.info.backend_pid,)
-                )
-                if await cur.fetchone() == ("Lock",):
-                    break
-                await asyncio.sleep(0.02)
-            else:
-                raise AssertionError("the claim never waited for the other one's lock")
+            # From an autocommit connection: a transaction keeps its first pg_stat_activity snapshot.
+            await wait_until_blocked(watcher, conn.info.backend_pid)
             await other.commit()
             assert await task is False
             assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS

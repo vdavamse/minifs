@@ -158,7 +158,7 @@ Each column choice, and why:
 | Enforced by | The `(node_id, node_kind)` foreign key: no extents on a directory | The `(parent_id, parent_kind)` foreign key: no children under a file |
 
 - **Kind never changes.** A file can't become a directory in place; replacing one with the other is unlink plus create, as in POSIX.
-- **Resolution returns the kind.** `vfs_lookup` returns `(id, kind)`, so the library reports `ENOTDIR` and `EISDIR` before calling an operation, and the directory cache stores the kind with the id. The foreign keys are the backstop.
+- **Resolution returns the kind.** `vfs_lookup` returns `(id, kind)` (with `err, err_detail`), so the directory cache stores the kind with the id. The operations report `ENOTDIR` and `EISDIR` themselves, and the foreign keys are the backstop.
 - **Directory `mtime` isn't maintained.** POSIX updates it on every create, unlink and rename inside the directory. Here that would lock and update the parent row on every create: a hot spot for shared directories such as `tasks/new/`, and an extra NOTIFY each time. Watchers get those events from NOTIFY by parent id instead.
 
 **Inode numbers and handles.** If a protocol needs a 64-bit inode number, take the low 64 bits of the UUID (the random part in v7). A stateful protocol can use the 16-byte UUID itself as the file handle. Unlike TigerFS's path-encoded NFS handles, it survives renames.

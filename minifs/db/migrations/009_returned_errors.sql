@@ -60,7 +60,7 @@ END $$;
 
 
 -- EINVAL for a NULL node id (see above).
-CREATE FUNCTION vfs_check_node(p_node uuid) RETURNS void LANGUAGE plpgsql IMMUTABLE SET search_path FROM CURRENT AS $$
+CREATE FUNCTION vfs_check_node(p_node uuid) RETURNS void LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $$
 BEGIN
     IF p_node IS NULL THEN
         PERFORM vfs_raise('EINVAL', 'node id is NULL');
