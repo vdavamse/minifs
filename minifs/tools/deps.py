@@ -53,9 +53,10 @@ class GlobSettings:
     """Paths returned at most."""
     excludes: tuple[str, ...] = DEFAULT_EXCLUDES
     """Skipped as well as ``ALWAYS_EXCLUDED``, which a caller can't turn off. A glob from a virtual directory
-    (``/``) restates each exclude in every mount, so avoid the forms ``VFSView.glob`` can't restate there (a
-    ``**`` segment followed by a wildcard one, a brace or class with ``/``, an escaped ``/``, a trailing ``//``):
-    they make every such glob EINVAL, which the model sees as a retry naming a pattern it never wrote."""
+    (``/``) restates each exclude in every mount, so avoid the forms ``VFSView.glob`` can't restate there: a
+    ``**`` segment followed by one that can match a directory at or above a mount point (``**/w*/`` or
+    ``**/workspace/**``, though not ``**/*.pyc``), a brace or class with ``/``, an escaped ``/``, a trailing
+    ``//``. They make every such glob EINVAL, which the model sees as a retry naming a pattern it never wrote."""
 
     def __post_init__(self) -> None:
         """A bad limit or exclude is the caller's mistake, so it fails here, not as a retry the model can't fix."""

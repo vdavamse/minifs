@@ -230,3 +230,14 @@ async def test_always_excluded_holds_with_hidden_files(client: VFSClient, view: 
     await make(client, ".git/HEAD.md", ".github/ci.md")
     result = await view.glob("**/*.md", "/workspace", excludes=ALWAYS_EXCLUDED, hidden=True)
     assert sorted(e.path for e in result.entries) == ["/workspace/.github/ci.md", "/workspace/notes.md"]
+
+
+@pytest.mark.parametrize(("exclude", "spans"), [("**/*.pyc", False), ("**/workspace/**", True)])
+async def test_exclude_across_mount_points(deps: Deps, exclude: str, spans: bool) -> None:
+    """The ``GlobSettings.excludes`` caveat: what matters is whether the segment after ``**`` can match a mount
+    point's directory, not whether it has a wildcard."""
+    custom = Deps(deps.vfs, vfs_settings=ToolSettings(glob=GlobSettings(excludes=(exclude,))))
+    call = await call_tool(Glob, custom, pattern="*.md", path="/")
+    assert call.retried == spans
+    if spans:
+        assert "spans mount points here" in call.retry
