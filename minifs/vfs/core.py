@@ -97,6 +97,15 @@ class FileVersion:
 
 
 @dataclass(frozen=True)
+class GlobResult:
+    """What ``VFSView.glob`` returns: the readable files it matched, newest first; ``truncated`` if it saw at least
+    one more readable match past them (``VFSView.glob`` says when it can't tell)."""
+
+    entries: list[Entry]
+    truncated: bool
+
+
+@dataclass(frozen=True)
 class ReadResult:
     """Bytes ``[offset, next_offset)`` of file ``id``, with its ``size`` and ``generation`` from the same snapshot.
 

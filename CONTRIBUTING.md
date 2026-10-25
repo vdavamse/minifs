@@ -128,8 +128,12 @@ entries with a 2 s TTL, kept fresh by `follow(watcher)` (evict by id on `move` a
 the paths of an actor's chroot (`workspace_mounts(workspace_id)` gives the agent's), each checked against the
 ordered rules of `minifs.vfs.policy.Policy` first. Paths outside every mount are ENOENT, a denial is EACCES and
 moving a mount point is EBUSY; errors come back with the visible path and no `detail`, other database errors
-as EIO. A new client operation reaches the tools by a view method that maps its paths with `_target` and wraps
-the call in `_mapped`.
+as EIO. `glob` returns a `GlobResult(entries, truncated)`, leaving out the files the actor may not read, and
+`grep` a `GrepResult` (it needs `read` on everything it searches, or it's EACCES). `truncated` says at least one
+more readable match exists, so exactly `limit` matches is not truncated, with two exceptions: glob reports False when
+hidden files fill its refetch window, and a grep from a virtual directory reports True when a later mount's
+search is refused after the limit is reached. A new client operation reaches the tools by a view method that
+maps its paths with `_target` and wraps the call in `_mapped`.
 
 Connections come from `minifs.db.pool`: a `Connector` (a static conninfo, plus an optional callable that returns
 a fresh password per connection, for Lakebase OAuth tokens) is also the `ConnectionFactory` for LISTEN, and

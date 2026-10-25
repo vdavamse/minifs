@@ -28,13 +28,13 @@ What each operation needs:
 - ``append`` (or ``write``) for ``append``.
 
 An actor may learn a little it can't read: ``append`` returns the new size of a file it may append to, and
-``create`` is EEXIST if something is there; a glob with a ``limit`` that comes back short, when the policy hides
-more than ``_REFETCH_FACTOR - 1`` times as many matches as it lets through, tells that unreadable newer files
-exist; and an ``expect`` naming some node id outside the path tells whether that id exists (ids are random,
-and the view hands out only ids inside the mounts). Moving or removing a mount point or a virtual directory is
-EBUSY. A mount point is a directory: a file can't be created there, and creating one with ``parents`` (or by
-``mkdir_p``) also creates the real directories above it. A database error other than a ``VFSError`` comes back
-as EIO, since its text may name real paths.
+``create`` is EEXIST if something is there; a glob with a ``limit`` that returns fewer than ``limit`` entries, or
+is not ``truncated``, while a glob without a limit finds more readable files, tells that unreadable newer files
+fill its refetch window; and an ``expect`` naming some node id outside the path tells whether that id exists (ids
+are random, and the view hands out only ids inside the mounts). Moving or removing a mount point or a virtual
+directory is EBUSY. A mount point is a directory: a file can't be created there, and creating one with ``parents``
+(or by ``mkdir_p``) also creates the real directories above it. A database error other than a ``VFSError`` comes
+back as EIO, since its text may name real paths.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ import psycopg
 from minifs.vfs import glob as globbing
 from minifs.vfs import search as searching
 from minifs.vfs.client import DEFAULT_LINE_BYTES, DEFAULT_LINE_LIMIT, DEFAULT_READ_LIMIT, MAX_TIMEOUT, VFSClient
-from minifs.vfs.core import Entry, FileVersion, LineReadResult, ReadResult, VFSError, join, split
+from minifs.vfs.core import Entry, FileVersion, GlobResult, LineReadResult, ReadResult, VFSError, join, split
 from minifs.vfs.policy import Action, Policy
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
@@ -156,12 +156,17 @@ class VFSView:
         excludes: Sequence[str] = (),
         hidden: bool = False,
         limit: int | None = None,
-    ) -> list[Entry]:
-        """``VFSClient.glob`` below directory ``path``: the first ``limit`` files the actor may read.
+    ) -> GlobResult:
+        """``VFSClient.glob`` below directory ``path``: the first ``limit`` files the actor may read, and whether
+        there is at least one more (``truncated``).
 
-        Mounts the actor can't read anything in are not searched. When the policy hides some of the first
-        ``limit`` matches, the glob looks further, up to ``_REFETCH_FACTOR`` times as many, so a policy that hides
-        most of the matches can return fewer than ``limit``.
+        Mounts the actor can't read anything in are not searched. The glob asks for ``limit + 1`` matches, so
+        exactly ``limit`` readable ones are not ``truncated``. When all ``limit + 1`` came back and the policy hid
+        some of them, it looks further, at ``min(_REFETCH_FACTOR * max(limit, 1) + 1, 2**31 - 1)`` matches, so a
+        policy that hides most of the matches can return fewer than ``limit``. Files the actor can't read never
+        count toward ``limit`` and never make the result ``truncated``: when hidden files fill that window, the
+        glob can't tell whether a readable match follows, and reports ``truncated`` only for one it has seen. So a
+        result can be not ``truncated`` though readable files lie past the window.
 
         Below a virtual directory, the glob runs in each mount and the results are merged, newest first. The
         pattern and excludes still match paths relative to ``path``, restated relative to each mount point. Where
@@ -176,18 +181,23 @@ class VFSView:
         - for an exclude, a trailing ``//`` (``**//``).
 
         Every mount's pattern and excludes are restated before any is searched, so whether a glob is EINVAL
-        doesn't depend on the order of the mounts. EINVAL too for a ``limit`` outside 0 to 2**31 - 1."""
+        doesn't depend on the order of the mounts. EINVAL too for a ``limit`` outside 0 to 2**31 - 2."""
         target = self._target(path, "read")
-        if limit is not None and not 0 <= limit <= _MAX_LIMIT:
+        if limit is not None and not 0 <= limit < _MAX_LIMIT:  # limit + 1 is asked for
             raise VFSError("EINVAL", target.visible, f"invalid limit {limit}")
-        entries = await self._glob(target, pattern, excludes, hidden, limit)
-        readable = [e for e in entries if self.policy.allows(self.actor, "read", e.path)]
-        if limit is not None and len(entries) == limit and len(readable) < limit:
-            # The policy hid some of the first `limit`: look past them, a bounded distance.
-            wider = min(limit * _REFETCH_FACTOR, _MAX_LIMIT)
-            entries = await self._glob(target, pattern, excludes, hidden, wider)
-            readable = [e for e in entries if self.policy.allows(self.actor, "read", e.path)][:limit]
-        return readable
+        if limit is None:
+            return GlobResult(self._readable(await self._glob(target, pattern, excludes, hidden, None)), False)
+        fetch = limit + 1
+        entries = await self._glob(target, pattern, excludes, hidden, fetch)
+        readable = self._readable(entries)
+        wider = min(max(limit, 1) * _REFETCH_FACTOR + 1, _MAX_LIMIT)
+        if len(entries) == fetch and len(readable) <= limit and wider > fetch:
+            # The policy hid some of the first `limit + 1`: look past them, a bounded distance.
+            readable = self._readable(await self._glob(target, pattern, excludes, hidden, wider))
+        return GlobResult(readable[:limit], len(readable) > limit)
+
+    def _readable(self, entries: list[Entry]) -> list[Entry]:
+        return [e for e in entries if self.policy.allows(self.actor, "read", e.path)]
 
     async def _glob(
         self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
@@ -230,7 +240,9 @@ class VFSView:
         ``include`` and ``excludes`` restated as for ``glob`` (EINVAL in the same cases). Each mount is its own
         snapshot, and the caps and the timeout apply to each mount's search; ``files`` and ``bytes`` are the
         totals of the mounts searched. Once there are ``limit`` hits, a later mount only tells whether there are
-        more (``truncated``), and is taken to have more if its search is refused."""
+        more (``truncated``), and is taken to have more if its search is refused (over a cap, before anything is
+        read, or on timeout, before the search finished), since there is no telling whether it holds a match. That
+        is the one case where ``truncated`` may be True with no more hits."""
         target = self._target(path, "read")
         if target.real is not None:
             return await self._grep_in_mount(

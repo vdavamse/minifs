@@ -16,7 +16,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import Entry, VFSError
+from minifs.vfs.core import Entry, GlobResult, VFSError
 from minifs.vfs.glob import GlobError, compile_excludes, compile_glob
 from minifs.vfs.policy import DEFAULT_POLICY, Policy, PolicyDenied, Rule
 from minifs.vfs.search import SearchRefused
@@ -340,7 +340,7 @@ async def test_a_claim_across_mounts(vfs: VFSClient) -> None:
 
 async def test_glob_skips_mounts_it_cannot_read(vfs: VFSClient) -> None:
     hidden = view(vfs, Policy({"agent": [Rule("/workspace/**"), Rule("/**", "read")]}))
-    assert [e.path for e in await hidden.glob("**", "/")] == ["/docs/guide.md"]
+    assert [e.path for e in (await hidden.glob("**", "/")).entries] == ["/docs/guide.md"]
     assert not hidden.policy.allows_any("agent", "read", "/workspace")
     assert hidden.policy.allows_any("agent", "read", "/")
     assert Policy({"a": [Rule("/w/x.md", "read"), Rule("/w/**")]}).allows_any("a", "read", "/w")
@@ -349,23 +349,86 @@ async def test_glob_skips_mounts_it_cannot_read(vfs: VFSClient) -> None:
 async def test_glob_limit_counts_only_readable_files(vfs: VFSClient) -> None:
     hiding = view(vfs, Policy({"agent": [Rule("/workspace/log.md"), Rule("/**", "read")]}))
     await vfs.append(f"/workspaces/{W1}/log.md", b"newest")
-    assert [e.path for e in await hiding.glob("*.md", "/workspace", limit=1)] == ["/workspace/notes.md"]
-    assert [e.path for e in await hiding.glob("**/log.md", "/", limit=1)] == []
+    assert [e.path for e in (await hiding.glob("*.md", "/workspace", limit=1)).entries] == ["/workspace/notes.md"]
+    assert [e.path for e in (await hiding.glob("**/log.md", "/", limit=1)).entries] == []
 
 
 async def test_glob_looks_past_hidden_matches_a_bounded_distance(vfs: VFSClient) -> None:
     hiding = view(vfs, Policy({"agent": [Rule("/workspace/hid/**"), Rule("/**", "read")]}))
     for i in range(7):  # newer than notes.md and log.md
         await vfs.create(f"/workspaces/{W1}/hid/{i}.md", b"", parents=True)
-    assert [e.path for e in await hiding.glob("**", "/workspace", limit=1)] == ["/workspace/log.md"]
-    for i in range(7, 9):  # now 9 hidden matches come first, past the 8 the re-fetch looks at
+    result = await hiding.glob("**", "/workspace", limit=1)
+    assert ([e.path for e in result.entries], result.truncated) == (["/workspace/log.md"], True)  # notes.md
+    for i in range(7, 9):  # now 9 hidden matches come first and fill the 9 the re-fetch looks at
         await vfs.create(f"/workspaces/{W1}/hid/{i}.md", b"")
-    assert await hiding.glob("**", "/workspace", limit=1) == []
+    assert await hiding.glob("**", "/workspace", limit=1) == GlobResult([], False)
+
+
+async def test_glob_looks_past_hidden_matches_across_mounts(vfs: VFSClient) -> None:
+    hiding = view(vfs, Policy({"agent": [Rule("/docs/hid/**"), Rule("/**", "read")]}))
+    for i in range(7):  # newer than every readable file; the match past the limit, log.md, is in /workspace
+        await vfs.create(f"/docs/hid/{i}.md", b"", parents=True)
+    result = await hiding.glob("**", "/", limit=1)
+    assert ([e.path for e in result.entries], result.truncated) == (["/docs/guide.md"], True)
+    for i in range(7, 9):  # the window, applied after the merge, is all hidden
+        await vfs.create(f"/docs/hid/{i}.md", b"")
+    assert await hiding.glob("**", "/", limit=1) == GlobResult([], False)
+
+
+async def test_glob_is_truncated_only_past_its_limit(vfs: VFSClient, policy: Policy) -> None:
+    agent = view(vfs, policy)
+
+    async def glob(path: str, limit: int) -> tuple[list[str], bool]:
+        result = await agent.glob("*.md", path, limit=limit)
+        return [e.path for e in result.entries], result.truncated
+
+    async def glob_from_root(pattern: str, limit: int) -> tuple[list[str], bool]:
+        result = await agent.glob(pattern, "/", limit=limit)
+        return [e.path for e in result.entries], result.truncated
+
+    assert await glob("/workspace", 2) == (["/workspace/log.md", "/workspace/notes.md"], False)  # exactly limit
+    assert await glob("/workspace", 1) == (["/workspace/log.md"], True)
+    assert await glob("/workspace", 0) == ([], True)
+    assert await glob("/docs", 1) == (["/docs/guide.md"], False)
+    # From /, each mount is asked for limit + 1 and the merge tells: 3 files in all, newest first.
+    assert await glob("/", 3) == (["/docs/guide.md", "/workspace/log.md", "/workspace/notes.md"], False)
+    assert await glob("/", 4) == (["/docs/guide.md", "/workspace/log.md", "/workspace/notes.md"], False)
+    assert await glob("/", 2) == (["/docs/guide.md", "/workspace/log.md"], True)
+    assert await glob("/", 0) == ([], True)
+    # Only one mount matches: its own limit + 1 tells.
+    workspace = ["/workspace/log.md", "/workspace/notes.md"]
+    assert await glob_from_root("workspace/*.md", 2) == (workspace, False)
+    assert await glob_from_root("workspace/*.md", 1) == (workspace[:1], True)
+    assert (await agent.glob("*.md", "/")).truncated is False  # no limit
+    assert await agent.glob("*.txt", "/", limit=0) == GlobResult([], False)
+    assert (await agent.glob("*.md", "/", limit=2**31 - 2)).truncated is False  # the largest: it asks for one more
+    await raises("EINVAL", agent.glob("*.md", "/", limit=2**31 - 1), "/")
+
+
+async def test_hidden_files_never_make_a_glob_truncated(vfs: VFSClient) -> None:
+    rules = [Rule("/workspace/log.md"), Rule("/docs/secret.md"), Rule("/**", "read")]
+    hiding = view(vfs, Policy({"agent": rules}))
+    await vfs.create("/docs/secret.md", b"")  # newest, then guide.md, log.md, notes.md
+
+    async def glob(path: str, limit: int) -> tuple[list[str], bool]:
+        result = await hiding.glob("*.md", path, limit=limit)
+        return [e.path for e in result.entries], result.truncated
+
+    # The hidden files come before, between and after the readable ones, and neither count nor truncate.
+    assert await glob("/", 2) == (["/docs/guide.md", "/workspace/notes.md"], False)
+    assert await glob("/", 1) == (["/docs/guide.md"], True)
+    assert await glob("/workspace", 1) == (["/workspace/notes.md"], False)
+    assert await glob("/docs", 1) == (["/docs/guide.md"], False)
+    assert await glob("/docs", 0) == ([], True)  # guide.md, past the secret.md that comes first
+    await vfs.append(f"/workspaces/{W1}/log.md", b"newer")  # a hidden file past the last readable one
+    await vfs.append(f"/workspaces/{W1}/notes.md", b"newest")
+    assert await glob("/workspace", 1) == (["/workspace/notes.md"], False)
+    assert await glob("/", 2) == (["/workspace/notes.md", "/docs/guide.md"], False)
 
 
 async def test_ingestion_globs_only_the_docs(vfs: VFSClient, policy: Policy) -> None:
     ingestion = view(vfs, policy, "ingestion")
-    assert [e.path for e in await ingestion.glob("**", "/")] == ["/docs/guide.md"]
+    assert [e.path for e in (await ingestion.glob("**", "/")).entries] == ["/docs/guide.md"]
     await raises("EACCES", ingestion.glob("**", "/workspace"), "/workspace")
 
 
@@ -550,7 +613,8 @@ def test_rules() -> None:
 
 async def test_glob_in_a_mount(vfs: VFSClient, policy: Policy) -> None:
     agent = view(vfs, policy)
-    assert [e.path for e in await agent.glob("*.md", "/workspace")] == ["/workspace/log.md", "/workspace/notes.md"]
+    result = await agent.glob("*.md", "/workspace")
+    assert [e.path for e in result.entries] == ["/workspace/log.md", "/workspace/notes.md"]
     await raises("ENOENT", agent.glob("*.md", "/workspace/none"), "/workspace/none")
 
 
@@ -560,7 +624,7 @@ async def test_glob_below_a_virtual_directory(vfs: VFSClient, policy: Policy) ->
     await vfs.create(f"/workspaces/{W1}/src/a.py", b"", parents=True)
 
     async def paths(pattern: str, *excludes: str, limit: int | None = None) -> list[str]:
-        return sorted(e.path for e in await agent.glob(pattern, "/", excludes=excludes, limit=limit))
+        return sorted(e.path for e in (await agent.glob(pattern, "/", excludes=excludes, limit=limit)).entries)
 
     assert await paths("workspace/*.md") == ["/workspace/log.md", "/workspace/notes.md"]  # anchored, not nested
     assert await paths("*/notes.md") == ["/workspace/notes.md"]
@@ -577,7 +641,7 @@ async def test_glob_below_a_virtual_directory(vfs: VFSClient, policy: Policy) ->
     assert await paths("workspace/**/a.py") == ["/workspace/src/a.py"]
     assert await paths("workspaces/**") == []
     assert len(await paths("**/*.md", limit=2)) == 2
-    mtimes = [e.mtime for e in await agent.glob("**", "/") if e.mtime is not None]
+    mtimes = [e.mtime for e in (await agent.glob("**", "/")).entries if e.mtime is not None]
     assert len(mtimes) == 5 and mtimes == sorted(mtimes, reverse=True)
     await vfs.create(f"/workspaces/{W1}/src/node_modules/n.md", b"", parents=True)
     assert await paths("**/*.md", "workspace/node_modules/") == [
@@ -737,7 +801,7 @@ async def test_glob_from_a_virtual_directory_matches_globbing_the_tree(vfs: VFSC
     for directory in ("/", "/a"):
         for pattern, excludes in cases:
             try:
-                seen = await tester.glob(pattern, directory, excludes=excludes, hidden=hidden)
+                seen = (await tester.glob(pattern, directory, excludes=excludes, hidden=hidden)).entries
             except VFSError as e:
                 assert e.errno == "EINVAL", (pattern, excludes)
                 continue
