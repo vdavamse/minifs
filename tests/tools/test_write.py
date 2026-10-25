@@ -1,8 +1,10 @@
 """``Write``: ladderframe's ``Write`` tests (``packages/harness/tests/test_tools.py``) through a real agent, its output
 against ladderframe's on a corpus, and what the VFS adds: the policy, the chroot and lost races."""
 
+import asyncio
 import base64
 import json
+import threading
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,9 @@ from typing import Any
 import pytest
 
 import minifs.tools._text as text
+import minifs.tools.write as write_module
 from minifs.tools import TOOLS, Write
+from minifs.tools.deps import ToolSettings, WriteSettings
 from minifs.tools.write import DESCRIPTION
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import FileVersion, ReadResult
@@ -336,3 +340,128 @@ async def test_a_change_between_pages_is_tried_again(
     assert reads == 2 + 3  # two pages before the change, then all three of the new version
     assert "-abcdefghij\n+new" in meta["diff"]
     assert await content(client, "notes.md") == b"new\n"
+
+
+# The diff cap
+
+
+class Preads(VFSView):
+    """The agent's view, recording the ``(offset, limit)`` of each ``pread``."""
+
+    def __init__(self, view: VFSView, client: VFSClient) -> None:
+        super().__init__(client, workspace_mounts(W1), view.policy, view.actor)
+        self.preads: list[tuple[int, int]] = []
+
+    async def pread(self, path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        self.preads.append((offset, limit))
+        return await super().pread(path, offset, limit)
+
+
+def capped(vfs: VFSView, max_diff_bytes: int = 100) -> Deps:
+    return Deps(vfs, vfs_settings=ToolSettings(write=WriteSettings(max_diff_bytes=max_diff_bytes)))
+
+
+async def test_over_the_cap_the_old_text_is_not_read(view: VFSView, client: VFSClient) -> None:
+    """Over ``max_diff_bytes`` only the first bytes are read, for the BOM, and the metadata has no diff."""
+    await client.create(f"/workspaces/{W1}/big.txt", b"old line\n" * 50)
+    preads = Preads(view, client)
+    result, meta = await write(capped(preads), "big.txt", "new\n")
+    assert result == "Wrote file successfully."
+    assert meta == {
+        "filepath": "/workspace/big.txt",
+        "exists": True,
+        "diff": "",
+        "additions": None,
+        "deletions": None,
+    }
+    assert preads.preads == [(0, 3)]
+    assert await content(client, "big.txt") == b"new\n"
+
+
+async def test_at_the_cap_the_old_text_is_diffed(view: VFSView, client: VFSClient) -> None:
+    await client.create(f"/workspaces/{W1}/big.txt", b"old line\n" * 50)
+    _, meta = await write(capped(view, 450), "big.txt", "new\n")
+    assert (meta["additions"], meta["deletions"]) == (1, 50)
+    assert "-old line\n" in meta["diff"]
+
+
+async def test_over_the_cap_the_bom_is_kept(view: VFSView, client: VFSClient) -> None:
+    await client.create(f"/workspaces/{W1}/big.txt", text.BOM.encode() + b"x" * 200)
+    await write(capped(view), "big.txt", "new\n")
+    assert await content(client, "big.txt") == text.BOM.encode() + b"new\n"
+
+
+async def test_over_the_cap_a_concurrent_writer_is_detected(view: VFSView, client: VFSClient) -> None:
+    await client.create(f"/workspaces/{W1}/big.txt", b"x" * 200)
+    racing = Racing(view, client, [overwrite(client, "big.txt", b"y" * 200)])
+    _, meta = await write(capped(racing), "big.txt", "mine\n")
+    assert racing.writes == 2
+    assert (meta["diff"], await content(client, "big.txt")) == ("", b"mine\n")
+    steps = [overwrite(client, "big.txt", f"theirs {i}".encode() * 50) for i in (1, 2, 3)]
+    racing = Racing(view, client, steps)
+    message = await retry_message(Write, capped(racing), content="mine\n", filePath="big.txt")
+    assert message == "/workspace/big.txt was modified since it was read. Read it again before writing."
+    assert await content(client, "big.txt") == b"theirs 2" * 50
+
+
+async def test_a_file_grown_past_the_cap_after_its_stat_is_not_diffed(view: VFSView, client: VFSClient) -> None:
+    """The size is checked again on the first page; the version of that page is not the one written over, so the
+    compare-and-swap uses that of the BOM read."""
+    big = f"/workspaces/{W1}/big.txt"
+    await client.create(big, b"small\n")
+
+    class Growing(Preads):
+        async def stat(self, path: str) -> Any:
+            entry = await super().stat(path)
+            await client.write(big, b"grown\n" * 50)
+            return entry
+
+    growing = Growing(view, client)
+    _, meta = await write(capped(growing), "big.txt", "new\n")
+    assert meta["diff"] == ""
+    assert growing.preads == [(0, text.PAGE), (0, 3)]
+    assert await content(client, "big.txt") == b"new\n"
+
+
+async def test_over_the_cap_write_only_rules_still_need_read(client: VFSClient) -> None:
+    """The old text isn't read, but its BOM is, and what the policy allows doesn't depend on a file's size."""
+    policy = Policy({"agent": [Rule("/workspace/out/**", "write"), Rule("/workspace/**", "read", "write")]})
+    deps = capped(VFSView(client, workspace_mounts(W1), policy, "agent"))
+    await client.create(f"/workspaces/{W1}/out/big.txt", b"x" * 200, parents=True)
+    denied = await run_tool(Write, deps, content="y", filePath="out/big.txt")
+    assert denied == "Permission denied: read /workspace/out/big.txt"
+    assert await content(client, "out/big.txt") == b"x" * 200
+
+
+def test_write_settings_are_checked() -> None:
+    assert WriteSettings().max_diff_bytes == 1024 * 1024
+    with pytest.raises(ValueError, match="at least 0"):
+        WriteSettings(max_diff_bytes=-1)
+    for bad in (1.5, True):
+        with pytest.raises(TypeError, match="must be an int"):
+            WriteSettings(max_diff_bytes=bad)  # pyright: ignore[reportArgumentType]
+
+
+async def test_the_diff_does_not_stall_the_event_loop(
+    deps: Deps, client: VFSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """difflib takes seconds on a file of a few MB, so the diff runs in a worker thread: a coroutine runs while it
+    does. Here the diff blocks until that coroutine releases it, which it can't if the diff holds the loop."""
+    await client.create(f"/workspaces/{W1}/big.txt", b"".join(b"line %d\n" % i for i in range(50_000)))
+    started, released = threading.Event(), threading.Event()
+    diff_metadata = write_module.diff_metadata
+
+    def blocking(*args: Any) -> dict[str, str | int]:
+        started.set()
+        assert released.wait(5), "the diff held the event loop"
+        return diff_metadata(*args)
+
+    async def concurrent() -> None:
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        released.set()
+
+    monkeypatch.setattr(write_module, "diff_metadata", blocking)
+    new = "".join(f"line {i}\n" if i != 25_000 else "changed\n" for i in range(50_000))
+    (_, meta), _ = await asyncio.gather(write(deps, "big.txt", new), concurrent())
+    assert (meta["additions"], meta["deletions"]) == (1, 1)
