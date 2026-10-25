@@ -756,7 +756,7 @@ Postgres's built-in ARE engine is the only regex engine available everywhere, so
 
 ## Agent tools
 
-minifs ships pydantic-ai tools with ladderframe's (opencode's) contracts, in `minifs.tools` behind the `minifs[pydantic-ai]` extra: the same names, parameters, descriptions, output formats and error handling as ladderframe's `Read`, `Write`, `Edit`, `Glob` and `Grep` (`packages/harness/src/ladderframe/tools`). ladderframe's tools track opencode's, which mirror Claude Code's, so models apply what they already practice, and an agent moves between a workspace on disk and minifs without prompt changes. Nothing in minifs imports ladderframe: ladderframe is a pydantic-ai harness, so it uses these tools like any other pydantic-ai project. The tools are plain `async def` functions over a `VFSView`, each also wrapped in a `pydantic_ai.Tool`.
+minifs ships pydantic-ai tools with ladderframe's (opencode's) contracts, in `minifs.tools` behind the `pydantic-ai` extra (`pip install 'minifs-pg[pydantic-ai]'`): the same names, parameters, descriptions, output formats and error handling as ladderframe's `Read`, `Write`, `Edit`, `Glob` and `Grep` (`packages/harness/src/ladderframe/tools`). ladderframe's tools track opencode's, which mirror Claude Code's, so models apply what they already practice, and an agent moves between a workspace on disk and minifs without prompt changes. Nothing in minifs imports ladderframe: ladderframe is a pydantic-ai harness, so it uses these tools like any other pydantic-ai project. The tools are plain `async def` functions over a `VFSView`, each also wrapped in a `pydantic_ai.Tool`.
 
 | Tool | Signature | Backed by |
 | --- | --- | --- |

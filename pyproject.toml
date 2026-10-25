@@ -3,7 +3,7 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
-name = "minifs"
+name = "minifs-pg"  # `minifs` is a prohibited name on PyPI; the import package is still minifs
 dynamic = ["version"]  # from crates/minifs-regex/Cargo.toml
 description = "Postgres based VFS for agents"
 readme = "README.md"
@@ -69,7 +69,7 @@ include = [{ path = "minifs/db/migrations/*.sql", format = ["sdist", "wheel"] }]
 [tool.uv]
 # The development build (uv sync) enables the regex oracle. uv applies this only to builds it runs in this
 # checkout: not maturin-action's release wheels, and not an sdist installed from anywhere else.
-config-settings-package = { minifs = { build-args = "--features oracle" } }
+config-settings-package = { minifs-pg = { build-args = "--features oracle" } }
 # Rebuild the extension on `uv sync` when the Rust sources change.
 cache-keys = [
     { file = "pyproject.toml" },

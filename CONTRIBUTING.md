@@ -10,7 +10,7 @@ uv sync            # creates .venv and builds minifs._regex in place, with the `
 ```
 
 `uv sync` rebuilds the extension whenever `crates/**` changes. To force a rebuild: `uv sync --reinstall-package
-minifs`.
+minifs-pg`.
 
 ## Checks
 

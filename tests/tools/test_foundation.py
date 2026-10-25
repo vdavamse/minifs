@@ -245,7 +245,7 @@ def test_vfs_imports_without_pydantic_ai() -> None:
         try:
             import minifs.tools
         except ImportError as e:
-            assert "minifs[pydantic-ai]" in str(e), e
+            assert "minifs-pg[pydantic-ai]" in str(e), e
         else:
             raise AssertionError("minifs.tools imported without pydantic-ai")
         """

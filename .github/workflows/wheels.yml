@@ -112,7 +112,7 @@ jobs:
           ls dist
           for f in dist/*; do
             case "$(basename "$f")" in
-              "minifs-$version-"*.whl | "minifs-$version.tar.gz") ;;
+              "minifs_pg-$version-"*.whl | "minifs_pg-$version.tar.gz") ;;
               *) echo "::error::$f is not version $version (tag $GITHUB_REF_NAME)"; exit 1 ;;
             esac
           done
@@ -125,7 +125,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/minifs/${{ needs.check-tag.outputs.version }}/
+      url: https://pypi.org/project/minifs-pg/${{ needs.check-tag.outputs.version }}/
     permissions:
       id-token: write
     steps:

@@ -306,7 +306,7 @@ wheels = [
 ]
 
 [[package]]
-name = "minifs"
+name = "minifs-pg"
 source = { editable = "." }
 dependencies = [
     { name = "psycopg" },
