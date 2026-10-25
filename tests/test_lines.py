@@ -75,6 +75,19 @@ async def check_layout(conn: AsyncConnection, node: UUID, content: bytes) -> Non
         assert len(data) <= TARGET or len(line_offsets) == 1, "only a single line makes an oversized extent"
         offset += len(data)
     assert offset == len(content)
+    cur = await conn.execute(
+        "SELECT utf8 FROM vfs_extents WHERE node_id = %s ORDER BY generation, byte_offset", (node,)
+    )
+    assert [u for (u,) in await cur.fetchall()] == [is_utf8(data) for *_, data, _ in rows], "utf8 per extent"
+
+
+def is_utf8(data: bytes) -> bool:
+    """What Postgres's convert_from(data, 'UTF8') accepts: strict UTF-8 without NUL."""
+    try:
+        data.decode()
+    except UnicodeDecodeError:
+        return False
+    return b"\0" not in data
 
 
 async def pread_lines_many(
