@@ -19,7 +19,7 @@ from minifs.vfs.client import VFSClient
 from minifs.vfs.core import Entry, GlobResult, VFSError
 from minifs.vfs.glob import GlobError, compile_excludes, compile_glob
 from minifs.vfs.policy import DEFAULT_POLICY, Policy, PolicyDenied, Rule
-from minifs.vfs.search import SearchRefused
+from minifs.vfs.search import GrepResult, SearchRefused
 from minifs.vfs.view import VFSView, _below, workspace_mounts  # pyright: ignore[reportPrivateUsage]
 from tests.test_tree import wait_until_blocked
 
@@ -552,7 +552,7 @@ async def test_grep_follows_a_rule_on_a_directory_alone(vfs: VFSClient) -> None:
 
 async def test_a_file_checked_alone_is_pinned(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
     # The policy lets only a file be moved at these paths. If a directory takes the file's place after the view's
-    # stat, the operation must not reach it. A grep needs no stat: it filters whatever it finds there.
+    # stat, the operation must not reach it. (A grep needs no stat: see test_grep_filters_what_replaced_a_file.)
     env = Policy({"agent": [Rule("/workspace/**/.env"), Rule("/**", "read", "write")]})
     agent = view(vfs, env)
     await vfs.create(f"/workspaces/{W1}/app/.env", b"KEY=secret", parents=True)
@@ -566,8 +566,36 @@ async def test_a_file_checked_alone_is_pinned(vfs: VFSClient, monkeypatch: pytes
     monkeypatch.setattr(vfs, "stat", stale_stat)
     await raises("ESTALE", agent.rename("/workspace/app", "/workspace/app2"), "/workspace/app")
     assert not await agent.claim("/workspace/app", "/docs/app")
-    assert (await agent.grep("secret", "/workspace/app")).hits == []
     assert (await real_stat(f"/workspaces/{W1}/app/.env")).size == 10
+
+
+async def test_grep_filters_what_replaced_a_file(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The view decides on the path alone: a directory that takes a checked file's place before the client's
+    # snapshot is filtered like any other.
+    env = Policy({"agent": [Rule("/workspace/**/.env"), Rule("/**", "read", "write")]})
+    agent = view(vfs, env)
+    app = f"/workspaces/{W1}/app"
+    await vfs.create(app, b"secret\n")
+    real_grep = vfs.grep
+
+    async def swapped(*args: Any, **kwargs: Any) -> GrepResult:
+        await vfs.unlink(app)
+        await vfs.create(f"{app}/.env", b"KEY=secret\n", parents=True)
+        return await real_grep(*args, **kwargs)
+
+    monkeypatch.setattr(vfs, "grep", swapped)
+    assert (await agent.grep("secret", "/workspace/app")).hits == []
+
+
+async def test_grep_from_a_virtual_directory_checks_a_file_mount(vfs: VFSClient) -> None:
+    # A mount whose real root is a file, under a rule on the mount point alone: searching it from / must not read it.
+    env = Policy({"agent": [Rule("/docs"), Rule("/**", "read", "write")]})
+    agent = view(vfs, env)
+    await vfs.unlink("/docs/guide.md")
+    await vfs.unlink("/docs")
+    await vfs.create("/docs", b"TOPSECRET\n")
+    await raises("EACCES", agent.grep("TOPSECRET", "/docs"), "/docs")
+    assert (await agent.grep("TOPSECRET", "/")).hits == []
 
 
 def test_rules() -> None:

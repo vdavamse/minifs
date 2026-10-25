@@ -41,7 +41,7 @@ async def grep(ctx: RunContext[HasVFS], pattern: str, path: str | None = None, i
             pattern,
             search,
             include=include,
-            excludes=(*config.excludes, *ALWAYS_EXCLUDED),
+            excludes=(*ALWAYS_EXCLUDED, *config.excludes),
             limit=config.limit,
             max_line_chars=config.max_line_chars,
             timeout=config.timeout,

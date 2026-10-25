@@ -263,10 +263,11 @@ class VFSClient:
     ) -> searching.GrepResult:
         """The lines matching ripgrep ``pattern`` (``fixed``: a literal string) in the files below directory
         ``path`` that match glob ``include`` (None: all) and none of ``excludes`` (as in ``glob``), or in file ``path``
-        alone (``include``, ``excludes``, ``hidden`` and ``keep`` don't apply, as for a path given to rg), in order
-        of path (bytewise), then line, at most ``limit`` (``minifs.vfs.search``). Unlike ``glob``, hidden files are
-        searched unless ``hidden`` is false, as ladderframe's Grep does; ``.git`` never is. Files that aren't UTF-8
-        are skipped. ``keep`` (a view's policy), given each file's path, leaves out the files it rejects: they
+        alone (``include``, ``excludes`` and ``hidden`` don't apply, as for a path given to rg), in order of path
+        (bytewise), then line, at most ``limit`` (``minifs.vfs.search``). Unlike ``glob``, hidden files are searched
+        unless ``hidden`` is false, as ladderframe's Grep does; ``.git`` never is. Files that aren't UTF-8 are
+        skipped. ``keep`` (a view's policy), given each file's path, a file ``path`` too, leaves out the files it
+        rejects: they
         count toward the file cap (the walk stops past it, before they can be filtered) but not the byte cap, the
         hits or the result's totals.
 
@@ -304,6 +305,8 @@ class VFSClient:
                         if kind == "file":
                             assert node is not None and size is not None
                             scope = searching.Scope((node,), (join(*segments),), (size,))
+                            if keep is not None:
+                                scope = scope.only(keep)
                     if scope is None:
                         scope = await searching.find_scope(
                             conn,

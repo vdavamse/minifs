@@ -6,8 +6,10 @@ from minifs.tools import Grep
 from minifs.tools.deps import GrepSettings, ToolSettings
 from minifs.tools.grep import DESCRIPTION
 from minifs.vfs.client import MAX_TIMEOUT, VFSClient
+from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.policy import Policy, Rule
+from minifs.vfs.search import GrepResult, SearchRefused
 from minifs.vfs.view import MAX_GLOB_LIMIT, VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
 
@@ -129,6 +131,21 @@ async def test_retries(client: VFSClient, deps: Deps) -> None:
     assert message.startswith("error parsing glob '*.{a': unclosed alternate group")
     too_many = await retry_message(Grep, deps, pattern="a{1000}")  # rg accepts it, ARE doesn't
     assert too_many.startswith("repetition count 1000 is too large")
+
+
+async def test_refused_and_internal_errors_are_retries(deps: Deps, monkeypatch: pytest.MonkeyPatch) -> None:
+    refusal = SearchRefused("files", "Search scope is over 10000 files; narrow the path or include pattern")
+
+    async def refused(*args: object, **kwargs: object) -> GrepResult:
+        raise refusal
+
+    async def broken(*args: object, **kwargs: object) -> GrepResult:
+        raise VFSError("EIO", "/workspace", "database error")
+
+    monkeypatch.setattr(deps.vfs, "grep", refused)
+    assert await retry_message(Grep, deps, pattern="x") == refusal.message
+    monkeypatch.setattr(deps.vfs, "grep", broken)
+    assert await retry_message(Grep, deps, pattern="x") == "Internal error reading /workspace"
 
 
 async def test_paths_outside_the_view_are_not_found(deps: Deps) -> None:

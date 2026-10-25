@@ -486,7 +486,8 @@ async def test_keep_filters_the_scope_before_the_caps(vfs: VFSClient) -> None:
     assert ([h.path for h in result.hits], result.files, result.bytes) == (["/w/a.md", "/w/c.md"], 2, 8)
     with pytest.raises(SearchRefused):  # the file cap counts every file listed, kept or not
         await vfs.grep("foo", "/w", keep=keep, max_files=2)
-    assert (await vfs.grep("foo", "/w/b/secret.md", keep=keep)).files == 1  # a file path isn't filtered
+    assert (await vfs.grep("foo", "/w/b/secret.md", keep=keep)).hits == []  # a file path is filtered too
+    assert (await vfs.grep("foo", "/w/a.md", keep=keep)).files == 1
 
 
 async def test_cut_ignores_a_final_cr(vfs: VFSClient) -> None:

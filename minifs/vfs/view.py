@@ -30,8 +30,9 @@ What each operation needs:
 An actor may learn a little it can't read: ``append`` returns the new size of a file it may append to, and
 ``create`` is EEXIST if something is there; a glob with a ``limit`` that returns fewer than ``limit`` entries, or
 is not ``truncated``, while a glob without a limit finds more readable files, tells that unreadable newer files
-fill its refetch window; a grep refused over the file cap, which counts unreadable files (or, from a virtual
-directory, ``truncated`` set by a later mount refused that way), tells that unreadable files fill the difference;
+fill its refetch window; a grep refused over the file cap, which counts unreadable files, or timed out while
+its walk lists them (or, from a virtual directory, ``truncated`` set by a later mount refused either way), tells
+that unreadable files are there;
 and an ``expect`` naming some node id outside the path tells whether that id exists (ids
 are random, and the view hands out only ids inside the mounts). Moving or removing a mount point or a virtual
 directory is EBUSY. A mount point is a directory: a file can't be created there, and creating one with ``parents``
@@ -342,11 +343,22 @@ class VFSView:
         )
 
     def _grep_keep(self, target: _Target) -> Callable[[str], bool] | None:
-        """The files below ``target`` a grep may search, by real path: None for all, when the actor may read the
-        whole subtree. A file ``target`` was checked itself, and the client doesn't filter a file's scope."""
+        """The files at or below ``target`` a grep may search, by real path: None for all, when the actor may read
+        the whole subtree. The client filters a file ``target`` too: a mount searched from a virtual directory
+        isn't checked on its own. A path outside the mount is refused, not guessed at."""
         if self.policy.allows(self.actor, "read", target.visible, subtree=True):
             return None
-        return lambda real: self.policy.allows(self.actor, "read", self._visible(real, target))
+        mount = target.mount
+        assert mount is not None
+
+        def keep(real: str) -> bool:
+            segments = split(real)
+            if segments[: len(mount.real)] != mount.real:
+                return False
+            visible = join(*mount.visible, *segments[len(mount.real) :])
+            return self.policy.allows(self.actor, "read", visible)
+
+        return keep
 
     # Writes
 
