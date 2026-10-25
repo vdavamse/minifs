@@ -858,9 +858,18 @@ crates/
 <!-- examples/agent.py -->
 ```python
 import logging
+from collections.abc import AsyncIterable
 from dataclasses import dataclass
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import (
+    AgentStreamEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartEndEvent,
+    TextPart,
+    ThinkingPart,
+)
 from pydantic_ai.models import Model
 
 from minifs.db.pool import Connector
@@ -880,19 +889,30 @@ class Deps:
 agent = Agent(deps_type=Deps, tools=[Read, Write, Edit, Glob, Grep], retries=3)
 
 
+async def show(ctx: RunContext[Deps], events: AsyncIterable[AgentStreamEvent]) -> None:
+    """Logs the model's text and each tool call and result, in full, as they happen."""
+    async for event in events:
+        if isinstance(event, PartEndEvent) and isinstance(event.part, TextPart | ThinkingPart):
+            logging.info("%s: %s", event.part.part_kind, event.part.content)
+        elif isinstance(event, FunctionToolCallEvent):
+            logging.info("call %s(%s)", event.part.tool_name, event.part.args_as_json_str())
+        elif isinstance(event, FunctionToolResultEvent):
+            logging.info("%s returned:\n%s", event.part.tool_name, event.part.content)
+
+
 async def main(dsn: str, workspace_id: str, prompt: str, model: Model | str) -> str:
     # On Lakebase: Connector(conninfo, password=fetch_token), called for each new connection.
     cache = DirEntryCache()  # one client and cache per process, shared by every run
     async with open_vfs(Connector(dsn), cache=cache) as client:
         view = VFSView(client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")  # one view per run
-        result = await agent.run(prompt, deps=Deps(vfs=view), model=model)
+        result = await agent.run(prompt, deps=Deps(vfs=view), model=model, event_stream_handler=show)
     logging.info("directory cache: %s", cache.stats())
     return result.output
 ```
 
 - **One agent, one client and cache per process, a view per run.** The `Agent` holds no workspace: each run's deps carry a `VFSView` of its own, over the process's one client, and the model can be given per run. `open_vfs` opens the write and search pools (see Operations) and, given a cache, the process's `Watcher` (its one LISTEN connection) that the cache follows, and closes them in order on exit.
 - **Lakebase.** `Connector(conninfo, password=fetch_token)` calls `fetch_token` (sync or async) for every new connection, the pools' and the watcher's reconnects alike, since its OAuth tokens expire after an hour. LISTEN needs a direct connection: if `conninfo` goes through a transaction-mode pooler, pass a direct `listen=Connector(...)` to `open_vfs`, or notifications stop without an error and the cache falls back to its TTL. A following cache keeps that connection open, and its keepalive probe keeps the compute awake; `open_vfs(..., min_size=0)` lets idle pools hold no connections.
-- **Running it.** `uv run python examples/agent.py <workspace-id> "<prompt>"` uses `$MINIFS_MODEL` (any pydantic-ai model name, `openrouter:<slug>` with `OPENROUTER_API_KEY` for instance), and otherwise pydantic-ai's `TestModel`, offline. It logs `cache.stats()` at the end, and with logfire installed (`--with 'pydantic-ai-slim[logfire]'`) prints every model and tool call to the console (`logfire.configure(send_to_logfire=False)`, `logfire.instrument_pydantic_ai()`).
+- **Running it.** `uv run python examples/agent.py <workspace-id> "<prompt>"` uses `$MINIFS_MODEL` (any pydantic-ai model name, `openrouter:<slug>` with `OPENROUTER_API_KEY` for instance), and otherwise pydantic-ai's `TestModel`, offline. It logs the model's text and every tool call and result as they happen (`show`, pydantic-ai's `event_stream_handler`), then `cache.stats()`; with logfire installed (`--with 'pydantic-ai-slim[logfire]'`) prints every model and tool call to the console (`logfire.configure(send_to_logfire=False)`, `logfire.instrument_pydantic_ai()`).
 
 **Deps.** The tools take `RunContext[HasVFS]`, where `HasVFS` is a protocol whose only member is `vfs: VFSView`, so the caller's own deps dataclass works as long as it has a `vfs`. Two optional attributes are read with defaults: `vfs_workdir` (`/workspace`), where relative paths resolve, and `vfs_settings`, a `ToolSettings` with ladderframe's limits (`Read` 2,000 lines of at most 2,000 characters and 50 KB, `Glob` and `Grep` 100 results, `Grep` lines cut at 2,000 characters and a 2 s timeout, `Edit` files up to 10 MB):
 

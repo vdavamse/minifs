@@ -16,9 +16,18 @@ import asyncio
 import logging
 import os
 import sys
+from collections.abc import AsyncIterable
 from dataclasses import dataclass
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import (
+    AgentStreamEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartEndEvent,
+    TextPart,
+    ThinkingPart,
+)
 from pydantic_ai.models import Model
 from pydantic_ai.models.test import TestModel
 
@@ -39,24 +48,35 @@ class Deps:
 agent = Agent(deps_type=Deps, tools=[Read, Write, Edit, Glob, Grep], retries=3)
 
 
+async def show(ctx: RunContext[Deps], events: AsyncIterable[AgentStreamEvent]) -> None:
+    """Logs the model's text and each tool call and result, in full, as they happen."""
+    async for event in events:
+        if isinstance(event, PartEndEvent) and isinstance(event.part, TextPart | ThinkingPart):
+            logging.info("%s: %s", event.part.part_kind, event.part.content)
+        elif isinstance(event, FunctionToolCallEvent):
+            logging.info("call %s(%s)", event.part.tool_name, event.part.args_as_json_str())
+        elif isinstance(event, FunctionToolResultEvent):
+            logging.info("%s returned:\n%s", event.part.tool_name, event.part.content)
+
+
 async def main(dsn: str, workspace_id: str, prompt: str, model: Model | str) -> str:
     # On Lakebase: Connector(conninfo, password=fetch_token), called for each new connection.
     cache = DirEntryCache()  # one client and cache per process, shared by every run
     async with open_vfs(Connector(dsn), cache=cache) as client:
         view = VFSView(client, workspace_mounts(workspace_id), DEFAULT_POLICY, "agent")  # one view per run
-        result = await agent.run(prompt, deps=Deps(vfs=view), model=model)
+        result = await agent.run(prompt, deps=Deps(vfs=view), model=model, event_stream_handler=show)
     logging.info("directory cache: %s", cache.stats())
     return result.output
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    try:  # model calls and tool calls as spans in the console: uv run --with 'pydantic-ai-slim[logfire]' ...
+    try:  # timed spans of the run, model calls and tools: uv run --with 'pydantic-ai-slim[logfire]' ...
         import logfire  # pyright: ignore[reportMissingImports]
 
         logfire.configure(send_to_logfire=False)  # pyright: ignore[reportUnknownMemberType]
         logfire.instrument_pydantic_ai()  # pyright: ignore[reportUnknownMemberType]
     except ImportError:
-        logging.info("without logfire: add --with 'pydantic-ai-slim[logfire]' to see model and tool calls")
+        logging.info("without logfire: add --with 'pydantic-ai-slim[logfire]' for timed spans")
     model = os.environ.get("MINIFS_MODEL") or TestModel(call_tools=["Glob", "Grep"])
     print(asyncio.run(main(os.environ.get("MINIFS_DSN", ""), sys.argv[1], " ".join(sys.argv[2:]) or "Hi", model)))

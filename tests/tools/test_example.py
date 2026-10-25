@@ -4,7 +4,7 @@ driven by a scripted ``FunctionModel``, with the directory cache on and followin
 
 import logging
 import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -12,7 +12,7 @@ from uuid import UUID
 
 import pytest
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from examples import agent as example
@@ -58,6 +58,18 @@ class Scripted:
             return ModelResponse(parts=[self.calls[-1]])
         return ModelResponse(parts=[TextPart(ANSWER)])
 
+    async def stream(self, messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str | DeltaToolCalls]:
+        """The same response, streamed: the example's ``show`` handler makes every run a streamed one."""
+        for part in self(messages, info).parts:
+            if isinstance(part, TextPart):
+                yield part.content
+            else:
+                assert isinstance(part, ToolCallPart)
+                yield {0: DeltaToolCall(name=part.tool_name, json_args=part.args_as_json_str())}
+
+    def model(self) -> FunctionModel:
+        return FunctionModel(self, stream_function=self.stream)
+
 
 async def workspace_files(db: str, workspace_id: UUID) -> dict[str, str]:
     """Every file of the workspace in Postgres, read by a client of its own without a cache."""
@@ -95,7 +107,7 @@ def caches(monkeypatch: pytest.MonkeyPatch) -> list[DirEntryCache]:
 async def test_scripted_run_fixes_the_workspace(db: str, caches: list[DirEntryCache]) -> None:
     workspace_id = await provision.provision(db)
     model = Scripted()
-    assert await example.main(db, str(workspace_id), PROMPT, FunctionModel(model)) == ANSWER
+    assert await example.main(db, str(workspace_id), PROMPT, model.model()) == ANSWER
 
     assert [(p.tool_name, p.args) for p in model.calls] == SCRIPT
     assert [p.outcome for p in model.returns] == ["success"] * len(SCRIPT), [p.content for p in model.returns]
@@ -146,5 +158,5 @@ async def test_readme_snippet_runs(db: str) -> None:
     namespace: dict[str, Any] = {"__name__": "readme_snippet"}
     exec(compile(readme_snippet(), "README.md", "exec"), namespace)
     workspace_id = await provision.provision(db)
-    assert await namespace["main"](db, str(workspace_id), PROMPT, FunctionModel(Scripted())) == ANSWER
+    assert await namespace["main"](db, str(workspace_id), PROMPT, Scripted().model()) == ANSWER
     assert await workspace_files(db, workspace_id) == FIXED
