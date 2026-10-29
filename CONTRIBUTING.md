@@ -107,6 +107,9 @@ aborts (a REPEATABLE READ snapshot, say). So:
   and the faults back to errnos.
 - Tests: `tests.test_tree.raises_errno` checks both the errno and its group (returned for an outcome, raised for a
   fault); `raises_db_errno` expects a raise, for the constraints.
+- Two errnos come from the server, not the schema, so they are in neither group nor in `vfs_raise`: EAGAIN for
+  `lock_not_available` (55P03) and ETIMEDOUT for `query_canceled` (57014), the write timeouts of `VFSClient` (below).
+  Both mean "try again later", and the tools report them as a retry.
 
 Production runs on Databricks Lakebase (PostgreSQL 16 to 18, no superuser, no `pg_uuidv7`, default collation
 `C.UTF-8`), so SQL must work as a plain role that owns its database; `test_migrations_need_no_superuser` checks
@@ -117,8 +120,13 @@ that.
 `minifs.vfs.client.VFSClient` takes absolute paths and wraps one SQL function per operation (`stat`, `readdir`,
 `pread`, `pread_lines`, `pread_many` (several preads, each path's outcome in its place, in one statement; with `groups`, only up to the first file of each group is read), `glob` (resolving and walking in one REPEATABLE READ snapshot on the search pool), `grep`
 (the same, then `vfs_search`, under a 2 s `statement_timeout`; `SearchRefused` over the scope caps or on timeout), `create`, `mkdir`, `mkdir_p`, `append`, `write`, `rename`, `claim`, `unlink`, `compact`). Each runs as one
-statement in its own transaction, resolving its paths on the server with `vfs_lookup` in a subquery, and calling
-the operation only if every lookup succeeded (`_gated`). It raises `minifs.vfs.core.VFSError(errno, path, message,
+statement in its own transaction (a write: after the `SET LOCAL` of its timeouts, below), resolving its paths on the server with `vfs_lookup` in a subquery, and calling
+the operation only if every lookup succeeded (`_gated`). A write runs under `lock_timeout` and `statement_timeout`
+(`VFSClient(lock_timeout=5.0, write_timeout=30.0)`, seconds, `SET LOCAL` in its transaction first): a writer waits
+for the lock another writer holds (the file's inode, or a directory on its path), and without a bound a long write
+would hold every waiter, each on a pool connection. Running out is EAGAIN (the lock) or ETIMEDOUT (the statement),
+logged as a warning, which the client doesn't retry, since the point is to give the connection back. Reads take no
+locks and run without them; the two errnos still apply to any statement the server cancels (`pg_cancel_backend`). It raises `minifs.vfs.core.VFSError(errno, path, message,
 detail)` for every errno the SQL layer reports, returned (through `_outcome`, with `db_error` None) or raised. `detail` (the
 server's DETAIL, with node ids and real path components) and `db_error` are for logs only: a view that rewrites
 paths (the chroot) translates `path` and never shows `detail`. Paths go through

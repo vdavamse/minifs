@@ -13,7 +13,6 @@ its statements (resolving the path, the scope, the search; ``regex.validate`` us
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -22,7 +21,7 @@ from uuid import UUID
 from psycopg import AsyncConnection
 
 from minifs.vfs import regex
-from minifs.vfs.core import VFSError
+from minifs.vfs.core import VFSError, millis
 from minifs.vfs.glob import compile_excludes, compile_glob
 
 DEFAULT_LIMIT = 100  # hits, as ladderframe's Grep
@@ -212,7 +211,7 @@ async def search(
 async def set_timeout(conn: AsyncConnection, seconds: float = TIMEOUT) -> None:
     """``SET LOCAL statement_timeout`` to ``seconds`` (rounded up to a millisecond), for the rest of the current
     transaction."""
-    await conn.execute("SELECT set_config('statement_timeout', %s, true)", (f"{max(1, math.ceil(seconds * 1000))}ms",))
+    await conn.execute("SELECT set_config('statement_timeout', %s, true)", (millis(seconds),))
 
 
 def timed_out() -> SearchRefused:

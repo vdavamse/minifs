@@ -6,6 +6,15 @@ Errors from the SQL layer come back as ``VFSError`` with the errno the function 
 EEXIST, ESTALE, ...) that it returned in its ``err`` column, or a fault (EINVAL, ENAMETOOLONG) that it raised
 (migration 009). Any other database error propagates unchanged.
 
+A write (anything that changes the tree or a file) runs under ``lock_timeout`` and ``statement_timeout``, set for
+its transaction before the statement: a writer waits for the lock another writer holds (the file's inode,
+``vfs_lock_file``, or a directory on its path), and without a bound a long write of that file would hold every
+waiter, each on a pool connection, until the whole pool is queued behind it. A wait that runs out is EAGAIN and a
+cancelled statement ETIMEDOUT (``minifs.db.errors``; any statement's, so an administrator's cancel of a read is
+ETIMEDOUT too), logged as a warning, for the caller to try again later; the client doesn't retry them itself,
+since the point is to give the connection back. Reads take no locks and keep their own caps, so they run without
+the timeouts.
+
 Path resolution: a statement resolves its own paths on the server (``vfs_lookup`` in a subquery), so an
 operation costs one round trip. The function is called only if every lookup succeeded, so it never sees the NULL
 id of a failed one, which for a directory would mean the root. A ``DirCache`` (the directory-entry cache of #19)
@@ -43,6 +52,7 @@ from minifs.vfs.core import (
     ReadResult,
     VFSError,
     join,
+    millis,
     normalize,
     split,
 )
@@ -53,6 +63,9 @@ DEFAULT_LINE_BYTES = 50 * 1024
 _MAX_INT = 2**31 - 1  # vfs_pread's limit, vfs_pread_lines' limits and vfs_compact's target are int
 _MAX_BIGINT = 2**63 - 1
 MAX_TIMEOUT = _MAX_INT / 1000  # seconds: statement_timeout is an int of milliseconds
+DEFAULT_LOCK_TIMEOUT = 5.0  # seconds a write waits for a lock another writer holds
+DEFAULT_WRITE_TIMEOUT = 30.0  # seconds a write statement may run (locally a write costs about 60-80 ms per MB)
+_SET_WRITE_TIMEOUTS = "SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)"
 _log = logging.getLogger(__name__)
 _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache links
 
@@ -127,6 +140,10 @@ class VFSClient:
 
     ``pool`` serves every operation; ``search_pool`` (default: ``pool``) serves the scans (glob, grep).
     Both come from ``minifs.db.pool``. ``cache`` is an optional ``DirCache``.
+
+    ``lock_timeout`` and ``write_timeout`` (seconds, over 0 and at most ``MAX_TIMEOUT``) bound every write: how
+    long it waits for a lock another writer holds (the file's inode, or a directory on its path; EAGAIN when it
+    runs out), and how long its statement may run (ETIMEDOUT). Searches have their own timeout (``grep``).
     """
 
     def __init__(
@@ -135,10 +152,18 @@ class VFSClient:
         *,
         search_pool: AsyncConnectionPool[AsyncConnection[Any]] | None = None,
         cache: DirCache | None = None,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+        write_timeout: float = DEFAULT_WRITE_TIMEOUT,
     ) -> None:
+        for name, value in (("lock_timeout", lock_timeout), ("write_timeout", write_timeout)):
+            if isinstance(value, bool) or not 0 < value <= MAX_TIMEOUT:
+                raise ValueError(f"{name} must be over 0 and at most {MAX_TIMEOUT} seconds, not {value!r}")
         self.pool = pool
         self.search_pool = search_pool or pool
         self.cache = cache
+        self.lock_timeout = lock_timeout
+        self.write_timeout = write_timeout
+        self._write_timeouts = (millis(lock_timeout), millis(write_timeout))
         self._background: set[asyncio.Task[None]] = set()
         self._evicting: dict[tuple[_Link, ...], asyncio.Task[None]] = {}  # by links, see _evict_stale_task
 
@@ -457,7 +482,11 @@ class VFSClient:
         segments = split(path)
         ref = _Ref(_MKDIR_P, [list(segments)], segments=segments)
         rows = await self._run(
-            path, f"SELECT {_walks([ref])}r0.id, r0.err, r0.err_detail FROM {ref.sql} r0", ref.params, [ref]
+            path,
+            f"SELECT {_walks([ref])}r0.id, r0.err, r0.err_detail FROM {ref.sql} r0",
+            ref.params,
+            [ref],
+            write=True,
         )
         node, err, detail = rows[0]
         await self._outcome(path, [], (err, detail))
@@ -470,7 +499,7 @@ class VFSClient:
         if not segments:
             raise VFSError("EISDIR", "/")
         ref = self._ref(segments)
-        rows = await self._call(path, [ref], "vfs_append({0}, %s)", [data])
+        rows = await self._call(path, [ref], "vfs_append({0}, %s)", [data], write=True)
         self._checked(ref, rows[0][0])
         return rows[0][3]
 
@@ -485,7 +514,7 @@ class VFSClient:
             raise VFSError("EISDIR", "/")
         if expect is None:
             ref = self._ref(segments)
-            rows = await self._call(path, [ref], "vfs_write({0}, %s)", [data])
+            rows = await self._call(path, [ref], "vfs_write({0}, %s)", [data], write=True)
             self._checked(ref, rows[0][0])
             return FileVersion(rows[0][0], *rows[0][3:5])
         parent = self._dir_ref(segments[:-1])
@@ -494,6 +523,7 @@ class VFSClient:
             [parent],
             "vfs_write(%s, %s, %s, %s, {0}, %s)",
             [expect.id, data, expect.generation, expect.size, segments[-1]],
+            write=True,
         )
         return FileVersion(expect.id, *rows[0][3:5])
 
@@ -518,7 +548,7 @@ class VFSClient:
         if not segments:
             raise VFSError("EINVAL", "/", "cannot remove the root")
         ref = self._ref(segments)
-        rows = await self._call(path, [ref], "vfs_unlink({0})", [])
+        rows = await self._call(path, [ref], "vfs_unlink({0})", [], write=True)
         self._evict(ref, rows[0][0])
 
     async def compact(self, path: str, target: int = 65536) -> int:
@@ -530,7 +560,7 @@ class VFSClient:
         if not 0 < target <= _MAX_INT:
             raise VFSError("EINVAL", join(*segments), f"invalid target size {target}")
         ref = self._ref(segments)
-        rows = await self._call(path, [ref], "vfs_compact({0}, %s::int)", [target])
+        rows = await self._call(path, [ref], "vfs_compact({0}, %s::int)", [target], write=True)
         self._checked(ref, rows[0][0])
         return rows[0][3]
 
@@ -544,7 +574,9 @@ class VFSClient:
             _Ref(_MKDIR_P, [list(segments[:-1])], segments=segments[:-1]) if parents else self._dir_ref(segments[:-1])
         )
         try:
-            rows = await self._call(path, [parent], "vfs_create({0}, %s, %s, %s)", [segments[-1], kind, data])
+            rows = await self._call(
+                path, [parent], "vfs_create({0}, %s, %s, %s)", [segments[-1], kind, data], write=True
+            )
         except VFSError as e:
             # vfs_mkdir_p reports a file at its last component, our parent, as EEXIST: for us it is ENOTDIR.
             if (
@@ -586,6 +618,7 @@ class VFSClient:
                 _gated(refs, "vfs_rename({0}, {1}, %s, {2})", pin[0]),
                 [*node.params, *parent.params, *expect_parent.params, dst_segments[-1], *pin[1]],
                 refs,
+                write=True,
             )
             if rows[0][-2] == "ESTALE":  # lost the compare-and-swap: someone else moved it first
                 self._checked_dirs(parent, expect_parent, rows[0])
@@ -789,11 +822,13 @@ class VFSClient:
             self.cache.evict(resolved)
 
     async def _call(
-        self, path: str, refs: Sequence[_Ref], call: str, params: Sequence[object]
+        self, path: str, refs: Sequence[_Ref], call: str, params: Sequence[object], *, write: bool = False
     ) -> list[tuple[Any, ...]]:
         """Runs ``_gated(refs, call)`` with ``params`` (the call's own) and raises the error it returned, if any:
-        the first failed lookup's, else the call's. Returns the rows (see ``_gated``)."""
-        rows = await self._run(path, _gated(refs, call), [*(p for ref in refs for p in ref.params), *params], refs)
+        the first failed lookup's, else the call's. Returns the rows (see ``_gated``). ``write``: see ``_run``."""
+        rows = await self._run(
+            path, _gated(refs, call), [*(p for ref in refs for p in ref.params), *params], refs, write=write
+        )
         lookups = _lookup_errors(rows[0], len(refs))
         self._vanished(rows[0], lookups, rows[0][-2])
         await self._outcome(path, refs, *lookups, (rows[0][-2], rows[0][-1]))
@@ -821,17 +856,28 @@ class VFSClient:
                 raise VFSError(err, normalize(path), detail=detail or "")
 
     async def _run(
-        self, path: str, query: str, params: Sequence[object], refs: Sequence[_Ref] = ()
+        self,
+        path: str,
+        query: str,
+        params: Sequence[object],
+        refs: Sequence[_Ref] = (),
+        *,
+        write: bool = False,
     ) -> list[tuple[Any, ...]]:
         """Runs ``query`` in its own transaction, retrying serialization failures; maps raised SQL errors (faults,
-        and the constraints' backstop) to VFSError. A path that no longer resolves evicts the links of ``refs``
-        that went stale. Returned errors are the caller's to check (``_outcome``).
+        the constraints' backstop, and the server's timeouts) to VFSError. A path that no longer resolves evicts
+        the links of ``refs`` that went stale. Returned errors are the caller's to check (``_outcome``).
+
+        A ``write`` runs under the client's ``lock_timeout`` and ``write_timeout``, ``SET LOCAL`` in the same
+        transaction first (one more round trip; EAGAIN and ETIMEDOUT when they run out).
 
         A query with ``refs`` starts with their ``_walks`` columns: they go to the cache (``_learn``) and are cut
         from the rows returned, which begin with the columns after them."""
 
         async def attempt() -> list[tuple[Any, ...]]:
             async with self.pool.connection() as conn, conn.transaction():
+                if write:
+                    await conn.execute(_SET_WRITE_TIMEOUTS, self._write_timeouts)
                 cur = await conn.execute(cast(Any, query), params)
                 if refs:  # a query that forgot the prefix would shift every column the caller reads
                     names = [column.name for column in cur.description or ()]
@@ -921,5 +967,7 @@ async def _mapped[T](path: str, call: Callable[[], Awaitable[T]]) -> T:
         error = VFSError.from_db(e, normalize(path))
         if error is None:
             raise
+        if error.errno in ("EAGAIN", "ETIMEDOUT"):  # the server's timeouts: what to watch (docs/design.md)
+            _log.warning("%s on %s: %s", error.errno, error.path, e.diag.message_primary)
         error.db_error = e
         raise error from None  # the psycopg error's text has the server DETAIL
