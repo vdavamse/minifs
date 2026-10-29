@@ -9,7 +9,6 @@ exception is cost: a pattern too expensive for Postgres to compile is the model'
 from __future__ import annotations
 
 import logging
-import math
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -18,6 +17,7 @@ from psycopg import AsyncConnection, errors
 
 from minifs import _regex
 from minifs._regex import RegexError
+from minifs.vfs.core import millis
 
 __all__ = [
     "RegexError",
@@ -122,7 +122,7 @@ async def validate(conn: AsyncConnection, translation: Translation, timeout: flo
     cancels the compile, ``QueryCanceled`` propagates for the caller to report as its own timeout.
     """
     shortened = timeout is not None and timeout < _VALIDATE_SECONDS
-    limit = f"{max(1, math.ceil(timeout * 1000))}ms" if timeout is not None and shortened else _VALIDATE_TIMEOUT
+    limit = millis(timeout) if timeout is not None and shortened else _VALIDATE_TIMEOUT
     # Reported by the server at connect time, so this costs no round trip.
     encoding = conn.info.parameter_status("server_encoding")
     if encoding != "UTF8":

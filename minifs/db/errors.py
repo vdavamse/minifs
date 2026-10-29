@@ -10,6 +10,12 @@ The constraints on ``vfs_nodes`` and ``vfs_extents`` are the backstop for raw SQ
 functions don't pre-check; their violations map to errnos too, on a best-effort basis: a foreign-key error can't
 tell a missing parent from a parent that is a file, so both map to ENOTDIR, and an extent on a missing node maps
 to EISDIR like one on a directory. The functions report each case precisely.
+
+Two errors the server raises on its own map to errnos as well, so a caller can tell them from a fault and try
+again later: a lock wait that ran out (``lock_not_available``, 55P03: the ``lock_timeout`` ``VFSClient`` sets on
+writes, or a ``NOWAIT``) is EAGAIN, and a cancelled statement (``query_canceled``, 57014: a ``statement_timeout``,
+or an administrator's ``pg_cancel_backend``, which the server reports alike) is ETIMEDOUT. Neither is in
+``SQLSTATE_BY_ERRNO``: the SQL functions never raise them.
 """
 
 from __future__ import annotations
@@ -37,12 +43,21 @@ _FOREIGN_KEY_VIOLATION = "23503"
 _RESTRICT_VIOLATION = "23001"  # what PostgreSQL 18 raises for ON DELETE RESTRICT; earlier versions raise 23503
 _CHECK_VIOLATION = "23514"
 
+# The server's own timeouts (see the module docstring); retrying later may succeed.
+_ERRNO_BY_SERVER_SQLSTATE: dict[str, str] = {
+    "55P03": "EAGAIN",  # lock_not_available
+    "57014": "ETIMEDOUT",  # query_canceled
+}
+
 
 def errno_name(error: psycopg.Error) -> str | None:
-    """The errno name (``"ENOENT"``, ...) for an error from the minifs schema, or None for any other error."""
+    """The errno name (``"ENOENT"``, ...) for an error from the minifs schema, or for a timeout the server raised
+    (EAGAIN, ETIMEDOUT); None for any other error."""
     sqlstate = error.sqlstate or ""
     if sqlstate in ERRNO_BY_SQLSTATE:
         return ERRNO_BY_SQLSTATE[sqlstate]
+    if sqlstate in _ERRNO_BY_SERVER_SQLSTATE:
+        return _ERRNO_BY_SERVER_SQLSTATE[sqlstate]
     constraint = error.diag.constraint_name
     if sqlstate == _UNIQUE_VIOLATION and constraint == "vfs_nodes_parent_name_key":
         return "EEXIST"

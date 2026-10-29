@@ -439,6 +439,8 @@ async def _backend(pool: Pool, task: asyncio.Task[None]) -> int:
 
 
 async def test_each_operation_is_one_statement(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cache adds no statement of its own: a read is one statement, cold or warm, and a write is one after the
+    `SET LOCAL` of its timeouts (#84)."""
     other = VFSClient(pool)
     await other.create("/a/b/c/f", b"f", parents=True)
     statements: list[str] = []
@@ -452,19 +454,19 @@ async def test_each_operation_is_one_statement(pool: Pool, monkeypatch: pytest.M
     monkeypatch.setattr(AsyncConnection, "execute", counting)
     vfs = VFSClient(pool, cache=DirEntryCache(ttl=60))
     operations = [
-        vfs.stat("/a/b/c/f"),  # cold: the walk comes back in the same row
-        vfs.stat("/a/b/c/f"),  # warm
-        vfs.pread("/a/b/c/f"),
-        vfs.create("/a/b/c/g", b"g"),
-        vfs.rename("/a/b/c/g", "/a/b/h"),
-        vfs.unlink("/a/b/h"),
-        vfs.readdir("/a/b"),
+        (vfs.stat("/a/b/c/f"), 1),  # cold: the walk comes back in the same row
+        (vfs.stat("/a/b/c/f"), 1),  # warm
+        (vfs.pread("/a/b/c/f"), 1),
+        (vfs.create("/a/b/c/g", b"g"), 2),  # a write: its timeouts (#84), then the operation
+        (vfs.rename("/a/b/c/g", "/a/b/h"), 2),
+        (vfs.unlink("/a/b/h"), 2),
+        (vfs.readdir("/a/b"), 1),
     ]
-    for operation in operations:
+    for operation, count in operations:
         statements.clear()
         await operation
         await vfs.settle()
-        assert len(statements) == 1, statements
+        assert len(statements) == count, statements
     statements.clear()
     with pytest.raises(VFSError):
         await vfs.stat("/a/b/missing")

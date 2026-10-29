@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from psycopg import AsyncConnection
 
 import minifs.tools._text as text
 import minifs.tools.write as write_module
@@ -478,3 +479,22 @@ async def test_the_diff_does_not_stall_the_event_loop(
     new = "".join(f"line {i}\n" if i != 25_000 else "changed\n" for i in range(50_000))
     (_, meta), _ = await asyncio.gather(write(deps, "big.txt", new), concurrent())
     assert (meta["additions"], meta["deletions"]) == (1, 1)
+
+
+# Write timeouts (#84)
+
+
+async def test_a_file_another_writer_holds_is_a_retry(view: VFSView, client: VFSClient, db: str) -> None:
+    """A write that waits out the client's ``lock_timeout`` is a retry for the model, not an internal error."""
+    quick = VFSClient(client.pool, cache=client.cache, lock_timeout=0.1)
+    deps = Deps(VFSView(quick, workspace_mounts(W1), view.policy, view.actor))
+    async with await AsyncConnection.connect(db) as other:
+        await other.execute(
+            "SELECT FROM vfs_nodes WHERE id = (SELECT id FROM vfs_lookup(%s)) FOR UPDATE",
+            (["workspaces", W1, "notes.md"],),
+        )
+        message = await retry_message(Write, deps, content="mine 2\n", filePath="notes.md")
+        await other.rollback()
+    await quick.settle()
+    assert message == "/workspace/notes.md is locked by another write in progress. Try again."
+    assert await content(client, "notes.md") == b"mine\n"

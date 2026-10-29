@@ -18,7 +18,13 @@ from psycopg_pool import AsyncConnectionPool, PoolTimeout
 from minifs import cli
 from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO
 from minifs.db.pool import Connector, Pools, open_pool, retry_serializable
-from minifs.vfs.client import VFSClient, _gated  # pyright: ignore[reportPrivateUsage]
+from minifs.vfs.client import (
+    DEFAULT_LOCK_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT,
+    MAX_TIMEOUT,
+    VFSClient,
+    _gated,  # pyright: ignore[reportPrivateUsage]
+)
 from minifs.vfs.core import FileVersion, Kind, ReadResult, VFSError
 from minifs.vfs.glob import GlobError
 from tests.test_tree import wait_until_blocked
@@ -992,3 +998,113 @@ async def test_a_claim_lost_inside_vfs_rename_raises_nothing(conn: AsyncConnecti
             assert await task is False
             assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
     assert [e.name for e in await vfs.readdir("/tasks/cur")] == ["t1-other"]
+
+
+# Write timeouts (#84): a write waits for a lock no longer than lock_timeout and runs no longer than write_timeout,
+# so one long write of a hot file can't hold every other writer, and with them the pool, behind it.
+
+
+@contextlib.asynccontextmanager
+async def holding_the_lock(db: str, path: str) -> AsyncGenerator[AsyncConnection]:
+    """Another session holding the inode of ``path`` FOR UPDATE, as a writer does, until the block exits."""
+    async with await AsyncConnection.connect(db) as other:
+        await other.execute(
+            "SELECT FROM vfs_nodes WHERE id = (SELECT id FROM vfs_lookup(%s)) FOR UPDATE", (path.strip("/").split("/"),)
+        )
+        yield other
+        await other.rollback()
+
+
+Writer = Callable[[VFSClient, FileVersion], Awaitable[object]]
+WRITERS: dict[str, tuple[str, str, Writer]] = {
+    # name: (the path locked by another writer, the path the error names, the write)
+    "append": ("/f", "/f", lambda vfs, _: vfs.append("/f", b"more\n")),
+    "write": ("/f", "/f", lambda vfs, _: vfs.write("/f", b"v2\n")),
+    "write-expect": ("/f", "/f", lambda vfs, v: vfs.write("/f", b"v2\n", expect=v)),
+    "compact": ("/f", "/f", lambda vfs, _: vfs.compact("/f")),
+    "unlink": ("/f", "/f", lambda vfs, _: vfs.unlink("/f")),
+    "rename": ("/f", "/f", lambda vfs, _: vfs.rename("/f", "/g")),
+    "claim": ("/d/f", "/d/f", lambda vfs, _: vfs.claim("/d/f", "/d/g")),
+    "create": ("/d", "/d/x", lambda vfs, _: vfs.create("/d/x")),  # the directory's lock
+    "mkdir_p": ("/d", "/d/x/y", lambda vfs, _: vfs.mkdir_p("/d/x/y")),
+}
+
+
+@pytest.mark.parametrize("name", sorted(WRITERS))
+async def test_a_write_waits_for_a_lock_no_longer_than_lock_timeout(pool: Pool, db: str, name: str) -> None:
+    locked, path, write = WRITERS[name]
+    vfs = VFSClient(pool, lock_timeout=0.1)
+    await vfs.mkdir("/d")
+    version = await vfs.create("/f", b"v1\n")
+    await vfs.create("/d/f", b"v1\n")
+    async with holding_the_lock(db, locked):
+        error = await raises("EAGAIN", asyncio.wait_for(write(vfs, version), 10), path)
+        assert isinstance(error.db_error, psycopg.errors.LockNotAvailable)
+        # A read takes no lock, and the failed write gave its connection back to the pool.
+        assert (await vfs.pread("/f")).content == b"v1\n"
+    await write(vfs, version)  # the lock is free again
+
+
+async def test_a_long_write_is_cancelled_after_write_timeout(pool: Pool) -> None:
+    vfs = VFSClient(pool, write_timeout=0.001)
+    data = (b"x" * 79 + b"\n") * 20_000  # 1.6 MB: tens of milliseconds to cut into extents
+    error = await raises("ETIMEDOUT", vfs.create("/f", data), "/f")
+    assert isinstance(error.db_error, psycopg.errors.QueryCanceled)
+    await raises("ENOENT", vfs.stat("/f"))  # rolled back
+    assert (await VFSClient(pool).create("/f", data)).size == len(data)  # the default leaves room for it
+
+
+async def test_a_lock_wait_counts_against_write_timeout(pool: Pool, db: str) -> None:
+    # A lock_timeout longer than write_timeout leaves statement_timeout to end the wait.
+    vfs = VFSClient(pool, lock_timeout=10, write_timeout=0.1)
+    await vfs.create("/f", b"v1\n")
+    async with holding_the_lock(db, "/f"):
+        error = await raises("ETIMEDOUT", asyncio.wait_for(vfs.append("/f", b"more\n"), 10), "/f")
+        assert isinstance(error.db_error, psycopg.errors.QueryCanceled)
+    assert await vfs.append("/f", b"more\n") == 3
+
+
+async def test_reads_run_without_the_write_timeouts(pool: Pool, db: str) -> None:
+    data = (b"x" * 79 + b"\n") * 20_000
+    await VFSClient(pool).create("/f", data)
+    vfs = VFSClient(pool, lock_timeout=0.001, write_timeout=0.001)
+    async with holding_the_lock(db, "/f"):  # a read takes no lock, and this one takes longer than a millisecond
+        assert (await vfs.pread("/f", 0, len(data))).content == data
+        assert (await vfs.stat("/f")).size == len(data)
+        assert [e.name for e in await vfs.readdir("/")] == ["f"]
+
+
+async def test_the_timeouts_are_not_retried(pool: Pool, db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Retrying would hold a connection again, which is what the timeout frees: one attempt, then the error.
+    vfs = VFSClient(pool, lock_timeout=0.1)
+    await vfs.create("/f", b"v1\n")
+    statements: list[str] = []
+    execute = AsyncConnection.execute
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        if str(query).strip():  # the pool's check at checkout is an empty query
+            statements.append(str(query))
+        return await execute(self, query, *args, **kwargs)
+
+    async with holding_the_lock(db, "/f"):
+        monkeypatch.setattr(AsyncConnection, "execute", counting)
+        await raises("EAGAIN", asyncio.wait_for(vfs.append("/f", b"more\n"), 10), "/f")
+    assert len(statements) == 2 and "lock_timeout" in statements[0] and "vfs_append" in statements[1], statements
+
+
+NO_POOL = cast(Pool, None)  # for a client that is only constructed
+
+
+def test_the_defaults() -> None:
+    vfs = VFSClient(NO_POOL)
+    assert (vfs.lock_timeout, vfs.write_timeout) == (DEFAULT_LOCK_TIMEOUT, DEFAULT_WRITE_TIMEOUT) == (5.0, 30.0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"lock_timeout": 0}, {"write_timeout": -1}, {"lock_timeout": MAX_TIMEOUT + 1}, {"write_timeout": True}],
+    ids=repr,
+)
+def test_the_timeouts_are_checked(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="must be over 0"):
+        VFSClient(NO_POOL, **kwargs)
