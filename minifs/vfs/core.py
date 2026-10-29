@@ -5,10 +5,14 @@ else looks at a path, as ladderframe's ``_path_subject`` does, so ``/workspace/.
 ``/docs/a.md`` name the same file everywhere (resolution, the chroot view, the write policy). ``..`` at the root
 stays at the root, as in POSIX. Unlike POSIX, a trailing slash is dropped too, so ``/notes.md/`` names the file
 ``/notes.md`` rather than failing with ENOTDIR: paths are names here, not walks through the kernel.
+
+A path with a control character is EINVAL (``CONTROL_CHARACTERS``): names can't contain one (migration 016), and
+refusing the path here keeps a newline or an escape sequence from reaching a round trip, a log line or a listing.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -19,6 +23,11 @@ import psycopg
 from minifs.db.errors import errno_name
 
 Kind = Literal["file", "dir"]
+
+CONTROL_CHARACTERS = re.compile("[\x00-\x1f\x7f-\x9f\u2028-\u202e\u2066-\u2069]")
+"""What a name can't contain, as ``vfs_check_name`` tests it (migration 016): the C0 controls, DEL, the C1
+controls, the Unicode line and paragraph separators, and the bidi embeddings, overrides and isolates. NUL is a
+C0 control the server never sees: refused here, it can't surface as an encoding error (EIO) from psycopg."""
 
 
 class VFSError(Exception):
@@ -153,7 +162,7 @@ class LineReadResult:
 def normalize(path: str) -> str:
     """The canonical form of absolute ``path``: no ``.``, ``..``, repeated or trailing slashes.
 
-    EINVAL for a relative path, an empty one, or one containing a NUL character.
+    EINVAL for a relative path, an empty one, or one containing a control character (``CONTROL_CHARACTERS``).
     """
     return "/" + "/".join(split(path))
 
@@ -162,8 +171,8 @@ def split(path: str) -> tuple[str, ...]:
     """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``."""
     if not path.startswith("/"):
         raise VFSError("EINVAL", path, "path must be absolute")
-    if "\0" in path:
-        raise VFSError("EINVAL", path, "path contains a NUL character")
+    if CONTROL_CHARACTERS.search(path):
+        raise VFSError("EINVAL", path, "path contains a control character")
     parts: list[str] = []
     for part in path.split("/"):
         if part in ("", "."):

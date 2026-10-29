@@ -46,10 +46,33 @@ def test_relative_paths_are_einval(path: str) -> None:
     assert info.value.path == path
 
 
-def test_nul_is_einval() -> None:
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/a\0b",
+        "/a\nb",
+        "/x\x1b[31m",
+        "/tab\there/x",
+        "/\x7f",
+        "/c1\x85",
+        "/\u202eevil",
+        "/\u2066x\u2069",
+        "/a/b\r",
+        "/p\u2029s",
+    ],
+)
+def test_control_characters_are_einval(path: str) -> None:
+    """A name can't contain one (migration 016), and the path is refused before any round trip."""
     with pytest.raises(VFSError) as info:
-        split("/a\0b")
+        split(path)
     assert info.value.errno == "EINVAL"
+    assert info.value.path == path
+    assert info.value.message == "path contains a control character"
+
+
+@pytest.mark.parametrize("path", ["/ a b /<x>", "/é/😀", "/a\\b", "/\u200emark"])
+def test_printable_characters_are_names(path: str) -> None:
+    assert split(path) == tuple(path.split("/")[1:])
 
 
 def test_basename_and_entry_name() -> None:

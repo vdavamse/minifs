@@ -146,6 +146,15 @@ async def test_paths_outside_the_view_are_not_found(deps: Deps, client: VFSClien
     assert (await client.pread(f"/workspaces/{W2}/secret.md")).content == b"theirs\n"
 
 
+@pytest.mark.parametrize("path", ["a\nb.md", "/workspace/x\x1b[31m.md", "\u202eevil.md"])
+async def test_control_characters_in_a_path_are_refused(deps: Deps, client: VFSClient, path: str) -> None:
+    """A name with a newline, an escape sequence or a bidi override can't be created (#92): the path is refused
+    before any round trip, with a message the model can act on."""
+    message = await retry_message(Write, deps, content="x", filePath=path)
+    assert message.endswith(": path contains a control character")
+    assert [e.name for e in await client.readdir(f"/workspaces/{W1}")] == ["notes.md"]
+
+
 async def test_directories(deps: Deps) -> None:
     """As in ladderframe, the permission is checked before whether the path is a directory."""
     assert await retry_message(Write, deps, content="x", filePath="/workspace") == (

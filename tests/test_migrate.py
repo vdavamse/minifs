@@ -63,6 +63,25 @@ async def test_pending_migrations_apply_in_order(empty_db: str) -> None:
         assert await cur.fetchone() == (2,)
 
 
+async def test_name_control_chars_migration_refuses_legacy_names(empty_db: str) -> None:
+    """Migration 016 validates its constraint: a name with a control character fails it, with the fix in its
+    header (rename the node), and it applies once the name is clean."""
+    migrations = load_migrations()
+    before = [m for m in migrations if m.version < 16]
+    async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
+        await migrate(conn, before)
+        await conn.execute("INSERT INTO vfs_nodes (name, kind) VALUES (%s, 'file')", ("a\nb",))
+        with pytest.raises(psycopg.errors.CheckViolation) as info:
+            await migrate(conn, migrations)
+        assert info.value.diag.constraint_name == "vfs_nodes_name_check"
+        assert 16 not in await applied_versions(conn)
+        await conn.execute("UPDATE vfs_nodes SET name = 'a b' WHERE name = %s", ("a\nb",))
+        applied = await migrate(conn, migrations)
+        assert [m.version for m in applied] == [m.version for m in migrations if m.version >= 16]
+        with pytest.raises(psycopg.errors.CheckViolation):
+            await conn.execute("INSERT INTO vfs_nodes (name, kind) VALUES (%s, 'file')", ("a\nb",))
+
+
 async def test_failed_migration_is_not_recorded(empty_db: str) -> None:
     good = Migration(1, "good", "CREATE TABLE ok ();")
     bad = Migration(2, "bad", "CREATE TABLE half (); SELECT * FROM missing;")
