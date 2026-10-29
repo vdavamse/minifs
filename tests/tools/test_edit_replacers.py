@@ -6,6 +6,7 @@ rewritten replacer must yield the same candidates in the same order, and ``repla
 the cost bounds: the cases that were quadratic finish in linear time, and a search that runs past ``timeout`` is a
 retry, from inside a replacer's loop too."""
 
+import math
 import random
 import re
 import time
@@ -333,9 +334,11 @@ PIECES = [
     "\\$",
     "\\\n",
     "\n",
+    "\r",
 ]
 """What random lines are made of: the characters the replacers treat specially (whitespace, backslash escapes, a
-backslash before a newline), and few distinct letters, so lines repeat and anchors recur."""
+backslash before a newline, a ``\\r`` as a CRLF file's lines keep), and few distinct letters, so lines repeat and
+anchors recur."""
 
 
 def random_text(rng: random.Random, max_lines: int) -> str:
@@ -445,14 +448,30 @@ def test_replace_stops_between_replacers(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_replace_stops_inside_a_replacer() -> None:
-    """A window scan whose every cheap gate passes (every line is the find's first line) is still O(n·m); the
-    deadline is checked inside the loop, so it ends within a tick of the timeout, not after the scan."""
+    """A window scan whose cheap gates pass everywhere (every line equals the find's first and last lines) and
+    whose block test fails late (the middle differs 1,000 lines in) is still O(n·m), tens of seconds here; the
+    deadline is checked inside the loop, so the search ends within a window of the timeout, not after the scan."""
     content = "x\n" * 200_000
-    find = "x\n" * 2_000 + "y"
+    find = "x\n" * 1_000 + "y\n" + "x\n" * 999 + "x"
     begin = time.monotonic()
     with pytest.raises(ReplaceTimeout):
         new.replace(content, find, "q", timeout=0.2)
-    assert time.monotonic() - begin < 3
+    assert time.monotonic() - begin < 2
+
+
+def test_replace_stops_between_block_scores() -> None:
+    """Hundreds of blocks with the find's anchors and six differing 200-character middle lines each: scoring one
+    block is tens of milliseconds of Levenshtein, so the deadline is checked before each distance, not every
+    4,096 lines (which let a 0.2 s timeout run for 44 s)."""
+    rng = random.Random(0)
+    letters = "abcdefghij"
+    middle = ["".join(rng.choice(letters) for _ in range(200)) for _ in range(6)]
+    content = "".join("{\n" + "\n".join(middle) + "\n}\n" for _ in range(600))
+    find = "{\n" + "\n".join("".join(rng.choice(letters) for _ in range(200)) for _ in range(6)) + "\n}"
+    begin = time.monotonic()
+    with pytest.raises(ReplaceTimeout):
+        new.replace(content, find, "q", timeout=0.2)
+    assert time.monotonic() - begin < 2
 
 
 async def test_a_slow_edit_is_a_retry(deps: Deps, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -465,6 +484,9 @@ async def test_a_slow_edit_is_a_retry(deps: Deps, monkeypatch: pytest.MonkeyPatc
 def test_edit_settings() -> None:
     assert (EditSettings().max_bytes, EditSettings().timeout) == (10 * 1024 * 1024, 10.0)
     assert EditSettings(timeout=1).timeout == 1
-    for timeout in (0, -1.0, True):
+    for timeout in (0, -1.0, math.inf):
         with pytest.raises(ValueError, match="edit timeout"):
             EditSettings(timeout=timeout)
+    for wrong in (True, "10"):
+        with pytest.raises(TypeError, match="edit timeout"):
+            EditSettings(timeout=wrong)  # pyright: ignore[reportArgumentType]

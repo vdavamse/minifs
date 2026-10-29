@@ -200,17 +200,20 @@ class ReplaceTimeout(ValueError):
 
 
 class _Deadline:
-    """When ``replace`` must stop. ``check`` looks at the clock; ``tick`` does so every ``_TICK`` calls, so it can
-    sit in a tight loop. With ``at`` None, nothing ever stops."""
+    """When ``replace`` must stop: ``timeout`` seconds after it started, or never (None). ``check`` looks at the
+    clock, for a loop whose iterations cost more than a clock read (a Levenshtein distance, a block test, a scan
+    of the file); ``tick`` does so every ``_TICK`` calls, for a tight loop over lines."""
 
-    __slots__ = ("at", "message", "_n")
+    __slots__ = ("at", "timeout", "_n")
 
-    def __init__(self, at: float | None, message: str = "") -> None:
-        self.at = at
-        self.message = message
+    def __init__(self, timeout: float | None) -> None:
+        self.timeout = timeout
+        self.at = None if timeout is None else time.monotonic() + timeout
         self._n = 0
 
     def tick(self) -> None:
+        if self.at is None:
+            return
         self._n += 1
         if self._n >= _TICK:
             self._n = 0
@@ -218,17 +221,15 @@ class _Deadline:
 
     def check(self) -> None:
         if self.at is not None and time.monotonic() > self.at:
-            raise ReplaceTimeout(self.message)
+            assert self.timeout is not None
+            raise ReplaceTimeout(timeout_message(self.timeout))
 
 
 _NO_DEADLINE = _Deadline(None)
 _deadline: ContextVar[_Deadline] = ContextVar("minifs_edit_deadline", default=_NO_DEADLINE)
-"""The deadline of the ``replace`` call running in this context, for the replacers (``_tick``). A context variable
-rather than a parameter, so the replacers keep ladderframe's ``(content, find)`` signature."""
-
-
-def _tick() -> None:
-    _deadline.get().tick()
+"""The deadline of the ``replace`` call running in this context, for the replacers: each binds it once when it
+starts (``deadline = _deadline.get()``). A context variable rather than a parameter, so the replacers keep
+ladderframe's ``(content, find)`` signature. A replacer called on its own, outside ``replace``, never stops."""
 
 
 def levenshtein(a: str, b: str) -> int:
@@ -275,10 +276,11 @@ def line_trimmed_replacer(content: str, find: str) -> Iterator[str]:
     joined = "\n".join(map(str.strip, original))
     needle = "\n".join(line.strip() for line in search)
     starts = _line_starts(original)
+    tick = _deadline.get().tick
     line = counted = 0  # the line at `counted`
     pos = joined.find(needle)
     while pos != -1:
-        _tick()
+        tick()
         end = pos + len(needle)
         if (pos == 0 or joined[pos - 1] == "\n") and (end == len(joined) or joined[end] == "\n"):
             line += joined.count("\n", counted, pos)
@@ -292,8 +294,9 @@ def _middle_similarity(original: list[str], start: int, size: int, search: list[
     if lines_to_check <= 0:
         return 1.0  # no middle lines to compare: accept on the anchors
     similarity = 0.0
+    deadline = _deadline.get()
     for j in range(1, min(len(search) - 1, size - 1)):
-        _tick()
+        deadline.tick()
         original_line = original[start + j].strip()
         search_line = search[j].strip()
         longest = max(len(original_line), len(search_line))
@@ -304,6 +307,7 @@ def _middle_similarity(original: list[str], start: int, size: int, search: list[
         elif longest > MAX_SCORED_LINE_LENGTH:
             score = 0.0
         else:
+            deadline.check()  # a distance between two 200-character lines is milliseconds of work
             score = 1 - levenshtein(original_line, search_line) / longest
         if early_exit:
             similarity += score / lines_to_check
@@ -333,9 +337,10 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
 
     last_at = _lines_equal_to(original, last)
     n = len(original)
+    tick = _deadline.get().tick
     candidates: list[tuple[int, int]] = []
     for i, line in enumerate(original):
-        _tick()
+        tick()
         if line.strip() != first:
             continue
         j = _next_line(last_at, i + 2, n)  # only the first occurrence of the last line
@@ -369,8 +374,9 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
 
     normalized_find = normalize(find)
     lines = content.split("\n")
+    deadline = _deadline.get()
     for line in lines:
-        _tick()
+        deadline.tick()
         normalized_line = normalize(line)
         if normalized_line == normalized_find:
             yield line
@@ -385,7 +391,7 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
     if len(find_lines) > 1:
         m = len(find_lines)
         for i in range(len(lines) - m + 1):
-            _tick()
+            deadline.tick()
             # A block's normalised text starts with its first line's and ends with its last line's (whitespace
             # runs collapse within a line as they do across one), so a block whose first line isn't a prefix of
             # the find, or whose last line isn't a suffix, can't match.
@@ -393,6 +399,7 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
                 normalize(lines[i + m - 1])
             ):
                 continue
+            deadline.check()  # the block test below costs the whole block, not one line
             block = "\n".join(lines[i : i + m])
             if normalize(block) == normalized_find:
                 yield block
@@ -415,10 +422,12 @@ def indentation_flexible_replacer(content: str, find: str) -> Iterator[str]:
     # and last lines are checked before the rest, so most windows cost two comparisons.
     m = len(find_lines)
     wanted = [line.lstrip() for line in find_lines]
+    deadline = _deadline.get()
     for i in range(len(content_lines) - m + 1):
-        _tick()
+        deadline.tick()
         if content_lines[i].lstrip() != wanted[0] or content_lines[i + m - 1].lstrip() != wanted[-1]:
             continue
+        deadline.check()  # the rest costs the whole block
         if any(content_lines[i + k].lstrip() != wanted[k] for k in range(1, m - 1)):
             continue
         block = "\n".join(content_lines[i : i + m])
@@ -441,8 +450,9 @@ def escape_normalized_replacer(content: str, find: str) -> Iterator[str]:
     lines = content.split("\n")
     find_lines = unescaped_find.split("\n")
     m = len(find_lines)
+    deadline = _deadline.get()
     for i in range(len(lines) - m + 1):
-        _tick()
+        deadline.tick()
         first, last = lines[i], lines[i + m - 1]
         # An escape never spans a line break unless the line ends in a backslash (``\`` + newline is one), so a
         # block's unescaped text starts with its first line's unless that line ends in one, and always ends with
@@ -451,6 +461,7 @@ def escape_normalized_replacer(content: str, find: str) -> Iterator[str]:
             continue
         if not first.endswith("\\") and not unescaped_find.startswith(_unescape(first) if "\\" in first else first):
             continue
+        deadline.check()  # the block test below costs the whole block
         block = "\n".join(lines[i : i + m])
         if _unescape(block) == unescaped_find:
             yield block
@@ -459,8 +470,9 @@ def escape_normalized_replacer(content: str, find: str) -> Iterator[str]:
 def multi_occurrence_replacer(content: str, find: str) -> Iterator[str]:
     """Every exact match, so `replace` can decide between unique and `replaceAll`."""
     start = 0
+    tick = _deadline.get().tick
     while (index := content.find(find, start)) != -1:
-        _tick()
+        tick()
         yield find
         start = index + len(find)
 
@@ -473,13 +485,17 @@ def trimmed_boundary_replacer(content: str, find: str) -> Iterator[str]:
         yield trimmed
     lines = content.split("\n")
     find_lines = find.split("\n")
-    for i in range(len(lines) - len(find_lines) + 1):
-        _tick()
+    m = len(find_lines)
+    deadline = _deadline.get()
+    for i in range(len(lines) - m + 1):
+        deadline.tick()
         # A stripped block starts with its first line's stripped text (or with a later line's, when the first is
-        # blank, whose stripped text is then empty), so that text must be a prefix of the stripped find.
-        if not trimmed.startswith(lines[i].strip()):
+        # blank, whose stripped text is then empty) and ends with its last line's, so those must be a prefix and
+        # a suffix of the stripped find.
+        if not trimmed.startswith(lines[i].strip()) or not trimmed.endswith(lines[i + m - 1].strip()):
             continue
-        block = "\n".join(lines[i : i + len(find_lines)])
+        deadline.check()  # the block test below costs the whole block
+        block = "\n".join(lines[i : i + m])
         if block.strip() == trimmed:
             yield block
 
@@ -495,14 +511,16 @@ def context_aware_replacer(content: str, find: str) -> Iterator[str]:
     first, last = wanted[0], wanted[-1]
     last_at = _lines_equal_to(content_lines, last)
     n = len(content_lines)
-    starts = _line_starts(content_lines)
+    starts: array[int] | None = None
+    deadline = _deadline.get()
     for i, line in enumerate(content_lines):
-        _tick()
+        deadline.tick()
         if line.strip() != first:
             continue
         # Only the first occurrence of the last line, and only a block of the find's length.
         j = _next_line(last_at, i + 2, n)
         if j < n and j - i + 1 == len(find_lines):
+            deadline.check()  # the middle check costs the whole block
             # at least half of the non-empty middle lines must match when trimmed
             matching = total = 0
             for k in range(1, len(find_lines) - 1):
@@ -511,6 +529,8 @@ def context_aware_replacer(content: str, find: str) -> Iterator[str]:
                     total += 1
                     matching += block_line == find_line
             if total == 0 or matching / total >= 0.5:
+                if starts is None:
+                    starts = _line_starts(content_lines)
                 yield content[starts[i] : starts[j + 1] - 1]
 
 
@@ -526,9 +546,9 @@ REPLACERS: tuple[Replacer, ...] = (
     multi_occurrence_replacer,
 )
 
-_SEEN_CANDIDATES = 4096
-"""Candidates ``replace`` remembers to skip repeats of, before it forgets them: enough to collapse the repeats of
-a few candidates, bounded so a flood of distinct ones doesn't pile up in memory."""
+_SEEN_BYTES = 1 << 20
+"""Characters of candidates ``replace`` remembers to skip repeats of, before it forgets them: enough to collapse
+the repeats of a few candidates, bounded so a flood of distinct ones doesn't pile up in memory."""
 
 
 def timeout_message(timeout: float) -> str:
@@ -550,20 +570,23 @@ def replace(
     if old_string == "":
         raise ValueError(EMPTY_OLD_STRING)
 
-    deadline = _Deadline(None if timeout is None else time.monotonic() + timeout, timeout_message(timeout or 0))
+    deadline = _Deadline(timeout)
     token = _deadline.set(deadline)
     try:
         not_found = True
         seen: set[str] = set()  # a candidate already tried gave its answer: the same find, the same ambiguity
+        seen_size = 0
         for replacer in REPLACERS:
             deadline.check()
             for search in replacer(content, old_string):
-                deadline.tick()
+                deadline.check()  # each candidate costs two scans of the file
                 if search in seen:
                     continue
-                if len(seen) >= _SEEN_CANDIDATES:
+                if seen_size + len(search) > _SEEN_BYTES:
                     seen.clear()
+                    seen_size = 0
                 seen.add(search)
+                seen_size += len(search)
                 index = content.find(search)
                 if index == -1:
                     continue
