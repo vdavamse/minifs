@@ -7,7 +7,8 @@ stays at the root, as in POSIX. Unlike POSIX, a trailing slash is dropped too, s
 ``/notes.md`` rather than failing with ENOTDIR: paths are names here, not walks through the kernel.
 
 A path with a control character is EINVAL (``CONTROL_CHARACTERS``): names can't contain one (migration 016), and
-refusing the path here keeps a newline or an escape sequence from reaching a round trip, a log line or a listing.
+refusing the path here keeps a newline or an escape sequence from reaching a round trip or a listing. The error
+reports the path with those characters escaped (``escape_controls``), so they don't reach a log line either.
 """
 
 from __future__ import annotations
@@ -171,8 +172,8 @@ def split(path: str) -> tuple[str, ...]:
     """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``."""
     if not path.startswith("/"):
         raise VFSError("EINVAL", path, "path must be absolute")
-    if CONTROL_CHARACTERS.search(path):
-        raise VFSError("EINVAL", path, "path contains a control character")
+    if found := CONTROL_CHARACTERS.search(path):
+        raise VFSError("EINVAL", escape_controls(path), f"path contains a control character U+{ord(found[0]):04X}")
     parts: list[str] = []
     for part in path.split("/"):
         if part in ("", "."):
@@ -183,6 +184,12 @@ def split(path: str) -> tuple[str, ...]:
             continue
         parts.append(part)
     return tuple(parts)
+
+
+def escape_controls(path: str) -> str:
+    """``path`` with each control character (``CONTROL_CHARACTERS``) spelled as ``\\uXXXX``, for an error message: a
+    refused path is reported without the newline or escape sequence it was refused for."""
+    return CONTROL_CHARACTERS.sub(lambda c: f"\\u{ord(c[0]):04x}", path)
 
 
 def join(*segments: str) -> str:

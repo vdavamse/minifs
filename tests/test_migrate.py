@@ -64,16 +64,15 @@ async def test_pending_migrations_apply_in_order(empty_db: str) -> None:
 
 
 async def test_name_control_chars_migration_refuses_legacy_names(empty_db: str) -> None:
-    """Migration 016 validates its constraint: a name with a control character fails it, with the fix in its
-    header (rename the node), and it applies once the name is clean."""
+    """Migration 016 refuses a tree with a name that has a control character, saying what to do (rename it, see
+    its header), records nothing, and applies once the name is clean; its constraint then backs the function."""
     migrations = load_migrations()
     before = [m for m in migrations if m.version < 16]
     async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
         await migrate(conn, before)
         await conn.execute("INSERT INTO vfs_nodes (name, kind) VALUES (%s, 'file')", ("a\nb",))
-        with pytest.raises(psycopg.errors.CheckViolation) as info:
+        with pytest.raises(psycopg.errors.RaiseException, match="1 name.* rename them first .*016_name_control_chars"):
             await migrate(conn, migrations)
-        assert info.value.diag.constraint_name == "vfs_nodes_name_check"
         assert 16 not in await applied_versions(conn)
         await conn.execute("UPDATE vfs_nodes SET name = 'a b' WHERE name = %s", ("a\nb",))
         applied = await migrate(conn, migrations)

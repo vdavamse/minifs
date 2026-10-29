@@ -214,6 +214,16 @@ async def test_control_characters_are_rejected_everywhere(conn: AsyncConnection,
     assert await readdir(conn, None) == [("f", "file")]  # nothing changed, and no "d" was made
 
 
+@pytest.mark.parametrize("name", CONTROL_NAMES)
+async def test_control_character_errors_name_the_code_point(conn: AsyncConnection, name: str) -> None:
+    """The DETAIL (which goes to the server log) names the code point, never the name with the character in it."""
+    with pytest.raises(psycopg.Error) as info:
+        await create(conn, None, name)
+    detail = info.value.diag.message_detail or ""
+    assert "control character U+" in detail and name not in detail
+    assert not any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or 0x2028 <= ord(c) <= 0x2069 for c in detail)
+
+
 @pytest.mark.parametrize("name", [" leading and trailing ", "<entries>", "a\\b", "é", "😀", "\u200eltr-mark"])
 async def test_printable_names_are_accepted(conn: AsyncConnection, name: str) -> None:
     """Only control characters are refused: spaces, angle brackets, backslashes and any printable Unicode stay
