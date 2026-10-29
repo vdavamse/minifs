@@ -99,12 +99,17 @@ class GrepSettings:
 class EditSettings:
     max_bytes: int = 10 * 1024 * 1024
     """Largest file ``Edit`` takes, since it holds the whole file in memory; ``Write`` replaces larger ones."""
+    timeout: float = 10.0
+    """Seconds the fallback matchers may spend looking for ``oldString`` before the call is a retry. They run in a
+    worker thread that holds the GIL and can't be cancelled, so this bounds what one call can cost the process."""
 
     def __post_init__(self) -> None:
         if isinstance(self.max_bytes, bool) or not isinstance(self.max_bytes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"edit max_bytes must be an int, not {self.max_bytes!r}")
         if self.max_bytes < 0:
             raise ValueError(f"edit max_bytes must be at least 0, not {self.max_bytes}")
+        if isinstance(self.timeout, bool) or not self.timeout > 0:
+            raise ValueError(f"edit timeout must be over 0 seconds, not {self.timeout!r}")
 
 
 @dataclass(frozen=True)
