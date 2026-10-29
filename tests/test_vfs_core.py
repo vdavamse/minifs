@@ -3,7 +3,7 @@
 import psycopg
 import pytest
 
-from minifs.vfs.core import Entry, VFSError, basename, join, normalize, split
+from minifs.vfs.core import CONTROL_CHARACTERS, Entry, VFSError, basename, escape_controls, join, normalize, split
 
 
 @pytest.mark.parametrize(
@@ -46,10 +46,40 @@ def test_relative_paths_are_einval(path: str) -> None:
     assert info.value.path == path
 
 
-def test_nul_is_einval() -> None:
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/a\0b",
+        "/a\nb",
+        "/x\x1b[31m",
+        "/tab\there/x",
+        "/\x7f",
+        "/c1\x85",
+        "/\u202eevil",
+        "/\u2066x\u2069",
+        "/a/b\r",
+        "/p\u2029s",
+    ],
+)
+def test_control_characters_are_einval(path: str) -> None:
+    """A name can't contain one (migration 016), and the path is refused before any round trip."""
     with pytest.raises(VFSError) as info:
-        split("/a\0b")
+        split(path)
     assert info.value.errno == "EINVAL"
+    assert info.value.path == escape_controls(path)
+    assert not CONTROL_CHARACTERS.search(str(info.value))  # the refused character isn't echoed
+    assert info.value.message.startswith("path contains a control character U+")
+    assert len(info.value.message) == len("path contains a control character U+0000")
+
+
+@pytest.mark.parametrize("path", ["/ a b /<x>", "/é/😀", "/a\\b", "/\u200emark"])
+def test_printable_characters_are_names(path: str) -> None:
+    assert split(path) == tuple(path.split("/")[1:])
+
+
+def test_escape_controls() -> None:
+    assert escape_controls("/a\nb/x\x1b[31m/\u202eevil") == "/a\\u000ab/x\\u001b[31m/\\u202eevil"
+    assert escape_controls("/plain/é") == "/plain/é"
 
 
 def test_basename_and_entry_name() -> None:

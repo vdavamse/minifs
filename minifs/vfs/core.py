@@ -5,10 +5,15 @@ else looks at a path, as ladderframe's ``_path_subject`` does, so ``/workspace/.
 ``/docs/a.md`` name the same file everywhere (resolution, the chroot view, the write policy). ``..`` at the root
 stays at the root, as in POSIX. Unlike POSIX, a trailing slash is dropped too, so ``/notes.md/`` names the file
 ``/notes.md`` rather than failing with ENOTDIR: paths are names here, not walks through the kernel.
+
+A path with a control character is EINVAL (``CONTROL_CHARACTERS``): names can't contain one (migration 016), and
+refusing the path here keeps a newline or an escape sequence from reaching a round trip or a listing. The error
+reports the path with those characters escaped (``escape_controls``), so they don't reach a log line either.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -19,6 +24,11 @@ import psycopg
 from minifs.db.errors import errno_name
 
 Kind = Literal["file", "dir"]
+
+CONTROL_CHARACTERS = re.compile("[\x00-\x1f\x7f-\x9f\u2028-\u202e\u2066-\u2069]")
+"""What a name can't contain, as ``vfs_check_name`` tests it (migration 016): the C0 controls, DEL, the C1
+controls, the Unicode line and paragraph separators, and the bidi embeddings, overrides and isolates. NUL is a
+C0 control the server never sees: refused here, it can't surface as an encoding error (EIO) from psycopg."""
 
 
 class VFSError(Exception):
@@ -153,7 +163,7 @@ class LineReadResult:
 def normalize(path: str) -> str:
     """The canonical form of absolute ``path``: no ``.``, ``..``, repeated or trailing slashes.
 
-    EINVAL for a relative path, an empty one, or one containing a NUL character.
+    EINVAL for a relative path, an empty one, or one containing a control character (``CONTROL_CHARACTERS``).
     """
     return "/" + "/".join(split(path))
 
@@ -162,8 +172,8 @@ def split(path: str) -> tuple[str, ...]:
     """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``."""
     if not path.startswith("/"):
         raise VFSError("EINVAL", path, "path must be absolute")
-    if "\0" in path:
-        raise VFSError("EINVAL", path, "path contains a NUL character")
+    if found := CONTROL_CHARACTERS.search(path):
+        raise VFSError("EINVAL", escape_controls(path), f"path contains a control character U+{ord(found[0]):04X}")
     parts: list[str] = []
     for part in path.split("/"):
         if part in ("", "."):
@@ -174,6 +184,12 @@ def split(path: str) -> tuple[str, ...]:
             continue
         parts.append(part)
     return tuple(parts)
+
+
+def escape_controls(path: str) -> str:
+    """``path`` with each control character (``CONTROL_CHARACTERS``) spelled as ``\\uXXXX``, for an error message: a
+    refused path is reported without the newline or escape sequence it was refused for."""
+    return CONTROL_CHARACTERS.sub(lambda c: f"\\u{ord(c[0]):04x}", path)
 
 
 def join(*segments: str) -> str:

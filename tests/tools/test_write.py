@@ -17,7 +17,7 @@ from minifs.tools import TOOLS, Write
 from minifs.tools.deps import ToolSettings, WriteSettings
 from minifs.tools.write import DESCRIPTION
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import FileVersion, ReadResult
+from minifs.vfs.core import CONTROL_CHARACTERS, FileVersion, ReadResult
 from minifs.vfs.policy import Policy, Rule
 from minifs.vfs.view import VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
@@ -144,6 +144,16 @@ async def test_paths_outside_the_view_are_not_found(deps: Deps, client: VFSClien
     message = await retry_message(Write, deps, content="x", filePath=path)
     assert message == f"File not found: /{path.removeprefix('../').removeprefix('/')}"
     assert (await client.pread(f"/workspaces/{W2}/secret.md")).content == b"theirs\n"
+
+
+@pytest.mark.parametrize("path", ["a\nb.md", "/workspace/x\x1b[31m.md", "\u202eevil.md"])
+async def test_control_characters_in_a_path_are_refused(deps: Deps, client: VFSClient, path: str) -> None:
+    """A name with a newline, an escape sequence or a bidi override can't be created (#92): the path is refused
+    before any round trip, with a message the model can act on."""
+    message = await retry_message(Write, deps, content="x", filePath=path)
+    assert ": path contains a control character U+" in message
+    assert not CONTROL_CHARACTERS.search(message)  # reported with the character escaped, not echoed
+    assert [e.name for e in await client.readdir(f"/workspaces/{W1}")] == ["notes.md"]
 
 
 async def test_directories(deps: Deps) -> None:

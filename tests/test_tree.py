@@ -180,12 +180,56 @@ async def test_kind_cannot_change(conn: AsyncConnection) -> None:
         await conn.execute("UPDATE vfs_nodes SET kind = 'dir' WHERE id = %s", (file,))
 
 
-@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "x" * 256])
+CONTROL_NAMES = [
+    "a\nb",  # a newline: a second line in a listing
+    "x\x1b[31m",  # an ANSI escape sequence
+    "tab\there",
+    "\x7f",  # DEL
+    "c1\x85",  # a C1 control (NEL)
+    "\u202eevil",  # right-to-left override
+    "\u2066x\u2069",  # bidi isolates
+    "line\u2028sep",  # LINE SEPARATOR: a line end to str.splitlines()
+]
+"""Names with the characters migration 016 refuses."""
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "x" * 256, *CONTROL_NAMES])
 async def test_invalid_names_are_rejected(conn: AsyncConnection, name: str) -> None:
     with raises_errno("ENAMETOOLONG" if len(name) > 255 else "EINVAL"):
         await create(conn, None, name)
     with raises_errno("EINVAL"):
         await conn.execute("INSERT INTO vfs_nodes (name, kind) VALUES (%s, 'file')", (name,))
+
+
+@pytest.mark.parametrize("name", CONTROL_NAMES)
+async def test_control_characters_are_rejected_everywhere(conn: AsyncConnection, name: str) -> None:
+    """Every way a name enters: rename and mkdir_p call vfs_check_name too, and the constraint backs raw updates."""
+    file = await create(conn, None, "f")
+    with raises_errno("EINVAL"):
+        await rename(conn, file, None, name)
+    with raises_errno("EINVAL"):
+        await mkdir_p(conn, "d", name)
+    with raises_db_errno("EINVAL"):
+        await conn.execute("UPDATE vfs_nodes SET name = %s WHERE id = %s", (name, file))
+    assert await readdir(conn, None) == [("f", "file")]  # nothing changed, and no "d" was made
+
+
+@pytest.mark.parametrize("name", CONTROL_NAMES)
+async def test_control_character_errors_name_the_code_point(conn: AsyncConnection, name: str) -> None:
+    """The DETAIL (which goes to the server log) names the code point, never the name with the character in it."""
+    with pytest.raises(psycopg.Error) as info:
+        await create(conn, None, name)
+    detail = info.value.diag.message_detail or ""
+    assert "control character U+" in detail and name not in detail
+    assert not any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or 0x2028 <= ord(c) <= 0x2069 for c in detail)
+
+
+@pytest.mark.parametrize("name", [" leading and trailing ", "<entries>", "a\\b", "é", "😀", "\u200eltr-mark"])
+async def test_printable_names_are_accepted(conn: AsyncConnection, name: str) -> None:
+    """Only control characters are refused: spaces, angle brackets, backslashes and any printable Unicode stay
+    legal, as on disk."""
+    node = await create(conn, None, name)
+    assert await resolve(conn, name) == (node, "file")
 
 
 async def test_longest_name_is_255_bytes(conn: AsyncConnection) -> None:
