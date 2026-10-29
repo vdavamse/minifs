@@ -196,7 +196,7 @@ class Deps:
 | `Read` | 2,000 lines, lines cut at 2,000 characters, output capped at 50 KB |
 | `Glob`, `Grep` | 100 results; excludes `node_modules`, `.venv`, `__pycache__`, `.mypy_cache` (and always `.git`) |
 | `Grep` | 2 s per statement; hit lines cut at 2,000 characters |
-| `Edit` | files up to 10 MB |
+| `Edit` | files up to 10 MB; 10 s for the fuzzy matchers to find `oldString`, then the call is a retry |
 | `Write` | diffs old files up to 1 MB (larger ones are replaced without a diff) |
 
 **The directory cache.** Use one `DirEntryCache` per long-running process; leave it out for one-shot scripts. It maps `(parent id, name)` to a node, follows other processes' renames and deletes through `NOTIFY`, and expires entries after 60 s. Every use is checked in the statement that uses it, so a stale entry costs a slower lookup, never the wrong file. `cache.stats()` reports the hit rate.

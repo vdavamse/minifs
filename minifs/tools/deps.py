@@ -10,6 +10,7 @@ settings, which they read with ``getattr`` and a default, so the caller's own de
 
 from __future__ import annotations
 
+import math
 import posixpath
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -99,12 +100,19 @@ class GrepSettings:
 class EditSettings:
     max_bytes: int = 10 * 1024 * 1024
     """Largest file ``Edit`` takes, since it holds the whole file in memory; ``Write`` replaces larger ones."""
+    timeout: float = 10.0
+    """Seconds the fallback matchers may spend looking for ``oldString`` before the call is a retry. They run in a
+    worker thread that holds the GIL and can't be cancelled, so this bounds what one call can cost the process."""
 
     def __post_init__(self) -> None:
         if isinstance(self.max_bytes, bool) or not isinstance(self.max_bytes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"edit max_bytes must be an int, not {self.max_bytes!r}")
         if self.max_bytes < 0:
             raise ValueError(f"edit max_bytes must be at least 0, not {self.max_bytes}")
+        if isinstance(self.timeout, bool) or not isinstance(self.timeout, int | float):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"edit timeout must be a number, not {self.timeout!r}")
+        if not 0 < self.timeout < math.inf:
+            raise ValueError(f"edit timeout must be over 0 seconds and finite, not {self.timeout!r}")
 
 
 @dataclass(frozen=True)
