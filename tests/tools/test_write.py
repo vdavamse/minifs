@@ -493,3 +493,13 @@ async def test_a_file_another_writer_holds_is_a_retry(view: VFSView, client: VFS
     await quick.settle()
     assert message == "/workspace/notes.md is locked by another write in progress. Try again."
     assert await content(client, "notes.md") == b"mine\n"
+
+
+async def test_a_write_that_times_out_is_a_retry_that_says_what_to_change(view: VFSView, client: VFSClient) -> None:
+    quick = VFSClient(client.pool, cache=client.cache, write_timeout=0.001)
+    deps = Deps(VFSView(quick, workspace_mounts(W1), view.policy, view.actor))
+    big = "x" * 79 + "\n"
+    message = await retry_message(Write, deps, content=big * 20_000, filePath="big.txt")  # 1.6 MB: over a millisecond
+    await quick.settle()
+    assert message == "Timed out on /workspace/big.txt. Try again; if it keeps timing out, write less at once."
+    assert not [e for e in await client.readdir(f"/workspaces/{W1}") if e.name == "big.txt"]

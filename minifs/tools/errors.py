@@ -30,13 +30,16 @@ MESSAGES: dict[str, str] = {
     "ESTALE": "{path} was modified since it was read. Read it again before writing.",
     "ENAMETOOLONG": "File name too long: {path}",
     "EAGAIN": "{path} is locked by another write in progress. Try again.",
-    "ETIMEDOUT": "Timed out on {path}. Try again; if it keeps timing out, write less at once.",
+    "ETIMEDOUT": "Timed out on {path}. Try again.",  # Write and Edit add what to change
     "EIO": "Internal error reading {path}",
 }
 """The ``ModelRetry`` message for each errno. EINVAL, and any errno not here, gets ``<path>: <the error's message>``
 (the view's messages name no real paths), or ``<errno>: <path>`` without one. EAGAIN and ETIMEDOUT are the
 server's timeouts, usually the write timeouts of ``VFSClient`` (a lock held by another writer, a statement that
 ran too long): a retry later may succeed, so the model gets one, unlike the EIO of any other database error."""
+
+TIMED_OUT_WRITE = "Timed out on {path}. Try again; if it keeps timing out, write less at once."
+"""The ETIMEDOUT message of ``Write`` and ``Edit``: a payload too big for ``write_timeout`` times out every time."""
 
 _OVERRIDABLE = frozenset(MESSAGES) | {"EINVAL"}
 

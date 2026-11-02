@@ -1029,7 +1029,7 @@ async def test_a_write_waits_for_a_lock_no_longer_than_lock_timeout(pool: Pool, 
     async with holding_the_lock(db, locked):
         error = await raises("EAGAIN", asyncio.wait_for(write(vfs, version), 10), path)
         assert isinstance(error.db_error, psycopg.errors.LockNotAvailable)
-        # A read takes no lock, and the failed write gave its connection back to the pool.
+        # A read takes no lock.
         assert (await vfs.pread("/f")).content == b"v1\n"
     await write(vfs, version)  # the lock is free again
 
@@ -1065,17 +1065,19 @@ async def test_reads_run_without_the_write_timeouts(pool: Pool, db: str) -> None
 
 async def test_the_timeouts_do_not_outlive_the_transaction(db: str) -> None:
     # SET LOCAL, not SET: behind a transaction-mode pooler, the next transaction on the connection is someone else's.
-    # One connection, so every statement here runs on it, and its pid shows the pool didn't replace it.
+    # One connection, so every statement here runs on it, and its pid shows the pool didn't replace it. A session
+    # SET would only outlive a transaction that commits (a rollback takes it back too), hence the second write.
     data = (b"x" * 79 + b"\n") * 20_000
     async with open_pool(Connector(db), min_size=1, max_size=1) as one:
         async with one.connection() as conn:
             pid = conn.info.backend_pid
         vfs = VFSClient(one, lock_timeout=0.001, write_timeout=0.001)
         await raises("ETIMEDOUT", vfs.create("/f", data), "/f")
+        await VFSClient(one, lock_timeout=0.25, write_timeout=0.5).create("/g", b"x\n")  # commits
         async with one.connection() as conn:
             assert conn.info.backend_pid == pid
             cur = await conn.execute("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")
-            assert await cur.fetchone() == ("0", "0")
+            assert await cur.fetchone() == ("0", "0")  # not ("250ms", "500ms")
         assert (await VFSClient(one).create("/f", data)).size == len(data)
         assert (await vfs.pread("/f", 0, len(data))).content == data  # longer than a millisecond, on that connection
 
