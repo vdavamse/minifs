@@ -108,7 +108,13 @@ async def edit(
 
 
 async def _edit(
-    vfs: VFSView, path: str, old_string: str, new_string: str, replace_all: bool, max_bytes: int, timeout: float
+    vfs: VFSView,
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool,
+    max_bytes: int,
+    timeout: float | None,
 ) -> tuple[str, str]:
     """Edits ``path``: ``(its old text, the new text)``, without BOMs. ``_Lost`` where another writer got in
     between: a create beaten to the file, a file changed, removed or replaced by a directory after its stat."""
@@ -245,17 +251,25 @@ def levenshtein(a: str, b: str) -> int:
     return previous[len(b)]
 
 
+def _ticked[T](items: Iterable[T]) -> Iterator[T]:
+    """``items``, with a ``tick`` of the running ``replace``'s deadline per item: for a pass over every line."""
+    tick = _deadline.get().tick
+    for item in items:
+        tick()
+        yield item
+
+
 def _line_starts(lines: Iterable[str]) -> array[int]:
     """``starts[k]``: the character offset of line ``k`` in the text ``lines`` were split from (on ``\\n``); one
     more entry past the last line. Built once, so a span of lines is two lookups (ladderframe's ``_span`` summed
     the lines before each candidate). An array, not a list: a file of millions of short lines has millions of
     entries, and the replacers already hold its lines."""
-    return array("q", accumulate((len(line) + 1 for line in lines), initial=0))
+    return array("q", accumulate((len(line) + 1 for line in _ticked(lines)), initial=0))
 
 
 def _lines_equal_to(lines: Iterable[str], wanted: str) -> array[int]:
     """The sorted line numbers whose stripped text is ``wanted``."""
-    return array("q", (k for k, line in enumerate(lines) if line.strip() == wanted))
+    return array("q", (k for k, line in enumerate(_ticked(lines)) if line.strip() == wanted))
 
 
 def simple_replacer(content: str, find: str) -> Iterator[str]:
@@ -268,14 +282,15 @@ def line_trimmed_replacer(content: str, find: str) -> Iterator[str]:
     The stripped lines are joined with ``\\n`` and searched for the joined stripped ``find`` with ``str.find``: a
     hit that starts and ends at line boundaries is a run of equal stripped lines, and the hits come in line order,
     as ladderframe's window loop gave them. The hit's line is the count of ``\\n`` before it, kept up as the hits
-    advance, so the stripped lines are never held as a list."""
+    advance, so the stripped lines are never held as a list. For a non-empty ``find``, as ``replace`` passes it:
+    for an empty one ladderframe's loop over zero-line windows gave slices of nothing, and this gives none."""
     original = content.split("\n")
     search = find.split("\n")
     if search[-1] == "":
         search.pop()
     joined = "\n".join(map(str.strip, original))
     needle = "\n".join(line.strip() for line in search)
-    starts = _line_starts(original)
+    starts: array[int] | None = None  # built on the first hit: a miss costs no pass over the lines
     tick = _deadline.get().tick
     line = counted = 0  # the line at `counted`
     pos = joined.find(needle)
@@ -283,6 +298,8 @@ def line_trimmed_replacer(content: str, find: str) -> Iterator[str]:
         tick()
         end = pos + len(needle)
         if (pos == 0 or joined[pos - 1] == "\n") and (end == len(joined) or joined[end] == "\n"):
+            if starts is None:
+                starts = _line_starts(original)
             line += joined.count("\n", counted, pos)
             counted = pos
             yield content[starts[line] : starts[line + len(search)] - 1]
@@ -554,8 +571,9 @@ the repeats of a few candidates, bounded so a flood of distinct ones doesn't pil
 def timeout_message(timeout: float) -> str:
     """The retry for a ``replace`` that ran past ``timeout`` seconds."""
     return (
-        f"Could not match oldString within {timeout:g} seconds: the file is large and oldString does not match it "
-        "exactly. Read the file again and provide the exact text to replace, including whitespace and indentation."
+        f"Could not match oldString within {timeout:g} seconds: it is not in the file exactly, and the fuzzy search "
+        "over this file was stopped. Read the file again and provide the exact text to replace, including whitespace "
+        "and indentation."
     )
 
 

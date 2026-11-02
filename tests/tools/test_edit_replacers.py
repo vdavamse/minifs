@@ -335,10 +335,11 @@ PIECES = [
     "\\\n",
     "\n",
     "\r",
+    "a" * 201,
 ]
 """What random lines are made of: the characters the replacers treat specially (whitespace, backslash escapes, a
-backslash before a newline, a ``\\r`` as a CRLF file's lines keep), and few distinct letters, so lines repeat and
-anchors recur."""
+backslash before a newline, a ``\\r`` as a CRLF file's lines keep), few distinct letters, so lines repeat and
+anchors recur, and now and then a line over ``MAX_SCORED_LINE_LENGTH``, which the block scorer doesn't score."""
 
 
 def random_text(rng: random.Random, max_lines: int) -> str:
@@ -353,7 +354,7 @@ def random_find(rng: random.Random, content: str) -> str:
     if not content or rng.random() < 0.3:
         return random_text(rng, 4)
     i = rng.randrange(len(lines))
-    taken = lines[i : i + rng.randint(1, 5)]
+    taken = lines[i : i + rng.randint(1, 9)]  # up to 9 lines: the block anchors' max_delta reaches 2
     for _ in range(rng.randint(0, 2)):
         match rng.randint(0, 6):
             case 0:
@@ -396,6 +397,19 @@ def test_replacers_give_ladderframes_candidates(seed: int) -> None:
             content,
             find,
         )
+
+
+def test_forgetting_tried_candidates_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``replace`` skips a candidate it already tried and forgets them past a byte budget: with the budget a few
+    characters, every candidate of a repetitive file is tried again, and the answers are still the oracle's."""
+    monkeypatch.setattr(new, "_SEEN_BYTES", 4)
+    rng = random.Random(7)
+    content = "\n".join("x" + " " * rng.randint(0, 3) for _ in range(300)) + "\n"
+    for find in ("x", "x\nx", "x \nx\nx", "  x\n", "y"):
+        for replace_all in (False, True):
+            assert outcome(new.replace, content, find, "R", replace_all) == outcome(
+                replace, content, find, "R", replace_all
+            )
 
 
 def test_replace_rejects_what_it_always_rejected() -> None:
@@ -448,15 +462,16 @@ def test_replace_stops_between_replacers(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_replace_stops_inside_a_replacer() -> None:
-    """A window scan whose cheap gates pass everywhere (every line equals the find's first and last lines) and
-    whose block test fails late (the middle differs 1,000 lines in) is still O(n·m), tens of seconds here; the
-    deadline is checked inside the loop, so the search ends within a window of the timeout, not after the scan."""
+    """Window scans whose cheap gates pass everywhere (every line equals the find's first and last lines) and
+    whose block test fails late (the middle differs 1,000 lines in) are still O(n·m), tens of seconds here; the
+    deadline is checked inside the replacers' loops, so the search ends soon after the timeout, not after a scan.
+    (Which loop it stops in depends on the machine; the bound is what matters.)"""
     content = "x\n" * 200_000
     find = "x\n" * 1_000 + "y\n" + "x\n" * 999 + "x"
     begin = time.monotonic()
     with pytest.raises(ReplaceTimeout):
         new.replace(content, find, "q", timeout=0.2)
-    assert time.monotonic() - begin < 2
+    assert 0.2 <= time.monotonic() - begin < 2
 
 
 def test_replace_stops_between_block_scores() -> None:
@@ -484,6 +499,7 @@ async def test_a_slow_edit_is_a_retry(deps: Deps, monkeypatch: pytest.MonkeyPatc
 def test_edit_settings() -> None:
     assert (EditSettings().max_bytes, EditSettings().timeout) == (10 * 1024 * 1024, 10.0)
     assert EditSettings(timeout=1).timeout == 1
+    assert EditSettings(timeout=None).timeout is None
     for timeout in (0, -1.0, math.inf):
         with pytest.raises(ValueError, match="edit timeout"):
             EditSettings(timeout=timeout)
