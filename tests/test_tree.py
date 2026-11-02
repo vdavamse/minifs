@@ -113,10 +113,11 @@ async def holding_the_lock(db: str, path: str) -> AsyncGenerator[AsyncConnection
     """Another session holding the inode of ``path`` FOR UPDATE, as a writer does, until the block exits."""
     async with await AsyncConnection.connect(db) as other:
         try:
-            await other.execute(
+            cur = await other.execute(
                 "SELECT FROM vfs_nodes WHERE id = (SELECT id FROM vfs_lookup(%s)) FOR UPDATE",
                 (path.strip("/").split("/"),),
             )
+            assert cur.rowcount == 1, path
             yield other
         finally:
             await other.rollback()

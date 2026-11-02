@@ -126,7 +126,7 @@ the operation only if every lookup succeeded (`_gated`). A write runs under `loc
 for the lock another writer holds (the file's inode, or a directory on its path), and without a bound a long write
 would hold every waiter, each on a pool connection. Running out is EAGAIN (the lock) or ETIMEDOUT (the statement),
 logged as a warning, which the client doesn't retry, since the point is to give the connection back. Reads take no
-locks and run without them; the two errnos still apply to any statement the server cancels (`pg_cancel_backend`). It raises `minifs.vfs.core.VFSError(errno, path, message,
+locks and run without them; the two errnos still apply to any statement the server cancels (`pg_cancel_backend`), except inside `grep`, which reports a cancel as `SearchRefused`. It raises `minifs.vfs.core.VFSError(errno, path, message,
 detail)` for every errno the SQL layer reports, returned (through `_outcome`, with `db_error` None) or raised. `detail` (the
 server's DETAIL, with node ids and real path components) and `db_error` are for logs only: a view that rewrites
 paths (the chroot) translates `path` and never shows `detail`. Paths go through

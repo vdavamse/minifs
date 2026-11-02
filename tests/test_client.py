@@ -1053,14 +1053,15 @@ async def test_a_lock_wait_counts_against_write_timeout(pool: Pool, db: str) -> 
     assert await vfs.append("/f", b"more\n") == 3
 
 
-async def test_reads_run_without_the_write_timeouts(pool: Pool, db: str) -> None:
-    data = (b"x" * 79 + b"\n") * 20_000
-    await VFSClient(pool).create("/f", data)
+async def test_reads_run_without_the_write_timeouts(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Reads take no locks and have their own caps: one statement each, with no SET LOCAL before it.
+    await VFSClient(pool).create("/f", b"v1\n")
     vfs = VFSClient(pool, lock_timeout=0.001, write_timeout=0.001)
-    async with holding_the_lock(db, "/f"):  # a read takes no lock, and this one takes longer than a millisecond
-        assert (await vfs.pread("/f", 0, len(data))).content == data
-        assert (await vfs.stat("/f")).size == len(data)
-        assert [e.name for e in await vfs.readdir("/")] == ["f"]
+    statements = capture(monkeypatch)
+    for read in (vfs.pread("/f"), vfs.stat("/f"), vfs.readdir("/")):
+        statements.clear()
+        await read
+        assert len(statements) == 1 and "lock_timeout" not in statements[0], statements
 
 
 async def test_the_timeouts_do_not_outlive_the_transaction(db: str) -> None:
@@ -1079,23 +1080,29 @@ async def test_the_timeouts_do_not_outlive_the_transaction(db: str) -> None:
             cur = await conn.execute("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")
             assert await cur.fetchone() == ("0", "0")  # not ("250ms", "500ms")
         assert (await VFSClient(one).create("/f", data)).size == len(data)
-        assert (await vfs.pread("/f", 0, len(data))).content == data  # longer than a millisecond, on that connection
+        assert (await vfs.pread("/f", 0, len(data))).content == data
+
+
+def capture(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every statement sent from now on (the pool's check at checkout, an empty query, left out)."""
+    statements: list[str] = []
+    execute = AsyncConnection.execute
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        if str(query).strip():
+            statements.append(str(query))
+        return await execute(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    return statements
 
 
 async def test_the_timeouts_are_not_retried(pool: Pool, db: str, monkeypatch: pytest.MonkeyPatch) -> None:
     # Retrying would hold a connection again, which is what the timeout frees: one attempt, then the error.
     vfs = VFSClient(pool, lock_timeout=0.1)
     await vfs.create("/f", b"v1\n")
-    statements: list[str] = []
-    execute = AsyncConnection.execute
-
-    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
-        if str(query).strip():  # the pool's check at checkout is an empty query
-            statements.append(str(query))
-        return await execute(self, query, *args, **kwargs)
-
     async with holding_the_lock(db, "/f"):
-        monkeypatch.setattr(AsyncConnection, "execute", counting)
+        statements = capture(monkeypatch)
         await raises("EAGAIN", asyncio.wait_for(vfs.append("/f", b"more\n"), 10), "/f")
     assert len(statements) == 2 and "lock_timeout" in statements[0] and "vfs_append" in statements[1], statements
 

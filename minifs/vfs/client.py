@@ -14,6 +14,19 @@ cancelled statement ETIMEDOUT (``minifs.db.errors``; any statement's outside ``g
 refused search, so an administrator's cancel of a read is ETIMEDOUT too), logged as a warning, for the caller to
 try again later; the client doesn't retry them itself, since the point is to give the connection back. Reads take
 no locks and keep their own caps, so they run without the timeouts.
+
+Path resolution: a statement resolves its own paths on the server (``vfs_lookup`` in a subquery), so an
+operation costs one round trip. The function is called only if every lookup succeeded, so it never sees the NULL
+id of a failed one, which for a directory would mean the root. A ``DirCache`` (the directory-entry cache of #19)
+saves the walk: when every component of a path is cached, the statement checks the cached chain instead, every
+``(parent, name) -> id`` link in one index lookup each, and falls back to ``vfs_lookup`` when any link no longer
+holds. So a stale cache costs a slower resolution, never the wrong node. Each statement returns the id it
+resolved, and a ``vfs_lookup`` the chain of ids it walked, in the same row: the client stores what it learns (every
+component of a walk, listings, creates, a rename's destination), evicts what it renames or removes, and evicts a
+cached id that turned out stale. A path whose first components are cached is walked on the server from the deepest
+of them, after checking them in the same statement. Keeping the cache fresh against other clients (NOTIFY, TTL)
+is the cache's job.
+Without a cache, every path is resolved on the server.
 """
 
 from __future__ import annotations
