@@ -130,6 +130,12 @@ class _Ref:
         self.kind: Kind | None = None
 
 
+def check_timeout(name: str, value: float) -> None:
+    """ValueError unless ``value`` is a timeout in seconds ``VFSClient`` takes: over 0 and at most ``MAX_TIMEOUT``."""
+    if isinstance(value, bool) or not 0 < value <= MAX_TIMEOUT:
+        raise ValueError(f"{name} must be over 0 and at most {MAX_TIMEOUT} seconds, not {value!r}")
+
+
 def _root() -> _Ref:
     """The root as a directory argument: NULL, with no subquery and nothing to learn."""
     return _Ref(_NULL, [])
@@ -143,7 +149,11 @@ class VFSClient:
 
     ``lock_timeout`` and ``write_timeout`` (seconds, over 0 and at most ``MAX_TIMEOUT``) bound every write: how
     long it waits for a lock another writer holds (the file's inode, or a directory on its path; EAGAIN when it
-    runs out), and how long its statement may run (ETIMEDOUT). Searches have their own timeout (``grep``).
+    runs out), and how long its statement may run (ETIMEDOUT). They replace the server's defaults (an ``ALTER ROLE
+    ... SET statement_timeout``) for the write's transaction, so a deployment with a tighter policy passes smaller
+    values. Keep ``lock_timeout`` above the server's ``deadlock_timeout`` (1 s by default): below it, a deadlock
+    is reported as EAGAIN before the server detects it, instead of the deadlock error the client retries. Searches
+    have their own timeout (``grep``).
     """
 
     def __init__(
@@ -155,9 +165,8 @@ class VFSClient:
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
         write_timeout: float = DEFAULT_WRITE_TIMEOUT,
     ) -> None:
-        for name, value in (("lock_timeout", lock_timeout), ("write_timeout", write_timeout)):
-            if isinstance(value, bool) or not 0 < value <= MAX_TIMEOUT:
-                raise ValueError(f"{name} must be over 0 and at most {MAX_TIMEOUT} seconds, not {value!r}")
+        check_timeout("lock_timeout", lock_timeout)
+        check_timeout("write_timeout", write_timeout)
         self.pool = pool
         self.search_pool = search_pool or pool
         self.cache = cache

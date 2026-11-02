@@ -27,7 +27,7 @@ from minifs.vfs.client import (
 )
 from minifs.vfs.core import FileVersion, Kind, ReadResult, VFSError
 from minifs.vfs.glob import GlobError
-from tests.test_tree import wait_until_blocked
+from tests.test_tree import holding_the_lock, wait_until_blocked
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
 
@@ -1004,17 +1004,6 @@ async def test_a_claim_lost_inside_vfs_rename_raises_nothing(conn: AsyncConnecti
 # so one long write of a hot file can't hold every other writer, and with them the pool, behind it.
 
 
-@contextlib.asynccontextmanager
-async def holding_the_lock(db: str, path: str) -> AsyncGenerator[AsyncConnection]:
-    """Another session holding the inode of ``path`` FOR UPDATE, as a writer does, until the block exits."""
-    async with await AsyncConnection.connect(db) as other:
-        await other.execute(
-            "SELECT FROM vfs_nodes WHERE id = (SELECT id FROM vfs_lookup(%s)) FOR UPDATE", (path.strip("/").split("/"),)
-        )
-        yield other
-        await other.rollback()
-
-
 Writer = Callable[[VFSClient, FileVersion], Awaitable[object]]
 WRITERS: dict[str, tuple[str, str, Writer]] = {
     # name: (the path locked by another writer, the path the error names, the write)
@@ -1072,6 +1061,23 @@ async def test_reads_run_without_the_write_timeouts(pool: Pool, db: str) -> None
         assert (await vfs.pread("/f", 0, len(data))).content == data
         assert (await vfs.stat("/f")).size == len(data)
         assert [e.name for e in await vfs.readdir("/")] == ["f"]
+
+
+async def test_the_timeouts_do_not_outlive_the_transaction(db: str) -> None:
+    # SET LOCAL, not SET: behind a transaction-mode pooler, the next transaction on the connection is someone else's.
+    # One connection, so every statement here runs on it, and its pid shows the pool didn't replace it.
+    data = (b"x" * 79 + b"\n") * 20_000
+    async with open_pool(Connector(db), min_size=1, max_size=1) as one:
+        async with one.connection() as conn:
+            pid = conn.info.backend_pid
+        vfs = VFSClient(one, lock_timeout=0.001, write_timeout=0.001)
+        await raises("ETIMEDOUT", vfs.create("/f", data), "/f")
+        async with one.connection() as conn:
+            assert conn.info.backend_pid == pid
+            cur = await conn.execute("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")
+            assert await cur.fetchone() == ("0", "0")
+        assert (await VFSClient(one).create("/f", data)).size == len(data)
+        assert (await vfs.pread("/f", 0, len(data))).content == data  # longer than a millisecond, on that connection
 
 
 async def test_the_timeouts_are_not_retried(pool: Pool, db: str, monkeypatch: pytest.MonkeyPatch) -> None:

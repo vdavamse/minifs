@@ -30,7 +30,7 @@ MESSAGES: dict[str, str] = {
     "ESTALE": "{path} was modified since it was read. Read it again before writing.",
     "ENAMETOOLONG": "File name too long: {path}",
     "EAGAIN": "{path} is locked by another write in progress. Try again.",
-    "ETIMEDOUT": "Timed out on {path}. Try again.",
+    "ETIMEDOUT": "Timed out on {path}. Try again; if it keeps timing out, write less at once.",
     "EIO": "Internal error reading {path}",
 }
 """The ``ModelRetry`` message for each errno. EINVAL, and any errno not here, gets ``<path>: <the error's message>``

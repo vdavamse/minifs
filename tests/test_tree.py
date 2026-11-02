@@ -3,8 +3,8 @@
 import asyncio
 import time
 import uuid
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import AsyncGenerator, Generator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from uuid import UUID
 
@@ -106,6 +106,20 @@ async def rename(
 
 async def unlink(conn: AsyncConnection, node: UUID) -> None:
     check(*await _one(conn, "SELECT err, err_detail FROM vfs_unlink(%s)", (node,)))
+
+
+@asynccontextmanager
+async def holding_the_lock(db: str, path: str) -> AsyncGenerator[AsyncConnection]:
+    """Another session holding the inode of ``path`` FOR UPDATE, as a writer does, until the block exits."""
+    async with await AsyncConnection.connect(db) as other:
+        try:
+            await other.execute(
+                "SELECT FROM vfs_nodes WHERE id = (SELECT id FROM vfs_lookup(%s)) FOR UPDATE",
+                (path.strip("/").split("/"),),
+            )
+            yield other
+        finally:
+            await other.rollback()
 
 
 async def wait_until_blocked(conn: AsyncConnection, pid: int) -> None:

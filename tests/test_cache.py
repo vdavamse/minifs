@@ -438,7 +438,7 @@ async def _backend(pool: Pool, task: asyncio.Task[None]) -> int:
     raise AssertionError("the unlink never started")
 
 
-async def test_each_operation_is_one_statement(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_the_cache_adds_no_statement(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
     """The cache adds no statement of its own: a read is one statement, cold or warm, and a write is one after the
     `SET LOCAL` of its timeouts (#84)."""
     other = VFSClient(pool)

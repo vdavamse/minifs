@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from psycopg import AsyncConnection
 
 import minifs.tools._text as text
 import minifs.tools.write as write_module
@@ -21,6 +20,7 @@ from minifs.vfs.client import VFSClient
 from minifs.vfs.core import FileVersion, ReadResult
 from minifs.vfs.policy import Policy, Rule
 from minifs.vfs.view import VFSView, workspace_mounts
+from tests.test_tree import holding_the_lock
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
 
 GOLDEN = json.loads((Path(__file__).parent / "data" / "write_golden.json").read_text())
@@ -488,13 +488,8 @@ async def test_a_file_another_writer_holds_is_a_retry(view: VFSView, client: VFS
     """A write that waits out the client's ``lock_timeout`` is a retry for the model, not an internal error."""
     quick = VFSClient(client.pool, cache=client.cache, lock_timeout=0.1)
     deps = Deps(VFSView(quick, workspace_mounts(W1), view.policy, view.actor))
-    async with await AsyncConnection.connect(db) as other:
-        await other.execute(
-            "SELECT FROM vfs_nodes WHERE id = (SELECT id FROM vfs_lookup(%s)) FOR UPDATE",
-            (["workspaces", W1, "notes.md"],),
-        )
+    async with holding_the_lock(db, f"/workspaces/{W1}/notes.md"):
         message = await retry_message(Write, deps, content="mine 2\n", filePath="notes.md")
-        await other.rollback()
     await quick.settle()
     assert message == "/workspace/notes.md is locked by another write in progress. Try again."
     assert await content(client, "notes.md") == b"mine\n"

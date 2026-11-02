@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from minifs.db.pool import Connector, Pools
 from minifs.vfs.cache import DirEntryCache
-from minifs.vfs.client import DEFAULT_LOCK_TIMEOUT, DEFAULT_WRITE_TIMEOUT, VFSClient
+from minifs.vfs.client import DEFAULT_LOCK_TIMEOUT, DEFAULT_WRITE_TIMEOUT, VFSClient, check_timeout
 from minifs.vfs.watch import Watcher
 
 
@@ -56,6 +56,8 @@ async def open_vfs(
     """
     if listen is not None and cache is None and not watch:
         raise ValueError("listen= needs a cache or watch=True: nothing would listen")
+    check_timeout("lock_timeout", lock_timeout)  # before any connection is opened
+    check_timeout("write_timeout", write_timeout)
     async with contextlib.AsyncExitStack() as stack:
         pools = await stack.enter_async_context(
             Pools(connector, write_size=write_size, search_size=search_size, min_size=min_size)
