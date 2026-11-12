@@ -7,6 +7,7 @@ import pytest
 from minifs.tools import Grep, Read
 from minifs.tools.deps import GrepSettings, ToolSettings
 from minifs.tools.grep import DESCRIPTION
+from minifs.vfs import regex
 from minifs.vfs.client import MAX_TIMEOUT, VFSClient
 from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError
@@ -158,6 +159,25 @@ async def test_a_translator_bug_is_a_retry(deps: Deps, monkeypatch: pytest.Monke
     assert await retry_message(Grep, deps, pattern="x") == "Internal error translating this pattern; try a simpler one"
 
 
+async def test_a_translator_bug_in_a_real_search_is_a_retry(
+    client: VFSClient, deps: Deps, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The whole chain: the error is raised by regex.validate inside the client's transaction and must reach the
+    # tool as itself, through the client and the view.
+    await make(client, {"a.txt": b"hit\n"})
+    real = regex.translate
+
+    def broken(pattern: str, ignore_case: bool = False) -> regex.Translation:
+        if pattern == "translated_wrongly":
+            return regex.Translation(pattern, ignore_case, "a{2,256}")  # Postgres rejects it
+        return real(pattern, ignore_case)
+
+    monkeypatch.setattr(regex, "translate", broken)
+    message = await retry_message(Grep, deps, pattern="translated_wrongly")
+    assert message == "Internal error translating this pattern; try a simpler one"
+    assert "Line 1: hit" in await run_tool(Grep, deps, pattern="hit")  # other patterns still search
+
+
 async def test_an_unsupported_database_is_a_result(
     deps: Deps, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -172,7 +192,7 @@ async def test_an_unsupported_database_is_a_result(
     assert "SQL_ASCII" in caplog.text  # for the operator, not the model
 
 
-async def test_any_other_runtime_error_is_a_retry_logged_with_a_cut_pattern(
+async def test_any_other_runtime_error_is_a_result_logged_with_a_cut_pattern(
     deps: Deps, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def broken(*args: object, **kwargs: object) -> GrepResult:
@@ -181,13 +201,14 @@ async def test_any_other_runtime_error_is_a_retry_logged_with_a_cut_pattern(
     monkeypatch.setattr(deps.vfs, "grep", broken)
     pattern = "secret" * 1000
     with caplog.at_level(logging.ERROR, logger="minifs.tools.grep"):
-        message = await retry_message(Grep, deps, pattern=pattern)
-    assert message == "Internal error searching for this pattern; try a simpler one"
+        # Not a retry: the cause may not be the pattern, and a retry that fails again ends the run.
+        out = await run_tool(Grep, deps, pattern=pattern)
+    assert out == "Grep failed: internal error. Try a different pattern or use the other tools."
     (record,) = caplog.records
     assert record.levelno == logging.ERROR and record.exc_info is not None
     logged = record.getMessage()
-    assert pattern[:LOG_CHARS] in logged and pattern[: LOG_CHARS + 1] not in logged
-    assert "(6000 characters)" in logged
+    assert pattern[: LOG_CHARS - 1] in logged and pattern[:LOG_CHARS] not in logged  # the repr opens with a quote
+    assert "(6000 characters, sha256 " in logged
 
 
 async def test_paths_outside_the_view_are_not_found(deps: Deps) -> None:

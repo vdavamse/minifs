@@ -65,10 +65,11 @@ async def grep(ctx: RunContext[HasVFS], pattern: str, path: str | None = None, i
         logger.error("Grep is unavailable: %s", e)
         return "Grep is unavailable: internal error. Use the other tools instead."
     except RuntimeError:
-        # Anything else that isn't the model's doing mustn't end the run either. The pattern may quote file
-        # contents, so the log carries it cut short.
+        # Anything else that isn't the model's doing mustn't end the run either. The cause is unknown and may not
+        # be the pattern, so this is a result too: a retry that fails again would end the run. The pattern may
+        # quote file contents, so the log carries it cut short.
         logger.exception("Grep failed on the pattern %s", clipped(pattern))
-        raise ModelRetry("Internal error searching for this pattern; try a simpler one") from None
+        return "Grep failed: internal error. Try a different pattern or use the other tools."
 
     if not result.hits:
         return "No files found"

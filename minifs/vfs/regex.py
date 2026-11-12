@@ -11,6 +11,7 @@ message carry both cut to ``LOG_CHARS`` (``clipped``).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import sys
@@ -69,10 +70,14 @@ LOG_CHARS = 200
 
 
 def clipped(text: str, limit: int = LOG_CHARS) -> str:
-    """``text``'s ``repr`` for a log line: whole up to ``limit`` characters, else its start and its full length."""
-    if len(text) <= limit:
-        return repr(text)
-    return f"{text[:limit]!r}... ({len(text)} characters)"
+    """``text``'s ``repr`` for a log line: whole, or its first ``limit`` characters followed by the text's length and
+    the start of its SHA-256, which tells one long pattern from another and confirms a candidate. The limit is on the
+    ``repr``, since escapes make it longer than the text."""
+    shown = repr(text)
+    if len(shown) <= limit:
+        return shown
+    digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    return f"{shown[:limit]}... ({len(text)} characters, sha256 {digest})"
 
 
 class RegexTranslationBug(RuntimeError):
