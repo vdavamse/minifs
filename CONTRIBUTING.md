@@ -38,6 +38,11 @@ cross-check against it; without it they skip, while in CI they fail.
 | `crates/minifs-regex/` | Rust regex translator, imported as `minifs._regex` (stubs in `minifs/_regex.pyi`) |
 | `tests/conftest.py` | Postgres fixtures |
 
+A new function of `minifs._regex` runs behind `translate::guarded`, like the others: a Rust panic then reaches
+Python as a `RegexError` ("internal error: ..."), not as pyo3's `PanicException`, a `BaseException` that no caller
+catches. Still return an `Err` rather than `expect`/`unwrap` on anything derived from a pattern; the guard is the
+backstop. `_regex.oracle_panic` (development builds) tests it.
+
 ## Migrations
 
 Add a file `minifs/db/migrations/NNN_lower_snake.sql` with the next free number. Each file runs in one

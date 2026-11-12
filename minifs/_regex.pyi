@@ -11,6 +11,10 @@ class RegexError(ValueError):
     ``message`` is the text to show: regex-syntax's error formatted as ripgrep prints it for parse errors, otherwise
     a one-line reason with a hint. ``span`` holds the character offsets ``(start, end)`` of the offending part when
     known. ``syntax`` is true when regex-syntax rejected the pattern, so ripgrep rejects it too.
+
+    A bug in the translator is one as well, with a ``message`` starting ``internal error:``: every function here
+    catches a Rust panic and raises it as ``RegexError``, never as pyo3's ``PanicException``, which is a
+    ``BaseException`` that no ``except Exception`` would catch.
     """
 
     message: str
@@ -52,3 +56,6 @@ def oracle_random_pattern(seed: int) -> str: ...
 def oracle_glob_is_match(pattern: str, path: str, is_dir: bool = False, exclude: bool = False) -> bool:
     """Whether ``rg -g pattern`` (with ``exclude``, ``rg -g '!pattern'``) matches ``path`` (a directory when
     ``is_dir``), by ripgrep's own matcher (bytes, not characters)."""
+
+def oracle_panic(message: str) -> None:
+    """Panics in Rust, behind the guard every function here runs under: raises ``RegexError``."""

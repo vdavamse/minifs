@@ -24,6 +24,8 @@ pyo3::create_exception!(
      `syntax` whether regex-syntax (and so ripgrep) rejected it."
 );
 
+/// The `RegexError` for `err`. Every entry point runs behind [`translate::guarded`], so a
+/// panic is one too ("internal error: ...").
 fn regex_error(py: Python<'_>, err: translate::Error) -> PyErr {
     let pyerr = RegexError::new_err(err.message.clone());
     let value = pyerr.value(py);
@@ -43,7 +45,7 @@ fn regex_error(py: Python<'_>, err: translate::Error) -> PyErr {
 #[pyfunction(name = "translate")]
 #[pyo3(signature = (pattern, ignore_case = false))]
 fn py_translate(py: Python<'_>, pattern: &str, ignore_case: bool) -> PyResult<String> {
-    translate::translate(pattern, ignore_case)
+    translate::guarded(|| translate::translate(pattern, ignore_case))
         .map(|t| t.line_form)
         .map_err(|e| regex_error(py, e))
 }
@@ -55,7 +57,8 @@ type PyGlobPlan = (String, Vec<String>, Option<u32>, Option<String>, bool);
 #[pyfunction(name = "compile_glob")]
 #[pyo3(signature = (pattern, exclude = false))]
 fn py_compile_glob(py: Python<'_>, pattern: &str, exclude: bool) -> PyResult<PyGlobPlan> {
-    let plan = glob::compile(pattern, exclude).map_err(|e| regex_error(py, e))?;
+    let plan =
+        translate::guarded(|| glob::compile(pattern, exclude)).map_err(|e| regex_error(py, e))?;
     Ok((
         plan.regex,
         plan.prefix,
@@ -69,7 +72,8 @@ fn py_compile_glob(py: Python<'_>, pattern: &str, exclude: bool) -> PyResult<PyG
 /// pattern ending in `/` matches only directories, so it is rejected.
 #[pyfunction(name = "glob_to_are")]
 fn py_glob_to_are(py: Python<'_>, pattern: &str) -> PyResult<String> {
-    let plan = glob::compile(pattern, false).map_err(|e| regex_error(py, e))?;
+    let plan =
+        translate::guarded(|| glob::compile(pattern, false)).map_err(|e| regex_error(py, e))?;
     if plan.only_dir {
         return Err(regex_error(
             py,
@@ -85,8 +89,8 @@ fn py_glob_to_are(py: Python<'_>, pattern: &str) -> PyResult<String> {
 
 /// Escapes regex metacharacters, so the result matches `text` literally.
 #[pyfunction(name = "escape")]
-fn py_escape(text: &str) -> String {
-    translate::escape(text)
+fn py_escape(py: Python<'_>, text: &str) -> PyResult<String> {
+    translate::guarded(|| Ok(translate::escape(text))).map_err(|e| regex_error(py, e))
 }
 
 #[cfg(feature = "oracle")]
@@ -116,6 +120,14 @@ fn py_oracle_random_pattern(seed: u64) -> String {
     oracle::random_pattern(seed)
 }
 
+/// Panics behind the same guard as every other entry point, for the test that a panic in
+/// the extension reaches Python as a `RegexError`.
+#[cfg(feature = "oracle")]
+#[pyfunction(name = "oracle_panic")]
+fn py_oracle_panic(py: Python<'_>, message: String) -> PyResult<()> {
+    translate::guarded::<()>(|| panic!("{message}")).map_err(|e| regex_error(py, e))
+}
+
 #[pymodule]
 fn _regex(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", VERSION)?;
@@ -132,6 +144,7 @@ fn _regex(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_oracle_is_match, m)?)?;
         m.add_function(wrap_pyfunction!(py_oracle_random_pattern, m)?)?;
         m.add_function(wrap_pyfunction!(py_oracle_glob_is_match, m)?)?;
+        m.add_function(wrap_pyfunction!(py_oracle_panic, m)?)?;
     }
     Ok(())
 }
