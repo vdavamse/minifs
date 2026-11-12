@@ -14,7 +14,7 @@ and treats no answer within ``probe_timeout`` as a lost connection, which it clo
 server. The probe keeps a Lakebase compute awake while a watcher runs; that is the price of noticing a dead
 connection.
 
-The channel is the schema's own (``vfs_channel()``, migration 016), read from the database when the watcher
+The channel is the schema's own (``vfs_channel()``, migration 017), read from the database when the watcher
 connects, so two minifs schemas in one database don't see each other's events. CONNECT on the database is still the
 trust boundary: channels are database-wide, so anyone who can connect can NOTIFY on it, and PostgreSQL folds
 identical payloads within one transaction. Events are hints, not facts: react to one by reading the database, never
@@ -498,7 +498,7 @@ class Watcher:
                         cur = await conn.execute("SELECT vfs_channel()")
                     except errors.UndefinedFunction as error:
                         raise RuntimeError(
-                            "vfs_channel() not found: the schema predates migration 016 (run `minifs db migrate`), "
+                            "vfs_channel() not found: the schema predates migration 017 (run `minifs db migrate`), "
                             "or it isn't on this connection's search_path"
                         ) from error
                     row = await cur.fetchone()

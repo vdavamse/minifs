@@ -24,7 +24,7 @@ BEGIN
     EXECUTE format('CREATE FUNCTION vfs_channel() RETURNS text LANGUAGE sql IMMUTABLE AS %L',
                    format('SELECT %L', v_channel));
     EXECUTE format('COMMENT ON FUNCTION vfs_channel() IS %L',
-                   'The NOTIFY channel of this schema (migration 016): what vfs_notify sends on and a watcher listens to.');
+                   'The NOTIFY channel of this schema (migration 017): what vfs_notify sends on and a watcher listens to.');
 END $$;
 
 

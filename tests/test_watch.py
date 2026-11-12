@@ -470,9 +470,9 @@ async def test_channel_is_the_schemas(conn: AsyncConnection, watcher: Watcher) -
 
 
 async def test_a_schema_without_the_channel_function_fails_at_start(empty_db: str) -> None:
-    """A schema that predates migration 016 has no vfs_channel(): the watcher says so instead of listening on a
+    """A schema that predates migration 017 has no vfs_channel(): the watcher says so instead of listening on a
     channel nothing notifies."""
-    with pytest.raises(RuntimeError, match="migration 016"):
+    with pytest.raises(RuntimeError, match="migration 017"):
         await Watcher(factory(empty_db)).start()
 
 

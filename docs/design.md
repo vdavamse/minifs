@@ -170,7 +170,7 @@ The remaining misses are first uses. An entry costs about 500 bytes, and `max_en
 
 ## Watch
 
-A trigger on `vfs_nodes` (migration 005) sends one NOTIFY per changed row, as a small JSON payload, on the schema's own channel: `vfs_channel()` returns `vfs_<schema>` (or `vfs_` and the md5 of a schema name too long for a channel), computed once by migration 016 from `current_schema()`, so two minifs schemas in one database don't see each other's events, names included. Every event has `op`, `id` and `parent`:
+A trigger on `vfs_nodes` (migration 005) sends one NOTIFY per changed row, as a small JSON payload, on the schema's own channel: `vfs_channel()` returns `vfs_<schema>` (or `vfs_` and the md5 of a schema name too long for a channel), computed once by migration 017 from `current_schema()`, so two minifs schemas in one database don't see each other's events, names included. Every event has `op`, `id` and `parent`:
 
 | `op` | Extra fields | Emitted by |
 | --- | --- | --- |
@@ -184,7 +184,7 @@ Notifications are delivered at commit, so a watcher is never woken for data it c
 
 **CONNECT is the trust boundary.** Channels are database-wide, so a role with CONNECT on the database can NOTIFY on this schema's channel: forge events, or send `rescan` in a loop. Forged events can't make a watcher act wrongly (it reads the database first) and can't name a node in another workspace (ids are random); what they can cost is bounded: a subscription delivers at most one `rescan` per `rescan_interval` (1 s by default; the rest collapse into it, so a real rescan is delayed at most that long, never lost), and a malformed payload is logged cut to 200 characters, at most once every 10 s. A deployment that can't trust every role with CONNECT should give minifs a database of its own.
 
-`minifs.vfs.watch.Watcher` holds the process's one `LISTEN` connection, from a connection factory, so each reconnect has a fresh credential; it reads the channel from the database (`SELECT vfs_channel()`) when that connection opens, and fails at start, saying so, on a schema that predates migration 016 (upgrade the schema and the clients together: an older client still listens on `vfs` and receives nothing). `watcher.watch(path)` filters it by node id (a file) or parent id (a directory). It subscribes before resolving the path, so nothing committed after it returns is missed. Like inotify, a watch follows the node through renames until it is deleted. After a reconnect, every subscriber gets a `rescan`, and a watch whose node is gone ends. A keepalive probe (every 30 s) notices a connection that died silently. The directory cache subscribes to the same connection.
+`minifs.vfs.watch.Watcher` holds the process's one `LISTEN` connection, from a connection factory, so each reconnect has a fresh credential; it reads the channel from the database (`SELECT vfs_channel()`) when that connection opens, and fails at start, saying so, on a schema that predates migration 017 (upgrade the schema and the clients together: an older client still listens on `vfs` and receives nothing). `watcher.watch(path)` filters it by node id (a file) or parent id (a directory). It subscribes before resolving the path, so nothing committed after it returns is missed. Like inotify, a watch follows the node through renames until it is deleted. After a reconnect, every subscriber gets a `rescan`, and a watch whose node is gone ends. A keepalive probe (every 30 s) notices a connection that died silently. The directory cache subscribes to the same connection.
 
 ## Glob
 
