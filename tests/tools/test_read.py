@@ -26,7 +26,7 @@ from minifs.tools import read as read_module
 from minifs.tools.deps import ReadSettings, ToolSettings
 from minifs.tools.read import DESCRIPTION, MAX_ATTACHMENT_BYTES, SAMPLE_BYTES
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import LineReadResult, ReadResult, VFSError
+from minifs.vfs.core import Entry, LineReadResult, ReadResult, VFSError
 from minifs.vfs.policy import Policy, Rule
 from minifs.vfs.view import VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
@@ -279,6 +279,128 @@ async def test_suggestions_come_from_the_view(deps: Deps) -> None:
     assert await retry_message(Read, deps, filePath="notes.md/x") == "File not found: /workspace/notes.md/x"
 
 
+# Caps (#86)
+
+
+async def test_instruction_files_are_cut_at_the_cap(client: VFSClient, deps: Deps) -> None:
+    """An instruction file is read up to ``instruction_bytes``, cut back to a whole character, and says so."""
+    await put(client, "/workspace/pkg/AGENTS.md", ("é" * 600).encode())  # 1,200 bytes; 1,001 splits a character
+    await put(client, "/workspace/pkg/sub/CLAUDE.md", b"short")
+    await put(client, "/workspace/pkg/sub/f.txt", b"x\n")
+    capped = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(instruction_bytes=1001)))
+    out = await run_tool(Read, capped, filePath="pkg/sub/f.txt")
+    assert out.endswith(
+        "<system-reminder>\nInstructions from: /workspace/pkg/sub/CLAUDE.md\nshort\n\n"
+        "Instructions from: /workspace/pkg/AGENTS.md\n" + "é" * 500 + "\n\n"
+        "(Instructions truncated at 1001 bytes of 1200)\n</system-reminder>"
+    )
+    assert "�" not in out
+    whole = await run_tool(Read, deps, filePath="pkg/sub/f.txt")  # the default cap, 64 KB, takes it whole
+    assert "Instructions from: /workspace/pkg/AGENTS.md\n" + "é" * 600 + "\n</system-reminder>" in whole
+
+
+def test_whole_characters() -> None:
+    cut = read_module._whole_characters  # pyright: ignore[reportPrivateUsage]
+    assert cut("é".encode()[:1]) == b""
+    assert cut(b"ab" + "😀".encode()[:3]) == b"ab"
+    assert cut(b"ab" + "😀".encode()) == b"ab" + "😀".encode()
+    assert cut(b"abc") == b"abc" and cut(b"") == b""
+    assert cut(b"\xff\xfe") == b"\xff\xfe"  # invalid bytes are kept, for errors="replace" to show
+
+
+async def test_a_directory_over_the_cap_is_paged_in_byte_order(client: VFSClient, deps: Deps) -> None:
+    """Up to ``max_entries`` a listing is ladderframe's (sorted case-insensitively, paged in Python); past it a
+    page is in byte order of name and at most ``max_entries`` long, the footer says so, and every entry stays
+    reachable."""
+    await client.mkdir(f"{WS}/big/d", parents=True)
+    for name in ("B", "a", "c", "é"):
+        await put(client, f"/workspace/big/{name}", b"")
+    small = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(max_entries=3)))
+    order = "in byte order of name: the directory is over the 3 entries Read sorts"
+    head = "<path>/workspace/big</path>\n<type>directory</type>\n<entries>\n"
+    more = f"(Showing 3 of more than 3 entries, {order}. Use 'offset' parameter to read beyond entry 4)\n</entries>"
+    assert await run_tool(Read, small, filePath="big") == f"{head}B\na\nc\n\n{more}"
+    assert await run_tool(Read, small, filePath="big", limit=2**40) == f"{head}B\na\nc\n\n{more}"  # a page is capped
+    assert await run_tool(Read, small, filePath="big", limit=2) == (
+        f"{head}B\na\n\n(Showing 2 of more than 3 entries, {order}. "
+        "Use 'offset' parameter to read beyond entry 3)\n</entries>"
+    )
+    # Past the entries the first call fetched, the page continues by name; at the end the count is known.
+    assert await run_tool(Read, small, filePath="big", offset=4, limit=2) == (
+        f"{head}d/\né\n\n(Showing 2 of 5 entries, {order})\n</entries>"
+    )
+    assert await run_tool(Read, small, filePath="big", offset=3) == (
+        f"{head}c\nd/\né\n\n(Showing 3 of 5 entries, {order})\n</entries>"
+    )
+    for offset in (9, 2**70):
+        assert f"<entries>\n\n\n(Showing 0 of 5 entries, {order})" in await run_tool(
+            Read, small, filePath="big", offset=offset
+        )
+    # With the cap at 5 the same directory is listed as ladderframe lists it.
+    sorted_deps = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(max_entries=5)))
+    assert "<entries>\na\nB\nc\nd/\né\n\n(5 entries)\n</entries>" in await run_tool(Read, sorted_deps, filePath="big")
+
+
+async def test_a_directory_over_the_cap_is_never_fetched_whole(
+    client: VFSClient, deps: Deps, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whatever the offset and the limit, no call asks for more than ``max_entries + 1`` entries."""
+    for i in range(12):
+        await put(client, f"/workspace/big/f{i:02}", b"")
+    asked: list[int | None] = []
+    readdir = VFSClient.readdir
+
+    async def spy(self: VFSClient, path: str, *, after: str | None = None, limit: int | None = None) -> list[Entry]:
+        asked.append(limit)
+        return await readdir(self, path, after=after, limit=limit)
+
+    monkeypatch.setattr(VFSClient, "readdir", spy)
+    monkeypatch.setattr("minifs.vfs.view._READDIR_BATCH", 1)
+    small = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(max_entries=3)))
+    out = await run_tool(Read, small, filePath="big", offset=9, limit=2**40)
+    assert "<entries>\nf08\nf09\nf10\n\n(Showing 3 of more than 3 entries" in out and "beyond entry 12)" in out
+    assert asked and all(limit is not None and limit <= 4 for limit in asked)
+    asked.clear()
+    assert await retry_message(Read, small, filePath="big/f") == "File not found: /workspace/big/f"
+    assert asked == [4]
+
+
+async def test_a_page_over_the_cap_counts_readable_entries(client: VFSClient, view: VFSView) -> None:
+    """Hidden entries take no place in a page: offsets count the entries the actor can read."""
+    await client.mkdir(f"{WS}/big", parents=True)
+    for name in "abcd":
+        await put(client, f"/workspace/big/{name}", b"")
+    policy = Policy({"agent": [Rule("/workspace/big/b"), Rule("/workspace/**", "read", "write")]})
+    agent = VFSView(view._client, workspace_mounts(W1), policy, "agent")  # pyright: ignore[reportPrivateUsage]
+    deps = Deps(agent, vfs_settings=ToolSettings(read=ReadSettings(max_entries=2)))
+    out = await run_tool(Read, deps, filePath="big", limit=3)
+    assert "<entries>\na\nc\n\n(Showing 2 of more than 2 entries, in byte order" in out and "beyond entry 3)" in out
+    assert "<entries>\nd\n\n(Showing 1 of 3 entries, in byte order" in await run_tool(
+        Read, deps, filePath="big", offset=3
+    )
+
+
+async def test_no_suggestions_from_a_directory_over_the_cap(client: VFSClient, deps: Deps) -> None:
+    for name in ("guide.md", "other.md", "third.md"):
+        await put(client, f"/workspace/big/{name}", b"")
+    small = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(max_entries=2)))
+    assert await retry_message(Read, small, filePath="big/guid") == "File not found: /workspace/big/guid"
+    enough = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(max_entries=3)))
+    assert await retry_message(Read, enough, filePath="big/guid") == (
+        "File not found: /workspace/big/guid\n\nDid you mean one of these?\n/workspace/big/guide.md"
+    )
+
+
+def test_read_settings_are_checked() -> None:
+    assert (ReadSettings().instruction_bytes, ReadSettings().max_entries) == (64 * 1024, 10_000)
+    with pytest.raises(ValueError, match="read max_entries must be at least 1"):
+        ReadSettings(max_entries=0)
+    with pytest.raises(ValueError, match="read max_bytes must be at least 0"):
+        ReadSettings(max_bytes=-1)
+    with pytest.raises(TypeError, match="read instruction_bytes"):
+        ReadSettings(instruction_bytes=True)
+
+
 # Byte-identical output: ladderframe's _read_lines over the same bytes
 
 
@@ -460,11 +582,12 @@ async def test_instructions_already_shown_are_looked_up_not_read(
     assert "Use tabs." in first and "not used" not in first
     assert again.endswith("</content>")
     agents, claude = "/workspace/pkg/AGENTS.md", "/workspace/pkg/CLAUDE.md"
-    assert asked == [[(agents, 0, 2**31 - 1), (claude, 0, 2**31 - 1)], [(agents, 0, 0), (claude, 0, 2**31 - 1)]]
+    cap = ReadSettings().instruction_bytes
+    assert asked == [[(agents, 0, cap), (claude, 0, cap)], [(agents, 0, 0), (claude, 0, cap)]]
     assert transferred == [[b"Use tabs.", b""], [b"", b""]]
     asked.clear()
     assert "<system-reminder>" not in await run_tool(Read, Deps(view), filePath="pkg/AGENTS.md")
-    assert asked == [[(agents, 0, 0), (claude, 0, 2**31 - 1)]]
+    assert asked == [[(agents, 0, 0), (claude, 0, cap)]]
 
 
 async def test_directory_paging_edges(deps: Deps) -> None:

@@ -10,7 +10,7 @@ from uuid import UUID
 
 import psycopg
 import pytest
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 
 from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO, errno_name
 
@@ -390,6 +390,60 @@ async def test_readdir_errors(conn: AsyncConnection) -> None:
         await readdir(conn, file)
     with raises_errno("ENOENT"):
         await readdir(conn, uuid.uuid4())
+
+
+async def test_readdir_pages_by_name(conn: AsyncConnection) -> None:
+    """p_after and p_limit page the listing in byte order; an empty page is no rows (migration 018)."""
+    directory = await create(conn, None, "d", "dir")
+    await create(conn, None, "e", "dir")
+    for name in ["B", "a", "b", "c", "é"]:
+        await create(conn, directory, name)
+
+    async def page(parent: UUID | None, after: str | None, limit: int | None) -> list[str]:
+        cur = await conn.execute("SELECT name, err FROM vfs_readdir(%s, %s, %s)", (parent, after, limit))
+        rows = await cur.fetchall()
+        assert all(err is None for _, err in rows)
+        return [name for name, _ in rows]
+
+    assert await page(directory, None, 2) == ["B", "a"]
+    assert await page(directory, "a", 2) == ["b", "c"]
+    assert await page(directory, "a", None) == ["b", "c", "é"]
+    assert await page(directory, "aa", 1) == ["b"]  # after a name that isn't there
+    assert await page(directory, "C", 1) == ["a"]  # byte order: "C" sorts before "a"
+    assert await page(directory, "é", 2) == []
+    assert await page(directory, None, 0) == []
+    assert await page(None, None, 1) == ["d"]
+    assert await page(None, "d", None) == ["e"]
+    assert await readdir(conn, directory) == [(name, "file") for name in ["B", "a", "b", "c", "é"]]  # one argument
+    with raises_errno("EINVAL"):
+        await page(directory, None, -1)
+    with raises_errno("ENOENT"):
+        await readdir(conn, uuid.uuid4())
+
+
+async def test_a_readdir_page_reads_only_its_rows(conn: AsyncConnection) -> None:
+    """A page is a bounded range scan of the (parent_id, name) index, under a generic plan too: no sort of the
+    directory, and no walk over the entries before the page."""
+    directory = await create(conn, None, "d", "dir")
+    await conn.execute(
+        "INSERT INTO vfs_nodes (parent_id, name, kind) SELECT %s, 'f' || lpad(i::text, 5, '0'), 'file'"
+        " FROM generate_series(1, 3000) i",
+        (directory,),
+    )
+    await conn.execute("ANALYZE vfs_nodes")
+    await conn.execute("SET plan_cache_mode = force_generic_plan")
+    await conn.execute(
+        "PREPARE page(uuid, text, int) AS SELECT n.name FROM vfs_nodes n"
+        ' WHERE n.parent_id = $1 AND n.name > $2 COLLATE "C" ORDER BY n.name LIMIT $3'
+    )
+    # EXPLAIN takes no parameters, so the id goes in as a literal.
+    explain = sql.SQL("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) EXECUTE page({}, 'f02000', 10)")
+    cur = await conn.execute(explain.format(sql.Literal(directory)))
+    plan = "\n".join(line for (line,) in await cur.fetchall())
+    assert "Sort" not in plan and "Bitmap" not in plan, plan
+    assert "rows=10" in plan and "Rows Removed" not in plan, plan
+    cur = await conn.execute("SELECT name FROM vfs_readdir(%s, 'f02000', 2)", (directory,))
+    assert [name for (name,) in await cur.fetchall()] == ["f02001", "f02002"]
 
 
 # vfs_create
