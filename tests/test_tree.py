@@ -1,6 +1,7 @@
 """vfs_nodes and the tree operations: vfs_lookup, vfs_readdir, vfs_create, vfs_mkdir_p, vfs_rename, vfs_unlink."""
 
 import asyncio
+import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, Generator
@@ -13,6 +14,7 @@ import pytest
 from psycopg import AsyncConnection
 
 from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO, errno_name
+from minifs.vfs.core import CONTROL_CHARACTERS
 
 Kind = str
 
@@ -910,3 +912,26 @@ async def test_a_lookup_joins_as_an_index_lookup(conn: AsyncConnection) -> None:
         "EXPLAIN SELECT n.size FROM vfs_lookup(ARRAY['d', 'f7']) r LEFT JOIN vfs_nodes n ON n.id = r.id"
     )
     assert "Seq Scan on vfs_nodes" in "\n".join(line for (line,) in await cur.fetchall())
+
+
+async def test_control_character_class_matches_the_client(conn: AsyncConnection) -> None:
+    """The class in vfs_check_name and in the constraint is ``CONTROL_CHARACTERS`` exactly, over every code point
+    (NUL aside, which text can't hold): the pattern is written out in both languages, and an edit to one copy
+    must fail here. A name with a control character is refused even when it has a '/' too, by code point."""
+    constraint = await conn.execute(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'vfs_nodes_name_check'"
+    )
+    function = await conn.execute("SELECT prosrc FROM pg_proc WHERE proname = 'vfs_check_name'")
+    sources = [row[0] for row in await constraint.fetchall()] + [row[0] for row in await function.fetchall()]
+    patterns = [pattern for source in sources for pattern in re.findall(r"'(\[\\u0001[^']*\])'", source)]
+    assert len(patterns) == 3 and len(set(patterns)) == 1  # the constraint, and the test and substring in the function
+    cursor = await conn.execute(
+        "SELECT i FROM generate_series(1, 1114111) AS i WHERE i NOT BETWEEN 55296 AND 57343 AND chr(i) ~ %s",
+        (patterns[0],),
+    )
+    refused = {row[0] for row in await cursor.fetchall()}
+    assert refused == {i for i in range(1, 0x110000) if CONTROL_CHARACTERS.fullmatch(chr(i))}
+
+    with pytest.raises(psycopg.Error) as info:
+        await create(conn, None, "a/\nb")
+    assert info.value.diag.message_detail == "name contains the control character U+000A"
