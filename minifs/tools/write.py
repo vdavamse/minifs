@@ -22,7 +22,7 @@ from pydantic_ai.messages import ToolReturn
 from minifs.tools._text import BOM, TooLarge, create_file, diff_metadata, encode_text, read_file, split_bom
 from minifs.tools.base import vfs_tool
 from minifs.tools.deps import HasVFS, resolve, settings
-from minifs.tools.errors import tool_error
+from minifs.tools.errors import TIMED_OUT_WRITE, tool_error
 from minifs.vfs.core import FileVersion, VFSError
 from minifs.vfs.view import VFSView
 
@@ -62,7 +62,7 @@ async def write(ctx: RunContext[HasVFS], content: str, filePath: str) -> str | T
         else:
             raise VFSError("ESTALE", path)
     except VFSError as e:
-        return tool_error(e, "write")
+        return tool_error(e, "write", ETIMEDOUT=TIMED_OUT_WRITE)
     if content_old is None:
         diff: dict[str, Any] = {"diff": "", "additions": None, "deletions": None}
     else:
