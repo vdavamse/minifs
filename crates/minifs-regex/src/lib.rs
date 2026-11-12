@@ -24,8 +24,8 @@ pyo3::create_exception!(
      `syntax` whether regex-syntax (and so ripgrep) rejected it."
 );
 
-/// The `RegexError` for `err`. Every entry point runs behind [`translate::guarded`], so a
-/// panic is one too ("internal error: ...").
+/// The `RegexError` for `err`. Every entry point but the oracle's (development builds only)
+/// runs behind [`translate::guarded`], so a panic is one too ("internal error: ...").
 fn regex_error(py: Python<'_>, err: translate::Error) -> PyErr {
     let pyerr = RegexError::new_err(err.message.clone());
     let value = pyerr.value(py);

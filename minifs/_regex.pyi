@@ -12,8 +12,8 @@ class RegexError(ValueError):
     a one-line reason with a hint. ``span`` holds the character offsets ``(start, end)`` of the offending part when
     known. ``syntax`` is true when regex-syntax rejected the pattern, so ripgrep rejects it too.
 
-    A bug in the translator is one as well, with a ``message`` starting ``internal error:``: every function here
-    catches a Rust panic and raises it as ``RegexError``, never as pyo3's ``PanicException``, which is a
+    A bug in the translator is one as well, with a ``message`` starting ``internal error:``: every function here but the
+    ``oracle_*`` ones (development builds only) catches a Rust panic and raises it as ``RegexError``, never as pyo3's ``PanicException``, which is a
     ``BaseException`` that no ``except Exception`` would catch.
     """
 

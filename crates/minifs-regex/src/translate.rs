@@ -83,7 +83,12 @@ pub fn guarded<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
             .copied()
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("no message");
-        let reason: String = reason.chars().take(MAX_PANIC_MESSAGE).collect();
+        // One line, as every message is: a panic message can hold anything.
+        let reason: String = reason
+            .chars()
+            .take(MAX_PANIC_MESSAGE)
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
         Err(Error {
             message: format!("internal error: the pattern translator panicked ({reason})"),
             span: None,
@@ -545,6 +550,10 @@ mod tests {
                 "internal error: the pattern translator panicked ({})",
                 "x".repeat(MAX_PANIC_MESSAGE)
             )
+        );
+        assert_eq!(
+            panicked(|| panic!("two\nlines\tand a tab")),
+            "internal error: the pattern translator panicked (two lines and a tab)"
         );
         assert_eq!(
             panicked(|| std::panic::panic_any(7)),
