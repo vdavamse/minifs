@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 
+from minifs.db.migrate import migrate
 from minifs.vfs.core import VFSError
 from minifs.vfs.watch import RESCAN, ConnectionFactory, Event, Subscription, Watcher
 from tests.test_tree import create, mkdir_p, rename, unlink
@@ -48,16 +50,37 @@ async def catch_up(watcher: Watcher, conn: AsyncConnection) -> None:
     marker = uuid4()
     with watcher.subscribe(lambda e: e.id == marker) as events:
         payload = json.dumps({"op": "modify", "id": str(marker), "parent": str(uuid4())})
-        await conn.execute("SELECT pg_notify('vfs', %s)", (payload,))
+        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (payload,))
         assert (await next_event(events)).id == marker
 
 
 @pytest.fixture
 async def listener(db: str) -> AsyncIterator[AsyncConnection]:
-    """A plain connection listening on vfs, to check the trigger's payloads."""
+    """A plain connection listening on the schema's channel, to check the trigger's payloads."""
     async with await AsyncConnection.connect(db, autocommit=True) as conn:
-        await conn.execute("LISTEN vfs")
+        await conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(await channel(conn))))
         yield conn
+
+
+async def channel(conn: AsyncConnection) -> str:
+    """The schema's NOTIFY channel, as the trigger and the watcher get it."""
+    row = await (await conn.execute("SELECT vfs_channel()")).fetchone()
+    assert row is not None and isinstance(row[0], str)
+    return row[0]
+
+
+async def collect(events: Subscription, seconds: float) -> list[tuple[float, Event]]:
+    """Every event delivered within ``seconds``, each with the loop time it was taken."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + seconds
+    taken: list[tuple[float, Event]] = []
+    while (left := end - loop.time()) > 0:
+        try:
+            event = await asyncio.wait_for(events.get(), left)
+        except TimeoutError:
+            break
+        taken.append((loop.time(), event))
+    return taken
 
 
 @pytest.fixture
@@ -431,10 +454,94 @@ async def test_forged_delete_does_not_end_the_watch(conn: AsyncConnection, watch
     await catch_up(watcher, conn)
     async with watcher.watch("d") as events:
         forged = {"op": "delete", "id": str(d), "parent": None, "name": "d", "kind": "dir"}
-        await conn.execute("SELECT pg_notify('vfs', %s)", (json.dumps(forged),))
+        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps(forged),))
         assert (await next_event(events)).op == "delete"
         f = await create(conn, d, "f")
         assert (await next_event(events)).id == f
+
+
+async def test_channel_is_the_schemas(conn: AsyncConnection, watcher: Watcher) -> None:
+    """The trigger notifies on vfs_channel(), vfs_<schema>, and the watcher listens there (the fixture's database
+    is migrated in public)."""
+    assert await channel(conn) == "vfs_public" == watcher.channel
+    with watcher.subscribe() as events:
+        f = await create(conn, None, "f")
+        assert await next_event(events) == Event("create", id=f, parent=None, name="f", kind="file")
+
+
+async def test_a_schema_without_the_channel_function_fails_at_start(empty_db: str) -> None:
+    """A schema that predates migration 016 has no vfs_channel(): the watcher says so instead of listening on a
+    channel nothing notifies."""
+    with pytest.raises(RuntimeError, match="migration 016"):
+        await Watcher(factory(empty_db)).start()
+
+
+async def test_each_schema_has_its_own_channel(conn: AsyncConnection, db: str) -> None:
+    """A second minifs schema in the same database gets its own channel, so a watcher on one never sees the
+    other's events; a schema name too long for a channel gets the md5 form."""
+    long = "s" * 60
+    for schema in ("other", long):
+        await conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+        async with await AsyncConnection.connect(db, autocommit=True, options=f"-c search_path={schema}") as c:
+            await migrate(c)
+            expected = "vfs_other" if schema == "other" else "vfs_" + hashlib.md5(long.encode()).hexdigest()
+            assert await channel(c) == expected
+
+    async def connect_other() -> AsyncConnection[Any]:
+        return await AsyncConnection.connect(db, autocommit=True, options="-c search_path=other")
+
+    async with Watcher(connect_other) as other:
+        assert other.channel == "vfs_other"
+        events = other.subscribe()
+        await create(conn, None, "in-public")  # public's trigger: not for this watcher
+        async with await connect_other() as c:
+            f = await create(c, None, "in-other")
+        assert (await next_event(events)).id == f
+        assert await collect(events, 0.3) == []
+
+
+async def test_rescan_floods_are_rate_limited(conn: AsyncConnection, db: str) -> None:
+    """Forged rescans (anyone with CONNECT can send them) collapse to one per interval; none is lost, and real
+    events still flow."""
+    async with Watcher(factory(db), rescan_interval=0.5) as watcher:
+        await catch_up(watcher, conn)
+        events = watcher.subscribe()  # after the catch-up, whose marker it would otherwise see
+        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ('{"op": "rescan"}',))
+        assert await next_event(events) == RESCAN  # the first is delivered at once
+        first = asyncio.get_running_loop().time()
+        for _ in range(20):  # a flood while the consumer keeps up: one deferred rescan stands for all of them
+            await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ('{"op": "rescan"}',))
+        f = await create(conn, None, "f")
+        taken = await collect(events, 1.2)
+        assert [e for _, e in taken] == [Event("create", id=f, parent=None, name="f", kind="file"), RESCAN]
+        assert taken[1][0] - first >= 0.5 - 0.05  # the deferred one came when the interval was up
+        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ('{"op": "rescan"}',))
+        assert await next_event(events) == RESCAN  # past the interval: delivered at once
+
+
+async def test_a_deferred_rescan_dies_with_its_subscription(db: str) -> None:
+    async with Watcher(factory(db), rescan_interval=0.2) as watcher:
+        events = watcher.subscribe()
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        assert await next_event(events) == RESCAN
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        assert events._rescan_timer is not None  # pyright: ignore[reportPrivateUsage]
+        events.close()
+        assert events._rescan_timer is None  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0.3)
+    assert await drain(events) == []
+
+
+async def test_malformed_payloads_are_logged_cut_short_and_seldom(
+    conn: AsyncConnection, watcher: Watcher, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("WARNING", logger="minifs.vfs.watch")
+    for _ in range(5):
+        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ("x" * 7000,))
+    await catch_up(watcher, conn)  # every payload before the marker has been handled
+    warnings = [r.getMessage() for r in caplog.records if "malformed" in r.getMessage()]
+    assert len(warnings) == 1, warnings  # the other four are counted into the next warning
+    assert len(warnings[0]) < 400 and "7000 characters" in warnings[0]
 
 
 async def test_consecutive_rescans_are_folded(db: str) -> None:
@@ -603,6 +710,12 @@ def test_malformed_payloads_are_rejected() -> None:
 def test_maxsize_must_be_positive() -> None:
     with pytest.raises(ValueError):
         Watcher(factory("unused"), maxsize=0)
+
+
+@pytest.mark.parametrize("interval", [-1.0, float("nan"), float("inf")])
+def test_rescan_interval_must_be_a_finite_non_negative_number(interval: float) -> None:
+    with pytest.raises(ValueError):
+        Watcher(factory("unused"), rescan_interval=interval)
 
 
 class Proxy:

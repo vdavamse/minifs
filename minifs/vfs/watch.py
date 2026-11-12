@@ -14,8 +14,13 @@ and treats no answer within ``probe_timeout`` as a lost connection, which it clo
 server. The probe keeps a Lakebase compute awake while a watcher runs; that is the price of noticing a dead
 connection.
 
-Events are hints, not facts: anyone who can connect can NOTIFY on the channel, and PostgreSQL folds identical
-payloads within one transaction. React to an event by reading the database, never by trusting its fields alone.
+The channel is the schema's own (``vfs_channel()``, migration 016), read from the database when the watcher
+connects, so two minifs schemas in one database don't see each other's events. CONNECT on the database is still the
+trust boundary: channels are database-wide, so anyone who can connect can NOTIFY on it, and PostgreSQL folds
+identical payloads within one transaction. Events are hints, not facts: react to one by reading the database, never
+by trusting its fields alone. What a flood of forged events can cost is bounded: each subscription delivers at most
+one ``rescan`` per ``rescan_interval`` (the rest collapse into it; none is lost, only delayed), and a malformed
+payload is logged cut short and at most once every few seconds.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import random
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
@@ -32,7 +38,7 @@ from types import TracebackType
 from typing import Any, Literal, Self, cast
 from uuid import UUID
 
-from psycopg import AsyncConnection, sql
+from psycopg import AsyncConnection, errors, sql
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import ConnectionFactory
@@ -40,7 +46,10 @@ from minifs.vfs.core import VFSError
 
 logger = logging.getLogger(__name__)
 
-CHANNEL = "vfs"  # the trigger in migration 005 notifies on this channel
+DEFAULT_RESCAN_INTERVAL = 1.0
+"""Seconds a subscription waits after delivering a ``rescan`` before it delivers the next (``Watcher``)."""
+_LOGGED_PAYLOAD_CHARS = 200
+_MALFORMED_LOG_INTERVAL = 10.0  # seconds between two warnings about malformed payloads
 
 Op = Literal["create", "modify", "move", "delete", "rescan"]
 
@@ -69,16 +78,16 @@ class Event:
         """Parses a ``vfs`` NOTIFY payload. ValueError (or a subclass) if it isn't one."""
         data = json.loads(payload)
         if not isinstance(data, dict):
-            raise ValueError(f"not a JSON object: {payload!r}")
+            raise ValueError("not a JSON object")
         fields = cast(dict[str, object], data)
         op = fields.get("op")
         if op == "rescan":  # TRUNCATE
             return RESCAN
         if op not in ("create", "modify", "move", "delete"):
-            raise ValueError(f"unknown op in {payload!r}")
+            raise ValueError("unknown op")
         node = _uuid(fields.get("id"))
         if node is None:
-            raise ValueError(f"no id in {payload!r}")
+            raise ValueError("no id")
         return cls(
             op=cast(Op, op),
             id=node,
@@ -93,6 +102,14 @@ class Event:
 
 
 RESCAN = Event("rescan")
+
+
+def _shown(payload: str) -> str:
+    """``payload`` as a log line shows it: its ``repr``, cut to ``_LOGGED_PAYLOAD_CHARS`` characters with its length,
+    so an 8 KB payload isn't a log-volume attack."""
+    if len(payload) <= _LOGGED_PAYLOAD_CHARS:
+        return repr(payload)
+    return f"{payload[:_LOGGED_PAYLOAD_CHARS]!r}... ({len(payload)} characters)"
 
 
 def _uuid(value: object) -> UUID | None:
@@ -118,15 +135,29 @@ class Subscription:
     The queue holds at most ``maxsize`` events. A subscriber that falls that far behind loses them and gets a
     ``rescan`` in their place, like inotify's queue overflow; so does one whose predicate raises. Iteration ends
     after ``close()`` or when the watcher closes, once the queued events are consumed.
+
+    Rescans are delivered at most once per ``rescan_interval`` seconds: one that arrives sooner after the last is
+    queued when the interval is up, and any number arriving meanwhile collapse into it. So a flood of forged
+    rescans (anyone with CONNECT can send them) costs a ``PathWatch`` one database check per interval, and a
+    directory cache one clear, while a real rescan is delayed by at most the interval, never lost.
     """
 
-    def __init__(self, watcher: Watcher, predicate: Callable[[Event], bool] | None, maxsize: int) -> None:
+    def __init__(
+        self,
+        watcher: Watcher,
+        predicate: Callable[[Event], bool] | None,
+        maxsize: int,
+        rescan_interval: float = DEFAULT_RESCAN_INTERVAL,
+    ) -> None:
         self._watcher = watcher
         self._predicate = predicate
         self._maxsize = maxsize
+        self._rescan_interval = rescan_interval
         self._events: deque[Event] = deque()
         self._wakeup = asyncio.Event()
         self._closed = False
+        self._last_rescan = -math.inf  # loop time the last rescan was queued at
+        self._rescan_timer: asyncio.TimerHandle | None = None  # a deferred rescan, within the interval
 
     def _offer(self, event: Event) -> None:
         if self._closed or (event.op != "rescan" and self._predicate is not None and not self._predicate(event)):
@@ -135,17 +166,39 @@ class Subscription:
             self._events.clear()
             event = RESCAN
         if event is RESCAN:
-            self._on_rescan()
-            if self._events and self._events[-1] is RESCAN:
-                return  # one rescan covers both
+            self._offer_rescan()
+            return
         self._events.append(event)
         self._wakeup.set()
 
+    def _offer_rescan(self) -> None:
+        self._on_rescan()
+        if self._events and self._events[-1] is RESCAN:
+            return  # one rescan covers both
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        wait = self._last_rescan + self._rescan_interval - now
+        if wait > 0:
+            if self._rescan_timer is None:  # else one is already due, and covers this one too
+                self._rescan_timer = loop.call_later(wait, self._deferred_rescan)
+            return
+        self._last_rescan = now
+        self._events.append(RESCAN)
+        self._wakeup.set()
+
+    def _deferred_rescan(self) -> None:
+        self._rescan_timer = None
+        if not self._closed:
+            self._offer_rescan()  # the interval is up: queued now, unless a rescan is still waiting at the tail
+
     def _on_rescan(self) -> None:
-        """Called whenever a rescan is queued, including one folded into the last or made by an overflow."""
+        """Called whenever a rescan arrives, including one folded into the last, deferred, or made by an overflow."""
 
     def _end(self) -> None:
         self._closed = True
+        if self._rescan_timer is not None:
+            self._rescan_timer.cancel()
+            self._rescan_timer = None
         self._wakeup.set()
 
     def close(self) -> None:
@@ -185,8 +238,10 @@ class PathWatch(Subscription):
     the path again to follow whatever it names now.
     """
 
-    def __init__(self, watcher: Watcher, segments: list[str], maxsize: int) -> None:
-        super().__init__(watcher, None, maxsize)
+    def __init__(
+        self, watcher: Watcher, segments: list[str], maxsize: int, rescan_interval: float = DEFAULT_RESCAN_INTERVAL
+    ) -> None:
+        super().__init__(watcher, None, maxsize, rescan_interval)
         self._segments = segments
         self.node: UUID | None = None
         """The watched node; None is the root."""
@@ -297,6 +352,10 @@ class Watcher:
     ``watch()`` runs a query when it starts, on each ``rescan`` and on its node's ``delete``: on a connection from
     ``pool`` if given, else on a short-lived one from ``connect``. Each is bounded by ``connect_timeout``. With many
     watches per process, pass a pool, so a reconnect doesn't open one connection per watch at once.
+
+    The channel is read from the database (``SELECT vfs_channel()``, the schema's own) when the first connection
+    opens, unless ``channel`` names one. ``rescan_interval`` is the least time between two ``rescan`` deliveries to
+    one subscription (see ``Subscription``); 0 delivers every one.
     """
 
     def __init__(
@@ -304,23 +363,31 @@ class Watcher:
         connect: ConnectionFactory,
         *,
         pool: AsyncConnectionPool[Any] | None = None,
+        channel: str | None = None,
         keepalive: float = 30.0,
         probe_timeout: float = 10.0,
         connect_timeout: float = 30.0,
         retry_min: float = 0.1,
         retry_max: float = 10.0,
         maxsize: int = 10_000,
+        rescan_interval: float = DEFAULT_RESCAN_INTERVAL,
     ) -> None:
         if maxsize < 1:
             raise ValueError("maxsize must be at least 1")
+        if not math.isfinite(rescan_interval) or rescan_interval < 0:
+            raise ValueError("rescan_interval must be a finite number of seconds, at least 0")
         self._connect = connect
         self._pool = pool
+        self._channel = channel
         self._keepalive = keepalive
         self._probe_timeout = probe_timeout
         self._connect_timeout = connect_timeout
         self._retry_min = retry_min
         self._retry_max = retry_max
         self._maxsize = maxsize
+        self._rescan_interval = rescan_interval
+        self._malformed_logged_at = -math.inf
+        self._malformed_suppressed = 0
         self._subscriptions: set[Subscription] = set()
         self._conn: AsyncConnection[Any] | None = None
         self._healthy = False  # the current connection has answered a probe
@@ -332,6 +399,11 @@ class Watcher:
         """Whether ``start()`` ran (entering the watcher runs it). Stays True after ``aclose()``, when events no longer
         arrive."""
         return self._task is not None
+
+    @property
+    def channel(self) -> str | None:
+        """The NOTIFY channel the watcher listens on: None until the first connection read it from the database."""
+        return self._channel
 
     @property
     def backend_pid(self) -> int | None:
@@ -369,7 +441,7 @@ class Watcher:
 
     def subscribe(self, predicate: Callable[[Event], bool] | None = None) -> Subscription:
         """Every event that ``predicate`` accepts (all of them if None), and every ``rescan``."""
-        return self._add(Subscription(self, predicate, self._maxsize))
+        return self._add(Subscription(self, predicate, self._maxsize, self._rescan_interval))
 
     @contextlib.asynccontextmanager
     async def watch(self, path: str) -> AsyncGenerator[PathWatch]:
@@ -380,7 +452,7 @@ class Watcher:
         if its notification was still on its way: events err towards repeating a change, never towards missing one.
         Raises ``VFSError`` ENOENT or ENOTDIR if the path doesn't resolve.
         """
-        watch = self._add(PathWatch(self, [s for s in path.split("/") if s], self._maxsize))
+        watch = self._add(PathWatch(self, [s for s in path.split("/") if s], self._maxsize, self._rescan_interval))
         try:
             await watch._open()  # pyright: ignore[reportPrivateUsage]
             yield watch
@@ -421,7 +493,18 @@ class Watcher:
             try:
                 if not conn.autocommit:
                     await conn.set_autocommit(True)
-                await conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(CHANNEL)))
+                if self._channel is None:
+                    try:
+                        cur = await conn.execute("SELECT vfs_channel()")
+                    except errors.UndefinedFunction as error:
+                        raise RuntimeError(
+                            "vfs_channel() not found: the schema predates migration 016 (run `minifs db migrate`), "
+                            "or it isn't on this connection's search_path"
+                        ) from error
+                    row = await cur.fetchone()
+                    assert row is not None and isinstance(row[0], str)
+                    self._channel = row[0]
+                await conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self._channel)))
             except BaseException:
                 await conn.close()
                 raise
@@ -461,17 +544,29 @@ class Watcher:
         while True:
             # notifies() returns after keepalive seconds, however many notifications arrived meanwhile.
             async for notify in conn.notifies(timeout=self._keepalive):
-                if notify.channel != CHANNEL:
+                if notify.channel != self._channel:
                     continue
                 try:
                     event = Event.from_payload(notify.payload)
-                except ValueError:
-                    logger.warning("minifs watch: ignoring malformed payload %r", notify.payload)
+                except ValueError as error:
+                    self._log_malformed(notify.payload, error)
                     continue
                 self._broadcast(event)
             # Notifications that arrive during the probe are kept by psycopg for the next notifies().
             await self._probe(conn)
             self._healthy = True
+
+    def _log_malformed(self, payload: str, error: ValueError) -> None:
+        """Warns about a malformed ``payload`` (shown cut short), at most once every ``_MALFORMED_LOG_INTERVAL``
+        seconds, with how many the warning stands for."""
+        now = asyncio.get_running_loop().time()
+        if now - self._malformed_logged_at < _MALFORMED_LOG_INTERVAL:
+            self._malformed_suppressed += 1
+            return
+        more = f" (and {self._malformed_suppressed} more since the last warning)" if self._malformed_suppressed else ""
+        logger.warning("minifs watch: ignoring malformed payload %s (%s)%s", _shown(payload), error, more)
+        self._malformed_logged_at = now
+        self._malformed_suppressed = 0
 
     async def _probe(self, conn: AsyncConnection[Any]) -> None:
         """SELECT 1, or TimeoutError after probe_timeout.

@@ -35,7 +35,7 @@ How minifs works and why, for contributors and for anyone who wants to check its
 | Agent tools | `minifs/tools/` | `Read`, `Write`, `Edit`, `Glob`, `Grep` as pydantic-ai tools over a `VFSView` |
 | View | `minifs/vfs/view.py`, `policy.py` | The agent's chroot (mounts) and the per-actor path rules |
 | Client | `minifs/vfs/client.py` | One SQL statement per operation; path resolution, with the directory cache |
-| Cache, watch | `minifs/vfs/cache.py`, `watch.py` | The directory-entry cache; `LISTEN vfs` and per-path watches |
+| Cache, watch | `minifs/vfs/cache.py`, `watch.py` | The directory-entry cache; `LISTEN` on the schema's channel and per-path watches |
 | Glob, search, regex | `minifs/vfs/glob.py`, `search.py`, `regex.py`, `crates/minifs-regex/` | Pattern compilation (Rust, `minifs._regex`) and the search statements |
 | Service | `minifs/vfs/service.py`, `minifs/db/pool.py` | `open_vfs`: pools, watcher and cache, opened and closed in order; credentials per connection |
 | SQL | `minifs/db/migrations/` | Tables, functions, the NOTIFY trigger |
@@ -170,7 +170,7 @@ The remaining misses are first uses. An entry costs about 500 bytes, and `max_en
 
 ## Watch
 
-A trigger on `vfs_nodes` (migration 005) sends one NOTIFY on channel `vfs` per changed row, as a small JSON payload. Every event has `op`, `id` and `parent`:
+A trigger on `vfs_nodes` (migration 005) sends one NOTIFY per changed row, as a small JSON payload, on the schema's own channel: `vfs_channel()` returns `vfs_<schema>` (or `vfs_` and the md5 of a schema name too long for a channel), computed once by migration 016 from `current_schema()`, so two minifs schemas in one database don't see each other's events, names included. Every event has `op`, `id` and `parent`:
 
 | `op` | Extra fields | Emitted by |
 | --- | --- | --- |
@@ -182,7 +182,9 @@ A trigger on `vfs_nodes` (migration 005) sends one NOTIFY on channel `vfs` per c
 
 Notifications are delivered at commit, so a watcher is never woken for data it can't read yet, and a rolled-back write emits nothing. Compaction emits nothing. Events are hints: Postgres drops a payload identical to one already sent in the same transaction, and any role that can connect can NOTIFY, so a watcher reads the database before acting.
 
-`minifs.vfs.watch.Watcher` holds the process's one `LISTEN` connection, from a connection factory, so each reconnect has a fresh credential. `watcher.watch(path)` filters it by node id (a file) or parent id (a directory). It subscribes before resolving the path, so nothing committed after it returns is missed. Like inotify, a watch follows the node through renames until it is deleted. After a reconnect, every subscriber gets a `rescan`, and a watch whose node is gone ends. A keepalive probe (every 30 s) notices a connection that died silently. The directory cache subscribes to the same connection.
+**CONNECT is the trust boundary.** Channels are database-wide, so a role with CONNECT on the database can NOTIFY on this schema's channel: forge events, or send `rescan` in a loop. Forged events can't make a watcher act wrongly (it reads the database first) and can't name a node in another workspace (ids are random); what they can cost is bounded: a subscription delivers at most one `rescan` per `rescan_interval` (1 s by default; the rest collapse into it, so a real rescan is delayed at most that long, never lost), and a malformed payload is logged cut to 200 characters, at most once every 10 s. A deployment that can't trust every role with CONNECT should give minifs a database of its own.
+
+`minifs.vfs.watch.Watcher` holds the process's one `LISTEN` connection, from a connection factory, so each reconnect has a fresh credential; it reads the channel from the database (`SELECT vfs_channel()`) when that connection opens, and fails at start, saying so, on a schema that predates migration 016 (upgrade the schema and the clients together: an older client still listens on `vfs` and receives nothing). `watcher.watch(path)` filters it by node id (a file) or parent id (a directory). It subscribes before resolving the path, so nothing committed after it returns is missed. Like inotify, a watch follows the node through renames until it is deleted. After a reconnect, every subscriber gets a `rescan`, and a watch whose node is gone ends. A keepalive probe (every 30 s) notices a connection that died silently. The directory cache subscribes to the same connection.
 
 ## Glob
 

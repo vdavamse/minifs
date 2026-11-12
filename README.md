@@ -103,7 +103,7 @@ async def main(dsn: str, workspace_id: str, prompt: str, model: Model | str) -> 
      VFSClient: one SQL statement per operation, directory cache
                                |
                    PostgreSQL SQL functions
-           vfs_nodes · vfs_extents · NOTIFY on channel vfs
+           vfs_nodes · vfs_extents · NOTIFY on the schema's channel
 ```
 
 ### The data model, in two tables
