@@ -4,6 +4,9 @@ The translation itself is the Rust extension ``minifs._regex``. This module cach
 and checks, once per translated pattern, that Postgres compiles it. Postgres rejecting a translation is a bug in the
 emitter, never a problem with the model's pattern, so it is logged and raised as ``RegexTranslationBug``. The one
 exception is cost: a pattern too expensive for Postgres to compile is the model's to simplify (``RegexTooExpensive``).
+
+A pattern can quote file contents and its translation can be 256 K characters, so the log line and the exception's
+message carry both cut to ``LOG_CHARS`` (``clipped``).
 """
 
 from __future__ import annotations
@@ -24,6 +27,8 @@ __all__ = [
     "RegexTooExpensive",
     "RegexTranslationBug",
     "Translation",
+    "UnsupportedDatabase",
+    "clipped",
     "compile_expense",
     "translate",
     "translate_fixed",
@@ -59,8 +64,23 @@ _validated: OrderedDict[tuple[str, bool], None] = OrderedDict()
 _too_expensive: OrderedDict[tuple[str, bool], str] = OrderedDict()
 
 
+# How much of a pattern or a translation a log line or an exception's message carries.
+LOG_CHARS = 200
+
+
+def clipped(text: str, limit: int = LOG_CHARS) -> str:
+    """``text``'s ``repr`` for a log line: whole up to ``limit`` characters, else its start and its full length."""
+    if len(text) <= limit:
+        return repr(text)
+    return f"{text[:limit]!r}... ({len(text)} characters)"
+
+
 class RegexTranslationBug(RuntimeError):
     """The translator emitted ARE that Postgres refuses: a bug in minifs, not in the pattern."""
+
+
+class UnsupportedDatabase(RuntimeError):
+    """The database can't run a translated pattern at all (it isn't UTF8): no pattern would do better."""
 
 
 class RegexTooExpensive(RegexError):
@@ -116,7 +136,7 @@ async def validate(conn: AsyncConnection, translation: Translation, timeout: flo
 
     Runs in a savepoint (or its own transaction) that is always rolled back, so the timeout doesn't outlive it.
     Raises ``RegexTooExpensive`` when Postgres finds the pattern too complex or too slow to compile, and
-    ``RegexTranslationBug`` for any other rejection. Raises ``RuntimeError`` if the database isn't UTF8.
+    ``RegexTranslationBug`` for any other rejection. Raises ``UnsupportedDatabase`` if the database isn't UTF8.
 
     ``timeout`` (seconds) shortens the compile's own 1 s limit to the caller's; when that shorter limit is what
     cancels the compile, ``QueryCanceled`` propagates for the caller to report as its own timeout.
@@ -127,7 +147,7 @@ async def validate(conn: AsyncConnection, translation: Translation, timeout: flo
     encoding = conn.info.parameter_status("server_encoding")
     if encoding != "UTF8":
         # The translation spells characters as code points, which only means the same thing in a UTF8 database.
-        raise RuntimeError(f"minifs needs a UTF8 database; this one's encoding is {encoding}")
+        raise UnsupportedDatabase(f"minifs needs a UTF8 database; this one's encoding is {encoding}")
     key = (translation.pattern, translation.ignore_case)
     if key in _validated:
         _validated.move_to_end(key)
@@ -154,15 +174,15 @@ async def validate(conn: AsyncConnection, translation: Translation, timeout: flo
         if not isinstance(e, errors.InvalidRegularExpression):
             raise  # not about the pattern: a cancel, a lost connection, ...
         logger.error(
-            "regex translator bug: Postgres rejected the translation of %r (ignore_case=%s): %s; line form: %r",
-            translation.pattern,
+            "regex translator bug: Postgres rejected the translation of %s (ignore_case=%s): %s; line form: %s",
+            clipped(translation.pattern),
             translation.ignore_case,
             e,
-            translation.line_form,
+            clipped(translation.line_form),
         )
         raise RegexTranslationBug(
-            f"internal error: the search pattern {translation.pattern!r} was translated into a regex Postgres "
-            f"rejects ({e})"
+            f"internal error: the search pattern {clipped(translation.pattern)} was translated into a regex "
+            f"Postgres rejects ({e})"
         ) from e
     _validated[key] = None
     if len(_validated) > _VALIDATED_SIZE:

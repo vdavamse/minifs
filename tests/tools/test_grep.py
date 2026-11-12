@@ -1,5 +1,7 @@
 """The ``Grep`` tool, through a real agent: ladderframe's tests, then the view's paths, policy and excludes."""
 
+import logging
+
 import pytest
 
 from minifs.tools import Grep, Read
@@ -9,6 +11,7 @@ from minifs.vfs.client import MAX_TIMEOUT, VFSClient
 from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.policy import Policy, Rule
+from minifs.vfs.regex import LOG_CHARS, RegexTranslationBug, UnsupportedDatabase
 from minifs.vfs.search import GrepResult, SearchRefused
 from minifs.vfs.view import MAX_GLOB_LIMIT, VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
@@ -145,6 +148,46 @@ async def test_refused_and_internal_errors_are_retries(deps: Deps, monkeypatch: 
     assert await retry_message(Grep, deps, pattern="x") == refusal.message
     monkeypatch.setattr(deps.vfs, "grep", broken)
     assert await retry_message(Grep, deps, pattern="x") == "Internal error reading /workspace"
+
+
+async def test_a_translator_bug_is_a_retry(deps: Deps, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def buggy(*args: object, **kwargs: object) -> GrepResult:
+        raise RegexTranslationBug("internal error: the search pattern 'x' was translated into ...")
+
+    monkeypatch.setattr(deps.vfs, "grep", buggy)
+    assert await retry_message(Grep, deps, pattern="x") == "Internal error translating this pattern; try a simpler one"
+
+
+async def test_an_unsupported_database_is_a_result(
+    deps: Deps, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def unsupported(*args: object, **kwargs: object) -> GrepResult:
+        raise UnsupportedDatabase("minifs needs a UTF8 database; this one's encoding is SQL_ASCII")
+
+    monkeypatch.setattr(deps.vfs, "grep", unsupported)
+    with caplog.at_level(logging.ERROR, logger="minifs.tools.grep"):
+        # Not a retry: no pattern would work, and retries that all fail end the run.
+        out = await run_tool(Grep, deps, pattern="x")
+    assert out == "Grep is unavailable: internal error. Use the other tools instead."
+    assert "SQL_ASCII" in caplog.text  # for the operator, not the model
+
+
+async def test_any_other_runtime_error_is_a_retry_logged_with_a_cut_pattern(
+    deps: Deps, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def broken(*args: object, **kwargs: object) -> GrepResult:
+        raise RuntimeError("something unforeseen")
+
+    monkeypatch.setattr(deps.vfs, "grep", broken)
+    pattern = "secret" * 1000
+    with caplog.at_level(logging.ERROR, logger="minifs.tools.grep"):
+        message = await retry_message(Grep, deps, pattern=pattern)
+    assert message == "Internal error searching for this pattern; try a simpler one"
+    (record,) = caplog.records
+    assert record.levelno == logging.ERROR and record.exc_info is not None
+    logged = record.getMessage()
+    assert pattern[:LOG_CHARS] in logged and pattern[: LOG_CHARS + 1] not in logged
+    assert "(6000 characters)" in logged
 
 
 async def test_paths_outside_the_view_are_not_found(deps: Deps) -> None:

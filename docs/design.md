@@ -249,7 +249,7 @@ So the translator never relies on ARE's classes, word boundaries or case folding
 | `*`, `+`, `?`, `{n,m}`, lazy forms | The same quantifier (counts up to 255, ARE's limit) |
 | Groups, alternation | `(?:...)`, `|` |
 
-**Rejected, with an rg-style message:** lookaround and backreferences (as rg without `-P`), a literal `\n` (as rg without `-U`), byte classes outside ASCII, counts above 255, and a translation over the size cap. Rejecting is always better than a silent zero-match. Each translation is also compiled once in Postgres (`SELECT '' ~ $1`); a failure there is reported as a translator bug, never as the model's mistake.
+**Rejected, with an rg-style message:** lookaround and backreferences (as rg without `-P`), a literal `\n` (as rg without `-U`), byte classes outside ASCII, counts above 255, and a translation over the size cap. Rejecting is always better than a silent zero-match. Each translation is also compiled once in Postgres (`SELECT '' ~ $1`); a failure there is reported as a translator bug, never as the model's mistake. The log line carries the pattern and the translation cut to 200 characters, since a pattern can quote file contents, and `Grep` asks the model for a simpler pattern instead of ending the run.
 
 **Cost of explicit classes**, on PG 18 over 200,000 lines:
 
