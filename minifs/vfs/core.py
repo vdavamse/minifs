@@ -13,6 +13,7 @@ reports the path with those characters escaped (``escape_controls``), so they do
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -61,7 +62,8 @@ class VFSError(Exception):
 
     @classmethod
     def from_db(cls, error: psycopg.Error, path: str) -> VFSError | None:
-        """The ``VFSError`` for an error from the minifs SQL functions or constraints, None for any other error."""
+        """The ``VFSError`` for an error from the minifs SQL functions or constraints, or for a timeout the server
+        raised (``minifs.db.errors``), None for any other error."""
         errno = errno_name(error)
         if errno is None:
             return None
@@ -158,6 +160,12 @@ class LineReadResult:
     lines: int
     eof: bool
     cut: frozenset[int] = frozenset()
+
+
+def millis(seconds: float) -> str:
+    """``seconds`` as the value of a timeout setting (``statement_timeout``, ``lock_timeout``): whole
+    milliseconds, rounded up, at least one."""
+    return f"{max(1, math.ceil(seconds * 1000))}ms"
 
 
 def normalize(path: str) -> str:
