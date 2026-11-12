@@ -399,6 +399,28 @@ def test_replacers_give_ladderframes_candidates(seed: int) -> None:
         )
 
 
+def test_words_within_a_line_are_found_as_the_regex_found_them() -> None:
+    """The whitespace matcher's search within a line (a find whose words are in the line with other whitespace
+    between them, starting and ending inside a token or not) no longer runs ladderframe's regex: the same text."""
+    rng = random.Random(3)
+    spaces = [" ", "  ", "\t", " \t ", "\xa0", "\x1c", "\r"]
+    for _ in range(4000):
+        tokens = [rng.choice(["a", "b", "ab", "ba", "a.b", "(a", "aa"]) for _ in range(rng.randint(1, 8))]
+        line = rng.choice(["", " "]) + "".join(token + rng.choice(spaces) for token in tokens)
+        i = rng.randrange(len(tokens))
+        words = tokens[i : i + rng.randint(1, 4)]
+        if rng.random() < 0.5:
+            words[0] = words[0][rng.randint(0, len(words[0]) - 1) :]  # starts inside a token
+        if rng.random() < 0.5:
+            words[-1] = words[-1][: rng.randint(1, len(words[-1]))]  # ends inside one
+        find = rng.choice(["", " "]) + rng.choice(spaces).join(words) + rng.choice(["", "\t"])
+        content = "\n".join([line, "b a", line])
+        assert list(new.whitespace_normalized_replacer(content, find)) == list(
+            whitespace_normalized_replacer(content, find)
+        ), (content, find)
+        assert outcome(new.replace, content, find, "R", True) == outcome(replace, content, find, "R", True)
+
+
 def test_forgetting_tried_candidates_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """``replace`` skips a candidate it already tried and forgets them past a byte budget: with the budget a few
     characters, every candidate of a repetitive file is tried again, and the answers are still the oracle's."""
@@ -424,25 +446,62 @@ def test_replace_rejects_what_it_always_rejected() -> None:
 
 def test_anchor_scans_are_linear() -> None:
     """Every line equals the first anchor and none the last: the scan for the last line was O(n²) (2.85 s at
-    8,000 lines, quadrupling per doubling); now the last line's positions are found once."""
+    8,000 lines, quadrupling per doubling, so minutes here); now the last line's positions are found once."""
     content = "x\n" * 40_000
     begin = time.monotonic()
     with pytest.raises(ValueError, match="Could not find oldString"):
         new.replace(content, "x\ny\nz", "q")
-    assert time.monotonic() - begin < 2
+    assert time.monotonic() - begin < 20
 
 
-def test_a_miss_in_a_large_file_is_fast() -> None:
-    """A 20-line find that is nowhere in a 1 MB file of varied lines: every replacer runs to the end."""
+def test_a_miss_costs_a_fraction_of_what_it_did() -> None:
+    """A 20-line find that is nowhere in a file of varied lines: every replacer runs to the end. Against the
+    reference on the same machine in the same test, so a slow runner slows both (measured: over ten times)."""
     rng = random.Random(0)
     content = "\n".join(
-        f"{'  ' * rng.randint(0, 4)}line {rng.randint(0, 50)} = {rng.randint(0, 9)}" for _ in range(50_000)
+        f"{'  ' * rng.randint(0, 4)}line {rng.randint(0, 50)} = {rng.randint(0, 9)}" for _ in range(10_000)
     )
     find = "\n".join(f"other {k}" for k in range(20))
+    took: list[float] = []
+    for search in (new.replace, replace):
+        begin = time.monotonic()
+        with pytest.raises(ValueError, match="Could not find oldString"):
+            search(content, find, "q")
+        took.append(time.monotonic() - begin)
+    assert took[0] < took[1] / 3
+
+
+def test_the_uniqueness_check_is_linear() -> None:
+    """An exact match of a long find in a repetitive file: ``str.rfind`` took 8 s for the check that it is the only
+    one, in one call that no deadline interrupts; a forward search for a second occurrence takes milliseconds."""
+    block = "xxxxx\n" * 4_000
+    find = block + "u\n" + block
+    content = find + "xxxxx\n" * 400_000
     begin = time.monotonic()
-    with pytest.raises(ValueError, match="Could not find oldString"):
-        new.replace(content, find, "q")
-    assert time.monotonic() - begin < 2
+    assert new.replace(content, find, "q", timeout=30) == "q" + "xxxxx\n" * 400_000
+    assert time.monotonic() - begin < 3
+
+
+def test_words_in_a_long_line_are_found_in_one_pass() -> None:
+    """A find of 10,000 words in a line of 40,000 with other whitespace between them: ladderframe's regex
+    restarted at every character (20 s in one call); the answer is the same text."""
+    line = "a " * 40_000 + "b"
+    find = "a  " * 10_000 + "b"
+    begin = time.monotonic()
+    assert new.replace(line, find, "q", timeout=30) == "a " * 30_000 + "q"
+    assert time.monotonic() - begin < 3
+
+
+def test_a_one_line_find_in_a_long_periodic_line_is_not_searched_at_every_period() -> None:
+    """A stripped find that recurs inside a 1 MB line, 500,000 times and never as a whole line: a search that
+    stops at each of those took 20 s in the trimmed-lines matcher alone, where the reference took milliseconds."""
+    content = "0," * 500_000 + "\n"
+    find = " " + "0," * 2_000
+    begin = time.monotonic()
+    assert list(new.line_trimmed_replacer(content, find)) == []
+    with pytest.raises(ValueError, match="Found multiple matches"):
+        new.replace(content, find, "q", timeout=30)
+    assert time.monotonic() - begin < 3
 
 
 def slow_replacer(content: str, find: str) -> Iterator[str]:
@@ -461,17 +520,58 @@ def test_replace_stops_between_replacers(monkeypatch: pytest.MonkeyPatch) -> Non
         new.replace("a\n", "b", "c")
 
 
-def test_replace_stops_inside_a_replacer() -> None:
+def test_replace_stops_on_a_scan_that_would_take_tens_of_seconds() -> None:
     """Window scans whose cheap gates pass everywhere (every line equals the find's first and last lines) and
-    whose block test fails late (the middle differs 1,000 lines in) are still O(n·m), tens of seconds here; the
-    deadline is checked inside the replacers' loops, so the search ends soon after the timeout, not after a scan.
-    (Which loop it stops in depends on the machine; the bound is what matters.)"""
+    whose block test fails late (the middle differs 1,000 lines in) are still O(n·m), tens of seconds here: the
+    search ends soon after the timeout. (Where it stops depends on the machine; the test below is the one that
+    holds each replacer to looking at the clock.)"""
     content = "x\n" * 200_000
     find = "x\n" * 1_000 + "y\n" + "x\n" * 999 + "x"
     begin = time.monotonic()
     with pytest.raises(ReplaceTimeout):
         new.replace(content, find, "q", timeout=0.2)
-    assert 0.2 <= time.monotonic() - begin < 2
+    assert 0.2 <= time.monotonic() - begin < 5
+
+
+LOOPS: list[tuple[Replacer, str, str]] = [
+    (new.line_trimmed_replacer, "a\n" * 10_000, "a"),  # a hit per line
+    (new.block_anchor_replacer, "a\n" * 10_000, "a\nb\nc"),
+    (new.whitespace_normalized_replacer, "a\n" * 10_000, "b\nc"),
+    (new.indentation_flexible_replacer, "a\n" * 10_000, "b\nc"),
+    (new.escape_normalized_replacer, "a\n" * 10_000, "b\nc"),
+    (new.trimmed_boundary_replacer, "a\n" * 10_000, " b\nc "),
+    (new.context_aware_replacer, "a\n" * 10_000, "a\nb\nc"),
+    (new.multi_occurrence_replacer, "a" * 10_000, "a"),
+]
+"""A replacer, and an input whose lines all fail its cheap test (or, for the two that only loop over hits, all
+hit), so nothing but the clock looked at inside its loop over lines can stop it."""
+
+
+@pytest.mark.parametrize(("replacer", "content", "find"), LOOPS, ids=[loop[0].__name__ for loop in LOOPS])
+def test_each_replacer_looks_at_the_clock_in_its_loop(replacer: Replacer, content: str, find: str) -> None:
+    """Under a deadline that has already passed, each replacer stops inside its own loop over the file (no
+    ``replace`` around it to stop between replacers, and no timing: the deadline is in the past from the start);
+    with none it runs to the end."""
+    for _ in replacer(content, find):  # runs to the end without a deadline
+        pass
+    late = new._Deadline(1.0)  # pyright: ignore[reportPrivateUsage]
+    late.at = time.monotonic() - 1
+    token = new._deadline.set(late)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(ReplaceTimeout, match=re.escape(timeout_message(1.0))):
+            for _ in replacer(content, find):
+                pass
+    finally:
+        new._deadline.reset(token)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_timeout_after_an_ambiguous_match_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The find is in the file twice, exactly, and the deadline passes in a later replacer: the retry doesn't
+    claim the text is missing."""
+    monkeypatch.setattr(new, "REPLACERS", (new.simple_replacer, slow_replacer, slow_replacer))
+    with pytest.raises(ReplaceTimeout, match=re.escape(timeout_message(0.01, ambiguous=True))) as caught:
+        new.replace("a\na\n", "a", "c", timeout=0.01)
+    assert "Found multiple matches" in str(caught.value)
 
 
 def test_replace_stops_between_block_scores() -> None:
@@ -500,7 +600,7 @@ def test_edit_settings() -> None:
     assert (EditSettings().max_bytes, EditSettings().timeout) == (10 * 1024 * 1024, 10.0)
     assert EditSettings(timeout=1).timeout == 1
     assert EditSettings(timeout=None).timeout is None
-    for timeout in (0, -1.0, math.inf):
+    for timeout in (0, -1.0, math.inf, math.nan, 10**400):  # the int is past the largest float
         with pytest.raises(ValueError, match="edit timeout"):
             EditSettings(timeout=timeout)
     for wrong in (True, "10"):

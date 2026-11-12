@@ -2,9 +2,10 @@
 indentation, escapes, ...). Keeps the file's BOM and line endings. ladderframe's ``Edit`` (``ladderframe.tools.edit``,
 which follows opencode's edit tool), over a ``VFSView``; the replacers below give ladderframe's answers (the same
 candidates in the same order, checked by ``tests/tools/test_edit_replacers.py`` against its code), but each is at
-most O(n·m) in content lines and ``oldString`` lines, where ladderframe's block scans were O(n²), and ``replace``
-runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker thread that can't be
-cancelled and holds the GIL while it works (#80).
+most O(n·m) in the content's and ``oldString``'s sizes, in lines and in characters (a file can be one line), where
+ladderframe's block scans were O(n²) in lines and its searches within a line O(n·m) per call that nothing could
+interrupt. ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker
+thread that can't be cancelled and holds the GIL while it works (#80).
 
 ladderframe serialises editors of a path with a thread lock; here an edit reads the whole file and its version,
 replaces in memory, and writes back with a compare-and-swap on that version, so a concurrent writer anywhere is
@@ -27,7 +28,7 @@ from array import array
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Iterator
 from contextvars import ContextVar
-from itertools import accumulate
+from itertools import accumulate, chain, islice
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ToolReturn
@@ -279,30 +280,30 @@ def simple_replacer(content: str, find: str) -> Iterator[str]:
 def line_trimmed_replacer(content: str, find: str) -> Iterator[str]:
     """Every run of lines that equals ``find``'s lines once both are stripped, as the lines of ``content``.
 
-    The stripped lines are joined with ``\\n`` and searched for the joined stripped ``find`` with ``str.find``: a
-    hit that starts and ends at line boundaries is a run of equal stripped lines, and the hits come in line order,
-    as ladderframe's window loop gave them. The hit's line is the count of ``\\n`` before it, kept up as the hits
-    advance, so the stripped lines are never held as a list. For a non-empty ``find``, as ``replace`` passes it:
-    for an empty one ladderframe's loop over zero-line windows gave slices of nothing, and this gives none."""
+    The stripped lines are joined with ``\\n``, with one before the first and one after the last, and searched
+    with ``str.find`` for the stripped ``find`` lines joined the same way: the ``\\n`` at both ends of the needle
+    make every hit a run of whole lines (a hit inside a line would cost a restart of the search each, O(characters
+    × needle) on a long periodic line), and the hits come in line order, as ladderframe's window loop gave them.
+    The hit's line is the count of ``\\n`` before it, kept up as the hits advance, so the stripped lines are never
+    held as a list. For a non-empty ``find``, as ``replace`` passes it: for an empty one ladderframe's loop over
+    zero-line windows gave slices of nothing, and this gives the blank lines."""
     original = content.split("\n")
     search = find.split("\n")
     if search[-1] == "":
         search.pop()
-    joined = "\n".join(map(str.strip, original))
-    needle = "\n".join(line.strip() for line in search)
+    joined = "\n".join(chain(("",), map(str.strip, original), ("",)))
+    needle = "\n".join(chain(("",), (line.strip() for line in search), ("",)))
     starts: array[int] | None = None  # built on the first hit: a miss costs no pass over the lines
-    tick = _deadline.get().tick
-    line = counted = 0  # the line at `counted`
+    deadline = _deadline.get()
+    line = counted = 0  # the line that starts after the `\n` at `counted`
     pos = joined.find(needle)
     while pos != -1:
-        tick()
-        end = pos + len(needle)
-        if (pos == 0 or joined[pos - 1] == "\n") and (end == len(joined) or joined[end] == "\n"):
-            if starts is None:
-                starts = _line_starts(original)
-            line += joined.count("\n", counted, pos)
-            counted = pos
-            yield content[starts[line] : starts[line + len(search)] - 1]
+        deadline.check()  # each hit costs a restart of the search, which prepares the needle again
+        if starts is None:
+            starts = _line_starts(original)
+        line += joined.count("\n", counted, pos)
+        counted = pos
+        yield content[starts[line] : starts[line + len(search)] - 1]
         pos = joined.find(needle, pos + 1)
 
 
@@ -384,12 +385,34 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
         yield content[starts[start] : starts[end + 1] - 1]
 
 
+def _words_in_line(line: str, at: int, words: list[str]) -> str:
+    """The text of ``line`` that ``words`` cover, any whitespace between them, where their single-space join starts
+    at offset ``at`` of the line's normalised text (its tokens joined by single spaces), ``at`` being the first
+    such offset. What ladderframe's ``re.search(r"\\s+".join(map(re.escape, words)), line)`` matched: the pattern
+    takes whole whitespace runs between the words, so its matches are the occurrences of the join in the normalised
+    line, in the same order, and the leftmost of one is the leftmost of the other. That search restarted at every
+    character of the line, O(line × words) in one call; this is one pass over the line's tokens."""
+    tokens = re.finditer(r"\S+", line)
+    token_at = 0  # the offset of `token` in the normalised line
+    for token in tokens:
+        size = token.end() - token.start()
+        if at < token_at + size:
+            start = token.start() + at - token_at
+            if len(words) == 1:
+                return line[start : start + len(words[0])]
+            last = next(islice(tokens, len(words) - 2, None))
+            return line[start : last.start() + len(words[-1])]
+        token_at += size + 1
+    raise AssertionError("the offset is past the line's normalised text")
+
+
 def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
     def normalize(text: str) -> str:
         # What re.sub(r"\s+", " ", text).strip() gives: str.split() splits on the same whitespace as \s.
         return " ".join(text.split())
 
     normalized_find = normalize(find)
+    words = normalized_find.split(" ") if normalized_find else []
     lines = content.split("\n")
     deadline = _deadline.get()
     for line in lines:
@@ -397,12 +420,11 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
         normalized_line = normalize(line)
         if normalized_line == normalized_find:
             yield line
-        elif normalized_find in normalized_line:
-            words = find.strip().split()
-            if words:
-                match = re.search(r"\s+".join(re.escape(word) for word in words), line)
-                if match:
-                    yield match.group(0)
+        elif words and len(normalized_line) > len(normalized_find):
+            at = normalized_line.find(normalized_find)
+            if at != -1:
+                deadline.check()  # a long line: the pass over its tokens costs the line
+                yield _words_in_line(line, at, words)
 
     find_lines = find.split("\n")
     if len(find_lines) > 1:
@@ -568,8 +590,14 @@ _SEEN_BYTES = 1 << 20
 the repeats of a few candidates, bounded so a flood of distinct ones doesn't pile up in memory."""
 
 
-def timeout_message(timeout: float) -> str:
-    """The retry for a ``replace`` that ran past ``timeout`` seconds."""
+def timeout_message(timeout: float, ambiguous: bool = False) -> str:
+    """The retry for a ``replace`` that ran past ``timeout`` seconds; ``ambiguous`` where a candidate had been
+    found by then, in more than one place (a later matcher could still have found a unique one)."""
+    if ambiguous:
+        return (
+            f"Found multiple matches for oldString, and the search for a unique one was stopped after {timeout:g} "
+            "seconds. Provide more surrounding context to make the match unique."
+        )
     return (
         f"Could not match oldString within {timeout:g} seconds: it is not in the file exactly, and the fuzzy search "
         "over this file was stopped. Read the file again and provide the exact text to replace, including whitespace "
@@ -590,8 +618,8 @@ def replace(
 
     deadline = _Deadline(timeout)
     token = _deadline.set(deadline)
+    not_found = True
     try:
-        not_found = True
         seen: set[str] = set()  # a candidate already tried gave its answer: the same find, the same ambiguity
         seen_size = 0
         for replacer in REPLACERS:
@@ -616,9 +644,15 @@ def replace(
                     )
                 if replace_all:
                     return content.replace(search, new_string)
-                if index != content.rfind(search):
+                # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one call
+                # on a repetitive file ran for seconds that no deadline could interrupt.
+                if content.find(search, index + 1) != -1:
                     continue
                 return content[:index] + new_string + content[index + len(search) :]
+    except ReplaceTimeout:
+        if not_found or timeout is None:
+            raise
+        raise ReplaceTimeout(timeout_message(timeout, ambiguous=True)) from None
     finally:
         _deadline.reset(token)
 
