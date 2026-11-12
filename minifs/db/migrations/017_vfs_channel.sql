@@ -1,31 +1,47 @@
--- A NOTIFY channel per schema (#87). Channels are database-wide, not per schema, and any role with CONNECT on the
--- database may NOTIFY on any channel. With one minifs schema per search_path in a shared database (which
--- minifs.db.migrate supports), every deployment's LISTEN connection received every other deployment's events on
--- the fixed channel 'vfs', file and directory names included.
+-- A NOTIFY channel per schema, with a name outsiders can't guess (#87). Channels are database-wide, not per schema:
+-- any role with CONNECT on the database may LISTEN and NOTIFY on any channel it can name. With one minifs schema
+-- per search_path in a shared database (which minifs.db.migrate supports), every deployment's LISTEN connection
+-- received every other deployment's events on the fixed channel 'vfs', file and directory names included, and any
+-- connecting role could read them or forge its own.
 --
--- vfs_channel() returns this schema's channel: 'vfs_<schema>' when that fits a channel name (63 bytes, as any
--- identifier), else 'vfs_' and the md5 of the schema name. It is computed once, here, from current_schema(), and
--- stored as the function's body, so the trigger (vfs_notify and vfs_notify_truncate, replaced below with the same
--- bodies but for the channel) and minifs.vfs.watch, which runs SELECT vfs_channel() on its LISTEN connection, agree
--- without configuration. A client older than this migration listens on 'vfs' and receives nothing: upgrade the
--- schema and the clients together.
+-- This schema's channel is now 'vfs_' and 32 random hex digits, generated once, here, and kept in the one row of
+-- vfs_channel_name. vfs_channel() returns it: the trigger functions (vfs_notify and vfs_notify_truncate, replaced
+-- below with the same bodies but for the channel) send on it, and minifs.vfs.watch runs SELECT vfs_channel() on its
+-- LISTEN connection, so they agree without configuration.
 --
--- What this doesn't change: CONNECT on the database is still the trust boundary for notifications. A role that can
--- connect can NOTIFY on this channel too, so events stay hints (a watcher reads the database before acting on
--- one), and the watcher rate-limits rescans per subscription and truncates the payloads it logs.
+-- Who can learn the name: a role that can call vfs_channel(), which takes USAGE on this schema (EXECUTE is PUBLIC's
+-- by default, as for every function). The table itself is its owner's alone, and vfs_channel() is SECURITY DEFINER
+-- so that a role with USAGE and its table grants keeps working without a grant on the new table. The name is in a
+-- table and not a literal in the function's body because pg_proc.prosrc is readable by every role. So USAGE on the
+-- schema is now the trust boundary for notifications, not CONNECT on the database: a role without it can neither
+-- read this schema's events nor forge them. A role with it still can, so events stay hints (a watcher reads the
+-- database before acting on one), and the watcher rate-limits rescans and truncates the payloads it logs.
+--
+-- A client older than this migration listens on 'vfs' and receives nothing: upgrade the schema and the clients
+-- together. A copy of this schema (dump and restore) in the same database shares the channel with the original
+-- until the row is given a new name; a restore into another database doesn't matter.
 
+CREATE TABLE vfs_channel_name (
+    one     boolean PRIMARY KEY DEFAULT true CHECK (one),  -- a single row
+    channel text    NOT NULL
+);
+COMMENT ON TABLE vfs_channel_name IS
+    'The NOTIFY channel of this schema, one row (migration 017). Read it through vfs_channel().';
+REVOKE ALL ON vfs_channel_name FROM PUBLIC;
+INSERT INTO vfs_channel_name (channel) VALUES ('vfs_' || replace(gen_random_uuid()::text, '-', ''));
+
+
+-- The schema is written into the body and the search_path (with pg_temp last), as a SECURITY DEFINER function
+-- should have it: no temporary table of the caller's can stand in for vfs_channel_name.
 DO $$
-DECLARE
-    v_channel text := 'vfs_' || current_schema();
 BEGIN
-    IF octet_length(v_channel) > 63 THEN
-        v_channel := 'vfs_' || md5(current_schema());
-    END IF;
-    EXECUTE format('CREATE FUNCTION vfs_channel() RETURNS text LANGUAGE sql IMMUTABLE AS %L',
-                   format('SELECT %L', v_channel));
-    EXECUTE format('COMMENT ON FUNCTION vfs_channel() IS %L',
-                   'The NOTIFY channel of this schema (migration 017): what vfs_notify sends on and a watcher listens to.');
+    EXECUTE format(
+        'CREATE FUNCTION vfs_channel() RETURNS text LANGUAGE sql STABLE SECURITY DEFINER '
+        'SET search_path = %I, pg_temp AS %L',
+        current_schema(), format('SELECT channel FROM %I.vfs_channel_name', current_schema()));
 END $$;
+COMMENT ON FUNCTION vfs_channel() IS
+    'The NOTIFY channel of this schema (migration 017): what vfs_notify sends on and a watcher listens to.';
 
 
 CREATE OR REPLACE FUNCTION vfs_notify() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$

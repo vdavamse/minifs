@@ -1,4 +1,4 @@
-"""Watch: inotify-style change events from the ``vfs`` NOTIFY channel (migration 005).
+"""Watch: inotify-style change events from the schema's NOTIFY channel (migrations 005 and 017).
 
 One ``Watcher`` per process holds one dedicated LISTEN connection and fans the events out to its subscriptions:
 ``watch(path)`` for callers, and ``subscribe()`` for the library's own consumers such as the directory cache.
@@ -14,13 +14,14 @@ and treats no answer within ``probe_timeout`` as a lost connection, which it clo
 server. The probe keeps a Lakebase compute awake while a watcher runs; that is the price of noticing a dead
 connection.
 
-The channel is the schema's own (``vfs_channel()``, migration 017), read from the database when the watcher
-connects, so two minifs schemas in one database don't see each other's events. CONNECT on the database is still the
-trust boundary: channels are database-wide, so anyone who can connect can NOTIFY on it, and PostgreSQL folds
-identical payloads within one transaction. Events are hints, not facts: react to one by reading the database, never
-by trusting its fields alone. What a flood of forged events can cost is bounded: each subscription delivers at most
-one ``rescan`` per ``rescan_interval`` (the rest collapse into it; none is lost, only delayed), and a malformed
-payload is logged cut short and at most once every few seconds.
+The channel is the schema's own (``vfs_channel()``, migration 017): a random name, read from the database when the
+watcher connects, so two minifs schemas in one database don't see each other's events. Channels are database-wide,
+and anyone who knows a channel's name can LISTEN and NOTIFY on it, so the trust boundary is who can learn the name:
+a role with USAGE on the schema. PostgreSQL also folds identical payloads within one transaction. So events are
+hints, not facts: react to one by reading the database, never by trusting its fields alone. What forged events can
+cost is bounded where it is cheap to: each subscription delivers at most one ``rescan`` per ``rescan_interval``
+(the rest collapse into it; none is lost, only delayed), and a malformed payload is logged cut short and at most
+once every few seconds. A forged ``delete`` of a watched node still costs that watch one database check each.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from types import TracebackType
 from typing import Any, Literal, Self, cast
 from uuid import UUID
 
-from psycopg import AsyncConnection, errors, sql
+from psycopg import AsyncConnection, sql
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import ConnectionFactory
@@ -116,7 +117,7 @@ def _uuid(value: object) -> UUID | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValueError(f"not a uuid: {value!r}")
+        raise ValueError("id is not a string")
     return UUID(value)
 
 
@@ -125,7 +126,7 @@ def _field[T](fields: dict[str, object], key: str, kind: type[T]) -> T | None:
     if value is None:
         return None
     if not isinstance(value, kind) or isinstance(value, bool):
-        raise ValueError(f"{key} is not a {kind.__name__}: {value!r}")
+        raise ValueError(f"{key} is not a {kind.__name__}")
     return value
 
 
@@ -138,8 +139,9 @@ class Subscription:
 
     Rescans are delivered at most once per ``rescan_interval`` seconds: one that arrives sooner after the last is
     queued when the interval is up, and any number arriving meanwhile collapse into it. So a flood of forged
-    rescans (anyone with CONNECT can send them) costs a ``PathWatch`` one database check per interval, and a
-    directory cache one clear, while a real rescan is delayed by at most the interval, never lost.
+    rescans (anyone who knows the channel can send them) costs a ``PathWatch`` one database check per interval,
+    and a directory cache one clear, while a real rescan is delayed by at most the interval, never lost. The
+    rescan of an overflow is not delayed: it stands where the lost events were, and the queue's size bounds it.
     """
 
     def __init__(
@@ -164,25 +166,29 @@ class Subscription:
             return
         if len(self._events) >= self._maxsize:
             self._events.clear()
-            event = RESCAN
+            self._offer_rescan(now=True)  # in place of the events just dropped, whatever the interval
+            return
         if event is RESCAN:
             self._offer_rescan()
             return
         self._events.append(event)
         self._wakeup.set()
 
-    def _offer_rescan(self) -> None:
+    def _offer_rescan(self, *, now: bool = False) -> None:
+        """Queues a rescan, or defers it to the end of the interval unless ``now``."""
         self._on_rescan()
         if self._events and self._events[-1] is RESCAN:
             return  # one rescan covers both
         loop = asyncio.get_running_loop()
-        now = loop.time()
-        wait = self._last_rescan + self._rescan_interval - now
-        if wait > 0:
+        wait = self._last_rescan + self._rescan_interval - loop.time()
+        if wait > 0 and not now:
             if self._rescan_timer is None:  # else one is already due, and covers this one too
                 self._rescan_timer = loop.call_later(wait, self._deferred_rescan)
             return
-        self._last_rescan = now
+        if self._rescan_timer is not None:  # the one queued here covers the deferred one
+            self._rescan_timer.cancel()
+            self._rescan_timer = None
+        self._last_rescan = loop.time()
         self._events.append(RESCAN)
         self._wakeup.set()
 
@@ -353,8 +359,9 @@ class Watcher:
     ``pool`` if given, else on a short-lived one from ``connect``. Each is bounded by ``connect_timeout``. With many
     watches per process, pass a pool, so a reconnect doesn't open one connection per watch at once.
 
-    The channel is read from the database (``SELECT vfs_channel()``, the schema's own) when the first connection
-    opens, unless ``channel`` names one. ``rescan_interval`` is the least time between two ``rescan`` deliveries to
+    The channel is read from the database (``vfs_channel()`` of the connection's ``current_schema()``) when the
+    first connection opens, unless ``channel`` names one; RuntimeError from ``start()`` if the schema has no such
+    function (it predates migration 017). ``rescan_interval`` is the least time between two ``rescan`` deliveries to
     one subscription (see ``Subscription``); 0 delivers every one.
     """
 
@@ -494,22 +501,34 @@ class Watcher:
                 if not conn.autocommit:
                     await conn.set_autocommit(True)
                 if self._channel is None:
-                    try:
-                        cur = await conn.execute("SELECT vfs_channel()")
-                    except errors.UndefinedFunction as error:
-                        raise RuntimeError(
-                            "vfs_channel() not found: the schema predates migration 017 (run `minifs db migrate`), "
-                            "or it isn't on this connection's search_path"
-                        ) from error
-                    row = await cur.fetchone()
-                    assert row is not None and isinstance(row[0], str)
-                    self._channel = row[0]
+                    self._channel = await self._read_channel(conn)
                 await conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self._channel)))
             except BaseException:
                 await conn.close()
                 raise
         self._healthy = False
         return conn
+
+    @staticmethod
+    async def _read_channel(conn: AsyncConnection[Any]) -> str:
+        """The channel of the connection's ``current_schema()``. The function is looked up in that schema alone:
+        through the search_path, a schema that predates migration 017 would get the channel of a later schema on
+        the path that has one, and listen to that schema's events instead of its own."""
+        cur = await conn.execute(
+            "SELECT current_schema(), to_regprocedure(quote_ident(current_schema()) || '.vfs_channel()') IS NOT NULL"
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        schema, found = row
+        if not found:
+            raise RuntimeError(
+                f"no vfs_channel() in schema {schema!r}: it predates migration 017 (run `minifs db migrate`), "
+                "or the connection's search_path doesn't start with the minifs schema"
+            )
+        cur = await conn.execute(sql.SQL("SELECT {}.vfs_channel()").format(sql.Identifier(schema)))
+        row = await cur.fetchone()
+        assert row is not None and isinstance(row[0], str)
+        return row[0]
 
     async def _discard(self) -> None:
         conn, self._conn = self._conn, None

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from psycopg import AsyncConnection, sql
+from psycopg import AsyncConnection, errors, sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 
@@ -461,37 +461,42 @@ async def test_forged_delete_does_not_end_the_watch(conn: AsyncConnection, watch
 
 
 async def test_channel_is_the_schemas(conn: AsyncConnection, watcher: Watcher) -> None:
-    """The trigger notifies on vfs_channel(), vfs_<schema>, and the watcher listens there (the fixture's database
-    is migrated in public)."""
-    assert await channel(conn) == "vfs_public" == watcher.channel
+    """The trigger notifies on vfs_channel(), a random name, and the watcher listens there."""
+    name = await channel(conn)
+    assert re.fullmatch(r"vfs_[0-9a-f]{32}", name) and watcher.channel == name
     with watcher.subscribe() as events:
         f = await create(conn, None, "f")
         assert await next_event(events) == Event("create", id=f, parent=None, name="f", kind="file")
 
 
-async def test_a_schema_without_the_channel_function_fails_at_start(empty_db: str) -> None:
+async def test_a_schema_without_the_channel_function_fails_at_start(conn: AsyncConnection, db: str) -> None:
     """A schema that predates migration 017 has no vfs_channel(): the watcher says so instead of listening on a
-    channel nothing notifies."""
-    with pytest.raises(RuntimeError, match="migration 017"):
-        await Watcher(factory(empty_db)).start()
+    channel nothing notifies, even when a later schema on the search_path has the function."""
+    await conn.execute("CREATE SCHEMA old")
+
+    async def connect_old() -> AsyncConnection[Any]:
+        return await AsyncConnection.connect(db, autocommit=True, options="-c search_path=old,public")
+
+    with pytest.raises(RuntimeError, match="no vfs_channel.. in schema 'old'.*migration 017"):
+        await Watcher(connect_old).start()
 
 
 async def test_each_schema_has_its_own_channel(conn: AsyncConnection, db: str) -> None:
     """A second minifs schema in the same database gets its own channel, so a watcher on one never sees the
-    other's events; a schema name too long for a channel gets the md5 form."""
-    long = "s" * 60
-    for schema in ("other", long):
-        await conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
-        async with await AsyncConnection.connect(db, autocommit=True, options=f"-c search_path={schema}") as c:
-            await migrate(c)
-            expected = "vfs_other" if schema == "other" else "vfs_" + hashlib.md5(long.encode()).hexdigest()
-            assert await channel(c) == expected
+    other's events. Its name needs quoting, which the migration and the watcher both do."""
+    schema = 'Other "one"'
+    await conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    options = "-c search_path=" + sql.Identifier(schema).as_string(conn).replace(" ", r"\ ") + ",public"
 
     async def connect_other() -> AsyncConnection[Any]:
-        return await AsyncConnection.connect(db, autocommit=True, options="-c search_path=other")
+        return await AsyncConnection.connect(db, autocommit=True, options=options)
 
+    async with await connect_other() as c:
+        await migrate(c)
+        theirs = await channel(c)
+    assert re.fullmatch(r"vfs_[0-9a-f]{32}", theirs) and theirs != await channel(conn)
     async with Watcher(connect_other) as other:
-        assert other.channel == "vfs_other"
+        assert other.channel == theirs
         events = other.subscribe()
         await create(conn, None, "in-public")  # public's trigger: not for this watcher
         async with await connect_other() as c:
@@ -500,48 +505,153 @@ async def test_each_schema_has_its_own_channel(conn: AsyncConnection, db: str) -
         assert await collect(events, 0.3) == []
 
 
-async def test_rescan_floods_are_rate_limited(conn: AsyncConnection, db: str) -> None:
-    """Forged rescans (anyone with CONNECT can send them) collapse to one per interval; none is lost, and real
-    events still flow."""
-    async with Watcher(factory(db), rescan_interval=0.5) as watcher:
+async def test_only_a_role_with_usage_on_the_schema_learns_the_channel(db: str) -> None:
+    """The channel's name is what keeps other roles out, so it must not leak: the table is the owner's, the name
+    isn't in vfs_channel()'s source, and the function takes USAGE on the schema. A role with USAGE and table grants,
+    but none on vfs_channel_name, still gets the name and still writes (the trigger calls vfs_channel() as it)."""
+    role = sql.Identifier(f"minifs_watch_{uuid4().hex[:8]}")
+    async with await AsyncConnection.connect(db, autocommit=True) as admin:
+        name = await channel(admin)
+        await admin.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(role))
+        try:
+            await admin.execute(
+                sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON vfs_nodes, vfs_extents TO {}").format(role)
+            )
+            await admin.execute(sql.SQL("SET ROLE {}").format(role))
+            assert await channel(admin) == name
+            with pytest.raises(errors.InsufficientPrivilege):
+                await admin.execute("SELECT channel FROM vfs_channel_name")
+            cur = await admin.execute("SELECT count(*) FROM pg_proc WHERE prosrc LIKE '%%' || %s || '%%'", (name,))
+            assert await cur.fetchone() == (0,)
+            async with await AsyncConnection.connect(db, autocommit=True) as listener:
+                await listener.execute(sql.SQL("LISTEN {}").format(sql.Identifier(name)))
+                f = await create(admin, None, "f")
+                notify = await anext(listener.notifies(timeout=10))
+                assert json.loads(notify.payload)["id"] == str(f)
+
+            await admin.execute("RESET ROLE")
+            await admin.execute("REVOKE USAGE ON SCHEMA public FROM PUBLIC")
+            await admin.execute(sql.SQL("SET ROLE {}").format(role))
+            with pytest.raises(errors.InsufficientPrivilege):
+                await admin.execute("SELECT public.vfs_channel()")
+        finally:
+            await admin.execute("RESET ROLE")
+            await admin.execute(sql.SQL("DROP OWNED BY {}").format(role))
+            await admin.execute(sql.SQL("DROP ROLE {}").format(role))
+
+
+async def test_rescan_floods_are_rate_limited(db: str) -> None:
+    """Forged rescans (anyone who knows the channel can send them) collapse to one per interval; none is lost,
+    and real events still flow. Driven through _broadcast, so no database latency falls inside the interval."""
+    async with Watcher(factory(db), rescan_interval=0.3) as watcher:
+        events = watcher.subscribe()
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        assert await next_event(events) == RESCAN  # the first is delivered at once
+        queued = events._last_rescan  # pyright: ignore[reportPrivateUsage]
+        real = Event("modify", id=uuid4())
+        for _ in range(20):  # a flood while the consumer keeps up: one deferred rescan stands for all of them
+            watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        watcher._broadcast(real)  # pyright: ignore[reportPrivateUsage]
+        taken = await collect(events, 0.8)
+        assert [e for _, e in taken] == [real, RESCAN]
+        assert taken[1][0] - queued >= 0.3  # the deferred one came when the interval was up
+        await asyncio.sleep(0.3)
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        assert await collect(events, 0.1) == [(pytest.approx(asyncio.get_running_loop().time(), abs=0.2), RESCAN)]
+
+
+async def test_forged_rescans_reach_the_limiter(conn: AsyncConnection, db: str) -> None:
+    """The same through the database: rescans NOTIFYed on the channel are folded like the watcher's own."""
+    async with Watcher(factory(db), rescan_interval=30) as watcher:
         await catch_up(watcher, conn)
         events = watcher.subscribe()  # after the catch-up, whose marker it would otherwise see
-        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ('{"op": "rescan"}',))
-        assert await next_event(events) == RESCAN  # the first is delivered at once
-        first = asyncio.get_running_loop().time()
-        for _ in range(20):  # a flood while the consumer keeps up: one deferred rescan stands for all of them
+        for _ in range(5):
             await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ('{"op": "rescan"}',))
-        f = await create(conn, None, "f")
-        taken = await collect(events, 1.2)
-        assert [e for _, e in taken] == [Event("create", id=f, parent=None, name="f", kind="file"), RESCAN]
-        assert taken[1][0] - first >= 0.5 - 0.05  # the deferred one came when the interval was up
-        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ('{"op": "rescan"}',))
-        assert await next_event(events) == RESCAN  # past the interval: delivered at once
+        await catch_up(watcher, conn)
+        # One rescan, then the second catch-up's marker: the other four wait for the interval.
+        assert [e.op for _, e in await collect(events, 0.2)] == ["rescan", "modify"]
 
 
-async def test_a_deferred_rescan_dies_with_its_subscription(db: str) -> None:
-    async with Watcher(factory(db), rescan_interval=0.2) as watcher:
+async def test_a_path_watch_checks_once_per_interval(conn: AsyncConnection, db: str) -> None:
+    """A rescan flood costs a watch one database check per interval, not one per rescan."""
+    await mkdir_p(conn, "d")
+    async with Watcher(factory(db), rescan_interval=0.3) as watcher, watcher.watch("d") as events:
+        checks = 0
+        still_there = events._still_there  # pyright: ignore[reportPrivateUsage]
+
+        async def counted() -> bool:
+            nonlocal checks
+            checks += 1
+            return await still_there()
+
+        events._still_there = counted  # pyright: ignore[reportPrivateUsage]
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        assert [e for _, e in await collect(events, 0.1)] == [RESCAN]
+        assert checks == 1
+        for _ in range(20):  # all inside the interval: one deferred rescan, one more check
+            watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        assert [e for _, e in await collect(events, 0.6)] == [RESCAN]
+        assert checks == 2
+
+
+async def test_an_overflow_rescan_is_not_deferred(db: str) -> None:
+    """Inside the interval too, the rescan of an overflow stands where the lost events were: the consumer learns
+    of the gap before it sees a later event. It also covers a deferred rescan."""
+    async with Watcher(factory(db), maxsize=3, rescan_interval=30) as watcher:
         events = watcher.subscribe()
         watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
         assert await next_event(events) == RESCAN
         watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
         assert events._rescan_timer is not None  # pyright: ignore[reportPrivateUsage]
-        events.close()
+        sent = [Event("modify", id=uuid4()) for _ in range(5)]
+        for event in sent:
+            watcher._broadcast(event)  # pyright: ignore[reportPrivateUsage]
         assert events._rescan_timer is None  # pyright: ignore[reportPrivateUsage]
-        await asyncio.sleep(0.3)
-    assert await drain(events) == []
+        assert [e for _, e in await collect(events, 0.2)] == [RESCAN, sent[4]]
+
+
+async def test_rescan_interval_zero_delivers_every_rescan(db: str) -> None:
+    async with Watcher(factory(db), rescan_interval=0) as watcher:
+        events = watcher.subscribe()
+        for _ in range(3):
+            watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+            assert await next_event(events) == RESCAN
+        assert events._rescan_timer is None  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_a_deferred_rescan_dies_with_its_subscription(db: str) -> None:
+    """Whether the subscription closes or the watcher does."""
+    async with Watcher(factory(db), rescan_interval=0.2) as watcher:
+        closed, left = watcher.subscribe(), watcher.subscribe()
+        for events in (closed, left):
+            watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+            assert await next_event(events) == RESCAN
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        assert closed._rescan_timer is not None  # pyright: ignore[reportPrivateUsage]
+        closed.close()
+        assert closed._rescan_timer is None  # pyright: ignore[reportPrivateUsage]
+        assert left._rescan_timer is not None  # pyright: ignore[reportPrivateUsage]
+    assert left._rescan_timer is None  # pyright: ignore[reportPrivateUsage]
+    await asyncio.sleep(0.3)
+    assert await drain(closed) == [] and await drain(left) == []
 
 
 async def test_malformed_payloads_are_logged_cut_short_and_seldom(
     conn: AsyncConnection, watcher: Watcher, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level("WARNING", logger="minifs.vfs.watch")
-    for _ in range(5):
-        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ("x" * 7000,))
+    # Not JSON, then JSON whose bad field is long: neither the payload nor the error's text carries it whole.
+    for payload in ("x" * 7000, json.dumps({"op": "create", "id": ["A" * 7000]}), "x", "x", "x"):
+        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (payload,))
     await catch_up(watcher, conn)  # every payload before the marker has been handled
     warnings = [r.getMessage() for r in caplog.records if "malformed" in r.getMessage()]
     assert len(warnings) == 1, warnings  # the other four are counted into the next warning
     assert len(warnings[0]) < 400 and "7000 characters" in warnings[0]
+    watcher._malformed_logged_at = -1e9  # pyright: ignore[reportPrivateUsage]
+    await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps({"op": "create", "id": ["A" * 7000]}),))
+    await catch_up(watcher, conn)
+    warnings = [r.getMessage() for r in caplog.records if "malformed" in r.getMessage()]
+    assert len(warnings) == 2 and len(warnings[1]) < 400 and "and 4 more since the last warning" in warnings[1]
 
 
 async def test_consecutive_rescans_are_folded(db: str) -> None:
