@@ -440,8 +440,9 @@ class Watcher:
     watches per process, pass a pool, so a reconnect doesn't open one connection per watch at once.
 
     A non-rescan event is offered only to the watches indexed by the event's id, parent and (for a move) old parent,
-    plus every ``subscribe()`` subscription and every watch still resolving; a ``rescan`` reaches all. The index only
-    narrows who is asked: each watch's ``matches`` still decides what it accepts.
+    and, for a move or delete, to the watches it is an ancestor of; plus every ``subscribe()`` subscription and
+    every watch still resolving. A ``rescan`` reaches all. The index only narrows who is asked: each watch's
+    ``matches`` still decides what it accepts.
 
     The channel is read from the database (``vfs_channel()`` of the schema ``vfs_nodes`` resolves to) whenever a
     connection opens, unless ``channel`` names one, and each keepalive probe checks it, so a watcher follows a
@@ -648,10 +649,10 @@ class Watcher:
     def _targets(self, event: Event) -> Iterable[Subscription]:
         """The subscriptions to offer ``event`` to: all of them for a ``rescan``, else the unindexed ones plus the
         watches its id, parent and (for a move) old parent select, and for a move or delete those it is an ancestor
-        of. ``PathWatch.matches`` accepts an event only for
-        a rescan, its node's id, a move or delete of an ancestor, or (a directory's) child events by parent or old
-        parent, so this is a superset of the subscriptions that would accept it, and ``_offer`` still filters. A
-        fresh collection, as subscriptions can close while the event is being offered."""
+        of. ``PathWatch.matches`` accepts an event only for a rescan, its node's id, a move or delete of an
+        ancestor, or (a directory's) child events by parent or old parent, so this is a superset of the
+        subscriptions that would accept it, and ``_offer`` still filters. A fresh collection, as subscriptions can
+        close while the event is being offered."""
         if event.op == "rescan":
             return list(self._subscriptions)
         targets = set(self._unindexed)

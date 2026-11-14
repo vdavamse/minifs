@@ -1091,7 +1091,8 @@ def _resolve(
     watcher: Watcher, watch: PathWatch, node: UUID | None, kind: str, chain: tuple[UUID, ...], up: bool
 ) -> None:
     """What ``PathWatch._open`` does once the lookup returns, without the database: resolve, index, filter the
-    buffer, and judge it as before the fence."""
+    buffer, and judge it as before the fence. Keep it in step with ``_open`` (the end-to-end test and the view
+    watch tests go through the real one)."""
     watch.node, watch.kind, watch.chain = node, kind, chain
     if up:
         watch.ancestors = frozenset(chain[:-1])
