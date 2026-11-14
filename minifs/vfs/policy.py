@@ -26,16 +26,22 @@ actions is a grant and stays exact. A segment folds only where folding keeps its
 character of the folded name (the sharp s folds to ``ss``). Suffixes and trailing spaces are other names: use
 ``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/workspace/Makefile")`` also hides ``MAKEFILE``, and a
 hide rule naming ``/Docs/**`` hides the ``/docs`` mount.
+
+Each rule compiles its alternatives once into a regex (``Rule.regex``) over the joined path string (for a hide
+rule the dual string, every name followed by a NUL and its folded form), so a lookup without ``subtree`` is one
+``fullmatch`` per rule instead of the recursive per-segment match (``_rests``, kept for ``subtree``,
+``allows_any`` and as the reference the differential test checks by).
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from fnmatch import fnmatchcase
+from fnmatch import fnmatchcase, translate
 from functools import lru_cache
 from typing import Literal, get_args
 
@@ -72,6 +78,9 @@ class Rule:
     actions: frozenset[Action]
     segments: tuple[str, ...] = field(repr=False, compare=False)
     alternatives: tuple[tuple[str, ...], ...] = field(repr=False, compare=False)
+    regex: re.Pattern[str] = field(repr=False, compare=False)
+    """The compiled ``alternatives`` (``_alt_regex``), whose ``fullmatch`` decides a lookup against the path
+    string (``_path_string``) or, for a hide rule, its dual string (``_dual_string``)."""
 
     def __init__(self, pattern: str, *actions: Action) -> None:
         unknown = set(actions) - _ACTIONS
@@ -88,6 +97,7 @@ class Rule:
         object.__setattr__(self, "actions", frozenset(actions))
         object.__setattr__(self, "segments", segments)
         object.__setattr__(self, "alternatives", alternatives)
+        object.__setattr__(self, "regex", re.compile("".join(_alt_regex(alt, not actions) for alt in alternatives)))
 
     @property
     def hides(self) -> bool:
@@ -96,7 +106,8 @@ class Rule:
 
     def matches(self, path: str) -> bool:
         """Whether the pattern matches ``path`` (normalised first)."""
-        return any(_only_globstars(rest) for rest in _rule_rests(self, split(path)))
+        joined = "".join("/" + s for s in split(path))
+        return bool(self.regex.fullmatch(_dual_string(joined) if self.hides else joined))
 
     def grants(self, action: Action) -> bool:
         return action in self.actions or (action == "append" and "write" in self.actions)
@@ -131,8 +142,17 @@ class Policy:
     def matches(self, actor: str, path: str) -> bool:
         """Whether some rule of ``actor`` matches ``path`` itself, so that the first such rule decides it. KeyError
         for an actor without rules; ``path`` as ``allows`` takes it."""
-        segments = split_trusted(path)
-        return any(any(_only_globstars(rest) for rest in _rule_rests(rule, segments)) for rule in self.rules[actor])
+        plain = _path_string(path)
+        dual: str | None = None
+        for rule in self.rules[actor]:
+            if rule.hides:
+                if dual is None:
+                    dual = _dual_string(plain)
+                if rule.regex.fullmatch(dual):
+                    return True
+            elif rule.regex.fullmatch(plain):
+                return True
+        return False
 
     def allows(self, actor: str, action: Action, path: str, *, subtree: bool = False) -> bool:
         """Whether ``actor`` may ``action`` at ``path`` and, with ``subtree``, at every path below it too (what
@@ -140,17 +160,27 @@ class Policy:
         and doesn't grant ``action`` refuses, unless an earlier rule covers the whole subtree. KeyError for an
         actor without rules. ``path`` isn't checked for control characters (``split_trusted``): it is as often a
         path the server listed as one from a caller, which ``check`` and the operation itself refuse."""
-        segments = split_trusted(path)
-        for rule in self.rules[actor]:
-            rests = _rule_rests(rule, segments)
-            if not subtree:
-                if any(_only_globstars(rest) for rest in rests):
+        if subtree:
+            segments = split_trusted(path)
+            for rule in self.rules[actor]:
+                rests = _rule_rests(rule, segments)
+                if rests:
+                    if not rule.grants(action):
+                        return False
+                    if any(rest and _only_globstars(rest) for rest in rests):  # ends in **: covers the subtree
+                        return True
+        else:
+            plain = _path_string(path)
+            dual: str | None = None
+            for rule in self.rules[actor]:
+                if rule.hides:
+                    if dual is None:  # the dual string is only needed once a hide rule is reached
+                        dual = _dual_string(plain)
+                    matched = rule.regex.fullmatch(dual) is not None
+                else:
+                    matched = rule.regex.fullmatch(plain) is not None
+                if matched:
                     return rule.grants(action)
-            elif rests:
-                if not rule.grants(action):
-                    return False
-                if any(rest and _only_globstars(rest) for rest in rests):  # ends in **: covers the subtree
-                    return True
         return action == "read" and self.read_unmatched
 
     def allows_any(self, actor: str, action: Action, path: str) -> bool:
@@ -251,6 +281,59 @@ def _fold_pattern(segment: str) -> str:
     return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", segment).casefold())
 
 
+def _segment_regex(segment: str, exclude: str) -> str:
+    """The regex for one raw pattern ``segment`` (never ``**``), matching one name of the string a rule regex is
+    fullmatched against: ``*`` and ``?`` become classes matching anything but the characters of ``exclude`` (the
+    separators a name never contains), a ``[...]`` class becomes the regex ``fnmatch.translate`` gives that class
+    token alone, behind a lookahead that keeps ``exclude`` out of it too, and any other character is literal
+    (``re.escape``). Classes are scanned exactly as ``_bad_class`` scans them, which ``_no_literal_globs`` has
+    been through, so every ``[`` closes within the segment."""
+    out: list[str] = []
+    i, n = 0, len(segment)
+    while i < n:
+        c, i = segment[i], i + 1
+        if c == "*":
+            out.append(f"[^{exclude}]*")
+        elif c == "?":
+            out.append(f"[^{exclude}]")
+        elif c == "[":
+            j = i
+            if j < n and segment[j] == "!":
+                j += 1
+            if j < n and segment[j] == "]":
+                j += 1
+            while j < n and segment[j] != "]":
+                j += 1
+            if j >= n:
+                raise AssertionError(f"unclosed [ in rule segment {segment!r}")
+            translated = translate(segment[i - 1 : j + 1])
+            shape = re.fullmatch(r"\(\?s:(.*)\)\\[Zz]", translated, re.DOTALL)
+            if shape is None:
+                raise AssertionError(f"fnmatch.translate has an unexpected shape: {translated!r}")
+            out.append(f"(?![{exclude}]){shape[1]}")
+            i = j + 1
+        else:
+            out.append(re.escape(c))
+    return "".join(out)
+
+
+def _alt_regex(alt: tuple[str, ...], hides: bool) -> str:
+    """The regex one segment of a rule's ``alternatives`` contributes, matching ``/name`` in the string a lookup
+    is fullmatched against (``_path_string``, or ``_dual_string`` for a hide rule): ``("**",)`` is zero or more
+    whole segments; a hide rule's foldable segment ``(s, f)`` matches a name's raw form against ``s`` or its
+    folded form against ``f`` (per segment, #93), where the ``/`` folding a fullwidth solidus gives is the NUL of
+    the dual string; a hide rule's exact-only segment ``(s,)`` matches the raw form and skips the folded one; a
+    grant rule's segment ``(s,)`` matches the raw form alone."""
+    if alt == ("**",):
+        return "(?:/[^/]+)*"
+    if len(alt) == 2:
+        raw = _segment_regex(alt[0], "/\x00")  # a raw name holds neither separator
+        folded = _segment_regex(alt[1].replace("/", "\x00"), "/")  # a folded name can hold the NUL of a folded /
+        return f"/(?:{raw}\x00[^/]*|[^/\x00]*\x00{folded})"
+    exact = _segment_regex(alt[0], "/\x00")
+    return f"/{exact}\x00[^/]*" if hides else f"/{exact}"
+
+
 @lru_cache(maxsize=65536)
 def _fold(name: str) -> str:
     """The form of ``name`` a hide rule matches by: the format characters (Unicode category Cf, such as the
@@ -316,6 +399,40 @@ def _rests(
 
 def _only_globstars(rest: tuple[tuple[str, ...], ...]) -> bool:
     return all(segment[0] == "**" for segment in rest)
+
+
+def _matches_by_rests(rule: Rule, segments: tuple[str, ...]) -> bool:  # pyright: ignore[reportUnusedFunction]
+    """Whether ``rule`` matches ``segments`` by the reference matcher (``_rests`` over the rule's alternatives),
+    what the lookups did before ``Rule.regex``: for the differential test (tests/test_policy.py) alone."""
+    return any(_only_globstars(rest) for rest in _rule_rests(rule, segments))
+
+
+def _path_string(path: str) -> str:
+    """The string a rule's regex is fullmatched against for a grant rule: ``""`` for the root, else
+    ``/seg1/seg2...`` with the segments ``split_trusted`` gives, so normalised, and it raises what it raises
+    today for a path it refuses. An already normalised absolute path (what the server listed, the common case) is
+    returned unchanged."""
+    if path == "/":
+        return ""
+    if (
+        path.startswith("/")
+        and not path.endswith("/")
+        and "//" not in path
+        and "/./" not in path + "/"
+        and "/../" not in path + "/"
+    ):
+        return path
+    return "".join("/" + s for s in split_trusted(path))
+
+
+def _dual_string(path_string: str) -> str:
+    """The string a hide rule's regex is fullmatched against: every segment of ``path_string`` as the raw name, a
+    NUL and the folded name (``_fold``), where the ``/`` folding can give (a fullwidth solidus) is spelled as a
+    NUL too, so ``/`` only ever separates segments and a name holds neither ``/`` nor a NUL. The root is ``""``,
+    as in ``_path_string``."""
+    if not path_string:
+        return ""
+    return "".join("/" + raw + "\x00" + _fold(raw).replace("/", "\x00") for raw in path_string[1:].split("/"))
 
 
 DEFAULT_POLICY = Policy(
