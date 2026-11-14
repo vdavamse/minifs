@@ -9,7 +9,8 @@ interrupt. ``replace`` departs from ladderframe on purpose where it edited the w
 exact ``oldString`` is reported, block anchors alone don't take the line between them, a block-anchored match
 longer than ``oldString``, whose extra non-blank lines would be deleted unseen, is refused with a retry unless
 a stricter replacer finds the text, with ``replaceAll`` a whitespace candidate of a non-blank ``oldString``
-is refused, and a fuzzy match never splits a CRLF line ending, where opencode left a bare LF or a lone CR (#127).
+is refused, and a fuzzy match never splits a CRLF line ending unless the model's oldString ends in that CR,
+where opencode left a bare LF or a lone CR (#127).
 ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker thread that
 can't be cancelled and holds the GIL while it works (#80).
 
@@ -745,7 +746,7 @@ def replace(
                     if replace_all:
                         if search == old_string:
                             return content.replace(search, new_string)
-                        return _substitute(content, search, index, new_string, old_string, True)
+                        return _substitute(content, search, index, new_string, _model_crs(old_string, replacer), True)
                     # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one
                     # call on a repetitive file ran for seconds that no deadline could interrupt.
                     if content.find(search, index + 1) != -1:
@@ -756,7 +757,7 @@ def replace(
                         continue
                     if search == old_string:
                         return content[:index] + new_string + content[index + len(search) :]
-                    return _substitute(content, search, index, new_string, old_string, False)
+                    return _substitute(content, search, index, new_string, _model_crs(old_string, replacer), False)
             except _LongerBlock as e:  # pending, not final (#117): a later replacer may still find the text
                 refusal = e
     except ReplaceTimeout:
@@ -780,7 +781,7 @@ def replace(
     raise ValueError(MULTIPLE_MATCHES)
 
 
-def _substitute(content: str, search: str, index: int, new_string: str, old_string: str, replace_all: bool) -> str:
+def _substitute(content: str, search: str, index: int, new_string: str, model_crs: int, replace_all: bool) -> str:
     """Substitute ``search`` (first occurrence at ``index``) by ``new_string`` (#127). A fuzzy candidate's span
     never splits a CRLF pair; the pair goes with the side that holds its ``\\n``, per occurrence:
 
@@ -789,8 +790,8 @@ def _substitute(content: str, search: str, index: int, new_string: str, old_stri
       ``\\r``, that ``\\r`` is the file's line ending, not the model's text: it stays in the file (the span
       shrinks a character) — unless the next occurrence being replaced starts right there, whose span then
       covers the pair's ``\\n`` too. But the ``\\r`` can be the model's own: only CRs beyond what the model
-      wrote are the file's, so the candidate's run of trailing ``\\r`` must be longer than the run
-      ``_unescape(old_string)`` ends with, and a deliberate CR removal (an escaped ``\\r`` the model wrote, or
+      wrote are the file's, so the candidate's run of trailing ``\\r`` must be longer than ``model_crs``, the
+      run the model's oldString ends with (see ``_model_crs``), and a deliberate CR removal (an escaped ``\\r`` the model wrote, or
       a real one a line matcher stripped as whitespace) removes it.
     - START: where the candidate starts with ``\\n`` and a ``\\r`` precedes the occurrence that no previous
       replaced span has claimed, that ``\\r`` is the pair's other half: it joins the span, since the ``\\n`` is
@@ -806,8 +807,7 @@ def _substitute(content: str, search: str, index: int, new_string: str, old_stri
     starts_with_lf = search.startswith("\n")
     end_cr = False  # END can only fire on a trailing "\r" that is the file's, not the model's own
     if search.endswith("\r"):
-        model = _unescape(old_string)  # the oldString as the model meant it; its CR count is per call
-        end_cr = len(search) - len(search.rstrip("\r")) > len(model) - len(model.rstrip("\r"))
+        end_cr = len(search) - len(search.rstrip("\r")) > model_crs
     if not end_cr and not starts_with_lf:  # neither rule can fire
         if replace_all:
             return content.replace(search, new_string)
@@ -833,6 +833,20 @@ def _substitute(content: str, search: str, index: int, new_string: str, old_stri
             nxt = content.find(search, at + size)
     out.write(content[cursor:])
     return out.getvalue()
+
+
+def _model_crs(old_string: str, replacer: Replacer) -> int:
+    """How many CRs the model's oldString ends with, as the replacer that yielded the candidate read it (#127).
+    Only the escape matcher reads oldString's escapes, so only for its candidates does a literal backslash-r count
+    as a CR; for every other replacer it is two characters of text, matched against the same two in the file.
+    Unescapes only the tail of trailing CRs, backslashes and ``r`` (the escapes there parse as they do in the whole
+    string, since the character before the tail is none of those), and without the deadline's ticks: the match is
+    already found, and a timeout now would report a failed search."""
+    if replacer is not escape_normalized_replacer:
+        return len(old_string) - len(old_string.rstrip("\r"))
+    tail = old_string[len(old_string.rstrip("\r\\r")) :]
+    text = _ESCAPE.sub(lambda m: _ESCAPES[m.group(1)], tail)
+    return len(text) - len(text.rstrip("\r"))
 
 
 def _is_disproportionate_match(search: str, old_string: str) -> bool:

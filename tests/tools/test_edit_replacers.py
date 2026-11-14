@@ -296,23 +296,28 @@ REPLACERS: tuple[Replacer, ...] = (
 )
 
 
-def _substitute(content: str, search: str, index: int, new_string: str, old_string: str, replace_all: bool) -> str:
+def _model_crs(old_string: str, replacer: Replacer) -> int:
+    """How many CRs the model's oldString ends with, as the replacer read it (#127): only the escape matcher reads
+    its escapes, so only there does a literal backslash-r count as a CR."""
+    model = _unescape(old_string) if replacer is escape_normalized_replacer else old_string
+    return len(model) - len(model.rstrip("\r"))
+
+
+def _substitute(content: str, search: str, index: int, new_string: str, model_crs: int, replace_all: bool) -> str:
     """The oracle's own copy of minifs's ``_substitute`` (the oracle mirrors the code; it must not import the
     private helper). Substitute ``search`` (first occurrence at ``index``) by ``new_string``: a candidate span
     never splits a CRLF pair; the pair goes with the side that holds its ``\n`` (#127). END: a candidate ending
     in ``\r`` whose occurrence is followed by ``\n`` (or by the end of the file) keeps that ``\r`` in the file
     unless ``new_string`` already ends in ``\r``, the next occurrence being replaced starts right there, or the
-    candidate's run of trailing ``\r`` is no longer than the run ``_unescape(old_string)`` ends with (only CRs
-    beyond what the model wrote are the file's). START: a candidate starting with ``\n`` preceded by a ``\r`` no
-    previous replaced span claimed takes that ``\r`` into the span."""
+    candidate's run of trailing ``\r`` is no longer than ``model_crs``, the run the model's oldString ends with
+    (only CRs beyond what the model wrote are the file's). START: a candidate starting with ``\n`` preceded by a
+    ``\r`` no previous replaced span claimed takes that ``\r`` into the span."""
     if not search.endswith("\r") and not search.startswith("\n"):  # neither rule can fire
         if replace_all:
             return content.replace(search, new_string)
         return content[:index] + new_string + content[index + len(search) :]
 
     size = len(search)
-    unescaped = _unescape(old_string)  # the oldString as the model meant it
-    model_crs = len(unescaped) - len(unescaped.rstrip("\r"))
     end_cr = len(search) - len(search.rstrip("\r")) > model_crs  # CRs beyond the model's are the file's
     starts: list[int] = []
     at: int = index
@@ -388,7 +393,7 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
                 if replace_all:
                     if search == old_string:
                         return content.replace(search, new_string)
-                    return _substitute(content, search, index, new_string, old_string, True)
+                    return _substitute(content, search, index, new_string, _model_crs(old_string, replacer), True)
                 if index != content.rfind(search):
                     if search == old_string:
                         # departs from ladderframe (#110): an ambiguous exact oldString is reported, not skipped
@@ -399,7 +404,7 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
                     continue
                 if search == old_string:
                     return content[:index] + new_string + content[index + len(search) :]
-                return _substitute(content, search, index, new_string, old_string, False)
+                return _substitute(content, search, index, new_string, _model_crs(old_string, replacer), False)
         except _LongerBlock as e:
             # departs from ladderframe (#117): pending, not final: a later replacer may still find the text.
             refusal = e
@@ -876,6 +881,47 @@ def test_a_fuzzy_cr_removal_is_the_models_to_make() -> None:
             assert search(content, find, new_string) == expected, (replacer.__name__, find, new_string)
 
 
+def test_a_literal_backslash_r_is_text_to_the_line_matchers() -> None:
+    """Only the escape matcher reads oldString's escapes: to the others a literal backslash-r is two characters
+    of text, matched against the same two in the file, and the candidate's trailing ``\\r`` after them is still
+    the file's line ending. Counting the model's CRs on the unescaped oldString for every replacer took that CR
+    and left a bare LF (#127)."""
+    cases = [
+        (
+            new.line_trimmed_replacer,
+            "  alpha\r\n  sep = \\r\r\nend\r\n",
+            "alpha\r\nsep = \\r",
+            "ALPHA\r\nsep = \\r",
+            "ALPHA\r\nsep = \\r\r\nend\r\n",
+        ),
+        (
+            new.block_anchor_replacer,
+            "x\r\ndef f():\r\n    a = 1\r\n    b = 2\r\n    sep = '\\r\r\ny\r\n",
+            "def f():\r\n    a = 1\r\n    b = 9\r\n    sep = '\\r",
+            "NEW",
+            "x\r\nNEW\r\ny\r\n",
+        ),
+    ]
+    for replacer, content, find, new_string, expected in cases:
+        assert next(islice(replacer(content, find), 1)).endswith("\\r\r"), replacer.__name__
+        for search in (new.replace, replace):
+            out = search(content, find, new_string)
+            assert out == expected, (replacer.__name__, out)
+            assert re.search(r"(?<!\r)\n", out) is None
+
+
+@pytest.mark.parametrize(
+    "old_string", ["\\r", "a\\r\\r", "\\\\r", "\\\\\\r", "\r\\r", "rr\\r", "x\\n\\r", "\\r\\", "q\r", "plain", "r\\\\"]
+)
+def test_the_model_crs_tail_parse_agrees_with_a_full_unescape(old_string: str) -> None:
+    """``_model_crs`` unescapes only the tail of trailing CRs, backslashes and ``r`` (and without the deadline):
+    its count must equal the full unescape's for the escape matcher, and the raw count for the others (#127)."""
+    model_crs = new._model_crs  # pyright: ignore[reportPrivateUsage]
+    unescaped = _unescape(old_string)
+    assert model_crs(old_string, new.escape_normalized_replacer) == len(unescaped) - len(unescaped.rstrip("\r"))
+    assert model_crs(old_string, new.line_trimmed_replacer) == len(old_string) - len(old_string.rstrip("\r"))
+
+
 def test_replace_all_decides_the_crlf_rules_per_occurrence() -> None:
     """With ``replaceAll`` every occurrence gets its own END-rule decision (#127); the old guard let the first
     occurrence decide for all. The line-trimmed candidate for ``"  foo"`` is ``"foo\\r"``: its first occurrence
@@ -974,16 +1020,16 @@ def test_substitute_agrees_with_the_oracle(seed: int) -> None:
                 search = extended
         index = content.find(search)
         new_string = rng.choice(["", "X", "A\r\nB", "Y\r"])
-        old_string = rng.choice([search, "x", "\\r", "q\r"])
+        model_crs = rng.choice([0, 1, 2])
         for replace_all in (False, True):
             assert new._substitute(  # pyright: ignore[reportPrivateUsage]
-                content, search, index, new_string, old_string, replace_all
-            ) == _substitute(content, search, index, new_string, old_string, replace_all), (
+                content, search, index, new_string, model_crs, replace_all
+            ) == _substitute(content, search, index, new_string, model_crs, replace_all), (
                 content,
                 search,
                 index,
                 new_string,
-                old_string,
+                model_crs,
                 replace_all,
             )
 
