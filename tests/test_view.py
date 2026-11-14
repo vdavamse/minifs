@@ -8,7 +8,7 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Sequence
 from functools import cache
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -16,9 +16,10 @@ from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import Connector, open_pool
+from minifs.vfs import glob as globbing
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import Entry, GlobResult, ReadResult, VFSError
-from minifs.vfs.glob import GlobError, compile_excludes, compile_glob
+from minifs.vfs.glob import GlobError, GlobMatch, compile_excludes, compile_glob
 from minifs.vfs.policy import DEFAULT_POLICY, Policy, PolicyDenied, Rule
 from minifs.vfs.search import GrepResult, SearchRefused
 from minifs.vfs.view import VFSView, _below, workspace_mounts  # pyright: ignore[reportPrivateUsage]
@@ -466,6 +467,46 @@ async def test_glob_skips_mounts_it_cannot_read(vfs: VFSClient) -> None:
     assert not hidden.policy.allows_any("agent", "read", "/workspace")
     assert hidden.policy.allows_any("agent", "read", "/")
     assert Policy({"a": [Rule("/w/x.md", "read"), Rule("/w/**")]}).allows_any("a", "read", "/w")
+
+
+async def test_glob_bounds_each_walk(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#85: ``max_nodes`` and ``timeout`` reach every walk the view makes: a mount's own, each mount's below
+    ``/``, and the second, wider look past matches the policy hides (each call's arguments are recorded). A cap of
+    0 is refused from a mount and from ``/``; bad bounds are EINVAL."""
+    calls: list[dict[str, object]] = []
+    original = vfs.glob
+
+    async def recording(*args: Any, **kwargs: Any) -> list[Entry]:
+        calls.append(kwargs)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(vfs, "glob", recording)
+    agent = view(vfs, Policy(DEFAULT_POLICY.rules))
+    hiding = view(vfs, Policy({"agent": [Rule("/workspace/hid/**"), Rule("/**", "read")]}))
+    for i in range(3):  # newer than everything else, and hidden: the first look (limit + 1 = 2) sees only these
+        await vfs.create(f"/workspaces/{W1}/hid/{i}.md", b"", parents=True)
+    for glob, path, expected_calls in [
+        (agent.glob, "/workspace", 1),
+        (agent.glob, "/", 2),
+        (hiding.glob, "/workspace", 2),
+    ]:
+        calls.clear()
+        await glob("**", path, limit=1, max_nodes=12345, timeout=1.5)
+        assert len(calls) == expected_calls, calls
+        assert all((c["max_nodes"], c["timeout"]) == (12345, 1.5) for c in calls), calls
+    everything = await agent.glob("**", "/")
+    assert everything.entries
+    for path in ("/workspace", "/"):
+        with pytest.raises(SearchRefused) as info:
+            await agent.glob("**", path, max_nodes=0)
+        assert info.value.reason == "nodes"
+        with pytest.raises(SearchRefused):
+            await agent.glob("**", path, max_nodes=0, limit=1)
+    assert await agent.glob("**", "/", max_nodes=None) == everything
+    for max_nodes in (-1, 2**31):
+        await raises("EINVAL", agent.glob("**", "/workspace", max_nodes=max_nodes), "/workspace")
+    for timeout in (0, 1e10):
+        await raises("EINVAL", agent.glob("**", "/workspace", timeout=timeout), "/workspace")
 
 
 async def test_glob_limit_counts_only_readable_files(vfs: VFSClient) -> None:
@@ -1014,3 +1055,82 @@ async def test_glob_from_a_virtual_directory_matches_globbing_the_tree(vfs: VFSC
             real = await vfs.glob(pattern, _MIRROR + directory.rstrip("/"), excludes=excludes, hidden=hidden)
             expected = sorted(e.path.removeprefix(_MIRROR) for e in real)
             assert sorted(e.path for e in seen) == expected, (directory, pattern, excludes)
+
+
+async def test_glob_reports_a_bad_root_at_its_path(
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A vfs_glob that reports ENOENT for its root (unreachable today: the client resolves the root in the same
+    snapshot, so faked here) is reported at the path the root was resolved from, not at the root's id, and the view
+    strips id and detail."""
+    real_glob = globbing.glob
+    fake_root = uuid4()  # vfs_glob returns ENOENT for a root that isn't there
+
+    async def broken_glob(conn: AsyncConnection, root: UUID | None, pattern: str, **kwargs: Any) -> list[GlobMatch]:
+        return await real_glob(conn, fake_root, pattern, **kwargs)
+
+    monkeypatch.setattr(globbing, "glob", broken_glob)
+    await raises("ENOENT", vfs.glob("*", f"/workspaces/{W1}"), f"/workspaces/{W1}")
+    error = await raises("ENOENT", view(vfs, policy).glob("*", "/workspace"), "/workspace")
+    assert str(fake_root) not in str(error)
+    assert error.detail == ""
+
+
+async def test_an_error_path_that_is_not_a_path_is_reported_at_the_target(
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A client error whose path isn't an absolute path (a node id, say) is reported at the target: the view
+    neither shows the string nor fails on it. One warning is logged each time, without the string."""
+    agent = view(vfs, policy)
+    with caplog.at_level(logging.WARNING, logger="minifs.vfs.view"):
+        fake = uuid4()
+
+        async def broken_rename(src: str, dst: str, *, expect: UUID | None = None) -> None:
+            raise VFSError("ENOENT", str(fake), detail="real detail")
+
+        # Two targets: the error is reported at the first (the source). Only rename is patched, so the stat
+        # `_pin` does on the source is the real one: this case must come before the loop below.
+        monkeypatch.setattr(vfs, "rename", broken_rename)
+        error = await raises(
+            "ENOENT", agent.rename("/workspace/notes.md", "/workspace/moved.md"), "/workspace/notes.md"
+        )
+        assert error.detail == ""
+        assert str(fake) not in str(error)
+        bads = [str(uuid4()), "None", ""]
+        for bad in bads:
+
+            async def broken_stat(path: str, bad: str = bad) -> Entry:
+                raise VFSError("ENOENT", bad, detail="real detail")
+
+            monkeypatch.setattr(vfs, "stat", broken_stat)
+            error = await raises("ENOENT", agent.stat("/workspace/notes.md"), "/workspace/notes.md")
+            assert error.detail == ""
+            if bad:
+                assert bad not in str(error)
+        messages = [r.getMessage() for r in caplog.records if "isn't absolute" in r.getMessage()]
+        assert len(messages) == 4  # the rename case, then one per bad path
+        for message in messages:
+            assert "isn't absolute" in message
+            assert "ENOENT" in message
+            assert str(fake) not in message
+            assert not any(bad and bad in message for bad in bads)
+
+
+async def test_a_result_path_that_is_not_a_path_is_eio(
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A listing entry whose path isn't an absolute path (a client bug) fails the call as EIO at the directory,
+    rather than being reported, and policy-checked, as the directory itself; the string is shown nowhere."""
+    fake = str(uuid4())
+
+    async def broken_readdir(path: str, *, after: str | None = None, limit: int | None = None) -> list[Entry]:
+        return [Entry(fake, uuid4(), "file", 0, None)]
+
+    monkeypatch.setattr(vfs, "readdir", broken_readdir)
+    with caplog.at_level(logging.ERROR, logger="minifs.vfs.view"):
+        error = await raises("EIO", view(vfs, policy).readdir("/workspace"), "/workspace")
+    assert fake not in str(error)
+    assert error.detail == ""
+    messages = [r.getMessage() for r in caplog.records if "isn't absolute" in r.getMessage()]
+    assert len(messages) == 1
+    assert fake not in messages[0]

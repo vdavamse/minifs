@@ -123,3 +123,30 @@ def test_glob(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -
     assert capsysbinary.readouterr().out == b"/w/a.md\n"
     assert run(db, "glob", "[", "/w") == 1
     assert capsysbinary.readouterr().err.startswith(b"minifs glob: ")
+
+
+def test_glob_bounds(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    """#85: the walk under /w keeps w/a.md, w/b.md and w/sub, w/sub/c.md; ``--max-nodes`` and ``--timeout``
+    lift or tighten the library's bounds."""
+    for path in ("/w/a.md", "/w/b.md", "/w/sub/c.md"):
+        monkeypatch.setattr(sys, "stdin", _Stdin(b"x"))
+        assert run(db, "put", "-p", path) == 0
+    capsysbinary.readouterr()
+    assert run(db, "glob", "**", "/w", "--max-nodes", "1") == 1
+    err = capsysbinary.readouterr().err
+    assert err.startswith(b"minifs glob: ") and b"Glob scope is over 1 files and directories" in err
+    assert run(db, "glob", "**", "/w", "--max-nodes", "none", "--timeout", "5") == 0
+    assert sorted(capsysbinary.readouterr().out.split()) == [b"/w/a.md", b"/w/b.md", b"/w/sub/c.md"]
+    assert run(db, "glob", "**", "/w", "--max-nodes", "4") == 0
+    capsysbinary.readouterr()
+    for bad in (
+        ["--max-nodes", "-1"],
+        ["--max-nodes", "x"],
+        ["--timeout", "x"],
+        ["--timeout", "0"],
+        ["--timeout", "inf"],
+    ):
+        with pytest.raises(SystemExit) as info:
+            run(db, "glob", "**", "/w", *bad)
+        assert info.value.code == 2
+        assert b"usage:" in capsysbinary.readouterr().err

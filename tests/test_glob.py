@@ -10,12 +10,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
+import psycopg
 import pytest
 from psycopg import AsyncConnection
 
 from minifs import _regex
+from minifs.db.errors import errno_name
 from minifs.vfs.core import VFSError
-from minifs.vfs.glob import GlobError, GlobPlan, compile_excludes, compile_glob, glob, glob_to_regex
+from minifs.vfs.glob import GlobError, GlobPlan, WalkTooWide, compile_excludes, compile_glob, glob, glob_to_regex
 from tests.test_tree import create, mkdir_p
 
 # The oracle exists only in development builds; test_regex_extension.py fails without it.
@@ -609,6 +611,84 @@ async def test_newest_first_and_limit(conn: AsyncConnection) -> None:
         await glob(conn, None, "**", limit=-1)
 
 
+async def test_node_cap(conn: AsyncConnection) -> None:
+    """``max_nodes`` counts the rows the walk keeps: the directories it descends into and the files whose name can
+    match. One row over, the glob is refused whole, whatever the limit."""
+    await _tree(conn, None, ["a.py", "b.md", "d/c.py", "d/e/f.py"])
+    # "**" keeps a.py, b.md, d, d/c.py, d/e and d/e/f.py.
+    assert len(await glob(conn, None, "**", max_nodes=6)) == 4
+    assert len(await glob(conn, None, "**", max_nodes=2**31 - 1)) == 4
+    for limit in (None, 1, 0):
+        with pytest.raises(WalkTooWide) as info:
+            await glob(conn, None, "**", max_nodes=5, limit=limit)
+        assert info.value.max_nodes == 5
+    # "*.py" doesn't keep b.md, unless the hints are off.
+    assert compile_glob("*.py").name_like is not None
+    assert len(await glob(conn, None, "*.py", max_nodes=5)) == 3
+    with pytest.raises(WalkTooWide):
+        await glob(conn, None, "*.py", max_nodes=4)
+    with pytest.raises(WalkTooWide):
+        await glob(conn, None, "*.py", max_nodes=5, hints=False)
+    # The walk starts below the pattern's literal prefix: "d/**" keeps d/c.py, d/e and d/e/f.py.
+    assert compile_glob("d/**").prefix == ("d",)
+    assert len(await glob(conn, None, "d/**", max_nodes=3)) == 2
+    with pytest.raises(WalkTooWide):
+        await glob(conn, None, "d/**", max_nodes=2)
+    # A cap of 0 allows only an empty directory.
+    with pytest.raises(WalkTooWide):
+        await glob(conn, None, "**", max_nodes=0)
+    empty = await mkdir_p(conn, "empty")
+    assert await glob(conn, empty, "**", max_nodes=0) == []
+    with pytest.raises(ValueError):
+        await glob(conn, None, "**", max_nodes=-1)
+    with pytest.raises(psycopg.Error) as raised:  # a fault: raised by the function, not returned
+        async with conn.transaction():
+            await conn.execute("SELECT * FROM vfs_glob(NULL, '', p_max_nodes => -1)")
+    assert errno_name(raised.value) == "EINVAL"
+
+
+async def test_the_walk_stops_at_the_node_cap(db: str) -> None:
+    """The cap ends the walk itself, not just its result: over a tree of ~5,050 rows a capped glob reads a few
+    dozen of them (11 here, against 5,051 uncapped). ``pg_stat_xact_user_tables`` counts the current transaction
+    only, so the tree, the counter reads and both globs all run in one transaction."""
+
+    async def walked(c: AsyncConnection) -> int:
+        """Rows of vfs_nodes this transaction has read: index fetches plus sequential reads."""
+        await c.execute("SELECT pg_stat_clear_snapshot()")  # the transaction's stats snapshot would be stale
+        cur = await c.execute(
+            "SELECT idx_tup_fetch + coalesce(seq_tup_read, 0) FROM pg_stat_xact_user_tables WHERE relname = 'vfs_nodes'"
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        return int(row[0])
+
+    async with await AsyncConnection.connect(db) as c, c.transaction():
+        # 50 directories of 100 files each below one directory, in one statement.
+        await c.execute(
+            "WITH root AS (INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (NULL, 'root', 'dir') RETURNING id),"
+            " d AS (INSERT INTO vfs_nodes (parent_id, name, kind) SELECT root.id, 'd' || g, 'dir'"
+            "       FROM root, generate_series(1, 50) AS g RETURNING id)"
+            " INSERT INTO vfs_nodes (parent_id, name, kind) SELECT d.id, 'f' || g, 'file'"
+            " FROM d, generate_series(1, 100) AS g"
+        )
+        await c.execute("ANALYZE vfs_nodes")  # so the walk plans nested loops over the (parent_id, name) index
+        before = await walked(c)
+        with pytest.raises(WalkTooWide):  # EOVERFLOW is returned in a row, not raised: no savepoint needed
+            await glob(c, None, "**", max_nodes=10)
+        capped = await walked(c) - before
+        assert capped < 500, capped
+        before = await walked(c)
+        assert len(await glob(c, None, "**", max_nodes=None)) == 5000  # the control: the counter does work
+        uncapped = await walked(c) - before
+        assert uncapped > 5000, uncapped
+
+
+async def test_a_bad_root_comes_before_the_node_cap(conn: AsyncConnection) -> None:
+    with pytest.raises(VFSError) as info:
+        await glob(conn, uuid.uuid4(), "*", max_nodes=0)
+    assert info.value.errno == "ENOENT"
+
+
 async def test_bad_root(conn: AsyncConnection) -> None:
     file = await create(conn, None, "f")
     missing = uuid.uuid4()
@@ -618,6 +698,9 @@ async def test_bad_root(conn: AsyncConnection) -> None:
         # Returned by vfs_glob, not raised.
         assert (info.value.errno, info.value.path, info.value.db_error) == (errno, str(root), None)
         assert info.value.detail
+        with pytest.raises(VFSError) as info:
+            await glob(conn, root, "*", root_path="/some/dir")
+        assert (info.value.errno, info.value.path) == (errno, "/some/dir")
 
 
 async def test_classes_on_non_ascii_names(db_any_locale: str) -> None:

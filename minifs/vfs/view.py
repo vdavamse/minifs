@@ -49,7 +49,7 @@ import logging
 import re
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 from uuid import UUID
 
 import psycopg
@@ -79,6 +79,15 @@ MAX_GLOB_LIMIT = _MAX_LIMIT - 1
 _REFETCH_FACTOR = 8
 _READDIR_BATCH = 256  # the fewest entries a paged readdir asks for after its first round
 _READDIR_MAX_BATCH = 8192  # and what that grows to, doubling each round, while it reads past hidden entries
+
+
+class _Bounds(NamedTuple):
+    """What bounds each walk of one ``VFSView.glob`` (``VFSClient.glob``'s ``max_nodes`` and ``timeout``)."""
+
+    max_nodes: int | None
+    timeout: float
+
+
 _NO_NODE = UUID(int=0)  # never a node id: a pin that nothing matches
 _log = logging.getLogger(__name__)
 
@@ -293,9 +302,15 @@ class VFSView:
         excludes: Sequence[str] = (),
         hidden: bool = False,
         limit: int | None = None,
+        max_nodes: int | None = searching.MAX_NODES,
+        timeout: float = searching.TIMEOUT,
     ) -> GlobResult:
         """``VFSClient.glob`` below directory ``path``: the first ``limit`` files the actor may read, and whether
         there is at least one more (``truncated``).
+
+        ``max_nodes`` and ``timeout`` bound each walk as in ``VFSClient.glob`` (``SearchRefused``): each mount's,
+        below a virtual directory, and the second look described below. Files the actor can't read count toward
+        the cap, as the walk meets them before the policy does.
 
         Mounts the actor can't read anything in are not searched. The glob asks for ``limit + 1`` matches, so
         exactly ``limit`` readable ones are not ``truncated``. When all ``limit + 1`` came back and the policy hid
@@ -318,19 +333,25 @@ class VFSView:
         - for an exclude, a trailing ``//`` (``**//``).
 
         Every mount's pattern and excludes are restated before any is searched, so whether a glob is EINVAL
-        doesn't depend on the order of the mounts. EINVAL too for a ``limit`` outside 0 to 2**31 - 2."""
+        doesn't depend on the order of the mounts. EINVAL too for a ``limit`` outside 0 to 2**31 - 2, and for a
+        bad ``max_nodes`` or ``timeout``."""
         target = self._target(path, "read")
         if limit is not None and not 0 <= limit < _MAX_LIMIT:  # limit + 1 is asked for
             raise VFSError("EINVAL", target.visible, f"invalid limit {limit}")
+        if max_nodes is not None and not 0 <= max_nodes <= _MAX_LIMIT:
+            raise VFSError("EINVAL", target.visible, f"invalid node cap {max_nodes}")
+        if not 0 < timeout <= MAX_TIMEOUT:
+            raise VFSError("EINVAL", target.visible, f"invalid timeout {timeout}")
+        bounds = _Bounds(max_nodes, timeout)
         if limit is None:
-            return GlobResult(self._readable(await self._glob(target, pattern, excludes, hidden, None)), False)
+            return GlobResult(self._readable(await self._glob(target, pattern, excludes, hidden, None, bounds)), False)
         fetch = limit + 1
-        entries = await self._glob(target, pattern, excludes, hidden, fetch)
+        entries = await self._glob(target, pattern, excludes, hidden, fetch, bounds)
         readable = self._readable(entries)
         wider = min(max(limit, 1) * _REFETCH_FACTOR + 1, _MAX_LIMIT)
         if len(entries) == fetch and len(readable) <= limit and wider > fetch:
             # The policy hid some of the first `limit + 1`: look past them, a bounded distance.
-            readable = self._readable(await self._glob(target, pattern, excludes, hidden, wider))
+            readable = self._readable(await self._glob(target, pattern, excludes, hidden, wider, bounds))
         return GlobResult(readable[:limit], len(readable) > limit)
 
     def _readable(self, entries: list[Entry]) -> list[Entry]:
@@ -339,18 +360,33 @@ class VFSView:
         return [_reported(e) for e in entries if self.policy.allows(self.actor, "read", e.path)]
 
     async def _glob(
-        self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
+        self,
+        target: _Target,
+        pattern: str,
+        excludes: Sequence[str],
+        hidden: bool,
+        limit: int | None,
+        bounds: _Bounds,
     ) -> list[Entry]:
         if target.real is not None:
             if not self.policy.allows_any(self.actor, "read", target.visible):
                 return []
             matches = await self._mapped(
-                self._client.glob(pattern, target.real, excludes=excludes, hidden=hidden, limit=limit), target
+                self._client.glob(
+                    pattern,
+                    target.real,
+                    excludes=excludes,
+                    hidden=hidden,
+                    limit=limit,
+                    max_nodes=bounds.max_nodes,
+                    timeout=bounds.timeout,
+                ),
+                target,
             )
             return [self._entry(e, target) for e in matches]
         globbing.compile_glob(pattern)  # a bad pattern is reported as such, not restated
         globbing.compile_excludes(excludes)
-        return await self._virtual_glob(target, pattern, excludes, hidden, limit)
+        return await self._virtual_glob(target, pattern, excludes, hidden, limit, bounds)
 
     async def grep(
         self,
@@ -655,7 +691,14 @@ class VFSView:
 
     def _visible(self, real: str, *targets: _Target) -> str:
         """The visible path of ``real``, a path the operation on ``targets`` reported: one of their real paths, or
-        a path below or above one in its mount. A path above a mount point is reported as the mount point."""
+        a path below or above one in its mount. A path above a mount point is reported as the mount point; a string
+        that isn't an absolute path is EIO at the first target."""
+        if not real.startswith("/"):
+            # Not a path (a node id, say) in a result: a client bug. Refused rather than mapped to a path it isn't,
+            # which the policy would then check, and without the string, even in the log. ``_mapped`` handles an
+            # error's path before calling this.
+            _log.error("the client reported a path that isn't absolute, in an operation on %s", targets[0].visible)
+            raise VFSError("EIO", targets[0].visible, "internal error")
         segments = split_trusted(real)
         for target in targets:
             if real == target.real:
@@ -678,7 +721,16 @@ class VFSView:
         try:
             return await call
         except VFSError as e:
-            error = VFSError(e.errno, self._visible(e.path, *targets), e.message)
+            if e.path.startswith("/"):
+                path = self._visible(e.path, *targets)
+            else:  # not a path (a node id, say): a client bug. The errno stands; the string is never shown
+                _log.warning(
+                    "%s from the client at a path that isn't absolute, in an operation on %s",
+                    e.errno,
+                    targets[0].visible,
+                )
+                path = targets[0].visible
+            error = VFSError(e.errno, path, e.message)
         except psycopg.Error as e:
             _log.warning("database error in an operation on %s", targets[0].visible, exc_info=e)
             error = VFSError("EIO", targets[0].visible, "database error")
@@ -705,7 +757,13 @@ class VFSView:
         return [children[name] for name in sorted(children)]
 
     async def _virtual_glob(
-        self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
+        self,
+        target: _Target,
+        pattern: str,
+        excludes: Sequence[str],
+        hidden: bool,
+        limit: int | None,
+        bounds: _Bounds,
     ) -> list[Entry]:
         entries: list[Entry] = []
         for mount_target, mount_pattern, mount_excludes in self._restated(target, pattern, excludes, hidden):
@@ -713,7 +771,13 @@ class VFSView:
             try:
                 matches = await self._mapped(
                     self._client.glob(
-                        mount_pattern, _real(mount_target), excludes=mount_excludes, hidden=hidden, limit=limit
+                        mount_pattern,
+                        _real(mount_target),
+                        excludes=mount_excludes,
+                        hidden=hidden,
+                        limit=limit,
+                        max_nodes=bounds.max_nodes,
+                        timeout=bounds.timeout,
                     ),
                     mount_target,
                 )
