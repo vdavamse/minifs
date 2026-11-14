@@ -408,7 +408,7 @@ async def test_readdir_errors(conn: AsyncConnection) -> None:
 
 
 async def test_readdir_pages_by_name(conn: AsyncConnection) -> None:
-    """p_after and p_limit page the listing in byte order; an empty page is no rows (migration 018)."""
+    """p_after and p_limit page the listing in byte order; an empty page is no rows (migration 016)."""
     directory = await create(conn, None, "d", "dir")
     await create(conn, None, "e", "dir")
     for name in ["B", "a", "b", "c", "é"]:
