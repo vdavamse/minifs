@@ -29,17 +29,18 @@ MAX_FILES = 10_000  # files in scope
 MAX_BYTES = 50 * 1024 * 1024  # bytes in scope, from vfs_nodes.size
 MAX_LINE_CHARS = 2000  # characters of each hit's line returned; the Grep tool cuts lines there
 TIMEOUT = 2.0  # seconds: the statement_timeout of each statement
+MAX_NODES = 200_000  # files and directories a glob's walk may keep (``VFSClient.glob``); grep has MAX_FILES
 
 # The scope when there is no include pattern: every file below the root.
 _ALL_FILES = "**"
 
 
 class SearchRefused(Exception):
-    """A search refused before or while scanning: ``reason`` is ``"files"`` or ``"bytes"`` (the scope is over a
-    cap; nothing was read) or ``"timeout"``. ``str()`` is a message for the model, with a hint to narrow the
-    search."""
+    """A search refused before or while scanning: ``reason`` is ``"files"`` or ``"bytes"`` (a grep's scope is over
+    a cap; nothing was read), ``"nodes"`` (a glob's walk is over its cap) or ``"timeout"``. ``str()`` is a message
+    for the model, with a hint to narrow the search."""
 
-    def __init__(self, reason: Literal["files", "bytes", "timeout"], message: str) -> None:
+    def __init__(self, reason: Literal["files", "bytes", "nodes", "timeout"], message: str) -> None:
         super().__init__(message)
         self.reason = reason
         self.message = message
@@ -219,6 +220,11 @@ def timed_out() -> SearchRefused:
     pg_cancel_backend with the same SQLSTATE and only a localized message to tell them apart, so both count as a
     timeout. (A cancelled asyncio task raises CancelledError instead.)"""
     return SearchRefused("timeout", "Search timed out; narrow the pattern or path")
+
+
+def too_wide(max_nodes: int) -> SearchRefused:
+    """What a glob whose walk passed ``max_nodes`` raises (``vfs_glob``'s EOVERFLOW)."""
+    return SearchRefused("nodes", f"Glob scope is over {max_nodes} files and directories; narrow the path or pattern")
 
 
 def _megabytes(size: int) -> str:

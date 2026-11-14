@@ -469,6 +469,46 @@ async def test_glob_skips_mounts_it_cannot_read(vfs: VFSClient) -> None:
     assert Policy({"a": [Rule("/w/x.md", "read"), Rule("/w/**")]}).allows_any("a", "read", "/w")
 
 
+async def test_glob_bounds_each_walk(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#85: ``max_nodes`` and ``timeout`` reach every walk the view makes: a mount's own, each mount's below
+    ``/``, and the second, wider look past matches the policy hides (each call's arguments are recorded). A cap of
+    0 is refused from a mount and from ``/``; bad bounds are EINVAL."""
+    calls: list[dict[str, object]] = []
+    original = vfs.glob
+
+    async def recording(*args: Any, **kwargs: Any) -> list[Entry]:
+        calls.append(kwargs)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(vfs, "glob", recording)
+    agent = view(vfs, Policy(DEFAULT_POLICY.rules))
+    hiding = view(vfs, Policy({"agent": [Rule("/workspace/hid/**"), Rule("/**", "read")]}))
+    for i in range(3):  # newer than everything else, and hidden: the first look (limit + 1 = 2) sees only these
+        await vfs.create(f"/workspaces/{W1}/hid/{i}.md", b"", parents=True)
+    for glob, path, expected_calls in [
+        (agent.glob, "/workspace", 1),
+        (agent.glob, "/", 2),
+        (hiding.glob, "/workspace", 2),
+    ]:
+        calls.clear()
+        await glob("**", path, limit=1, max_nodes=12345, timeout=1.5)
+        assert len(calls) == expected_calls, calls
+        assert all((c["max_nodes"], c["timeout"]) == (12345, 1.5) for c in calls), calls
+    everything = await agent.glob("**", "/")
+    assert everything.entries
+    for path in ("/workspace", "/"):
+        with pytest.raises(SearchRefused) as info:
+            await agent.glob("**", path, max_nodes=0)
+        assert info.value.reason == "nodes"
+        with pytest.raises(SearchRefused):
+            await agent.glob("**", path, max_nodes=0, limit=1)
+    assert await agent.glob("**", "/", max_nodes=None) == everything
+    for max_nodes in (-1, 2**31):
+        await raises("EINVAL", agent.glob("**", "/workspace", max_nodes=max_nodes), "/workspace")
+    for timeout in (0, 1e10):
+        await raises("EINVAL", agent.glob("**", "/workspace", timeout=timeout), "/workspace")
+
+
 async def test_glob_limit_counts_only_readable_files(vfs: VFSClient) -> None:
     hiding = view(vfs, Policy({"agent": [Rule("/workspace/log.md"), Rule("/**", "read")]}))
     await vfs.append(f"/workspaces/{W1}/log.md", b"newest")
