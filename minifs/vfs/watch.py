@@ -17,9 +17,10 @@ connection.
 The channel is the schema's own (``vfs_channel()``, migration 016): a random name, read from the database when the
 watcher connects, so two minifs schemas in one database don't see each other's events. Channels are database-wide,
 and anyone who knows a channel's name can LISTEN and NOTIFY on it, so the trust boundary is who can learn the name:
-a role with EXECUTE on ``vfs_channel()``, which is the schema's owner until it grants it. PostgreSQL also folds identical payloads within one transaction. So events are
-hints, not facts: react to one by reading the database, never by trusting its fields alone. What forged events can
-cost is bounded where it is cheap to: each subscription delivers at most one ``rescan`` per ``rescan_interval``
+a role with EXECUTE on ``vfs_channel()``, which is the schema's owner until it grants it. PostgreSQL also folds
+identical payloads within one transaction. So events are hints, not facts: react to one by reading the database,
+never by trusting its fields alone. What forged events can cost is bounded where it is cheap to: each subscription
+delivers at most one ``rescan`` per ``rescan_interval``
 (the rest collapse into it; none is lost, only delayed), and a malformed payload is logged cut short and at most
 once every few seconds. A forged ``delete`` of a watched node still costs that watch one database check each.
 """
@@ -363,8 +364,8 @@ class Watcher:
     connection opens, unless ``channel`` names one, and each keepalive probe checks it, so a watcher follows a
     changed name within ``keepalive`` seconds, with a ``rescan``. RuntimeError from ``start()`` if the schema has no
     such function (it predates migration 016), or the role may not call it: EXECUTE on ``vfs_channel()`` is the
-    owner's alone until granted, and it is what lets a role read the schema's events. ``rescan_interval`` is the least time between two ``rescan`` deliveries to
-    one subscription (see ``Subscription``); 0 delivers every one.
+    owner's alone until granted, and it is what lets a role read the schema's events. ``rescan_interval`` is the
+    least time between two ``rescan`` deliveries to one subscription (see ``Subscription``); 0 delivers every one.
     """
 
     def __init__(
