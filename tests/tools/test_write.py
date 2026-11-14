@@ -14,7 +14,7 @@ import pytest
 import minifs.tools._text as text
 import minifs.tools.write as write_module
 from minifs.tools import TOOLS, Write
-from minifs.tools.deps import ToolSettings, WriteSettings
+from minifs.tools.deps import EditSettings, ToolSettings, WriteSettings
 from minifs.tools.write import DESCRIPTION
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import CONTROL_CHARACTERS, FileVersion, ReadResult
@@ -460,6 +460,11 @@ async def test_read_file_reads_a_file_within_the_cap_in_one_pread(view: VFSView,
     assert got == data
     assert version.size == len(data)
     assert spy.preads == [(0, 4 * 1024 * 1024)]
+
+
+def test_the_default_edit_cap_is_one_page() -> None:
+    """Edit's default cap fits in one page, so a default Edit reads its file in one statement."""
+    assert EditSettings().max_bytes <= text.PAGE
 
 
 async def test_read_file_pages_past_page(view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
