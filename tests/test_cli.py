@@ -210,6 +210,7 @@ def test_password_prompt(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary:
         prompts.append(prompt)
         return password
 
+    monkeypatch.setattr(cli, "_has_terminal", lambda: True)  # pytest has no terminal
     monkeypatch.setattr(cli.getpass, "getpass", right)
     monkeypatch.setenv("MINIFS_DSN", _conninfo_without_password(db))
     assert main(["ls", "-W"]) == 0
@@ -225,6 +226,29 @@ def test_password_prompt(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary:
     assert "PlaceHolder-7f3a" not in err
 
 
+def test_password_prompt_needs_a_terminal(monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    """Without a terminal ``-W`` refuses instead of reading the password from stdin, which is ``put``'s data;
+    a getpass that ends at the prompt (EOF, Ctrl-C) is "no password entered", not a traceback."""
+
+    def never(prompt: str = "") -> str:
+        pytest.fail("getpass must not be called without a terminal")
+
+    monkeypatch.setattr(cli, "_has_terminal", lambda: False)
+    monkeypatch.setattr(cli.getpass, "getpass", never)
+    assert main(["ls", "-W"]) == 1
+    assert "-W needs a terminal" in capsysbinary.readouterr().err.decode()
+
+    def eof(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr(cli, "_has_terminal", lambda: True)
+    monkeypatch.setattr(cli.getpass, "getpass", eof)
+    assert main(["ls", "-W"]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert "no password entered" in err
+    assert "Traceback" not in err
+
+
 def test_unparseable_conninfo_is_not_shown(monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
     assert main(["ls", "--dsn", "password=PlaceHolder-7f3a junk"]) == 1
     err = capsysbinary.readouterr().err.decode()
@@ -236,6 +260,134 @@ def test_unparseable_conninfo_is_not_shown(monkeypatch: pytest.MonkeyPatch, caps
     err = capsysbinary.readouterr().err.decode()
     assert "invalid connection string (not shown" in err
     assert "PlaceHolder-7f3a" not in err
+
+
+@pytest.mark.parametrize(
+    ("dsn", "expected", "forbidden"),
+    [
+        # libpq quotes the sslmode value back: the one error here that only passes because _mask replaces the
+        # password (with _mask deleted, "PH-7f3a" would show instead of "****").
+        ("host=127.0.0.1 port=1 sslmode=PH-7f3a password=PH-7f3a", 'invalid sslmode value: "****"', ("PH-7f3a",)),
+        # Unparseable conninfos: the CLI's own fixed text, never libpq's message, which quotes the input.
+        ("postgresql://u:PH-7f3a@[h", "invalid connection string (not shown", ("PH-7f3a",)),
+        ("host=h PH-7f3a", "invalid connection string (not shown", ("PH-7f3a",)),
+        # A bad percent escape: the password as written and its percent-encoded form must both stay hidden.
+        ("postgresql://u:PH%zz7f3a@h/db", "invalid connection string (not shown", ("PH%zz7f3a", "PH%25zz7f3a")),
+    ],
+)
+def test_errors_that_quote_the_password_are_masked(
+    monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture, dsn: str, expected: str, forbidden: tuple[str, ...]
+) -> None:
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", "2")
+    assert main(["ls", "--dsn", dsn]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert expected in err
+    for secret in forbidden:
+        assert secret not in err
+
+
+# URIs libpq misreads: it ends the userinfo at the first @ before the first /, so an unescaped @ or / in the
+# password leaves part of it in a field (host, port, dbname) error messages quote without masking.
+_MISREAD_URIS = (
+    "postgresql://u:PH@ss7f3a@127.0.0.1:1/x",
+    "postgresql://u:PH/ss7f3a@127.0.0.1:1/x",
+    "postgres://u:PH@ss7f3a@127.0.0.1:1/x",
+    "postgres://u:PH/ss7f3a@127.0.0.1:1/x",
+)
+# The same passwords written so libpq reads them right: these must reach the connection, not the refusal.
+_MISREAD_SAFE_URIS = (
+    "postgresql://u:PH%40ss7f3a@127.0.0.1:1/x",
+    "postgresql://u:PH?ss7f3a@127.0.0.1:1/x",
+    "postgresql://127.0.0.1:1/db?user=me@corp",
+)
+
+
+@pytest.mark.parametrize("dsn", _MISREAD_URIS)
+def test_misread_uri_is_refused(monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture, dsn: str) -> None:
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", "2")
+    assert main(["ls", "--dsn", dsn]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert "write @ as %40" in err
+    assert "ss7f3a" not in err
+
+
+@pytest.mark.parametrize("dsn", _MISREAD_SAFE_URIS)
+def test_misread_uri_counter_cases_reach_the_connection(
+    monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture, dsn: str
+) -> None:
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", "2")
+    assert main(["ls", "--dsn", dsn]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert "Connection refused" in err
+    assert "%40" not in err
+
+
+def test_misread_uri() -> None:
+    misread = cli._misread_uri  # pyright: ignore[reportPrivateUsage]
+    for dsn in _MISREAD_URIS:
+        assert misread(dsn, conninfo_to_dict(dsn))
+    for dsn in _MISREAD_SAFE_URIS:
+        assert not misread(dsn, conninfo_to_dict(dsn))
+    keyword = "host=127.0.0.1 port=1 password=PH-7f3a"
+    assert not misread(keyword, conninfo_to_dict(keyword))  # not a URI: nothing libpq could misread
+
+
+@pytest.mark.parametrize("password", ["a", "1", "%25"])
+def test_short_password_hides_the_error(monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture, password: str) -> None:
+    """A password under _MIN_MASKED characters isn't masked (it would garble the message and show where it
+    matched), so the whole libpq error is withheld."""
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", "2")
+    assert main(["ls", "--dsn", f"host=127.0.0.1 port=1 password={password}"]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert "database error (not shown: the password is too short to mask)" in err
+    assert "Connection refused" not in err
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected", "forbidden"),
+    [
+        # argparse quotes argv in its errors: _Parser.error masks the passwords out of them.
+        (["ls", "--password=PH7f3a"], "unrecognized arguments: --password=****", ("PH7f3a",)),
+        # -WPH7f3a leaves "-PH7f3a" over as an unrecognized word: masked whole, no fragment may show.
+        (["ls", "-WPH7f3a"], "unrecognized arguments: ****", ("7f3a",)),
+        (["ls", "--dns=postgresql://u:PH@ss7f3a@h/x"], "--dns=****", ("ss7f3a",)),
+        # An invalid subcommand choice quotes the whole word: the URI userinfo masking covers it.
+        (["postgresql://u:PH7f3a@h/x"], "invalid choice", ("PH7f3a",)),
+    ],
+)
+def test_argparse_errors_mask_passwords(
+    capsysbinary: Capture, argv: list[str], expected: str, forbidden: tuple[str, ...]
+) -> None:
+    with pytest.raises(SystemExit) as info:
+        main(argv)
+    assert info.value.code == 2
+    err = capsysbinary.readouterr().err.decode()
+    assert expected in err
+    for secret in forbidden:
+        assert secret not in err
+
+
+def test_dsn_file_encoding(db: str, tmp_path: Path, capsysbinary: Capture) -> None:
+    with_bom = tmp_path / "dsn"
+    with_bom.write_bytes(b"\xef\xbb\xbf" + db.encode() + b"\n")  # a UTF-8 BOM must be tolerated
+    assert main(["ls", "--dsn-file", str(with_bom)]) == 0
+    capsysbinary.readouterr()
+
+    not_utf8 = tmp_path / "latin1"
+    not_utf8.write_bytes(b"host=h password=PH\xe97f3a\n")  # \xe9 is not valid UTF-8 on its own
+    assert main(["ls", "--dsn-file", str(not_utf8)]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert "--dsn-file is not UTF-8 text" in err
+    assert "7f3a" not in err
+
+
+def test_undecodable_argv_is_refused(capsysbinary: Capture) -> None:
+    """argv bytes that were not UTF-8 reach Python as surrogates: refused with the fixed text, not a traceback."""
+    assert main(["ls", "--dsn", "host=h \udcff password=PH-7f3a"]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert "invalid connection string (not shown" in err
+    assert "Traceback" not in err
+    assert "PH-7f3a" not in err
 
 
 def test_dsn_and_dsn_file_are_exclusive(tmp_path: Path, capsysbinary: Capture) -> None:
@@ -260,3 +412,6 @@ def test_mask() -> None:
     assert mask("pw Place%20Holder-7f3a end", forms("Place Holder-7f3a", "x")) == "pw **** end"
     uri = "postgresql://u:Place%20Holder-7f3a@h/x"
     assert mask(f"connect to {uri} refused", forms("Place Holder-7f3a", uri)) == "connect to **** refused"
+
+    # A secret shorter than _MIN_MASKED characters is left alone (see test_short_password_hides_the_error).
+    assert mask("failed", ["a"]) == "failed"
