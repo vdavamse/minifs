@@ -127,9 +127,9 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
         start, end = candidates_list[0]
         if _middle_similarity(original, start, end - start + 1, search, True) >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD:
             # departs from ladderframe (#117): a block longer than the find has lines the find doesn't include;
-            # the middle is scored by position over the shorter of the two, so those lines were never compared
-            # and the replacement deleted them. Refused with a retry rather than dropped: dropping it let a
-            # weaker block elsewhere win the scoring.
+            # the middle is scored by position over the shorter of the two, so the block's lines past the find's
+            # length were never compared and the replacement deleted them. Refused with a retry rather than
+            # dropped: dropping it let another block elsewhere win the scoring.
             if end - start + 1 > len(search):
                 raise ValueError(
                     BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=end - start + 1 - len(search))
@@ -140,10 +140,13 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
 
     best: tuple[int, int] | None = None
     best_similarity = -1.0
+    best_longer = False
     for start, end in candidates_list:
         similarity = _middle_similarity(original, start, end - start + 1, search, False)
-        if similarity > best_similarity:
-            best_similarity, best = similarity, (start, end)
+        longer = end - start + 1 > len(search)
+        # departs from ladderframe (#117): on a tie, a block no longer than the find beats a longer one
+        if similarity > best_similarity or (similarity == best_similarity and best_longer and not longer):
+            best_similarity, best, best_longer = similarity, (start, end), longer
     if best is not None and best_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD:
         start, end = best
         # departs from ladderframe (#117): as above, for the best of several candidates.
@@ -565,9 +568,9 @@ def test_block_anchors_alone_dont_take_the_line_between() -> None:
 
 def test_block_anchors_refuse_a_longer_block() -> None:
     """A block longer than the find has lines the find doesn't include: the middle is scored by position over the
-    shorter of the two, so those lines were never compared and the replacement deleted them (#117). Such a block is
-    refused with a retry rather than dropped: dropping it let a weaker block elsewhere win the scoring. A shorter
-    block is still taken."""
+    shorter of the two, so the block's lines past the find's length were never compared and the replacement deleted
+    lines the model never wrote (#117). Such a block is refused with a retry rather than dropped: dropping it let
+    another block elsewhere win the scoring. A shorter block is still taken, and wins a tie with a longer one."""
     content = "def f():\n    keep_me()\n    delete_me()\n    return 1\n"
     find = "def f():\n    keep_me()\n    return 1\n"
     message = re.escape(BLOCK_LEAVES_OUT_LINES.format(first=1, last=4, extra=1))
@@ -605,6 +608,13 @@ def test_block_anchors_refuse_a_longer_block() -> None:
             "def f():\n    a()\n    b()\n    c()\n    gone()\n    return 1\n",
         )
     ) == ["def f():\n    a()\n    b()\n    c()\n    return 1"]
+    # A tie: both blocks score the same and the longer one comes first. The block of the find's length wins, rather
+    # than a refusal that points at the wrong block. With the longer block twice, ladderframe got there too: its
+    # pick was ambiguous, and whitespace_normalized_replacer found the right block.
+    longer, same = "if x:\n  a = 1\n  b = 2\n  c = 3\nreturn\n", "if x:\n  a = 1\n  b = 2\nreturn\n"
+    for content in (longer + same, longer + longer + same):
+        for search in (new.replace, replace):
+            assert search(content, "if x:\n  a  =  1\n  b = 2\nreturn", "NEW") == content.removesuffix(same) + "NEW\n"
 
 
 def test_multi_occurrence_replacer_is_not_tried() -> None:

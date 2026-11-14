@@ -72,8 +72,8 @@ EMPTY_OLD_STRING = (
     "or use write for an intentional full-file replacement."
 )
 BLOCK_LEAVES_OUT_LINES = (
-    "oldString looks like lines {first}-{last} of the file, but {extra} of those lines are not in oldString and "
-    "the replacement would delete them. Read those lines again and include every one of them in oldString."
+    "oldString looks like lines {first}-{last} of the file, but that block has {extra} more line(s) than oldString, "
+    "which the replacement would delete. Read those lines again and include every one of them in oldString."
 )
 
 
@@ -380,9 +380,9 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
         j = _next_line(last_at, i + 2, n)  # only the first occurrence of the last line
         # ladderframe's window: the block may differ from the find by at most max_delta lines; a shorter block is
         # still taken. A block longer than the find has lines the find doesn't include: the middle is scored by
-        # position over the shorter of the two, so those lines were never compared and the replacement deleted
-        # them (#117). Such a block is refused with a retry where it would be yielded, not dropped here: dropping
-        # it let a weaker block elsewhere win the scoring.
+        # position over the shorter of the two, so the block's lines past the find's length were never compared
+        # and the replacement deleted lines the model never wrote (#117). Such a block is refused with a retry
+        # where it would be yielded, not dropped here: dropping it let another block elsewhere win the scoring.
         if j < n and abs((j - i + 1) - len(search)) <= max_delta:
             candidates.append((i, j))
     if not candidates:
@@ -392,7 +392,7 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
     if len(candidates) == 1:
         start, end = candidates[0]
         if _middle_similarity(original, start, end - start + 1, search, True) >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD:
-            if end - start + 1 > len(search):  # the block's extra lines were never compared (#117): refuse
+            if end - start + 1 > len(search):  # lines the find doesn't include (#117): refuse
                 raise ValueError(
                     BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=end - start + 1 - len(search))
                 )
@@ -401,13 +401,16 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
 
     best: tuple[int, int] | None = None
     best_similarity = -1.0
+    best_longer = False
     for start, end in candidates:
         similarity = _middle_similarity(original, start, end - start + 1, search, False)
-        if similarity > best_similarity:
-            best_similarity, best = similarity, (start, end)
+        longer = end - start + 1 > len(search)
+        # on a tie, a block no longer than the find beats a longer one, which would only be refused (#117)
+        if similarity > best_similarity or (similarity == best_similarity and best_longer and not longer):
+            best_similarity, best, best_longer = similarity, (start, end), longer
     if best is not None and best_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD:
         start, end = best
-        if end - start + 1 > len(search):  # the block's extra lines were never compared (#117): refuse
+        if end - start + 1 > len(search):  # lines the find doesn't include (#117): refuse
             raise ValueError(
                 BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=end - start + 1 - len(search))
             )
