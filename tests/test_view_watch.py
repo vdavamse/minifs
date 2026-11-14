@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -145,9 +146,10 @@ async def test_moves_across_the_view_name_only_this_side(vfs: VFSClient, watcher
 
 
 async def test_a_preexisting_child_modify_is_reported(vfs: VFSClient, watcher: Watcher) -> None:
-    """A modify of a child the watch never saw created is looked up once and reported; a hidden one isn't."""
+    """A modify of a child the watch never saw created is reported under the name in its notification; a modify
+    under a hidden name isn't."""
     agent = view(vfs, watcher)
-    await vfs.create(f"/workspaces/{W1}/d/.env", b"KEY=1")  # before the watch: its name is not known
+    await vfs.create(f"/workspaces/{W1}/d/.env", b"KEY=1")  # before the watch: it never sees the create
     async with agent.watch("/workspace/d") as w:
         await agent.append("/workspace/d/old.md", b"more\n")
         entry = await agent.stat("/workspace/d/old.md")
@@ -205,21 +207,6 @@ async def test_a_rescan_is_reported_at_the_watched_path(vfs: VFSClient, watcher:
     agent = view(vfs, watcher)
     async with agent.watch("/workspace/d") as w:
         watcher._broadcast(RESCAN, now=True)  # pyright: ignore[reportPrivateUsage]
-        assert await next_seen(w) == WatchEvent("rescan", "/workspace/d")
-
-
-async def test_a_failed_name_lookup_is_a_rescan(
-    vfs: VFSClient, watcher: Watcher, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A modify whose name lookup fails is reported as a rescan: the actor re-checks the directory."""
-    agent = view(vfs, watcher)
-
-    async def broken(self: ViewWatch, child: UUID) -> str | None:
-        raise OSError("down")
-
-    monkeypatch.setattr(ViewWatch, "_lookup", broken)
-    async with agent.watch("/workspace/d") as w:
-        await agent.append("/workspace/d/old.md", b"more\n")
         assert await next_seen(w) == WatchEvent("rescan", "/workspace/d")
 
 
@@ -355,22 +342,21 @@ async def test_a_rescan_after_a_missed_move_ends_the_watch(
 async def test_a_cancelled_get_keeps_its_event(
     vfs: VFSClient, watcher: Watcher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A get() cancelled mid-lookup keeps the event and its check: the next get() resumes and returns it."""
-    original = ViewWatch._lookup  # pyright: ignore[reportPrivateUsage]
+    """A get() cancelled while the watch checks its path keeps the event and the check: the next get() resumes
+    and returns it."""
+    original = ViewWatch._at  # pyright: ignore[reportPrivateUsage]
 
-    async def slow_lookup(self: ViewWatch, child: UUID) -> str | None:
+    async def slow(real: tuple[str, ...], conn: AsyncConnection[Any]) -> tuple[UUID, ...] | None:
         await asyncio.sleep(0.5)
-        return await original(self, child)
+        return await original(real, conn)
 
-    monkeypatch.setattr(ViewWatch, "_lookup", slow_lookup)
+    monkeypatch.setattr(ViewWatch, "_at", staticmethod(slow))
     agent = view(vfs, watcher)
     async with agent.watch("/workspace/d") as w:
-        await agent.append("/workspace/d/old.md", b"more\n")
+        watcher._broadcast(RESCAN, now=True)  # pyright: ignore[reportPrivateUsage]
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(w.get(), 0.1)
-        event = await next_seen(w)
-    assert event.op == "modify"
-    assert event.path == "/workspace/d/old.md"
+        assert await next_seen(w) == WatchEvent("rescan", "/workspace/d")
 
 
 async def test_a_move_just_before_the_watch_is_not_a_delete(
@@ -396,31 +382,6 @@ async def test_a_move_just_before_the_watch_is_not_a_delete(
     assert event.path == "/workspace/tasks/cur/t1"
 
 
-async def test_a_forged_child_modify_is_looked_up_once(
-    vfs: VFSClient, watcher: Watcher, conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Three forged modify notifications of one unknown child cost a single name lookup: the miss is remembered."""
-    original = ViewWatch._lookup  # pyright: ignore[reportPrivateUsage]
-    calls = 0
-
-    async def counting_lookup(self: ViewWatch, child: UUID) -> str | None:
-        nonlocal calls
-        calls += 1
-        return await original(self, child)
-
-    monkeypatch.setattr(ViewWatch, "_lookup", counting_lookup)
-    agent = view(vfs, watcher)
-    d = (await vfs.stat(f"{R1}/d")).id
-    assert d is not None
-    async with agent.watch("/workspace/d") as w:
-        payload = {"op": "modify", "id": str(uuid4()), "parent": str(d), "size": 1, "gen": 1}
-        for _ in range(3):
-            await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps(payload),))
-        await agent.create("/workspace/d/marker", b"")
-        assert await next_seen(w) == WatchEvent("create", "/workspace/d/marker", kind="file")
-    assert calls == 1
-
-
 async def test_impossible_names_are_dropped(vfs: VFSClient, watcher: Watcher, conn: AsyncConnection) -> None:
     """Forged creates with names no node can have (a path, '..', empty) are dropped; a real create follows."""
     agent = view(vfs, watcher)
@@ -432,3 +393,112 @@ async def test_impossible_names_are_dropped(vfs: VFSClient, watcher: Watcher, co
             await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps(payload),))
         await agent.create("/workspace/d/marker", b"")
         assert await next_seen(w) == WatchEvent("create", "/workspace/d/marker", kind="file")
+
+
+async def test_a_parent_swapped_for_a_same_named_one_ends_the_watch(vfs: VFSClient, watcher: Watcher) -> None:
+    """A directory above the watch replaced by another of the same name changes the chain of ids: the watch
+    reports a delete at the old path and ends, delivering nothing of the new subtree."""
+    await vfs.mkdir_p(f"{R1}/pub/d")
+    await vfs.mkdir_p(f"{R1}/private")
+    agent = view(vfs, watcher, private_policy())
+    async with agent.watch("/workspace/pub/d") as w:
+        await vfs.rename(f"{R1}/pub", f"{R1}/old")
+        await vfs.mkdir_p(f"{R1}/pub")
+        await vfs.rename(f"{R1}/old/d", f"{R1}/pub/d")
+        await vfs.rename(f"{R1}/pub", f"{R1}/private/pub")
+        await vfs.create(f"{R1}/private/pub/d/salaries.csv", b"x", parents=True)
+        events = await drained(w)
+    assert events[-1] == WatchEvent("delete", "/workspace/pub/d", kind="dir")
+    assert all("salaries" not in repr(event) for event in events)
+
+
+async def test_the_final_event_survives_a_timed_out_get(
+    vfs: VFSClient, watcher: Watcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A get() that times out while the watch checks its path does not lose the event that ends the watch:
+    the next get() still returns it."""
+    original = ViewWatch._at  # pyright: ignore[reportPrivateUsage]
+
+    async def slow(real: tuple[str, ...], conn: AsyncConnection[Any]) -> tuple[UUID, ...] | None:
+        await asyncio.sleep(0.5)
+        return await original(real, conn)
+
+    monkeypatch.setattr(ViewWatch, "_at", staticmethod(slow))
+    await vfs.mkdir_p(f"{R1}/pub/d")
+    agent = view(vfs, watcher)
+    async with agent.watch("/workspace/pub/d") as w:
+        await vfs.rename(f"{R1}/pub", f"{R1}/moved")
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(w.get(), 0.1)
+        assert await next_seen(w) == WatchEvent("delete", "/workspace/pub/d", kind="dir")
+        assert await drained(w) == []
+
+
+async def test_a_size_under_a_hidden_name_is_not_reported(vfs: VFSClient, watcher: Watcher) -> None:
+    """A size appended under a hidden name never surfaces under a readable one: each event is judged by the
+    name in its own notification, and the rename to a readable name is the create the actor may see."""
+    agent = view(vfs, watcher)
+    await vfs.create(f"{R1}/d/.env", b"KEY=1")  # before the watch
+    async with agent.watch("/workspace/d") as w:
+        await vfs.append(f"{R1}/d/.env", b"SECRET=" * 10)
+        await vfs.rename(f"{R1}/d/.env", f"{R1}/d/public.md")
+        await agent.create("/workspace/d/marker", b"")
+        assert await next_seen(w) == WatchEvent("create", "/workspace/d/public.md", kind="file")
+        assert await next_seen(w) == WatchEvent("create", "/workspace/d/marker", kind="file")
+
+
+async def test_a_forged_own_delete_changes_nothing(vfs: VFSClient, watcher: Watcher, conn: AsyncConnection) -> None:
+    """A forged delete of the watched file itself is checked against the database and changes nothing: a real
+    modify is still delivered at the watched path."""
+    agent = view(vfs, watcher)
+    async with agent.watch("/workspace/notes.md") as w:
+        notes = (await vfs.stat(f"{R1}/notes.md")).id
+        root = (await vfs.stat(R1)).id
+        assert notes is not None and root is not None
+        payload = {"op": "delete", "id": str(notes), "parent": str(root), "name": "notes.md", "kind": "file"}
+        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps(payload),))
+        await agent.append("/workspace/notes.md", b"more\n")
+        event = await next_seen(w)
+    assert event.op == "modify"
+    assert event.path == "/workspace/notes.md"
+
+
+async def test_two_quick_renames_are_followed_to_the_last_name(vfs: VFSClient, watcher: Watcher) -> None:
+    """Two renames before any event is read end at the last name: a move is judged by where the node is now,
+    and the watch carries on there."""
+    agent = view(vfs, watcher)
+    async with agent.watch("/workspace/notes.md") as w:
+        await vfs.rename(f"{R1}/notes.md", f"{R1}/a.md")
+        await vfs.rename(f"{R1}/a.md", f"{R1}/b.md")
+        await vfs.append(f"{R1}/b.md", b"more\n")
+        events: list[WatchEvent] = []
+        while True:
+            event = await next_seen(w)
+            events.append(event)
+            if event.op == "modify":
+                break
+        assert w.path == "/workspace/b.md"
+        assert event.path == "/workspace/b.md"
+        moves = [e for e in events if e.op == "move"]
+        assert moves and all(e.path == "/workspace/b.md" for e in moves)
+        await vfs.append(f"{R1}/b.md", b"again\n")
+        assert (await next_seen(w)).op == "modify"  # the watch did not end
+
+
+async def test_leaving_the_block_closes_the_watch(
+    vfs: VFSClient, watcher: Watcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VFSView.watch closes its ViewWatch when the block exits."""
+    calls = 0
+    original = ViewWatch.close
+
+    def counting(self: ViewWatch) -> None:
+        nonlocal calls
+        calls += 1
+        original(self)
+
+    monkeypatch.setattr(ViewWatch, "close", counting)
+    agent = view(vfs, watcher)
+    async with agent.watch("/workspace/d"):
+        pass
+    assert calls == 1

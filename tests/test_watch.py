@@ -127,8 +127,8 @@ async def test_payload_of_each_op(conn: AsyncConnection, listener: AsyncConnecti
     ]
     assert got[2:] == [
         {"op": "create", "id": str(f), "parent": str(d), "name": "f", "kind": "file"},
-        {"op": "modify", "id": str(f), "parent": str(d), "size": 5, "gen": 0},
-        {"op": "modify", "id": str(f), "parent": str(d), "size": 2, "gen": 1},
+        {"op": "modify", "id": str(f), "parent": str(d), "name": "f", "size": 5, "gen": 0},
+        {"op": "modify", "id": str(f), "parent": str(d), "name": "f", "size": 2, "gen": 1},
         {
             "op": "move",
             "id": str(f),
@@ -215,7 +215,7 @@ async def test_watch_file_sees_appends_as_modify(conn: AsyncConnection, watcher:
         assert (events.node, events.kind) == (log, "file")
         await append(conn, other, 3)
         await append(conn, log, 10)
-        assert await next_event(events) == Event("modify", id=log, parent=logs, size=10, generation=0)
+        assert await next_event(events) == Event("modify", id=log, parent=logs, name="app.log", size=10, generation=0)
 
 
 async def test_watch_directory_sees_its_entries_only(conn: AsyncConnection, watcher: Watcher) -> None:
@@ -230,7 +230,7 @@ async def test_watch_directory_sees_its_entries_only(conn: AsyncConnection, watc
         await unlink(conn, x)
         assert [(e.op, e.id, e.name) for e in [await next_event(events) for _ in range(4)]] == [
             ("create", x, "x"),
-            ("modify", x, None),
+            ("modify", x, "x"),
             ("move", x, "z"),
             ("delete", x, "z"),
         ]
