@@ -88,7 +88,7 @@ END $$;
 
 
 CREATE TABLE vfs_quotas (
-    root        uuid PRIMARY KEY REFERENCES vfs_nodes (id) ON DELETE CASCADE,   -- a directory
+    root        uuid PRIMARY KEY,                       -- a directory (no foreign key: see below)
     max_bytes   bigint CHECK (max_bytes >= 0),          -- NULL: no limit
     max_nodes   bigint CHECK (max_nodes >= 0),          -- NULL: no limit
     used_bytes  bigint NOT NULL DEFAULT 0,              -- the sizes of the files below root
@@ -97,11 +97,14 @@ CREATE TABLE vfs_quotas (
 );
 
 CREATE TABLE vfs_quota_defaults (
-    parent      uuid PRIMARY KEY REFERENCES vfs_nodes (id) ON DELETE CASCADE,   -- a directory
+    parent      uuid PRIMARY KEY,                       -- a directory
     max_bytes   bigint CHECK (max_bytes >= 0),
     max_nodes   bigint CHECK (max_nodes >= 0),
     CHECK (max_bytes IS NOT NULL OR max_nodes IS NOT NULL)
 );
+-- No foreign keys to vfs_nodes: one would make TRUNCATE vfs_nodes (which the watchers handle as a rescan) fail.
+-- vfs_unlink removes the rows of the directory it removes; a row raw SQL orphans names an id no node will have
+-- again, so it is never matched (delete it with DELETE ... WHERE root NOT IN (SELECT id FROM vfs_nodes)).
 
 
 -- The quota roots at p_start and above it (p_start included; NULL, the root, has none), bottom up. Walks
@@ -522,7 +525,7 @@ END $$;
 
 -- Removes p_node, like unlink(2) for a file and rmdir(2) for a directory, and returns one row, with err NULL
 -- when it was removed. err ENOENT if it doesn't exist, ENOTEMPTY for a directory with entries. EINVAL for a NULL
--- p_node. Since 023 the quota roots above it lose its bytes and the node (a quota on it goes with it).
+-- p_node. Since 023 the quota roots above it lose its bytes and the node, and a quota or child quota on it goes.
 CREATE OR REPLACE FUNCTION vfs_unlink(p_node uuid) RETURNS TABLE (err text, err_detail text)
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
@@ -547,6 +550,10 @@ BEGIN
         RETURN;
     END IF;
     DELETE FROM vfs_nodes n WHERE n.id = p_node;
+    IF v_kind = 'dir' THEN
+        DELETE FROM vfs_quotas q WHERE q.root = p_node;
+        DELETE FROM vfs_quota_defaults d WHERE d.parent = p_node;
+    END IF;
     PERFORM vfs_charge(v_parent, -v_size, -1);
     RETURN NEXT;
 END $$;
