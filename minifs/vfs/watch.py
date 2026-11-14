@@ -246,15 +246,29 @@ class PathWatch(Subscription):
     After a ``rescan``, or a ``delete`` of the node itself, it checks the database, and ends (after delivering
     that event) if the node is gone or the check fails: a watch is never left on a node it can't vouch for. Watch
     the path again to follow whatever it names now.
+
+    With ``ancestors``, the ``move`` and ``delete`` events of the directories above the node are delivered too
+    (``ancestors`` holds their ids), for a consumer that must know when the node's path changes (``VFSView.watch``).
     """
 
     def __init__(
-        self, watcher: Watcher, segments: list[str], maxsize: int, rescan_interval: float = DEFAULT_RESCAN_INTERVAL
+        self,
+        watcher: Watcher,
+        segments: list[str],
+        maxsize: int,
+        rescan_interval: float = DEFAULT_RESCAN_INTERVAL,
+        *,
+        ancestors: bool = False,
     ) -> None:
         super().__init__(watcher, None, maxsize, rescan_interval)
         self._segments = segments
+        self._follow_ancestors = ancestors
         self.node: UUID | None = None
         """The watched node; None is the root."""
+        self.chain: tuple[UUID, ...] = ()
+        """The ids from the root's first child down to the node, as the watch resolved the path."""
+        self.ancestors: frozenset[UUID] = frozenset()
+        """With ``ancestors=True``, the ids of the directories above the node."""
         self.kind = "dir"
         self._resolved = False
         self._gone = False
@@ -271,18 +285,23 @@ class PathWatch(Subscription):
     def matches(self, event: Event) -> bool:
         if event.op == "rescan" or (self.node is not None and event.id == self.node):
             return True
+        if event.op in ("move", "delete") and event.id in self.ancestors:
+            return True
         if self.kind != "dir":
             return False
         return event.parent == self.node or (event.op == "move" and event.old_parent == self.node)
 
     async def _open(self) -> None:
         async with self._watcher._query() as conn:  # pyright: ignore[reportPrivateUsage]
-            cur = await conn.execute("SELECT id, kind, err, err_detail FROM vfs_lookup(%s)", (self._segments,))
+            cur = await conn.execute("SELECT id, kind, chain, err, err_detail FROM vfs_lookup(%s)", (self._segments,))
             row = await cur.fetchone()
         assert row is not None
-        if row[2] is not None:
-            raise VFSError(row[2], "/" + "/".join(self._segments), detail=row[3] or "")
+        if row[3] is not None:
+            raise VFSError(row[3], "/" + "/".join(self._segments), detail=row[4] or "")
         self.node, self.kind = row[0], row[1]
+        self.chain = tuple(row[2] or ())
+        if self._follow_ancestors:
+            self.ancestors = frozenset(self.chain[:-1])
         self._resolved = True
         self._events = deque(e for e in self._events if self.matches(e))
 
@@ -475,7 +494,14 @@ class Watcher:
         from anywhere in the tree. Code acting for an actor watches through its view, ``VFSView.watch``, which
         applies the mounts and the policy.
         """
-        watch = self._add(PathWatch(self, [s for s in path.split("/") if s], self._maxsize, self._rescan_interval))
+        async with self._watch(path) as watch:
+            yield watch
+
+    @contextlib.asynccontextmanager
+    async def _watch(self, path: str, *, ancestors: bool = False) -> AsyncGenerator[PathWatch]:
+        """``watch``, with ``PathWatch``'s ``ancestors`` option."""
+        segments = [s for s in path.split("/") if s]
+        watch = self._add(PathWatch(self, segments, self._maxsize, self._rescan_interval, ancestors=ancestors))
         try:
             await watch._open()  # pyright: ignore[reportPrivateUsage]
             yield watch

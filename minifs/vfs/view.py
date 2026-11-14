@@ -504,14 +504,22 @@ class VFSView:
         virtual directory (watch a mount point instead). RuntimeError if the view was built without a watcher.
         This is the watch for code acting for an actor: ``Watcher.watch`` takes real paths and applies no policy.
         """
-        target = self._target(path, "read")
         if self._watcher is None:
             raise RuntimeError("this VFSView has no watcher: pass watcher= (open_vfs(..., watch=True) opens one)")
+        target = self._target(path, "read")
         if target.real is None:
             raise VFSError("EINVAL", target.visible, "a virtual directory can't be watched")
         async with contextlib.AsyncExitStack() as stack:
-            inner = await self._mapped(stack.enter_async_context(self._watcher.watch(target.real)), target)
-            yield ViewWatch(inner, target.path, mount_point=target.is_mount_point, policy=self.policy, actor=self.actor)
+            watch = self._watcher._watch(target.real, ancestors=True)  # pyright: ignore[reportPrivateUsage]
+            inner = await self._mapped(stack.enter_async_context(watch), target)
+            yield ViewWatch(
+                inner,
+                target.path,
+                split_trusted(target.real),
+                mount_point=target.is_mount_point,
+                policy=self.policy,
+                actor=self.actor,
+            )
 
     # Writes
 
