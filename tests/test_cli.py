@@ -299,13 +299,17 @@ _MISREAD_URIS = (
     "postgresql://u:PH-1@localhost/7f3a@h/x",  # in the database name
     "postgresql://u:P?7f3a@b:c@h/x",  # libpq doesn't end the userinfo at ?
     "postgresql://127.0.0.1:1/db@7f3a",  # a database name with @: refused, %40 writes it
+    "postgresql://u:PH-1@127.0.0.1?port=7f3a@h/db",  # a ? in the password: the rest lands in a query parameter
+    "postgresql://u:PH-1@127.0.0.1?sslmode=7f3a@h:1/db",
+    "postgresql://u:PH-7f3a/x?hostaddr=127.0.0.1&application_name=b@h/db",  # no userinfo, port = the password
+    "postgresql://127.0.0.1:1/db?user=me@7f3a",  # a query value with @: refused, %40 writes it
 )
 # The same passwords written so libpq reads them right: these must reach the connection, not the refusal.
 _MISREAD_SAFE_URIS = (
     "postgresql://u:PH%40ss7f3a@127.0.0.1:1/x",
     "postgresql://u:PH?ss7f3a@127.0.0.1:1/x",
-    "postgresql://127.0.0.1:1/db?user=me@corp",
-    "postgresql://u:PH-7f3a@127.0.0.1:1/db?user=me@corp",
+    "postgresql://127.0.0.1:1/db?user=me%40corp",
+    "postgresql://u:PH-7f3a@127.0.0.1:1/db?user=me%40corp",
     "postgresql://127.0.0.1:1/db%407f3a",
 )
 
@@ -355,12 +359,21 @@ def test_short_password_hides_the_error(monkeypatch: pytest.MonkeyPatch, capsysb
     ("argv", "expected", "forbidden"),
     [
         # argparse quotes argv in its errors: _Parser.error masks the passwords out of them.
-        (["ls", "--password=PH7f3a"], "unrecognized arguments: --password=****", ("PH7f3a",)),
+        (["ls", "--password=PH7f3a"], "unrecognized arguments: ****", ("PH7f3a",)),
         # -WPH7f3a leaves "-PH7f3a" over as an unrecognized word: masked whole, no fragment may show.
         (["ls", "-WPH7f3a"], "unrecognized arguments: ****", ("7f3a",)),
-        (["ls", "--dns=postgresql://u:PH@ss7f3a@h/x"], "--dns=****", ("ss7f3a",)),
+        (["ls", "--dns=postgresql://u:PH@ss7f3a@h/x"], "unrecognized arguments: ****", ("ss7f3a",)),
         # An invalid subcommand choice quotes the whole word: the URI userinfo masking covers it.
         (["postgresql://u:PH7f3a@h/x"], "invalid choice", ("PH7f3a",)),
+        # A misplaced --dsn: the subcommand choice error quotes the URI, here with a space in the password.
+        (["--dsn", "postgresql://u:PH 7f3a@h/x", "ls"], "invalid choice", ("7f3a",)),
+        # argparse's repr doubles the backslash of an escaped quote in a keyword value.
+        (["--dsn", "host=h password='PH \\'7f3a'", "ls"], "invalid choice", ("7f3a",)),
+        # -W doesn't take a value: a password starting with -- is an unrecognized word, not an option name.
+        (["ls", "-W", "--PH-7f3a"], "unrecognized arguments: ****", ("7f3a",)),
+        (["ls", "--dns"], "unrecognized arguments: ****", ("dns",)),
+        # One of the CLI's own options (here glob's, given to ls) is still named.
+        (["ls", "--hidden"], "unrecognized arguments: --hidden", ()),
     ],
 )
 def test_argparse_errors_mask_passwords(

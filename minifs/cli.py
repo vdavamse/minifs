@@ -131,22 +131,37 @@ class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         prefix = "unrecognized arguments: "
         if message.startswith(prefix):
-            # Any word may be a password (``-Wsecret`` leaves ``-secret`` over): show option names only.
+            # Any word may be a password (``-Wsecret`` leaves ``-secret`` over, ``-W --secret`` leaves ``--secret``):
+            # show only (prefixes of) the CLI's own long option names.
+            known = self._long_options()
             words = (w.partition("=") for w in message.removeprefix(prefix).split())
             message = prefix + " ".join(
-                f"{n}{'=****' if eq else ''}" if n.startswith("--") else "****" for n, eq, _ in words
+                f"{n}{'=****' if eq else ''}" if any(k.startswith(n) for k in known) and n.startswith("--") else "****"
+                for n, eq, _ in words
             )
         for pattern, repl in _ARGV_PASSWORDS:
             message = pattern.sub(repl, message)
         super().error(message)
 
+    def _long_options(self) -> set[str]:
+        """The ``--`` option strings of this parser and its subparsers."""
+        found: set[str] = set()
+        for action in self._actions:
+            found.update(o for o in action.option_strings if o.startswith("--"))
+            if isinstance(action, argparse._SubParsersAction):  # pyright: ignore[reportPrivateUsage]
+                for sub in action.choices.values():  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
+                    if isinstance(sub, _Parser):
+                        found |= sub._long_options()
+        return found
 
-# Where an argparse error can quote a password: a URI's userinfo (up to the last @ of the word, since an unescaped
-# @ may be in the password), a ``password=`` keyword (also ``--password=...``), and the value given to a flag that
-# takes none (``-Wsecret``).
+
+# Where an argparse error can quote a password: a URI's userinfo (up to the last @ of the message, since the
+# password may hold an unescaped @ or a space), a ``password=`` keyword (also ``--password=...``; to the end of the
+# message, as argparse's repr of a quoted value escapes it unpredictably), and the value given to a flag that takes
+# none (``-Wsecret``). Argparse messages are one line.
 _ARGV_PASSWORDS = (
-    (re.compile(r"(://[^:/@\s]*:)\S*@"), r"\1****@"),
-    (re.compile(r"(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)"), r"\1****"),
+    (re.compile(r"(://[^:/@]*:).*@"), r"\1****@"),
+    (re.compile(r"(password\s*=).*"), r"\1****"),
     (re.compile(r"(ignored explicit argument )'.*'"), r"\1'****'"),
 )
 
@@ -196,7 +211,8 @@ def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
         raise _Refused(_INVALID) from None
     if _misread_uri(dsn):
         raise _Refused(
-            f"{_INVALID}: in a postgresql:// URI, write @ as %40 and / as %2F in the user, password and database name"
+            f"{_INVALID}: in a postgresql:// URI, write @ as %40 and / as %2F"
+            " (in the user, password, database name and query values)"
         )
     password = params.get("password")
     secrets = _forms(str(password), dsn) if password else []
@@ -220,16 +236,17 @@ def _misread_uri(dsn: str) -> bool:
     """Whether a URI holds an unescaped ``@`` that libpq doesn't read as the end of the userinfo, so that part of
     a password may land in a field an error message quotes (``invalid integer value "rest-of-password@host" for
     connection option "port"``) without being parsed as the password, hence unmasked. libpq ends the userinfo
-    at the first ``@`` before the first ``/``; past it, an ``@`` before the query string can only be a misread
-    password (a second ``@`` lands in the host, port or host list; a ``/`` in the password leaves no userinfo
-    and puts the ``@`` in the database name), or an ``@`` in a database name, which ``%40`` writes as well."""
+    at the first ``@`` before the first ``/``; any ``@`` past it is refused: a second ``@`` lands in the host,
+    port or host list; a ``/`` in the password leaves no userinfo and puts the ``@`` in the database name; a
+    ``?`` in it puts the rest in a query parameter (``?port=rest@host``). That also refuses a real ``@`` in a
+    database name or query value, which ``%40`` writes as well (libpq decodes both)."""
     scheme = next((s for s in _URI_SCHEMES if dsn.startswith(s)), None)
     if scheme is None:
         return False
     rest = dsn[len(scheme) :]
     if "@" in rest.partition("/")[0]:
         rest = rest.partition("@")[2]
-    return "@" in rest.partition("?")[0]
+    return "@" in rest
 
 
 def _ask_password() -> str:
