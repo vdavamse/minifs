@@ -473,7 +473,7 @@ async def test_channel_is_the_schemas(conn: AsyncConnection, watcher: Watcher) -
 
 
 async def test_a_schema_without_the_channel_function_fails_at_start(conn: AsyncConnection, db: str) -> None:
-    """A schema that predates migration 016 has no vfs_channel(): the watcher says so instead of listening on a
+    """A schema that predates migration 018 has no vfs_channel(): the watcher says so instead of listening on a
     channel nothing notifies, even when a later schema on the search_path has the function."""
     await conn.execute("CREATE SCHEMA old")
 
@@ -481,8 +481,8 @@ async def test_a_schema_without_the_channel_function_fails_at_start(conn: AsyncC
         return await AsyncConnection.connect(db, autocommit=True, options="-c search_path=old,public")
 
     async with await connect_old() as c:
-        await migrate(c, [m for m in load_migrations() if m.version < 16])
-    with pytest.raises(RuntimeError, match="no vfs_channel.. in schema 'old'.*migration 016"):
+        await migrate(c, [m for m in load_migrations() if m.version < 18])
+    with pytest.raises(RuntimeError, match="no vfs_channel.. in schema 'old'.*migration 018"):
         await Watcher(connect_old).start()
 
 
@@ -704,6 +704,31 @@ async def test_an_overflow_rescan_is_not_deferred(db: str) -> None:
         assert [e for _, e in await collect(events, 0.2)] == [RESCAN, sent[4]]
 
 
+async def test_a_reconnect_rescan_is_not_deferred(conn: AsyncConnection, db: str) -> None:
+    """Inside the interval too, the rescan after a reconnect is queued at once: the consumer learns of the gap
+    before it sees a later event."""
+    async with Watcher(factory(db), rescan_interval=30, retry_min=0.01) as watcher:
+        events = watcher.subscribe()
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        assert await next_event(events) == RESCAN
+        await terminate(conn, watcher.backend_pid)
+        assert await next_event(events) == RESCAN  # a deferred one would outlast next_event's bound
+
+
+async def test_a_failed_predicate_rescan_is_not_deferred(db: str) -> None:
+    """The rescan for a subscription whose predicate raised is queued at once, inside the interval too."""
+
+    def broken(event: Event) -> bool:
+        raise RuntimeError("the predicate is broken")
+
+    async with Watcher(factory(db), rescan_interval=30, retry_min=0.01) as watcher:
+        events = watcher.subscribe(broken)
+        watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
+        assert await next_event(events) == RESCAN
+        watcher._broadcast(Event("modify", id=uuid4()))  # pyright: ignore[reportPrivateUsage]
+        assert await next_event(events) == RESCAN
+
+
 async def test_rescan_interval_zero_delivers_every_rescan(db: str) -> None:
     async with Watcher(factory(db), rescan_interval=0) as watcher:
         events = watcher.subscribe()
@@ -920,6 +945,15 @@ def test_maxsize_must_be_positive() -> None:
 def test_rescan_interval_must_be_a_finite_non_negative_number(interval: float) -> None:
     with pytest.raises(ValueError):
         Watcher(factory("unused"), rescan_interval=interval)
+
+
+def test_channel_argument_is_validated(db: str) -> None:
+    """A given channel must be one LISTEN and pg_notify take: LISTEN cuts a longer name silently, and the watcher
+    would then drop every notification."""
+    for bad in ("", "x" * 64):
+        with pytest.raises(ValueError):
+            Watcher(factory(db), channel=bad)
+    Watcher(factory(db), channel="x" * 63)  # the longest name it takes; not started, so nothing listens on it
 
 
 class Proxy:
