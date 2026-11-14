@@ -71,7 +71,8 @@ async def test_name_control_chars_migration_refuses_legacy_names(empty_db: str) 
     async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
         await migrate(conn, before)
         await conn.execute("INSERT INTO vfs_nodes (name, kind) VALUES (%s, 'file')", ("a\nb",))
-        with pytest.raises(psycopg.errors.RaiseException, match="1 name.* rename them first .*016_name_control_chars"):
+        refusal = "names in vfs_nodes contain control characters; rename them first .*016_name_control_chars"
+        with pytest.raises(psycopg.errors.RaiseException, match=refusal):
             await migrate(conn, migrations)
         assert 16 not in await applied_versions(conn)
         await conn.execute("UPDATE vfs_nodes SET name = 'a b' WHERE name = %s", ("a\nb",))

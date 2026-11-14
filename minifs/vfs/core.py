@@ -189,7 +189,7 @@ def split(path: str) -> tuple[str, ...]:
 def split_trusted(path: str) -> tuple[str, ...]:
     """``split`` without the control-character check, for a path the server reported or one ``split`` has been
     through: a listing or a search with a name from before migration 016 is filtered and mapped rather than
-    failed, and those hot paths skip the scan."""
+    failed (the view then reports the name escaped)."""
     if not path.startswith("/"):
         raise VFSError("EINVAL", escape_controls(path), "path must be absolute")
     parts: list[str] = []
