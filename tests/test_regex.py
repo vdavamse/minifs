@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import random
 import subprocess
@@ -244,9 +245,39 @@ async def test_validate_reports_an_emitter_bug(conn: AsyncConnection, caplog: py
     with caplog.at_level(logging.ERROR, logger="minifs.vfs.regex"), pytest.raises(RegexTranslationBug):
         await regex.validate(conn, broken)
     assert "regex translator bug" in caplog.text
+    assert "'a{2,256}'" in caplog.text  # a short translation is logged whole
     # A failed translation isn't remembered as valid.
     with pytest.raises(RegexTranslationBug):
         await regex.validate(conn, broken)
+
+
+async def test_an_emitter_bug_is_logged_and_raised_with_the_pattern_cut(
+    conn: AsyncConnection, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The pattern may quote file contents, and a translation can be 256 K characters.
+    pattern = "secret" * 1000
+    line_form = "a{2,256}" + "x" * 5000
+    with (
+        caplog.at_level(logging.ERROR, logger="minifs.vfs.regex"),
+        pytest.raises(RegexTranslationBug) as raised,
+    ):
+        await regex.validate(conn, Translation(pattern, False, line_form))
+    (record,) = caplog.records
+    for text in (record.getMessage(), str(raised.value)):
+        assert pattern[: regex.LOG_CHARS - 1] in text and pattern[: regex.LOG_CHARS] not in text
+        assert "(6000 characters, sha256 " in text
+        assert len(text) < 1000
+    assert f"({len(line_form)} characters, sha256 " in record.getMessage()
+
+
+def test_clipped() -> None:
+    assert regex.clipped("ab", 4) == "'ab'"
+    digest = hashlib.sha256(b"abc").hexdigest()[:12]
+    assert regex.clipped("abc", 4) == f"'abc... (3 characters, sha256 {digest})"
+    assert regex.clipped("a\nb") == "'a\\nb'"  # a repr: control characters can't forge log lines
+    # The limit is on what is logged: escapes don't stretch it.
+    assert regex.clipped("\x00" * 300).startswith("'" + "\\x00" * 49 + "\\x0... (300 characters, sha256 ")
+    assert regex.clipped("\ud800" * 300).endswith(")")  # a lone surrogate still has a digest
 
 
 async def test_validate_failure_leaves_the_outer_transaction_usable(db: str) -> None:
@@ -334,7 +365,7 @@ async def test_validate_refuses_a_non_utf8_database(pg_server: PgServer) -> None
         )
     try:
         async with await AsyncConnection.connect(pg_server.database(name), autocommit=True) as conn:
-            with pytest.raises(RuntimeError, match="UTF8"):
+            with pytest.raises(regex.UnsupportedDatabase, match="UTF8"):
                 await regex.validate(conn, regex.translate(r"\bnot_cached_elsewhere\b"))
     finally:
         with psycopg.connect(pg_server.conninfo, autocommit=True) as admin:

@@ -157,7 +157,7 @@ Found 1 matches
   Line 2:     return a - b
 ```
 
-Mistakes the model can fix (a missing path, an offset past the end, a bad regex) come back as pydantic-ai retries with a hint, such as `File not found` with similar names. A policy denial comes back as the tool's result, `Permission denied: write /docs/guide.md`, since retrying won't help.
+Mistakes the model can fix (a missing path, an offset past the end, a bad regex) come back as pydantic-ai retries with a hint, such as `File not found` with similar names. A policy denial comes back as the tool's result, `Permission denied: write /docs/guide.md`, since retrying won't help. An internal error in `Grep` is reported to the model too, and logged, instead of ending the run.
 
 ### How `Grep` runs in Postgres
 
