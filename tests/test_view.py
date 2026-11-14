@@ -1010,8 +1010,9 @@ def test_rules() -> None:
 
 
 def test_hide_rules_match_variants() -> None:
-    """A hide rule (no actions) also hides case and Unicode variants of the names it spells; a grant rule stays
-    byte-exact and case-sensitive, since a loosened grant would fail open."""
+    """A hide rule (no actions) hides what its pattern matches byte for byte and, in addition, case and Unicode
+    variants of the names it spells; a grant rule stays byte-exact and case-sensitive, since a loosened grant
+    would fail open."""
     zwsp = chr(0x200B)  # a zero-width space: a format character, ignored when folding
     fullwidth = "".join(chr(ord(c) + 0xFEE0) for c in ".env")
     hiding = Policy({"a": [Rule("/w/**/.env"), Rule("/w/**", "read", "write")]})
@@ -1029,7 +1030,8 @@ def test_hide_rules_match_variants() -> None:
     assert not Rule("/w/log.md", "read").matches("/w/LOG.md")
     assert Rule("/w/.env").matches("/w/.ENV")  # the same pattern, hiding, matches the variant
     assert Rule("/w/.e?nv").matches("/w/.EXNV")  # ? matches one character of the folded name
-    assert not Rule("/w/.e?nv").matches("/w/.e" + zwsp + "nv")  # the zwsp is gone: the folded name is .env
+    assert Rule("/w/.e?nv").matches("/w/.e" + zwsp + "nv")  # byte-exactly, the ? is the zwsp itself
+    assert not Rule("/w/.e?nv").matches("/w/.env")  # the folded name is .env: too short for .e?nv
     assert Policy({"a": [Rule("/A")]}).matches("a", "/a")
     assert not Policy({"a": [Rule("/A", "read")]}).matches("a", "/a")
     subtree = Policy({"a": [Rule("/w/**/.ENV"), Rule("/w/**", "read", "write")]})
@@ -1042,6 +1044,35 @@ def test_hide_rules_match_variants() -> None:
     with pytest.raises(ValueError, match="fnmatch"):
         Rule(bracket)
     Rule(bracket, "read")  # a grant rule isn't folded: the bracket is an ordinary character
+    # #130: a hide rule matches byte for byte too, so a pattern whose folded form misses a name still hides
+    # what it spells (the folded-only match was fail-open: [!a-z]* missed README).
+    for pattern, path in (
+        ("/w/[!a-z]*", "/w/README"),  # byte for byte, R is not in [a-z]
+        ("/w/[!A-Z]*", "/w/readme"),  # byte for byte, r is not in [A-Z]
+        ("/w/[A-z]*", "/w/_private"),  # byte for byte, _ is between Z and a
+        ("/w/?", "/w/" + chr(0xDF)),  # the sharp s is one character byte for byte, "ss" folded
+        ("/w/stra?e", "/w/stra" + chr(0xDF) + "e"),
+        ("/w/?le", "/w/" + chr(0xFB01) + "le"),  # the fi ligature is one character byte for byte
+        ("/w/??", "/w/e" + chr(0x301)),  # e plus a combining acute is two characters byte for byte
+    ):
+        p = Policy({"a": [Rule(pattern), Rule("/w/**", "read")]})
+        assert not p.allows("a", "read", path), (pattern, path)
+    below = Policy({"a": [Rule("/w/[!a-z]*/**"), Rule("/w/**", "read")]})
+    assert not below.allows("a", "read", "/w/SECRET/x")
+    assert not below.allows_any("a", "read", "/w/SECRET")  # the hide rule covers the whole subtree
+    assert not below.allows("a", "read", "/w", subtree=True)  # and could match below /w
+    composed = Policy({"a": [Rule("/w/" + chr(0xE9)), Rule("/w/**", "read")]})
+    assert not composed.allows("a", "read", "/w/e" + zwsp + chr(0x301))  # Cf dropped before composing
+    for ch in (
+        chr(0xFF0A),  # a fullwidth asterisk: it folds to *
+        chr(0xFF1F),  # a fullwidth question mark: it folds to ?
+        chr(0xFF3B) + "x" + chr(0xFF3D),  # fullwidth square brackets: they fold to [x]
+        "[" + chr(0xFF01) + "a]",  # a fullwidth !: the folded [!a] negates the class
+        "[a" + chr(0xFF0D) + "c]",  # a fullwidth -: the folded [a-c] is a range
+    ):
+        with pytest.raises(ValueError, match="fnmatch"):  # a hide rule can't fold to glob syntax
+            Rule("/w/a" + ch)
+        Rule("/w/a" + ch, "read")  # a grant rule isn't folded: each is an ordinary character
 
 
 async def test_a_hide_rule_hides_case_and_unicode_variants(vfs: VFSClient) -> None:
@@ -1055,6 +1086,31 @@ async def test_a_hide_rule_hides_case_and_unicode_variants(vfs: VFSClient) -> No
         "/workspace/notes.md",
     ]
     await raises("EACCES", agent.pread("/workspace/.ENV"), "/workspace/.ENV")
+
+
+async def test_a_hide_rule_hides_variants_from_glob_grep_and_stat(vfs: VFSClient) -> None:
+    """#130: Glob, Grep and Stat agree on the variants a hide rule covers: a glob with ``hidden`` (which would
+    otherwise list dotfiles) returns neither, a grep for their contents finds nothing and ``stat`` is EACCES."""
+    operator = view(vfs, Policy({"operator": [Rule("/**", "read", "write")]}), "operator")
+    await operator.create("/workspace/.ENV", b"secret\n")
+    await operator.create("/workspace/sub/.Env", b"secret\n", parents=True)
+    agent = view(vfs, Policy({"agent": [Rule("/workspace/**/.env"), Rule("/**", "read", "write")]}))
+    paths = [e.path for e in (await agent.glob("**/*", "/workspace", hidden=True)).entries]
+    assert "/workspace/.ENV" not in paths and "/workspace/sub/.Env" not in paths
+    assert "/workspace/log.md" in paths  # the glob walked and matched the other files
+    assert (await agent.grep("secret", "/workspace")).hits == []
+    await raises("EACCES", agent.stat("/workspace/.ENV"), "/workspace/.ENV")
+
+
+async def test_a_hide_rule_hides_a_virtual_directory_named_in_another_case(vfs: VFSClient) -> None:
+    """#94: a hide rule decides a virtual directory like any path: ``/A`` hides the virtual ``/a`` above a
+    mount. A grant rule stays byte-exact: ``/A`` with ``read`` doesn't decide ``/a``, the readable mount below
+    it does."""
+    mounts = {"/a/ws": f"/workspaces/{W1}"}
+    hidden = VFSView(vfs, mounts, Policy({"x": [Rule("/A"), Rule("/**", "read")]}), "x")
+    await raises("EACCES", hidden.readdir("/a"), "/a")
+    granted = VFSView(vfs, mounts, Policy({"x": [Rule("/A", "read"), Rule("/a/ws/**", "read")]}), "x")
+    assert [e.path for e in await granted.readdir("/a")] == ["/a/ws"]
 
 
 # Glob
