@@ -443,8 +443,55 @@ async def test_a_file_grown_past_the_cap_after_its_stat_is_not_diffed(view: VFSV
     growing = Growing(view, client)
     _, meta = await write(capped(growing), "big.txt", "new\n")
     assert meta["diff"] == ""
-    assert growing.preads == [(0, text.PAGE), (0, 3)]
+    assert growing.preads == [(0, 100), (0, 3)]
     assert await content(client, "big.txt") == b"new\n"
+
+
+async def test_read_file_reads_a_file_within_the_cap_in_one_pread(view: VFSView, client: VFSClient) -> None:
+    """A file within ``max_size`` is one statement: a 2.56 MB file, more than the old 1 MB page, is one pread
+    asking for the cap."""
+    data = b"0123456789abcde\n" * 160_000
+    await client.create(f"/workspaces/{W1}/big.txt", data)
+    spy = Preads(view, client)
+    got, version = await text.read_file(spy, "/workspace/big.txt", 4 * 1024 * 1024)
+    assert got == data
+    assert version.size == len(data)
+    assert spy.preads == [(0, 4 * 1024 * 1024)]
+
+
+async def test_read_file_pages_past_page(view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A file larger than the page is still read in pages of at most ``PAGE`` bytes, here 4."""
+    monkeypatch.setattr(text, "PAGE", 4)
+    await client.create(f"/workspaces/{W1}/paged.txt", b"0123456789")
+    spy = Preads(view, client)
+    got, _ = await text.read_file(spy, "/workspace/paged.txt", 100)
+    assert got == b"0123456789"
+    assert spy.preads == [(0, 4), (4, 4), (8, 4)]
+
+
+async def test_read_file_without_a_cap_asks_for_page(view: VFSView, client: VFSClient) -> None:
+    """With no ``max_size`` the first pread asks for ``PAGE``, the largest limit ``vfs_pread`` takes."""
+    await client.create(f"/workspaces/{W1}/whole.txt", b"abc\n")
+    spy = Preads(view, client)
+    got, _ = await text.read_file(spy, "/workspace/whole.txt")
+    assert got == b"abc\n"
+    assert spy.preads == [(0, text.PAGE)]
+
+
+async def test_read_file_with_a_zero_cap(view: VFSView, client: VFSClient) -> None:
+    """``max_size == 0`` stays valid: an empty file reads as ``b""``, and any non-empty one is ``TooLarge`` after
+    one pread, which read nothing."""
+    await client.create(f"/workspaces/{W1}/empty.txt", b"")
+    spy = Preads(view, client)
+    got, _ = await text.read_file(spy, "/workspace/empty.txt", 0)
+    assert got == b""
+    assert spy.preads == [(0, 0)]
+    await client.create(f"/workspaces/{W1}/one.txt", b"x")
+    spy = Preads(view, client)
+    with pytest.raises(text.TooLarge) as raised:
+        await text.read_file(spy, "/workspace/one.txt", 0)
+    assert raised.value.size == 1
+    assert spy.preads == [(0, 0)]
 
 
 async def test_over_the_cap_write_only_rules_still_need_read(client: VFSClient) -> None:
