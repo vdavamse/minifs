@@ -235,6 +235,8 @@ minifs mv /docs/a.md /docs/b.md && minifs rm /docs/b.md
 
 `minifs glob` stops past 200,000 files and directories walked or 2 s per statement; `--max-nodes N` (or `none`, no cap) and `--timeout S` change them.
 
+Credentials: keep the password out of the command line, where other users see it in the process list and your shell keeps it in its history. Use `$MINIFS_DSN`, libpq's `PGPASSWORD` or `~/.pgpass`, `--dsn-file PATH` (a file holding the connection string), or `-W` to be asked for it. `--dsn` with a password still works, with a warning; no error message shows the password. The CLI is an operator tool: it works on real paths and applies no policy, so don't hand it to an agent or a tenant.
+
 ## Limits
 
 - Text first: files from kilobytes to a few megabytes. Images and PDFs can be read as attachments, other binaries are refused by `Read`, and non-UTF-8 files are skipped by `Grep`.
