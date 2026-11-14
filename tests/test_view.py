@@ -249,7 +249,7 @@ def test_bad_configuration(vfs: VFSClient, policy: Policy) -> None:
 )
 def test_hand_built_mounts_are_refused(vfs: VFSClient, policy: Policy, mounts: dict[str, str], match: str) -> None:
     with pytest.raises(ValueError, match=match):
-        VFSView(vfs, {**mounts, "/docs": "/docs"}, policy, "agent")
+        VFSView(vfs, mounts, policy, "agent")  # alone: with a /docs mount, some would hit the nesting check
 
 
 def test_hand_built_mounts_in_normal_form_are_accepted(vfs: VFSClient, policy: Policy) -> None:
