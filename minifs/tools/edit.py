@@ -5,10 +5,13 @@ candidates in the same order, checked by ``tests/tools/test_edit_replacers.py`` 
 O(n·m) in the content's and ``oldString``'s sizes, in lines and in characters (a file can be one line), where
 ladderframe's block scans were O(n²) in lines and its searches within a line O(n·m) per call that nothing could
 interrupt. ``replace`` departs from ladderframe on purpose where it edited the wrong text and reported success (#110,
-#122, marked in the oracle): a whitespace-only ``oldString`` matches only exactly, an ambiguous exact ``oldString`` is
-reported, block anchors alone don't take the line between them, and with ``replaceAll`` a whitespace candidate of a
-non-blank ``oldString`` is refused. ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole
-search runs in a worker thread that can't be cancelled and holds the GIL while it works (#80).
+#122, #117, marked in the oracle): a whitespace-only ``oldString`` matches only exactly, an ambiguous exact
+``oldString`` is reported, block anchors alone don't take the line between them, a block-anchored match longer
+than ``oldString``, whose extra non-blank lines would be deleted unseen, is refused with a retry unless a
+stricter replacer finds the text, and with ``replaceAll`` a whitespace candidate of a non-blank ``oldString``
+is refused.
+``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker thread that
+can't be cancelled and holds the GIL while it works (#80).
 
 ladderframe serialises editors of a path with a thread lock; here an edit reads the whole file and its version,
 replaces in memory, and writes back with a compare-and-swap on that version, so a concurrent writer anywhere is
@@ -29,6 +32,7 @@ import re
 import time
 from array import array
 from bisect import bisect_left
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextvars import ContextVar
 from itertools import accumulate, chain, islice
@@ -69,10 +73,26 @@ EMPTY_OLD_STRING = (
     "oldString cannot be empty when editing an existing file. Provide the exact text to replace, "
     "or use write for an intentional full-file replacement."
 )
+BLOCK_LEAVES_OUT_LINES = (
+    "oldString looks like lines {first}-{last} of the file, but {extra} non-blank line(s) of that block have no "
+    "counterpart in oldString, and the replacement would delete them. Read those lines again and include every one "
+    "of them in oldString."
+)
 
 
 class _Lost(Exception):
     """Another writer got in between the read and the write of an ``_edit``; starting over resolves it."""
+
+
+class _LongerBlock(ValueError):
+    """A block-anchored match that leaves out non-blank lines (#117): replacing it would delete lines the model
+    never wrote. Raised where the block would be yielded, but ``replace`` keeps it pending while the stricter
+    replacers still look for the exact text; only if none finds it does the refusal become the retry."""
+
+    def __init__(self, start: int, end: int, extra: int) -> None:
+        """``start`` and ``end``: the 0-based indices of the block's first and last line; ``extra``: how many
+        non-blank lines of the block pair with no line of the find."""
+        super().__init__(BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=extra))
 
 
 async def edit(
@@ -363,6 +383,18 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
     first, last = search[0].strip(), search[-1].strip()
     max_delta = max(1, len(search) // 4)
 
+    def leaves_out_lines(start: int, end: int) -> int | None:
+        """How many non-blank lines of the block ``start..end`` pair with no line of the find, or None when there
+        are none (#117). The middle is scored by position over the shorter of the two, so in a block longer than the
+        find the lines from the find's length up to the last anchor are never compared, and the replacement would
+        delete lines the model never wrote. Those lines may be blank: the block is then yielded as ladderframe did
+        (a model often leaves out a blank line, and losing one is harmless). The count is of these lines only, not
+        a net count of the block against the find: a find line missing from the file must not cancel out a block
+        line nobody compared."""
+        unpaired = range(start + len(search) - 1, end)  # empty unless the block is longer than the find
+        extra = sum(1 for k in unpaired if original[k].strip())
+        return extra or None
+
     last_at = _lines_equal_to(original, last)
     n = len(original)
     tick = _deadline.get().tick
@@ -372,6 +404,9 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
         if line.strip() != first:
             continue
         j = _next_line(last_at, i + 2, n)  # only the first occurrence of the last line
+        # ladderframe's window: the block may differ from the find by at most max_delta lines; a shorter block is
+        # still taken. A block that leaves out non-blank lines is refused with a retry (#117) where it would be
+        # yielded, not dropped here: dropping it let another block elsewhere win the scoring.
         if j < n and abs((j - i + 1) - len(search)) <= max_delta:
             candidates.append((i, j))
     if not candidates:
@@ -381,17 +416,25 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
     if len(candidates) == 1:
         start, end = candidates[0]
         if _middle_similarity(original, start, end - start + 1, search, True) >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD:
+            extra = leaves_out_lines(start, end)
+            if extra is not None:  # non-blank lines the find doesn't include (#117): refuse
+                raise _LongerBlock(start, end, extra)
             yield content[starts[start] : starts[end + 1] - 1]
         return
 
     best: tuple[int, int] | None = None
     best_similarity = -1.0
+    best_extra: int | None = None
     for start, end in candidates:
         similarity = _middle_similarity(original, start, end - start + 1, search, False)
-        if similarity > best_similarity:
-            best_similarity, best = similarity, (start, end)
+        extra = leaves_out_lines(start, end)
+        # on a tie, a block that doesn't leave out lines beats one that does, which would only be refused (#117)
+        if similarity > best_similarity or (similarity == best_similarity and best_extra is not None and extra is None):
+            best_similarity, best, best_extra = similarity, (start, end), extra
     if best is not None and best_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD:
         start, end = best
+        if best_extra is not None:  # non-blank lines the find doesn't include (#117): refuse
+            raise _LongerBlock(start, end, best_extra)
         yield content[starts[start] : starts[end + 1] - 1]
 
 
@@ -428,6 +471,7 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
     words = normalized_find.split(" ") if normalized_find else []
     lines = content.split("\n")
     deadline = _deadline.get()
+    find_lines = find.split("\n")
     for line in lines:
         deadline.tick()
         normalized_line = normalize(line)
@@ -441,17 +485,21 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
                 deadline.check()  # a long line: the pass over its tokens costs the line
                 yield _words_in_line(line, at, words)
 
-    find_lines = find.split("\n")
     if len(find_lines) > 1:
         m = len(find_lines)
-        for i in range(len(lines) - m + 1):
+        # A sliding window of the last m lines' normalisations: each line is normalised once in this loop, and
+        # the memory stays O(m), where a per-line cache would hold every normalisation of the whole file.
+        window: deque[str] = deque(maxlen=m)
+        for k, line in enumerate(lines):
             deadline.tick()
+            window.append(normalize(line))
+            if len(window) < m:
+                continue
+            i = k - m + 1
             # A block's normalised text starts with its first line's and ends with its last line's (whitespace
             # runs collapse within a line as they do across one), so a block whose first line isn't a prefix of
             # the find, or whose last line isn't a suffix, can't match.
-            if not normalized_find.startswith(normalize(lines[i])) or not normalized_find.endswith(
-                normalize(lines[i + m - 1])
-            ):
+            if not normalized_find.startswith(window[0]) or not normalized_find.endswith(window[-1]):
                 continue
             deadline.check()  # the block test below costs the whole block, not one line
             block = "\n".join(lines[i : i + m])
@@ -532,7 +580,8 @@ def escape_normalized_replacer(content: str, find: str) -> Iterator[str]:
 def multi_occurrence_replacer(content: str, find: str) -> Iterator[str]:
     """Every exact match, so `replace` can decide between unique and `replaceAll`. None for an empty ``find``
     (``replace`` never passes one): it matches at every offset without advancing, so ladderframe's loop never
-    ended."""
+    ended. Not in ``REPLACERS``: it re-yields oldString, which ``simple_replacer`` already tried, so it could
+    never change ``replace``'s outcome; kept for the parity tests."""
     if not find:
         return
     start = 0
@@ -609,7 +658,6 @@ REPLACERS: tuple[Replacer, ...] = (
     escape_normalized_replacer,
     trimmed_boundary_replacer,
     context_aware_replacer,
-    multi_occurrence_replacer,
 )
 
 _SEEN_BYTES = 1 << 20
@@ -649,6 +697,7 @@ def replace(
     deadline = _Deadline(timeout)
     token = _deadline.set(deadline)
     not_found = True
+    refusal: _LongerBlock | None = None
     try:
         seen: set[str] = set()  # a candidate already tried gave its answer: the same find, the same ambiguity
         seen_size = 0
@@ -658,41 +707,53 @@ def replace(
         replacers = (simple_replacer,) if not old_string.strip() else REPLACERS
         for replacer in replacers:
             deadline.check()
-            for search in replacer(content, old_string):
-                deadline.check()  # each candidate costs two scans of the file
-                # an empty candidate is never a match (#110); with replaceAll, neither is a whitespace candidate
-                # of a non-blank oldString, e.g. an escaped `\n` unescaped to a newline would replace every
-                # newline in the file (#122). Without replaceAll it may still match once (an escaped `\t` for a
-                # real tab).
-                if not search or (replace_all and search != old_string and not search.strip()):
-                    continue
-                if search in seen:
-                    continue
-                if seen_size + len(search) > _SEEN_BYTES:
-                    seen.clear()
-                    seen_size = 0
-                seen.add(search)
-                seen_size += len(search)
-                index = content.find(search)
-                if index == -1:
-                    continue
-                not_found = False
-                if _is_disproportionate_match(search, old_string):
-                    raise ValueError(
-                        "Refusing replacement because the matched span is much larger than oldString. "
-                        "Re-read the file and provide the full exact oldString for the intended replacement."
-                    )
-                if replace_all:
-                    return content.replace(search, new_string)
-                # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one call
-                # on a repetitive file ran for seconds that no deadline could interrupt.
-                if content.find(search, index + 1) != -1:
-                    if search == old_string:
-                        # the exact oldString is ambiguous: a looser match elsewhere is not what was meant (#110)
-                        raise ValueError(MULTIPLE_MATCHES)
-                    continue
-                return content[:index] + new_string + content[index + len(search) :]
+            # A refused block (#117) stays pending while the other replacers still look for the exact text; the
+            # context-aware matcher is skipped once there is a refusal, as it would take a looser sibling block.
+            if refusal is not None and replacer is context_aware_replacer:
+                continue
+            try:
+                for search in replacer(content, old_string):
+                    deadline.check()  # each candidate costs two scans of the file
+                    # an empty candidate is never a match (#110); with replaceAll, neither is a whitespace
+                    # candidate of a non-blank oldString, e.g. an escaped `\n` unescaped to a newline would
+                    # replace every newline in the file (#122). Without replaceAll it may still match once (an
+                    # escaped `\t` for a real tab).
+                    if not search or (replace_all and search != old_string and not search.strip()):
+                        continue
+                    if search in seen:
+                        continue
+                    if seen_size + len(search) > _SEEN_BYTES:
+                        seen.clear()
+                        seen_size = 0
+                    seen.add(search)
+                    seen_size += len(search)
+                    index = content.find(search)
+                    if index == -1:
+                        continue
+                    not_found = False
+                    if _is_disproportionate_match(search, old_string):
+                        raise ValueError(
+                            "Refusing replacement because the matched span is much larger than oldString. "
+                            "Re-read the file and provide the full exact oldString for the intended replacement."
+                        )
+                    if replace_all:
+                        return content.replace(search, new_string)
+                    # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one
+                    # call on a repetitive file ran for seconds that no deadline could interrupt.
+                    if content.find(search, index + 1) != -1:
+                        if search == old_string:
+                            # the exact oldString is ambiguous: a looser match elsewhere is not what was meant
+                            # (#110)
+                            raise ValueError(MULTIPLE_MATCHES)
+                        continue
+                    return content[:index] + new_string + content[index + len(search) :]
+            except _LongerBlock as e:  # pending, not final (#117): a later replacer may still find the text
+                refusal = e
     except ReplaceTimeout:
+        # A refusal is the answer when no replacer found the text anywhere (#117): it names the block, where a
+        # timeout says nothing. Once the text was found, ambiguously, the ambiguous timeout below says more.
+        if refusal is not None and not_found:
+            raise refusal from None
         if not_found or timeout is None:
             raise
         raise ReplaceTimeout(timeout_message(timeout, ambiguous=True)) from None
@@ -700,6 +761,8 @@ def replace(
         _deadline.reset(token)
 
     if not_found:
+        if refusal is not None:  # nothing found the text: the refused block is what oldString looked like (#117)
+            raise refusal
         raise ValueError(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
             "and line endings."
