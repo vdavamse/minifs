@@ -214,9 +214,11 @@ await view.create("/workspace/notes/today.md", b"# Today\n", parents=True)
 await view.append("/workspace/notes/today.md", b"- started\n")     # returns the offset it landed at
 page = await view.pread_lines("/workspace/notes/today.md", first_line=1, max_lines=50)
 await vfs.client.claim("/workspaces/w/tasks/new/t1", "/workspaces/w/tasks/cur/t1")   # exactly one claimer wins
-async with vfs.watcher.watch("/workspaces/w/tasks/new") as events:              # needs open_vfs(..., watch=True)
-    async for event in events: ...                                              # create, modify, move, delete, rescan
+async with view.watch("/workspace/tasks/new") as events:                     # VFSView(..., watcher=vfs.watcher)
+    async for event in events: ...                     # visible paths, filtered by the policy; rescan: re-check
 ```
+
+`vfs.watcher.watch(real_path)` is the operator's version: real paths, no policy, node ids; don't hand it to code that acts for an agent or a tenant.
 
 The `minifs` command works on the same tree, using `$MINIFS_DSN` or the `PG*` variables:
 

@@ -470,6 +470,10 @@ class Watcher:
         a later ``rescan`` if the connection drops. A change committed just before the call may be delivered too,
         if its notification was still on its way: events err towards repeating a change, never towards missing one.
         Raises ``VFSError`` ENOENT or ENOTDIR if the path doesn't resolve.
+
+        This is the operator's API: ``path`` is a real path, no policy applies, and events carry node ids and names
+        from anywhere in the tree. Code acting for an actor watches through its view, ``VFSView.watch``, which
+        applies the mounts and the policy.
         """
         watch = self._add(PathWatch(self, [s for s in path.split("/") if s], self._maxsize, self._rescan_interval))
         try:
