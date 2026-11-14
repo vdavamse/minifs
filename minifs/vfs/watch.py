@@ -35,7 +35,7 @@ import logging
 import math
 import random
 from collections import deque
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Literal, Self, cast
@@ -285,6 +285,7 @@ class PathWatch(Subscription):
         """With ``ancestors=True``, the ids of the directories above the node."""
         self.kind = "dir"
         self._resolved = False
+        self._indexed = False  # filed in the watcher's indexes, under keys derived from node, kind and ancestors
         self._gone = False
         self._check: asyncio.Task[bool] | None = None  # survives a cancelled get(), so the next one resumes it
         self._checks: set[asyncio.Task[bool]] = set()  # every check still running, so closing can cancel them
@@ -339,6 +340,8 @@ class PathWatch(Subscription):
             if self._follow_ancestors:
                 self.ancestors = frozenset(self.chain[:-1])
             self._resolved = True
+            # Indexed at once, with no await in between: an event arriving resolved-but-unindexed would be lost.
+            self._watcher._index(self)  # pyright: ignore[reportPrivateUsage]
             self._events = deque(e for e in self._events if self.matches(e))
             if not self._fenced:
                 await self._send_fence(conn)
@@ -436,6 +439,11 @@ class Watcher:
     ``pool`` if given, else on a short-lived one from ``connect``. Each is bounded by ``connect_timeout``. With many
     watches per process, pass a pool, so a reconnect doesn't open one connection per watch at once.
 
+    A non-rescan event is offered only to the watches indexed by the event's id, parent and (for a move) old parent,
+    and, for a move or delete, to the watches it is an ancestor of; plus every ``subscribe()`` subscription and
+    every watch still resolving. A ``rescan`` reaches all. The index only narrows who is asked: each watch's
+    ``matches`` still decides what it accepts.
+
     The channel is read from the database (``vfs_channel()`` of the schema ``vfs_nodes`` resolves to) whenever a
     connection opens, unless ``channel`` names one, and each keepalive probe checks it, so a watcher follows a
     changed name within ``keepalive`` seconds, with a ``rescan``. RuntimeError from ``start()`` if the schema has no
@@ -481,6 +489,16 @@ class Watcher:
         self._fences: dict[str, PathWatch] = {}  # fence payload -> the watch waiting for it
         self._malformed_suppressed = 0
         self._subscriptions: set[Subscription] = set()
+        self._unindexed: set[Subscription] = set()
+        """Subscriptions every non-rescan event is offered to: every ``subscribe()`` one, and every ``PathWatch``
+        until ``_index`` (an unresolved watch buffers every event, so it must be offered all of them)."""
+        self._by_id: dict[UUID, set[PathWatch]] = {}
+        """Resolved watches by node id."""
+        self._by_ancestor: dict[UUID, set[PathWatch]] = {}
+        """Resolved watches with ``ancestors`` by the ids of the directories above their node (move and delete
+        only: the only events ``matches`` takes from an ancestor)."""
+        self._by_parent: dict[UUID | None, set[PathWatch]] = {}
+        """Resolved directory watches by the id of the node whose children they see; None is the root."""
         self._conn: AsyncConnection[Any] | None = None
         self._healthy = False  # the current connection has answered a probe
         self._task: asyncio.Task[None] | None = None
@@ -522,6 +540,10 @@ class Watcher:
             for subscription in list(self._subscriptions):
                 subscription._end()  # pyright: ignore[reportPrivateUsage]
             self._subscriptions.clear()
+            self._unindexed.clear()
+            self._by_id.clear()
+            self._by_ancestor.clear()
+            self._by_parent.clear()
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -579,13 +601,72 @@ class Watcher:
         if self._closed:
             raise RuntimeError("the Watcher is closed")
         self._subscriptions.add(subscription)
+        self._unindexed.add(subscription)
         return subscription
 
+    def _index(self, watch: PathWatch) -> None:
+        """Moves a just-resolved ``watch`` from ``_unindexed`` into the lookup indexes. Its keys never change
+        afterwards: a watch follows its node by id, and ``node``, ``kind`` and ``ancestors`` are set once, in
+        ``PathWatch._open``, so a rename needs no re-indexing and ``_unsubscribe`` derives the same keys. Nothing is
+        filed once the watcher is closed (a watch that resolves after ``aclose``)."""
+        self._unindexed.discard(watch)
+        if self._closed:
+            return
+        if watch.node is not None:
+            self._by_id.setdefault(watch.node, set()).add(watch)
+        for ancestor in watch.ancestors:
+            self._by_ancestor.setdefault(ancestor, set()).add(watch)
+        if watch.kind == "dir":
+            self._by_parent.setdefault(watch.node, set()).add(watch)
+        watch._indexed = True  # pyright: ignore[reportPrivateUsage]
+
+    @staticmethod
+    def _forget[K](index: dict[K, set[PathWatch]], key: K, watch: PathWatch) -> None:
+        """Discards ``watch`` from ``index[key]``, deleting the key once its set is empty, so the indexes don't
+        grow with closed watches."""
+        bucket = index.get(key)
+        if bucket is None:
+            return
+        bucket.discard(watch)
+        if not bucket:
+            del index[key]
+
     def _unsubscribe(self, subscription: Subscription) -> None:
+        """Forgets a subscription everywhere it may be filed. Safe to call twice, and on a watch that was never
+        indexed (a failed lookup): the stored keys name no bucket then, and discards miss."""
         self._subscriptions.discard(subscription)
+        self._unindexed.discard(subscription)
+        if not isinstance(subscription, PathWatch) or not subscription._indexed:  # pyright: ignore[reportPrivateUsage]
+            return
+        subscription._indexed = False  # pyright: ignore[reportPrivateUsage]
+        if subscription.node is not None:
+            self._forget(self._by_id, subscription.node, subscription)
+        for ancestor in subscription.ancestors:
+            self._forget(self._by_ancestor, ancestor, subscription)
+        if subscription.kind == "dir":
+            self._forget(self._by_parent, subscription.node, subscription)
+
+    def _targets(self, event: Event) -> Iterable[Subscription]:
+        """The subscriptions to offer ``event`` to: all of them for a ``rescan``, else the unindexed ones plus the
+        watches its id, parent and (for a move) old parent select, and for a move or delete those it is an ancestor
+        of. ``PathWatch.matches`` accepts an event only for a rescan, its node's id, a move or delete of an
+        ancestor, or (a directory's) child events by parent or old parent, so this is a superset of the
+        subscriptions that would accept it, and ``_offer`` still filters. A fresh collection, as subscriptions can
+        close while the event is being offered."""
+        if event.op == "rescan":
+            return list(self._subscriptions)
+        targets = set(self._unindexed)
+        if event.id is not None:  # the id indexes have no None key: matches never takes an event by a None id
+            targets.update(self._by_id.get(event.id, ()))
+            if event.op in ("move", "delete"):
+                targets.update(self._by_ancestor.get(event.id, ()))
+        targets.update(self._by_parent.get(event.parent, ()))  # None is the root's key, as in matches
+        if event.op == "move":
+            targets.update(self._by_parent.get(event.old_parent, ()))
+        return list(targets)
 
     def _broadcast(self, event: Event, *, now: bool = False) -> None:
-        for subscription in list(self._subscriptions):
+        for subscription in self._targets(event):
             try:
                 subscription._offer(event, now=now)  # pyright: ignore[reportPrivateUsage]
             except Exception:
