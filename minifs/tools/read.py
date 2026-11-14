@@ -386,7 +386,7 @@ async def _nearby_instructions(ctx: RunContext[HasVFS], path: str) -> list[str]:
                 break  # any other outcome: skip the directory, as for EIO
             text = _instruction_text(result, cap)
             if limit and text:
-                texts.append(f"Instructions from: {candidate}\n{text}")
+                texts.append(f"{_FROM}{candidate}\n{text}")
             break
     return texts
 
@@ -418,6 +418,15 @@ def _whole_characters(data: bytes) -> bytes:
 _ABSENT = frozenset({"ENOENT", "ENOTDIR", "EISDIR", "EACCES"})
 """What a lookup of an instruction file says when it's missing, a directory or the actor may not read it."""
 
+_FROM = "Instructions from: "
+"""The marker that opens the first line of every block of a reminder: ``_nearby_instructions`` writes it and
+``already_loaded`` reads it back, so the writer and the reader can't drift."""
+
+_REMINDER = "\n</content>\n\n<system-reminder>\n"
+"""Where the reminder of a file result begins: inside ``<content>`` every ``\\n`` is followed by a line number,
+an empty line, the footer or the closing tag, so in a result that ends with ``\\n</system-reminder>`` the first
+occurrence of this is the real closing tag and the reminder that follows it."""
+
 
 def _loaded_instructions(ctx: RunContext[HasVFS]) -> set[str]:
     # ladderframe also takes the list from a Temporal run context, which has no ``messages``; minifs has no
@@ -429,12 +438,25 @@ def _loaded_instructions(ctx: RunContext[HasVFS]) -> set[str]:
 
 
 def already_loaded(messages: list[Any]) -> set[str]:
-    """Instruction files that earlier Read results in the conversation already included."""
+    """Instruction files that earlier Read results in the conversation already included.
+
+    Only the reminder that ends a result is read: a file result carries instruction blocks if and only if it
+    ends with ``\\n</system-reminder>``, and any other result — a directory listing, an error message, an
+    attachment, or one whose reminder a compacted or edited history cut off — is skipped by that one check, so
+    a marker line elsewhere (file text is printed raw, stray ``\\r`` included) never counts. Each Read used to
+    rescan every earlier result line by line, which made a session quadratic on the event loop; now the cost
+    grows with the reminders alone."""
     loaded: set[str] = set()
     for message in messages:
         for part in getattr(message, "parts", []):
             if isinstance(part, ToolReturnPart) and part.tool_name == "Read" and isinstance(part.content, str):
-                for line in part.content.splitlines():
-                    if line.startswith("Instructions from: "):
-                        loaded.add(line.removeprefix("Instructions from: "))
+                content = part.content
+                if not content.endswith("\n</system-reminder>"):
+                    continue  # the only thing looked at in a result that carries no reminder
+                start = content.find(_REMINDER)
+                if start == -1:
+                    continue
+                for line in content[start + len(_REMINDER) :].split("\n"):
+                    if line.startswith(_FROM):
+                        loaded.add(line.removeprefix(_FROM))
     return loaded
