@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 from minifs.db.migrate import migrate
 from minifs.db.pool import Connector
 from minifs.vfs.service import open_vfs
+from minifs.vfs.view import WORKSPACES
 
 FILES = {
     "calc.py": "def add(a, b):\n    return a - b\n\n\ndef mul(a, b):\n    return a * b\n",
@@ -34,7 +35,7 @@ async def provision(dsn: str) -> UUID:
     workspace_id = uuid4()
     async with open_vfs(connector, min_size=0) as vfs:
         for name, text in FILES.items():
-            await vfs.client.create(f"/workspaces/{workspace_id}/{name}", text.encode(), parents=True)
+            await vfs.client.create(f"{WORKSPACES}/{workspace_id}/{name}", text.encode(), parents=True)
     return workspace_id
 
 
