@@ -19,9 +19,22 @@ from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError
-from minifs.vfs.search import DEFAULT_LIMIT, SearchRefused
+from minifs.vfs.search import DEFAULT_LIMIT, MAX_NODES, TIMEOUT, SearchRefused
 
 _CAT_CHUNK = 1 << 20
+
+
+def _max_nodes(text: str) -> int | None:
+    """The ``--max-nodes`` argument: an int >= 0, or the word ``none`` for no cap."""
+    if text == "none":
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid max_nodes value: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"max_nodes must be >= 0 or 'none', not {value}")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,6 +61,15 @@ def main(argv: list[str] | None = None) -> int:
     glob.add_argument("pattern")
     glob.add_argument("path", nargs="?", default="/", help="directory to search (default: /)")
     glob.add_argument("--hidden", action="store_true", help="include hidden files and directories")
+    glob.add_argument(
+        "--max-nodes",
+        type=_max_nodes,
+        default=MAX_NODES,
+        help=f'stop past this many files and directories walked (default {MAX_NODES}; "none": no cap)',
+    )
+    glob.add_argument(
+        "--timeout", type=float, default=TIMEOUT, help=f"seconds each statement may run (default {TIMEOUT:g})"
+    )
     grep = _add_dsn(commands.add_parser("grep", help="print the lines matching a regex (ripgrep syntax)"))
     grep.add_argument("pattern")
     grep.add_argument("path", nargs="?", default="/", help="directory or file to search (default: /)")
@@ -152,7 +174,10 @@ async def _rm(vfs: VFSClient, args: argparse.Namespace) -> int:
 
 
 async def _glob(vfs: VFSClient, args: argparse.Namespace) -> int:
-    for entry in await vfs.glob(args.pattern, args.path, hidden=args.hidden):
+    entries = await vfs.glob(
+        args.pattern, args.path, hidden=args.hidden, max_nodes=args.max_nodes, timeout=args.timeout
+    )
+    for entry in entries:
         print(entry.path)
     return 0
 
