@@ -22,9 +22,10 @@ segment, not per character, so one segment that needs both (``[!a-z]*.env`` agai
 hidden; spell such rules as two rules or with ``*``. A hide rule that missed a variant would leak it, while a
 loosened grant would grant more than written, so a rule with some actions is a grant and stays exact. A hide
 rule may not contain a character that folds to glob syntax, such as the fullwidth asterisk U+FF0A, which folds
-to ``*``, nor one in a ``[...]`` class that folds to more or fewer than one character, which would split the
-class. Suffixes and trailing spaces are other names: use ``*`` (``.env*``). Over-hiding is the trade-off:
-``Rule("/workspace/Makefile")`` also hides ``MAKEFILE``.
+to ``*``, nor a ``[...]`` class that folding would change into another class: a member that folds to more or
+fewer than one character, a range whose endpoints fold (ASCII capital ranges such as ``[A-Z]`` excepted), a
+negated class that folding changes, or members NFKC composes. Suffixes and trailing spaces are other names: use
+``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/workspace/Makefile")`` also hides ``MAKEFILE``.
 """
 
 from __future__ import annotations
@@ -242,16 +243,26 @@ def _no_folded_class_splits(pattern: str, segments: tuple[str, ...]) -> None:
     or fewer than one character: the folded class would gain or lose members, so fnmatch would read it as a
     different class than the one spelled. E.g. the sharp s U+00DF folds to ``ss`` and the zero-width space U+200B
     to nothing. Scans as ``_bad_class`` does: a ``]`` first in a class, after any ``!``, is literal. Grant rules
-    aren't folded, so they aren't checked."""
+    aren't folded, so they aren't checked.
+
+    Folding a whole segment must also leave each class meaning the folds of what it lists, so these are refused
+    too: a segment whose fold differs from folding its classes member by member (NFKC composing a member with
+    its neighbour: ``[e<U+0301>]``); a range whose endpoints folding changes, unless both are ASCII capitals
+    (``[A-Z]`` folds to ``[a-z]``, but ``[Z-z]`` would fold to ``[z-z]`` and ``[A-z]`` lose ``_``); and a
+    negated class that folding changes at all (``[!A-Z]*`` would fold to ``[!a-z]*`` and miss ``README``, the
+    variant of the ``readme`` it hides)."""
     for segment in segments:
         i, n = 0, len(segment)
+        start, pieces = 0, list[str]()
         while i < n:
             c, i = segment[i], i + 1
             if c != "[":
                 continue
             j = i
-            if j < n and segment[j] == "!":
+            negated = j < n and segment[j] == "!"
+            if negated:
                 j += 1
+            body_start = j
             if j < n and segment[j] == "]":
                 j += 1
             while j < n and segment[j] != "]":
@@ -262,7 +273,30 @@ def _no_folded_class_splits(pattern: str, segments: tuple[str, ...]) -> None:
                         f" {len(_fold(member))} characters, splitting the class fnmatch would match: {pattern!r}"
                     )
                 j += 1
-            i = j + 1
+            body = segment[body_start:j]
+            folded_body = "".join(_fold(m) for m in body)
+            if negated and folded_body != body:
+                raise ValueError(
+                    f"rule pattern has a negated class [!{body}] that folding changes, so its folded form would"
+                    f" exclude other characters than fnmatch reads byte for byte: {pattern!r}"
+                )
+            for k in range(1, len(body) - 1):
+                lo, hi = body[k - 1], body[k + 1]
+                if body[k] != "-" or (_fold(lo), _fold(hi)) == (lo, hi):
+                    continue
+                if not ("A" <= lo <= "Z" and "A" <= hi <= "Z"):
+                    raise ValueError(
+                        f"rule pattern has a range {lo}-{hi} in a class whose endpoints folding changes, so the"
+                        f" folded range would cover other characters than fnmatch reads byte for byte: {pattern!r}"
+                    )
+            pieces += [_fold(segment[start : i - 1]), "[!" if negated else "[", folded_body, "]"]
+            start = i = j + 1
+        pieces.append(_fold(segment[start:]))
+        if pieces[1:] and "".join(pieces) != _fold(segment):
+            raise ValueError(
+                f"rule pattern has a class whose folded form differs from its members folded one by one (NFKC"
+                f" composes a member with its neighbour), which fnmatch would read as another class: {pattern!r}"
+            )
 
 
 @lru_cache(maxsize=4096)

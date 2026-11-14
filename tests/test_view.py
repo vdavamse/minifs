@@ -1048,8 +1048,7 @@ def test_hide_rules_match_variants() -> None:
     # what it spells (the folded-only match was fail-open: [!a-z]* missed README).
     for pattern, path in (
         ("/w/[!a-z]*", "/w/README"),  # byte for byte, R is not in [a-z]
-        ("/w/[!A-Z]*", "/w/readme"),  # byte for byte, r is not in [A-Z]
-        ("/w/[A-z]*", "/w/_private"),  # byte for byte, _ is between Z and a
+        ("/w/[!a-z]*", "/w/_private"),  # byte for byte, _ is not in [a-z]
         ("/w/?", "/w/" + chr(0xDF)),  # the sharp s is one character byte for byte, "ss" folded
         ("/w/stra?e", "/w/stra" + chr(0xDF) + "e"),
         ("/w/?le", "/w/" + chr(0xFB01) + "le"),  # the fi ligature is one character byte for byte
@@ -1070,8 +1069,12 @@ def test_hide_rules_match_variants() -> None:
     assert exact_folded.allows("a", "read", "/w/config/.env")  # config matches neither: [!a-z] folds to itself
     sharp = Policy({"a": [Rule("/w/?/.env"), Rule("/w/**", "read")]})
     assert not sharp.allows("a", "read", "/w/" + chr(0xDF) + "/.ENV")  # ? is the sharp s byte for byte
-    between = Policy({"a": [Rule("/w/[A-z]*/.env"), Rule("/w/**", "read")]})
-    assert not between.allows("a", "read", "/w/_p/.ENV")  # _ is between Z and a byte for byte
+    between = Policy({"a": [Rule("/w/[!a-z]*/.env"), Rule("/w/**", "read")]})
+    assert not between.allows("a", "read", "/w/_p/.ENV")  # _ is not in [a-z] byte for byte
+    capitals = Policy({"a": [Rule("/w/[A-Z]*"), Rule("/w/**", "read")]})  # an ASCII capital range folds whole
+    for name in ("Readme", "readme", chr(0xFF32) + "eadme"):  # R, r and a fullwidth R
+        assert not capitals.allows("a", "read", f"/w/{name}"), name
+    assert capitals.allows("a", "read", "/w/_x")
     both_ways = Policy({"a": [Rule("/w/Secret/[!a-z]*"), Rule("/w/**", "read")]})
     assert not both_ways.allows("a", "read", "/w/SECRET/README")  # SECRET folded, README byte for byte
     deep = Policy({"a": [Rule("/w/[!a-z]*/.env/**"), Rule("/w/**", "read")]})
@@ -1084,6 +1087,13 @@ def test_hide_rules_match_variants() -> None:
         "/w/[" + chr(0x1C5) + "]",  # the DZ digraph folds to two characters
         "/w/[" + chr(0xFB01) + "]x",  # the fi ligature folds to "fi"
         "/w/[a" + chr(0x200B) + "]",  # the zero-width space folds to nothing
+        "/w/[Z-z]",  # would fold to [z-z], leaving A visible while a is hidden
+        "/w/[A-z]*",  # would fold to [a-z], losing _ and the variants of it
+        "/w/[A-_]x",  # would fold to the empty range [a-_]
+        "/w/[" + chr(0xC0) + "-" + chr(0xFF) + "]",  # a non-ASCII range whose endpoint folds
+        "/w/[!A-Z]*",  # would fold to [!a-z]*, missing README, the variant of the readme it hides
+        "/w/[!R]*",  # likewise: the folded [!r]* misses Readme
+        "/w/[e" + chr(0x301) + "]",  # NFKC composes e and the combining acute into one member
     ):
         with pytest.raises(ValueError, match="fnmatch"):  # it would split the class the folded pattern matches
             Rule(member)
