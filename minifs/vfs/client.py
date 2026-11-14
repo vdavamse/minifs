@@ -1013,6 +1013,6 @@ async def _mapped[T](path: str, call: Callable[[], Awaitable[T]]) -> T:
         if error is None:
             raise
         if error.errno in ("EAGAIN", "ETIMEDOUT"):  # the server's timeouts: what to watch (docs/design.md)
-            _log.warning("%s on %s: %s", error.errno, error.path, e.diag.message_primary)
+            _log.warning("%s on %r: %s", error.errno, error.path, e.diag.message_primary)
         error.db_error = e
         raise error from None  # the psycopg error's text has the server DETAIL

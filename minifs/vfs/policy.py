@@ -154,9 +154,10 @@ class Policy:
         if not self.allows(actor, action, path, subtree=subtree):
             if count_denials:
                 self.denials[actor, action] += 1
-                _log.info("write policy denied %s %s on %s", actor, action, path)
+                # %r: a name may hold a newline, which %s would write as the start of a forged log line (#98).
+                _log.info("write policy denied %s %s on %r", actor, action, path)
             else:
-                _log.debug("write policy refused the lookup %s %s on %s", actor, action, path)
+                _log.debug("write policy refused the lookup %s %s on %r", actor, action, path)
             raise PolicyDenied(path, actor, action)
 
 

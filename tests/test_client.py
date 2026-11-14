@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import contextlib
+import logging
 import pickle
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -1081,6 +1082,17 @@ async def test_a_write_waits_for_a_lock_no_longer_than_lock_timeout(pool: Pool, 
         # A read takes no lock.
         assert (await vfs.pread("/f")).content == b"v1\n"
     await write(vfs, version)  # the lock is free again
+
+
+async def test_a_timeout_logs_the_path_as_its_repr(pool: Pool, db: str, caplog: pytest.LogCaptureFixture) -> None:
+    vfs = VFSClient(pool, lock_timeout=0.1)
+    await vfs.create("/f", b"v1\n")
+    async with holding_the_lock(db, "/f"):
+        with caplog.at_level(logging.WARNING, logger="minifs.vfs.client"):
+            await raises("EAGAIN", asyncio.wait_for(vfs.append("/f", b"more\n"), 10), "/f")
+    (record,) = caplog.records
+    # The quotes are the repr's, which escapes a newline in a name (#98).
+    assert record.getMessage().startswith("EAGAIN on '/f': ")
 
 
 async def test_a_long_write_is_cancelled_after_write_timeout(pool: Pool) -> None:

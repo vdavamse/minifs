@@ -292,6 +292,58 @@ async def test_agent_policy(vfs: VFSClient, policy: Policy) -> None:
     assert await agent.mkdir_p("/") is None  # a virtual directory exists already: nothing to deny
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/workspace/x\nINFO minifs.vfs.policy write policy denied operator write on /docs",  # a forged line
+        "/workspace/x\x1b[2J\x1b[31m.md",  # ANSI escapes: clear the screen, then red
+        "/workspace/x\u2028y\u202eexe.md",  # a line separator and a bidi override
+    ],
+)
+def test_a_path_with_a_control_character_is_refused_before_any_log(path: str, caplog: pytest.LogCaptureFixture) -> None:
+    """A newline or an escape sequence can't forge a log line or reach the operator's terminal: Policy.check, public
+    and taking any string, refuses such a path (EINVAL, #92) before it logs anything (#98)."""
+    policy = Policy({"agent": [Rule("/workspace/**", "read")]})
+    with caplog.at_level(logging.DEBUG, logger="minifs.vfs.policy"):
+        for count_denials in (True, False):
+            with pytest.raises(VFSError, match="control character"):
+                policy.check("agent", "write", path, count_denials=count_denials)
+    assert caplog.records == []
+    assert policy.denials == {}
+
+
+def test_a_denial_logs_the_path_as_its_repr_on_one_line(caplog: pytest.LogCaptureFixture) -> None:
+    """The path is logged as its repr (#98), which escapes the invisible characters a name may still hold (a
+    right-to-left mark, a zero-width space, a byte order mark) and any control character a future code path lets
+    through, so one denial is one printable line."""
+    policy = Policy({"agent": [Rule("/workspace/**", "read")]})
+    path = "/workspace/a\u200fb\u200bc\ufeff.md"
+    with caplog.at_level(logging.DEBUG, logger="minifs.vfs.policy"):
+        for count_denials in (True, False):
+            with pytest.raises(PolicyDenied):
+                policy.check("agent", "write", path, count_denials=count_denials)
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "write policy denied agent write on '/workspace/a\\u200fb\\u200bc\\ufeff.md'",
+        "write policy refused the lookup agent write on '/workspace/a\\u200fb\\u200bc\\ufeff.md'",
+    ]
+    assert all(message.isprintable() for message in messages)
+
+
+async def test_a_database_error_logs_the_path_as_its_repr(
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def lost(*args: object, **kwargs: object) -> None:
+        raise psycopg.OperationalError("the connection is lost")
+
+    monkeypatch.setattr(vfs, "stat", lost)
+    with caplog.at_level(logging.WARNING, logger="minifs.vfs.view"):
+        await raises("EIO", view(vfs, policy).stat("/workspace/notes.md"), "/workspace/notes.md")
+    (record,) = caplog.records
+    # The quotes are the repr's, which escapes a newline in a name (#98).
+    assert record.getMessage() == "database error in an operation on '/workspace/notes.md'"
+
+
 async def test_uncounted_reads_are_refused_but_not_counted(vfs: VFSClient, caplog: pytest.LogCaptureFixture) -> None:
     policy = Policy({"agent": [Rule("/workspace/secret.md"), Rule("/workspace/**", "read", "write")]})
     agent = view(vfs, policy)
