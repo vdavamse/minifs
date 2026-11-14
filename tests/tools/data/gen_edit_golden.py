@@ -40,7 +40,7 @@ CASES = [
     ("escaped", b's = "x"\ny\n', 's = \\"x\\"', 's = "z"', None),
     ("block_anchor", b"start {\n    alpha_value = 1\n}\n", "start {\n    alpha_valu = 1\n}", "start {}", None),
     ("literal_dollar", b"a\n", "a", "$&", None),
-    ("disproportionate", ("first\nm1\nm2\n" + "z" * 700 + "\nlast\n").encode(), "first\nm1\nm2\nlast", "x", None),
+    ("disproportionate", ("first\nm1\nm2\n" + "z" * 700 + "\nlast\n").encode(), "first\nm1\nm2\nm3\nlast", "x", None),
     ("no_final_newline", b"a\nb", "b", "c", None),
     ("delete_line", b"a\nb\nc\n", "b\n", "", None),
     ("unicode", "héllo wörld\n".encode(), "wörld", "\U0001f30d", None),
