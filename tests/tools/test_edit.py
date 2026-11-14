@@ -111,6 +111,20 @@ async def test_keeps_crlf_and_bom(deps: Deps, client: VFSClient) -> None:
     assert await content(client, "win.txt") == "\ufeffuno\r\ndos\r\nthree\r\n".encode()
 
 
+async def test_a_block_that_leaves_out_lines_is_a_retry(deps: Deps, client: VFSClient) -> None:
+    """The block anchors match the whole function, whose extra line ``delete_me()`` oldString leaves out: the
+    replacement would delete it unseen, so the edit is refused with a retry that points at the block (#117), in
+    a BOM/CRLF file too, and nothing is written."""
+    text = "\ufeffdef f():\r\n    keep_me()\r\n    delete_me()\r\n    return 1\r\n"
+    await put(client, "win.py", text.encode())
+    message = await edit_retry(
+        deps, "win.py", "def f():\n    keep_me()\n    return 1\n", "def f():\n    keep_me()\n    return 2\n"
+    )
+    assert "lines 1-4" in message
+    assert "1 more non-blank line(s)" in message
+    assert await content(client, "win.py") == text.encode()
+
+
 async def test_refuses_non_utf8(deps: Deps, client: VFSClient) -> None:
     await put(client, "latin.txt", b"caf\xe9\n")
     assert (
