@@ -588,21 +588,24 @@ async def test_cut_ignores_a_final_cr(vfs: VFSClient) -> None:
     assert [(h.text, h.cut) for h in result.hits] == [("a" * 10, False), ("b" * 10, True)]
 
 
-def test_cli_grep(db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_grep(db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setenv("MINIFS_DSN", db)  # never in argv: the conninfo holds the password
     for path, content in [("/w/a.py", b"def foo():\n    return 1\n"), ("/w/b.md", b"Foo\nfoo\n")]:
         source = tmp_path / "source"
         source.write_bytes(content)
-        assert main(["put", "--dsn", db, "-p", path, str(source)]) == 0
-    assert main(["grep", "--dsn", db, "foo", "/w"]) == 0
+        assert main(["put", "-p", path, str(source)]) == 0
+    assert main(["grep", "foo", "/w"]) == 0
     assert capsys.readouterr().out == "/w/a.py:1:def foo():\n/w/b.md:2:foo\n"
-    assert main(["grep", "--dsn", db, "-i", "-g", "*.md", "foo", "/w"]) == 0
+    assert main(["grep", "-i", "-g", "*.md", "foo", "/w"]) == 0
     assert capsys.readouterr().out == "/w/b.md:1:Foo\n/w/b.md:2:foo\n"
-    assert main(["grep", "--dsn", db, "-m", "1", "-F", "foo"]) == 0
+    assert main(["grep", "-m", "1", "-F", "foo"]) == 0
     captured = capsys.readouterr()
     assert captured.out == "/w/a.py:1:def foo():\n"
     assert "more" in captured.err
-    assert main(["grep", "--dsn", db, "(", "/w"]) == 1
-    assert capsys.readouterr().err.startswith("minifs grep: ")
+    assert main(["grep", "(", "/w"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("minifs grep: ")
+    assert "warning" not in err
 
 
 async def raises(errno: str, call: Any) -> VFSError:

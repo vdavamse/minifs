@@ -3,9 +3,9 @@
 The ``reference`` section is ladderframe's matcher code as minifs shipped it before #80 (ladderframe's
 ``packages/harness/src/ladderframe/tools/edit.py``), kept here as the oracle: for random content and finds, each
 rewritten replacer must yield the same candidates in the same order, and ``replace`` the same result or error. The
-oracle is ladderframe's code with four deliberate departures (#110, #122), marked in the code. Then the cost bounds:
-the cases that were quadratic finish in linear time, and a search that runs past ``timeout`` is a retry, from inside a
-replacer's loop too."""
+oracle is ladderframe's code with five deliberate departures (#110, #122, #117), marked in the code. Then the cost
+bounds: the cases that were quadratic finish in linear time, and a search that runs past ``timeout`` is a retry, from
+inside a replacer's loop too."""
 
 import math
 import random
@@ -18,7 +18,14 @@ import pytest
 
 import minifs.tools.edit as new
 from minifs.tools.deps import EditSettings, ToolSettings
-from minifs.tools.edit import EMPTY_OLD_STRING, MULTIPLE_MATCHES, Edit, ReplaceTimeout, timeout_message
+from minifs.tools.edit import (
+    BLOCK_LEAVES_OUT_LINES,
+    EMPTY_OLD_STRING,
+    MULTIPLE_MATCHES,
+    Edit,
+    ReplaceTimeout,
+    timeout_message,
+)
 from tests.tools.conftest import Deps, retry_message
 
 Replacer = Callable[[str, str], Iterator[str]]
@@ -49,6 +56,13 @@ def _span(lines: list[str], start: int, end: int) -> tuple[int, int]:
     begin = sum(len(line) + 1 for line in lines[:start])
     finish = begin + sum(len(line) for line in lines[start : end + 1]) + (end - start)
     return begin, finish
+
+
+class _LongerBlock(ValueError):
+    # departs from ladderframe (#117): a block-anchored match that leaves out non-blank lines is refused with a
+    # retry, kept pending by ``replace`` so the stricter replacers still look for the exact text.
+    def __init__(self, start: int, end: int, extra: int) -> None:
+        super().__init__(BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=extra))
 
 
 def simple_replacer(content: str, find: str) -> Iterator[str]:
@@ -104,33 +118,55 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
     first, last = search[0].strip(), search[-1].strip()
     max_delta = max(1, len(search) // 4)
 
-    candidates: list[tuple[int, int]] = []
+    def leaves_out_lines(start: int, end: int) -> int | None:
+        # departs from ladderframe (#117): how many non-blank lines of the block start..end pair with no line of
+        # the find (the middle is scored by position over the shorter of the two, so in a longer block the lines
+        # from the find's length up to the last anchor were never compared and the replacement deleted them), or
+        # None. Blank ones are fine: the block is yielded as ladderframe did. Not a net count: a find line missing
+        # from the file must not cancel out a block line nobody compared.
+        extra = sum(1 for k in range(start + len(search) - 1, end) if original[k].strip())
+        return extra or None
+
+    blocks: list[tuple[int, int]] = []
     for i, line in enumerate(original):
         if line.strip() != first:
             continue
         for j in range(i + 2, len(original)):
             if original[j].strip() == last:
-                if abs((j - i + 1) - len(search)) <= max_delta:
-                    candidates.append((i, j))
+                if abs(j - i + 1 - len(search)) <= max_delta:
+                    blocks.append((i, j))
                 break  # only the first occurrence of the last line
-    if not candidates:
+    if not blocks:
         return
 
-    if len(candidates) == 1:
-        start, end = candidates[0]
+    if len(blocks) == 1:
+        start, end = blocks[0]
         if _middle_similarity(original, start, end - start + 1, search, True) >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD:
+            # departs from ladderframe (#117): a block that leaves out non-blank lines is refused with a retry
+            # rather than yielded, and rather than dropped: dropping it let another block elsewhere win the
+            # scoring.
+            extra = leaves_out_lines(start, end)
+            if extra is not None:
+                raise _LongerBlock(start, end, extra)
             begin, finish = _span(original, start, end)
             yield content[begin:finish]
         return
 
     best: tuple[int, int] | None = None
     best_similarity = -1.0
-    for start, end in candidates:
+    best_extra: int | None = None
+    for start, end in blocks:
         similarity = _middle_similarity(original, start, end - start + 1, search, False)
-        if similarity > best_similarity:
-            best_similarity, best = similarity, (start, end)
+        extra = leaves_out_lines(start, end)
+        # departs from ladderframe (#117): on a tie, a block that doesn't leave out lines beats one that does
+        if similarity > best_similarity or (similarity == best_similarity and best_extra is not None and extra is None):
+            best_similarity, best, best_extra = similarity, (start, end), extra
     if best is not None and best_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD:
-        begin, finish = _span(original, *best)
+        start, end = best
+        # departs from ladderframe (#117): as above, for the best of several candidates.
+        if best_extra is not None:
+            raise _LongerBlock(start, end, best_extra)
+        begin, finish = _span(original, start, end)
         yield content[begin:finish]
 
 
@@ -273,36 +309,51 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
     # matchers would only yield blank lines to throw away (a blank line of spaces for a tab rewrote every
     # indentation run).
     replacers = (simple_replacer,) if not old_string.strip() else REPLACERS
+    refusal: _LongerBlock | None = None
     for replacer in replacers:
-        for search in replacer(content, old_string):
-            # departs from ladderframe (#110, #122): an empty candidate is never a match (it is "found" at 0 and
-            # with replace_all inserts new_string between every character); with replace_all, neither is a
-            # whitespace candidate of a non-blank oldString (an escaped `\n` unescaped to a newline would replace
-            # every newline in the file). Without replace_all it may still match once (an escaped `\t` for a real
-            # tab).
-            if not search or (replace_all and search != old_string and not search.strip()):
-                continue
-            index = content.find(search)
-            if index == -1:
-                continue
-            not_found = False
-            if _is_disproportionate_match(search, old_string):
-                raise ValueError(
-                    "Refusing replacement because the matched span is much larger than oldString. "
-                    "Re-read the file and provide the full exact oldString for the intended replacement."
-                )
-            if replace_all:
-                return content.replace(search, new_string)
-            if index != content.rfind(search):
-                if search == old_string:
-                    # departs from ladderframe (#110): an ambiguous exact oldString is reported, not skipped in
-                    # favour of a later fuzzy candidate elsewhere. A whole-line candidate can be the one meant, but
-                    # it replaces text the model left out of oldString (its indentation, say): an error is safer.
-                    raise ValueError(MULTIPLE_MATCHES)
-                continue
-            return content[:index] + new_string + content[index + len(search) :]
+        # departs from ladderframe (#117): a refused block stays pending while the other replacers still look
+        # for the exact text; the context-aware matcher is skipped once there is a refusal, as it would take a
+        # looser sibling block.
+        if refusal is not None and replacer is context_aware_replacer:
+            continue
+        try:
+            for search in replacer(content, old_string):
+                # departs from ladderframe (#110, #122): an empty candidate is never a match (it is "found" at 0
+                # and with replace_all inserts new_string between every character); with replace_all, neither is
+                # a whitespace candidate of a non-blank oldString (an escaped `\n` unescaped to a newline would
+                # replace every newline in the file). Without replace_all it may still match once (an escaped
+                # `\t` for a real tab).
+                if not search or (replace_all and search != old_string and not search.strip()):
+                    continue
+                index = content.find(search)
+                if index == -1:
+                    continue
+                not_found = False
+                if _is_disproportionate_match(search, old_string):
+                    raise ValueError(
+                        "Refusing replacement because the matched span is much larger than oldString. "
+                        "Re-read the file and provide the full exact oldString for the intended replacement."
+                    )
+                if replace_all:
+                    return content.replace(search, new_string)
+                if index != content.rfind(search):
+                    if search == old_string:
+                        # departs from ladderframe (#110): an ambiguous exact oldString is reported, not skipped
+                        # in favour of a later fuzzy candidate elsewhere. A whole-line candidate can be the one
+                        # meant, but it replaces text the model left out of oldString (its indentation, say): an
+                        # error is safer.
+                        raise ValueError(MULTIPLE_MATCHES)
+                    continue
+                return content[:index] + new_string + content[index + len(search) :]
+        except _LongerBlock as e:
+            # departs from ladderframe (#117): pending, not final: a later replacer may still find the text.
+            refusal = e
 
     if not_found:
+        # departs from ladderframe (#117): nothing found the text, so the refusal is the answer; when a replacer
+        # found it more than once, the ambiguity is (the refused block is not what was meant).
+        if refusal is not None:
+            raise refusal
         raise ValueError(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
             "and line endings."
@@ -402,6 +453,14 @@ def outcome(replace: Callable[..., str], content: str, find: str, new_string: st
         return ("error", str(e))
 
 
+def candidates(replacer: Replacer, content: str, find: str) -> object:
+    """A replacer's candidates, or the retry it raises instead (#117): both replacers must give the same."""
+    try:
+        return list(replacer(content, find))
+    except ValueError as e:
+        return ("error", str(e))
+
+
 @pytest.mark.parametrize("seed", range(4))
 def test_replacers_give_ladderframes_candidates(seed: int) -> None:
     rng = random.Random(seed)
@@ -409,7 +468,7 @@ def test_replacers_give_ladderframes_candidates(seed: int) -> None:
         content = random_text(rng, 10)
         find = random_find(rng, content) or "x"  # replace() rejects an empty find before any replacer runs
         for name, rewritten, reference in PAIRS:
-            assert list(rewritten(content, find)) == list(reference(content, find)), (name, content, find)
+            assert candidates(rewritten, content, find) == candidates(reference, content, find), (name, content, find)
         replace_all = rng.random() < 0.2
         assert outcome(new.replace, content, find, "R", replace_all) == outcome(
             replace, content, find, "R", replace_all
@@ -532,6 +591,123 @@ def test_block_anchors_alone_dont_take_the_line_between() -> None:
     assert list(new.block_anchor_replacer(content, "def f():\n    keep_me( )\n    return 1\n")) == [
         "def f():\n    keep_me()\n    return 1"
     ]
+
+
+def test_block_anchors_refuse_a_longer_block() -> None:
+    """A block-anchored match longer than the find has lines the find doesn't include: the
+    middle is scored by position over the shorter of the two, so the block's lines past the find's length were
+    never compared and the replacement deleted lines the model never wrote (#117). Such a block is refused with
+    a retry rather than dropped: dropping it let another block elsewhere win the scoring. The refusal is pending
+    in ``replace`` (the stricter replacers still run), but nothing here finds the text, so it is the answer. A
+    shorter block is still taken, and a block that doesn't leave out lines wins a tie with one that does."""
+    content = "def f():\n    keep_me()\n    delete_me()\n    return 1\n"
+    find = "def f():\n    keep_me()\n    return 1\n"
+    message = re.escape(BLOCK_LEAVES_OUT_LINES.format(first=1, last=4, extra=1))
+    with pytest.raises(ValueError, match=message):
+        next(islice(new.block_anchor_replacer(content, find), 1))
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match=message):
+            search(content, find, "def f():\n    keep_me()\n    return 2\n")
+    # A longer block whose extra line sits at the end of the middle, where the positional scoring would still
+    # accept the block (max_delta is 1 for 6 lines).
+    with pytest.raises(ValueError, match=re.escape(BLOCK_LEAVES_OUT_LINES.format(first=1, last=7, extra=1))):
+        next(
+            islice(
+                new.block_anchor_replacer(
+                    "def f():\n    a()\n    b()\n    c()\n    d()\n    x()\n    return 1\n",
+                    "def f():\n    a()\n    b()\n    c()\n    d()\n    return 1\n",
+                ),
+                1,
+            )
+        )
+    # Dropping the longer block let the second block (b = 9) win and be overwritten; and the refusal stays
+    # pending only for the stricter replacers: ``context_aware_replacer`` would take that looser sibling block
+    # (its middle matches half of the time), so it is skipped once there is a refusal (#117).
+    sibling = (
+        "if ready:\n    a = 1\n    b = 2\n    extra()\n    return a\n\nif ready:\n    a = 1\n    b = 9\n    return a\n"
+    )
+    sibling_find = "if ready:\n    a = 1\n    b = 2\n    return a"
+    sibling_message = re.escape(BLOCK_LEAVES_OUT_LINES.format(first=1, last=5, extra=1))
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match=sibling_message):
+            search(sibling, sibling_find, "if ready:\n    a = 1\n    b = 3\n    return a")
+    # Positive control: a SHORTER block is still found.
+    assert list(
+        new.block_anchor_replacer(
+            "def f():\n    a()\n    b()\n    c()\n    return 1\n",
+            "def f():\n    a()\n    b()\n    c()\n    gone()\n    return 1\n",
+        )
+    ) == ["def f():\n    a()\n    b()\n    c()\n    return 1"]
+    # A tie: both blocks score the same and the one that leaves out lines comes first. The block that doesn't
+    # leave out lines wins, rather than a refusal that points at the wrong block. With the longer block twice,
+    # ladderframe got there too: its pick was ambiguous, and whitespace_normalized_replacer found the right block.
+    longer, same = "if x:\n  a = 1\n  b = 2\n  c = 3\nreturn\n", "if x:\n  a = 1\n  b = 2\nreturn\n"
+    for content in (longer + same, longer + longer + same):
+        for search in (new.replace, replace):
+            assert search(content, "if x:\n  a  =  1\n  b = 2\nreturn", "NEW") == content.removesuffix(same) + "NEW\n"
+
+
+def test_a_stricter_replacer_finds_the_text_the_block_anchor_refused() -> None:
+    """Raising the refusal out of ``replace`` ended the whole search, so later replacers that would have found
+    the exact text (modulo whitespace) never ran, and the retry pointed the model at the wrong block (#117). The
+    refusal is pending now: here a strictly-higher-scoring longer block comes first, and the right block is
+    found later."""
+    content = "if x:\n  a = 1\n  b = 2\n  c = 3\nreturn\nif x:\n  a  = 1\n  b = 2\nreturn\n"
+    for search in (new.replace, replace):
+        assert search(content, "if x:\n  a = 1\n  b = 2\nreturn", "NEW") == (
+            "if x:\n  a = 1\n  b = 2\n  c = 3\nreturn\nNEW\n"
+        )
+
+
+def test_a_single_refused_candidate_does_not_end_the_search() -> None:
+    """A single block-anchor candidate whose extra line is non-blank is refused (#117), but the search goes on
+    and the right block is replaced: the refusal never becomes the answer."""
+    content = "f\n x\n }x\n y = 1\n w\n}\nf\n x\n}\n y  =  1\n}\n"
+    for search in (new.replace, replace):
+        assert search(content, "f\n x\n}\n y = 1\n}", "NEW") == "f\n x\n }x\n y = 1\n w\n}\nNEW\n"
+
+
+def test_a_left_out_blank_line_is_accepted() -> None:
+    """A longer block whose extra lines are all blank is yielded as ladderframe did (#117): a model often leaves
+    out a blank line, and losing one is harmless, so it is not a refusal."""
+    for search in (new.replace, replace):
+        assert (
+            search(
+                "def f():\n    a()\n\n    return 1\n",
+                "def f():\n    a()\n    return 1",
+                "def f():\n    a()\n    return 2",
+            )
+            == "def f():\n    a()\n    return 2\n"
+        )
+
+
+def test_lines_missing_from_the_file_dont_cancel_out_a_left_out_line() -> None:
+    """Only the block's lines that pair with no find line count (#117), not the block's non-blank lines against the
+    find's: here the find's ``e()`` and ``g()`` aren't in the file, the block has blank lines in their place, and
+    ``x()`` past the find's length was never compared. A net count (7 non-blank lines against 8) deleted it."""
+    content = "def f():\n    a()\n    b()\n    c()\n    d()\n\n\n    x()\n    return 1\n"
+    find = "def f():\n    a()\n    b()\n    c()\n    d()\n    e()\n    g()\n    return 1"
+    message = re.escape(BLOCK_LEAVES_OUT_LINES.format(first=1, last=9, extra=1))
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match=message):
+            search(content, find, "NEW")
+
+
+def test_an_ambiguous_match_outranks_a_refusal() -> None:
+    """When a stricter replacer finds the text twice after the block anchors refused a block, the answer is the
+    ambiguity: the refused block (lines 1-5 here) is not what was meant, and a retry naming it would send the model
+    to edit it (#117)."""
+    same = "if x:\n  a  = 1\n  b = 2\nreturn\n"
+    content = "if x:\n  a = 1\n  b = 2\n  c = 3\nreturn\n" + same + same
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match="Found multiple matches"):
+            search(content, "if x:\n  a = 1\n  b = 2\nreturn", "NEW")
+
+
+def test_multi_occurrence_replacer_is_not_tried() -> None:
+    """``multi_occurrence_replacer`` re-yields the oldString, which ``simple_replacer`` already tried, so it could
+    never change ``replace``'s outcome: it is not in ``REPLACERS`` (kept for the parity tests)."""
+    assert new.multi_occurrence_replacer not in new.REPLACERS
 
 
 # ---------------------------------------------------------------- bounded cost

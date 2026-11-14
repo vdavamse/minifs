@@ -111,6 +111,20 @@ async def test_keeps_crlf_and_bom(deps: Deps, client: VFSClient) -> None:
     assert await content(client, "win.txt") == "\ufeffuno\r\ndos\r\nthree\r\n".encode()
 
 
+async def test_a_block_that_leaves_out_lines_is_a_retry(deps: Deps, client: VFSClient) -> None:
+    """The block anchors match the whole function, whose extra line ``delete_me()`` oldString leaves out: the
+    replacement would delete it unseen, so the edit is refused with a retry that points at the block (#117), in
+    a BOM/CRLF file too, and nothing is written."""
+    text = "\ufeffdef f():\r\n    keep_me()\r\n    delete_me()\r\n    return 1\r\n"
+    await put(client, "win.py", text.encode())
+    message = await edit_retry(
+        deps, "win.py", "def f():\n    keep_me()\n    return 1\n", "def f():\n    keep_me()\n    return 2\n"
+    )
+    assert "lines 1-4" in message
+    assert "1 non-blank line(s) of that block have no counterpart" in message
+    assert await content(client, "win.py") == text.encode()
+
+
 async def test_refuses_non_utf8(deps: Deps, client: VFSClient) -> None:
     await put(client, "latin.txt", b"caf\xe9\n")
     assert (
@@ -192,10 +206,11 @@ def test_replace_fallback_matchers() -> None:
 
 
 def test_replace_refuses_a_disproportionate_match() -> None:
-    # the block anchors match one line further apart than oldString, and that extra line is huge
+    # the block anchors match a block as long as oldString whose middle line is huge (a longer block would be
+    # refused with a retry (#117)), and the matched span's text is much larger than oldString's
     content = "first\nm1\nm2\n" + "z" * 700 + "\nlast\n"
     with pytest.raises(ValueError, match="much larger than oldString"):
-        replace(content, "first\nm1\nm2\nlast", "x")
+        replace(content, "first\nm1\nm2\nm3\nlast", "x")
 
 
 def test_replace_other_fallback_matchers() -> None:
