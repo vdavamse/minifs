@@ -90,6 +90,17 @@ async def test_start_refusals(vfs: VFSClient, watcher: Watcher) -> None:
             pass
 
 
+async def test_watching_a_virtual_directory_follows_the_read_rule(vfs: VFSClient, watcher: Watcher) -> None:
+    """A virtual directory is checked as Read checks it before it is refused as unwatchable: where nothing in a mount
+    below it may be read, watching it is EACCES (counted), not EINVAL."""
+    hidden = view(vfs, watcher, Policy({"agent": [Rule("/workspace/**")]}))
+    with pytest.raises(PolicyDenied) as info:
+        async with hidden.watch("/"):
+            pass
+    assert (info.value.errno, info.value.path) == ("EACCES", "/")
+    assert hidden.policy.denials == {("agent", "read"): 1}
+
+
 async def test_directory_events_are_in_visible_paths(vfs: VFSClient, watcher: Watcher) -> None:
     """A directory watch reports a child's create, modify, move and delete in visible paths, never real ones."""
     agent = view(vfs, watcher)
