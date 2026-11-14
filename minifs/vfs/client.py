@@ -371,7 +371,9 @@ class VFSClient:
                     if error[0] is not None:
                         return error, None, []  # committed, not rolled back: nothing failed on the server
                     root = node
-                matches = await globbing.glob(conn, root, pattern, excludes=excludes, hidden=hidden, limit=limit)
+                matches = await globbing.glob(
+                    conn, root, pattern, excludes=excludes, hidden=hidden, limit=limit, root_path=join(*segments)
+                )
                 return (None, None), root, matches
 
         try:

@@ -119,12 +119,14 @@ async def glob(
     hidden: bool = False,
     limit: int | None = None,
     hints: bool = True,
+    root_path: str | None = None,
 ) -> list[GlobMatch]:
     """The files below directory ``root`` (None: ``/``) that match ``pattern``, newest first, as ``vfs_glob``
     returns them. ``.git`` directories are never walked. Without ``hints`` it walks the whole tree (for tests).
 
-    Raises GlobError for a bad pattern, and ``VFSError`` ENOENT / ENOTDIR for a bad ``root`` (with the root's id
-    as its path).
+    Raises GlobError for a bad pattern, and ``VFSError`` ENOENT / ENOTDIR for a bad ``root``, reported at
+    ``root_path``, the path the caller resolved ``root`` from (without it, at the root's id: not a path, so pass
+    it wherever the error may be shown).
     """
     if limit is not None and limit < 0:
         raise ValueError(f"limit must not be negative, got {limit}")
@@ -148,7 +150,7 @@ async def glob(
     )
     rows = await cur.fetchall()
     if rows and rows[0][4] is not None:  # the only row, then
-        raise VFSError(rows[0][4], str(root), detail=rows[0][5] or "")
+        raise VFSError(rows[0][4], str(root) if root_path is None else root_path, detail=rows[0][5] or "")
     return [GlobMatch(*row[:4]) for row in rows]
 
 

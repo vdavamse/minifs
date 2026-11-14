@@ -617,7 +617,14 @@ class VFSView:
 
     def _visible(self, real: str, *targets: _Target) -> str:
         """The visible path of ``real``, a path the operation on ``targets`` reported: one of their real paths, or
-        a path below or above one in its mount. A path above a mount point is reported as the mount point."""
+        a path below or above one in its mount. A path above a mount point is reported as the mount point; a string
+        that isn't an absolute path is EIO at the first target."""
+        if not real.startswith("/"):
+            # Not a path (a node id, say) in a result: a client bug. Refused rather than mapped to a path it isn't,
+            # which the policy would then check, and without the string, even in the log. ``_mapped`` handles an
+            # error's path before calling this.
+            _log.error("the client reported a path that isn't absolute, in an operation on %s", targets[0].visible)
+            raise VFSError("EIO", targets[0].visible, "internal error")
         segments = split_trusted(real)
         for target in targets:
             if real == target.real:
@@ -640,7 +647,16 @@ class VFSView:
         try:
             return await call
         except VFSError as e:
-            error = VFSError(e.errno, self._visible(e.path, *targets), e.message)
+            if e.path.startswith("/"):
+                path = self._visible(e.path, *targets)
+            else:  # not a path (a node id, say): a client bug. The errno stands; the string is never shown
+                _log.warning(
+                    "%s from the client at a path that isn't absolute, in an operation on %s",
+                    e.errno,
+                    targets[0].visible,
+                )
+                path = targets[0].visible
+            error = VFSError(e.errno, path, e.message)
         except psycopg.Error as e:
             _log.warning("database error in an operation on %s", targets[0].visible, exc_info=e)
             error = VFSError("EIO", targets[0].visible, "database error")
