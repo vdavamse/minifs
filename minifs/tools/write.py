@@ -6,9 +6,9 @@ version read for the diff, so a concurrent writer anywhere is detected. A lost r
 the file created, a file gone or replaced by a directory before its overwrite) is tried once more from the start,
 which is safe since ``Write`` replaces the whole file; a second loss is the ``ModelRetry`` of ``tool_error``.
 
-The old text only feeds the diff in the metadata, so a file over ``WriteSettings.max_diff_bytes`` isn't read or
-diffed (ladderframe has no such limit): only its first bytes are read, for the BOM to keep, along with the version
-for the compare-and-swap. The result text is the same either way.
+The old text only feeds the diff in the metadata, so a file over ``WriteSettings.max_diff_bytes``, or when
+reading it times out, isn't read for a diff (ladderframe has no such limit): only its first bytes are read, for
+the BOM to keep, along with the version for the compare-and-swap. The result text is the same either way.
 """
 
 from __future__ import annotations
@@ -19,10 +19,19 @@ from typing import Any
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ToolReturn
 
-from minifs.tools._text import BOM, TooLarge, create_file, diff_metadata, encode_text, read_file, split_bom
+from minifs.tools._text import (
+    BOM,
+    ReadTimedOut,
+    TooLarge,
+    create_file,
+    diff_metadata,
+    encode_text,
+    read_file,
+    split_bom,
+)
 from minifs.tools.base import vfs_tool
 from minifs.tools.deps import HasVFS, resolve, settings
-from minifs.tools.errors import TIMED_OUT_WRITE, tool_error
+from minifs.tools.errors import TIMED_OUT_READ, TIMED_OUT_WRITE, tool_error
 from minifs.vfs.core import FileVersion, VFSError
 from minifs.vfs.view import VFSView
 
@@ -61,6 +70,8 @@ async def write(ctx: RunContext[HasVFS], content: str, filePath: str) -> str | T
                 continue
         else:
             raise VFSError("ESTALE", path)
+    except ReadTimedOut as e:
+        raise ModelRetry(TIMED_OUT_READ.format(path=e.path)) from None
     except VFSError as e:
         return tool_error(e, "write", ETIMEDOUT=TIMED_OUT_WRITE)
     if content_old is None:
@@ -73,8 +84,9 @@ async def write(ctx: RunContext[HasVFS], content: str, filePath: str) -> str | T
 
 async def _write(vfs: VFSView, path: str, content: str, max_diff_bytes: int) -> tuple[bool, str | None, str]:
     """Writes ``content`` to ``path``: ``(the file existed, its old text, the new text)``, without BOMs; the old
-    text is None for a file over ``max_diff_bytes``, which isn't read. ``_Lost`` where another writer got in
-    between: a create beaten to the file, a file changed, removed or replaced by a directory after its stat."""
+    text is None for a file over ``max_diff_bytes``, which isn't read, or when reading it times out. ``_Lost``
+    where another writer got in between: a create beaten to the file, a file changed, removed or replaced by a
+    directory after its stat."""
     next_bom, content_new = split_bom(content)
     if not vfs.allows("read", path):
         # ladderframe checks the write permission first. Allowed to write but not read: a new file needs no old
@@ -119,17 +131,22 @@ async def _write(vfs: VFSView, path: str, content: str, max_diff_bytes: int) -> 
 
 async def _read_old(vfs: VFSView, path: str, size: int, max_diff_bytes: int) -> tuple[bool, str | None, FileVersion]:
     """Whether the file of ``size`` bytes at ``path`` starts with a BOM, its text without it, and its version. Over
-    ``max_diff_bytes`` the text is None: only the bytes of a BOM are read."""
+    ``max_diff_bytes``, or when the read times out, the text is None: only the bytes of a BOM are read."""
     if size <= max_diff_bytes:
         try:
             data, version = await read_file(vfs, path, max_diff_bytes)
-        except TooLarge:  # grew past the cap since the stat
+        except (TooLarge, ReadTimedOut):  # grew past the cap, or too slow to read for a diff: write without one
             pass
         else:
             # The old text only feeds the diff, so an undecodable file is still overwritten.
             source_bom, content_old = split_bom(data.decode("utf-8", errors="replace"))
             return source_bom, content_old, version
-    head = await vfs.pread(path, 0, len(_BOM_BYTES))
+    try:
+        head = await vfs.pread(path, 0, len(_BOM_BYTES))
+    except VFSError as e:
+        if e.errno == "ETIMEDOUT":
+            raise ReadTimedOut(path) from None
+        raise
     return head.content == _BOM_BYTES, None, FileVersion(head.id, head.generation, head.size)
 
 

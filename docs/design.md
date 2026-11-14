@@ -34,7 +34,7 @@ How minifs works and why, for contributors and for anyone who wants to check its
 | --- | --- | --- |
 | Agent tools | `minifs/tools/` | `Read`, `Write`, `Edit`, `Glob`, `Grep` as pydantic-ai tools over a `VFSView` |
 | View | `minifs/vfs/view.py`, `policy.py` | The agent's chroot (mounts) and the per-actor path rules |
-| Client | `minifs/vfs/client.py` | One SQL statement per operation; path resolution, with the directory cache |
+| Client | `minifs/vfs/client.py` | One SQL statement per operation (a whole-file read: one per page, on one snapshot); path resolution, with the directory cache |
 | Cache, watch | `minifs/vfs/cache.py`, `watch.py` | The directory-entry cache; `LISTEN` on the schema's channel and per-path watches |
 | Glob, search, regex | `minifs/vfs/glob.py`, `search.py`, `regex.py`, `crates/minifs-regex/` | Pattern compilation (Rust, `minifs._regex`) and the search statements |
 | Service | `minifs/vfs/service.py`, `minifs/db/pool.py` | `open_vfs`: pools, watcher and cache, opened and closed in order; credentials per connection |
@@ -130,6 +130,8 @@ CREATE INDEX vfs_extents_not_utf8_idx ON vfs_extents (node_id, generation) WHERE
 **One snapshot.** Both read functions are `STABLE`, so all their statements share the caller's snapshot: `size`, `generation`, `lines` and the bytes describe the same moment, even while another client appends. Lines split on `\n` only, and a trailing `\n` adds no empty last line, so `a\nb\n` and `a\nb` both have 2 lines, and `Read`'s numbers are `Grep`'s.
 
 **Reading several files at once.** `VFSClient.pread_many(reads, groups=)` resolves and reads several paths in one statement and one snapshot. `VFSClient.pread_page` is that statement plus the page's first `vfs_pread_lines`: `Read` uses it to fetch the 4 KB sample, the page and the nearby `AGENTS.md` / `CLAUDE.md` files together. With `groups`, only the first existing file of each group is read: `AGENTS.md`, else `CLAUDE.md`.
+
+**Reading a whole file.** `VFSClient.pread_file(path, page)` reads every page of a file on one pooled connection, in one read-only `REPEATABLE READ` transaction: one snapshot at any size, so the pages can't mix two versions and no `ESTALE` check between them is needed. `Write` and `Edit` read the old text through it, in pages of at most 16 MiB (a long line is one compressed extent, decompressed from its start for each page that reads into it, so pages stay large). It takes no lock and sets no `statement_timeout` of its own; a server one applies to each page statement, and `page` bounds what one statement holds on the server and in client memory: about 3x the page while it arrives, since bytea comes as hex text. The connection and the snapshot are held for the whole read, so their hold time grows with the file, one statement per page; a server `transaction_timeout` bounds the whole read and `idle_in_transaction_session_timeout` the gaps between pages, and both, as a page's `statement_timeout`, are reported as a timeout (ETIMEDOUT). When reading the old text times out, `Write` writes without a diff, like a file over `max_diff_bytes` (the old text only feeds the diff), and `Edit` tells the model to use `Write`.
 
 ## Writes
 
