@@ -103,7 +103,7 @@ async def main(dsn: str, workspace_id: str, prompt: str, model: Model | str) -> 
      VFSClient: one SQL statement per operation, directory cache
                                |
                    PostgreSQL SQL functions
-           vfs_nodes · vfs_extents · NOTIFY on channel vfs
+           vfs_nodes · vfs_extents · NOTIFY on the schema's channel
 ```
 
 ### The data model, in two tables
@@ -193,10 +193,10 @@ class Deps:
 
 | Setting | Default |
 | --- | --- |
-| `Read` | 2,000 lines, lines cut at 2,000 characters, output capped at 50 KB |
+| `Read` | 2,000 lines, lines cut at 2,000 characters, output capped at 50 KB; `AGENTS.md`/`CLAUDE.md` attachments cut at 64 KB; directories sorted up to 10,000 entries (larger ones are paged in byte order of name) |
 | `Glob`, `Grep` | 100 results; excludes `node_modules`, `.venv`, `__pycache__`, `.mypy_cache` (and always `.git`) |
 | `Grep` | 2 s per statement; hit lines cut at 2,000 characters |
-| `Edit` | files up to 10 MB |
+| `Edit` | files up to 10 MB; 10 s to find `oldString` (the exact match, then the fuzzy matchers), after which the call is a retry (`EditSettings(timeout=None)`: no limit) |
 | `Write` | diffs old files up to 1 MB (larger ones are replaced without a diff) |
 
 **The directory cache.** Use one `DirEntryCache` per long-running process; leave it out for one-shot scripts. It maps `(parent id, name)` to a node, follows other processes' renames and deletes through `NOTIFY`, and expires entries after 60 s. Every use is checked in the statement that uses it, so a stale entry costs a slower lookup, never the wrong file. `cache.stats()` reports the hit rate.

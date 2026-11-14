@@ -10,6 +10,7 @@ settings, which they read with ``getattr`` and a default, so the caller's own de
 
 from __future__ import annotations
 
+import math
 import posixpath
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -38,6 +39,33 @@ class ReadSettings:
     """Characters kept of each line; longer lines are cut."""
     max_bytes: int = 50 * 1024
     """Output cap per call."""
+    instruction_bytes: int = 64 * 1024
+    """Bytes read of each ``AGENTS.md`` / ``CLAUDE.md`` attached to a result; a longer one is cut there, with a
+    note (ladderframe reads them whole). 0 attaches none."""
+    max_entries: int = 10_000
+    """Entries of a directory ``Read`` fetches to sort and page as ladderframe does. A directory with more is paged
+    in byte order of name, at most this many entries a page, and no names are suggested for a missing path in
+    it. At least 1."""
+
+    def __post_init__(self) -> None:
+        # Only instruction_bytes and max_entries are capped: they reach SQL functions that take an int, and a
+        # directory Read asks for max_entries + 1 entries.
+        bounds: dict[str, tuple[int, int | None]] = {
+            "default_limit": (0, None),
+            "max_line_length": (0, None),
+            "max_bytes": (0, None),
+            "instruction_bytes": (0, 2**31 - 1),
+            "max_entries": (1, 2**31 - 2),
+        }
+        for name, (low, high) in bounds.items():
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"read {name} must be an int, not {value!r}")
+            if high is None:
+                if value < low:
+                    raise ValueError(f"read {name} must be at least {low}, not {value}")
+            elif not low <= value <= high:
+                raise ValueError(f"read {name} must be from {low} to {high}, not {value}")
 
 
 ALWAYS_EXCLUDED: tuple[str, ...] = ("**/.git/**",)
@@ -99,12 +127,27 @@ class GrepSettings:
 class EditSettings:
     max_bytes: int = 10 * 1024 * 1024
     """Largest file ``Edit`` takes, since it holds the whole file in memory; ``Write`` replaces larger ones."""
+    timeout: float | None = 10.0
+    """Seconds one search for ``oldString`` may take (the exact match and the fallback matchers after it) before
+    the call is a retry. It runs in a worker thread that holds the GIL and can't be cancelled, so this bounds what
+    it can cost the process; a call that lost a race with another writer searches once more, with the same limit.
+    None: no limit, for a caller that bounds the search some other way."""
 
     def __post_init__(self) -> None:
         if isinstance(self.max_bytes, bool) or not isinstance(self.max_bytes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"edit max_bytes must be an int, not {self.max_bytes!r}")
         if self.max_bytes < 0:
             raise ValueError(f"edit max_bytes must be at least 0, not {self.max_bytes}")
+        if self.timeout is None:
+            return
+        if isinstance(self.timeout, bool) or not isinstance(self.timeout, int | float):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"edit timeout must be a number or None, not {self.timeout!r}")
+        try:
+            seconds = float(self.timeout)
+        except OverflowError:  # an int past the largest float
+            seconds = math.inf
+        if not 0 < seconds < math.inf:
+            raise ValueError(f"edit timeout must be over 0 seconds and finite (None: no limit), not {self.timeout!r}")
 
 
 @dataclass(frozen=True)
