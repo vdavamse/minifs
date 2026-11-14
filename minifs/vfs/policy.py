@@ -104,9 +104,7 @@ class Policy:
         and doesn't grant ``action`` refuses, unless an earlier rule covers the whole subtree. KeyError for an
         actor without rules. ``path`` isn't checked for control characters (``split_trusted``): it is as often a
         path the server listed as one from a caller, which ``check`` and the operation itself refuse."""
-        return self._allows(actor, action, split_trusted(path), subtree)
-
-    def _allows(self, actor: str, action: Action, segments: tuple[str, ...], subtree: bool) -> bool:
+        segments = split_trusted(path)
         for rule in self.rules[actor]:
             rests = _rests(rule.segments, segments)
             if not subtree:
@@ -138,8 +136,8 @@ class Policy:
     ) -> None:
         """Raises EACCES (``PolicyDenied``) for ``path`` unless ``actor`` may ``action`` there (``allows``), and
         counts the denial unless ``count_denials`` is False (a speculative lookup)."""
-        segments = split(path)  # EINVAL before EACCES for a path with a control character: ``allows`` doesn't look
-        if not self._allows(actor, action, segments, subtree):
+        split(path)  # EINVAL before EACCES for a path with a control character: ``allows`` doesn't look
+        if not self.allows(actor, action, path, subtree=subtree):
             if count_denials:
                 self.denials[actor, action] += 1
                 _log.info("write policy denied %s %s on %s", actor, action, path)
