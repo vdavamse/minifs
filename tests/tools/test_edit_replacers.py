@@ -296,20 +296,24 @@ REPLACERS: tuple[Replacer, ...] = (
 )
 
 
-def _substitute(content: str, search: str, index: int, new_string: str, replace_all: bool) -> str:
+def _substitute(content: str, search: str, index: int, new_string: str, old_string: str, replace_all: bool) -> str:
     """The oracle's own copy of minifs's ``_substitute`` (the oracle mirrors the code; it must not import the
     private helper). Substitute ``search`` (first occurrence at ``index``) by ``new_string``: a candidate span
     never splits a CRLF pair; the pair goes with the side that holds its ``\n`` (#127). END: a candidate ending
     in ``\r`` whose occurrence is followed by ``\n`` (or by the end of the file) keeps that ``\r`` in the file
-    unless ``new_string`` already ends in ``\r`` or the next occurrence being replaced starts right there.
-    START: a candidate starting with ``\n`` preceded by a ``\r`` no previous replaced span claimed takes that
-    ``\r`` into the span."""
+    unless ``new_string`` already ends in ``\r``, the next occurrence being replaced starts right there, or the
+    candidate's run of trailing ``\r`` is no longer than the run ``_unescape(old_string)`` ends with (only CRs
+    beyond what the model wrote are the file's). START: a candidate starting with ``\n`` preceded by a ``\r`` no
+    previous replaced span claimed takes that ``\r`` into the span."""
     if not search.endswith("\r") and not search.startswith("\n"):  # neither rule can fire
         if replace_all:
             return content.replace(search, new_string)
         return content[:index] + new_string + content[index + len(search) :]
 
     size = len(search)
+    unescaped = _unescape(old_string)  # the oldString as the model meant it
+    model_crs = len(unescaped) - len(unescaped.rstrip("\r"))
+    end_cr = len(search) - len(search.rstrip("\r")) > model_crs  # CRs beyond the model's are the file's
     starts: list[int] = []
     at: int = index
     while at != -1:
@@ -323,7 +327,7 @@ def _substitute(content: str, search: str, index: int, new_string: str, replace_
         if search.startswith("\n") and s > 0 and content[s - 1] == "\r" and s - 1 >= previous_end:
             s -= 1  # START: the pair's "\r" joins the span, since its "\n" is in the span
         if (
-            search.endswith("\r")
+            end_cr
             and (e == len(content) or content[e] == "\n")
             and not new_string.endswith("\r")
             and not (k + 1 < len(starts) and starts[k + 1] == e)
@@ -378,13 +382,13 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
                 # goes with the side that holds its "\n", per occurrence (see _substitute): a candidate's
                 # trailing "\r" with the file's "\n" right after is the line ending and stays (deleting a block
                 # with newString "" then leaves "\r\n", as an LF file leaves "\n"), and a candidate starting
-                # with "\n" takes the "\r" right before it, rather than leaving a lone CR. The model's literal
-                # text is never adjusted: the exact match substitutes as ladderframe did, so a deliberate CR
-                # removal (an exact "\r" the model asked to delete) deletes it.
+                # with "\n" takes the "\r" right before it, rather than leaving a lone CR. The exact match is
+                # never adjusted, and a fuzzy candidate's trailing CRs are the file's only beyond the ones the
+                # model's oldString ends with, so a deliberate CR removal works through the fuzzy replacers too.
                 if replace_all:
                     if search == old_string:
                         return content.replace(search, new_string)
-                    return _substitute(content, search, index, new_string, True)
+                    return _substitute(content, search, index, new_string, old_string, True)
                 if index != content.rfind(search):
                     if search == old_string:
                         # departs from ladderframe (#110): an ambiguous exact oldString is reported, not skipped
@@ -395,7 +399,7 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
                     continue
                 if search == old_string:
                     return content[:index] + new_string + content[index + len(search) :]
-                return _substitute(content, search, index, new_string, False)
+                return _substitute(content, search, index, new_string, old_string, False)
         except _LongerBlock as e:
             # departs from ladderframe (#117): pending, not final: a later replacer may still find the text.
             refusal = e
@@ -773,10 +777,9 @@ def test_a_fuzzy_match_in_a_crlf_file_keeps_the_line_ending() -> None:
 def test_each_line_based_replacers_candidate_keeps_its_trailing_cr() -> None:
     """Each line-based replacer's candidate in a CRLF file ends with its last line's ``\\r``, and the
     replacement keeps it, so the output has no bare LF (#127). Each find routes to the named replacer (the
-    earlier ones find nothing), except the indentation-flexible one: a window whose lines are lstrip-equal to
-    the find's (its gate) is necessarily strip-equal (the line-trimmed gate), so the line-trimmed matcher
-    always finds what the indentation-flexible one finds and its identical candidate wins in ``replace``; that
-    case checks the indentation-flexible candidate directly. The context-aware find departs from the issue's
+    earlier ones find nothing). The indentation-flexible matcher isn't here: its candidate compares equal to the
+    de-indented find, so it ends in ``\r`` only when the find does, and that CR is then the model's own, which
+    the END rule leaves to the model. The context-aware find departs from the issue's
     example (a ``zzz = 9`` middle between two exact middles still scores 0.78 at the block anchors, which win):
     with one exact and one wholly different middle the block score is 0.5 (< 0.65) and the context match is
     1/2 (>= 0.5), so the context-aware matcher is the one that yields."""
@@ -798,12 +801,6 @@ def test_each_line_based_replacers_candidate_keeps_its_trailing_cr() -> None:
             "    alpha = 1\r\n    beta = 2",
             "    alpha = ONE\r\n    beta = 2",
             "def f():\r\n    alpha = ONE\r\n    beta = 2\r\n    gamma = 3\r\nend\r\n",
-        ),
-        (
-            new.indentation_flexible_replacer,
-            "    def f():\r\n        alpha = 1\r",
-            "def f():\r\nalpha = ONE",
-            "def f():\r\nalpha = ONE\r\n    beta  = 2\r\n    gamma = 3\r\nend\r\n",
         ),
         (
             new.context_aware_replacer,
@@ -860,6 +857,25 @@ def test_an_exact_cr_removal_is_the_models_to_make() -> None:
         assert search("x\r\nfoo\r\ny\r\n", "foo\r", "foo") == "x\r\nfoo\ny\r\n"
 
 
+def test_a_fuzzy_cr_removal_is_the_models_to_make() -> None:
+    """A fuzzy candidate's trailing ``\\r`` can be the model's own: the escape matcher unescapes a literal
+    backslash-r of oldString, and ``line_trimmed`` strips a real trailing ``\\r`` of oldString as whitespace.
+    The END rule kept it as the file's line ending, so a deliberate CR removal silently changed nothing (or put
+    the text before the CR) and Edit reported success. Only CRs beyond the run the model's oldString ends with
+    are the file's, so the CR goes here (#127)."""
+    cases = [
+        (new.escape_normalized_replacer, "line1\r\nline2\nline3\n", "\\r", "\r", "", "line1\nline2\nline3\n"),
+        (new.escape_normalized_replacer, "line1\r\nline2\nline3\n", "\\r", "\r", "X", "line1X\nline2\nline3\n"),
+        (new.escape_normalized_replacer, "foo\r\nbar\nbaz\n", "foo\\r", "foo\r", "foo", "foo\nbar\nbaz\n"),
+        (new.line_trimmed_replacer, "foo\r\nbar\nbaz\n", " foo\r", "foo\r", "foo", "foo\nbar\nbaz\n"),
+    ]
+    for replacer, content, find, candidate, new_string, expected in cases:
+        # the named replacer is the one that yields, so the case exercises the fuzzy path
+        assert next(islice(replacer(content, find), 1)) == candidate, replacer.__name__
+        for search in (new.replace, replace):
+            assert search(content, find, new_string) == expected, (replacer.__name__, find, new_string)
+
+
 def test_replace_all_decides_the_crlf_rules_per_occurrence() -> None:
     """With ``replaceAll`` every occurrence gets its own END-rule decision (#127); the old guard let the first
     occurrence decide for all. The line-trimmed candidate for ``"  foo"`` is ``"foo\\r"``: its first occurrence
@@ -887,12 +903,13 @@ def test_the_crlf_rules_interleave_across_replace_all_occurrences() -> None:
     """The two rules per occurrence with ``replaceAll`` (#127): in ``"a\\r\\nfoo\\r\\nfoo\\r\\n"`` the
     candidate ``"\\nfoo\\r"`` (the escape matcher unescapes the literal ``\\nfoo\\r``) is at 2 and 7. First
     occurrence: the START rule extends the span to [1, 7); the END rule is off, as the next occurrence starts
-    at 7. Second: the START rule is off (6 < the previous span's end, 7); the END rule keeps the ``\\r`` at 11
-    (a ``\\n`` follows at 12, and there is no next occurrence): the span is [7, 11)."""
+    at 7. Second: the START rule is off (6 < the previous span's end, 7). The END rule would keep the ``\\r`` at
+    11, but that CR is one the model wrote (its oldString, unescaped, ends in one ``\\r``, as many as the
+    candidate), so it goes with the span: the model asked for ``\\nfoo\\r`` to be replaced, twice."""
     content = "a\r\nfoo\r\nfoo\r\n"
     assert next(islice(new.escape_normalized_replacer(content, "\\nfoo\\r"), 1)) == "\nfoo\r"
     for search in (new.replace, replace):
-        assert search(content, "\\nfoo\\r", "X", True) == "aXX\r\n"
+        assert search(content, "\\nfoo\\r", "X", True) == "aXX\n"
 
 
 def test_a_file_ending_in_a_lone_cr_keeps_it() -> None:
@@ -914,8 +931,8 @@ def test_crlf_replacements_never_leave_a_bare_lf(seed: int) -> None:
     newString has none, and a fuzzy candidate's span never splits a CRLF pair (#127) — a candidate's trailing
     ``\\r`` with the file's ``\\n`` right after stays, and a candidate starting with ``\\n`` takes the ``\\r``
     before it. An exact find is the model's literal text and is never adjusted: one ending in ``\\r`` removes
-    that CR on purpose and may leave the file's ``\\n`` bare. The oracle must give the same outcome in every
-    case."""
+    that CR on purpose and may leave the file's ``\\n`` bare, and so does a fuzzy find whose unescaped text ends
+    in ``\\r`` (those CRs are the model's too). The oracle must give the same outcome in every case."""
     rng = random.Random(seed)
     for _ in range(500):
         content_lf = random_text(rng, 10)
@@ -924,8 +941,51 @@ def test_crlf_replacements_never_leave_a_bare_lf(seed: int) -> None:
         replace_all = rng.random() < 0.2
         result = outcome(new.replace, content, find, "R\r\nS", replace_all)
         assert result == outcome(replace, content, find, "R\r\nS", replace_all), (content, find, replace_all)
-        if isinstance(result, str) and find not in content:
+        if isinstance(result, str) and find not in content and not _unescape(find).endswith("\r"):
             assert re.search(r"(?<!\r)\n", result) is None, (content, find, replace_all, result)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_substitute_agrees_with_the_oracle(seed: int) -> None:
+    """``new._substitute``'s one pass (the next occurrence's start kept in a variable, an ``io.StringIO`` for
+    the output) gives exactly the oracle's list-based reference: random CRLF content with lone CRs and LFs
+    mixed in, substring searches sometimes extended to start with ``\\n`` or end with ``\\r`` (the START and
+    END rules), and small newString/oldString sets that reach both rules and the model's-own-CR comparison
+    (#127)."""
+    rng = random.Random(seed)
+    for _ in range(1000):
+        content = random_text(rng, 8).replace("\n", "\r\n")
+        for _ in range(rng.randint(0, 3)):  # mix in lone CRs and LFs
+            if not content:
+                break
+            k = rng.randrange(len(content))
+            content = content[:k] + rng.choice("\r\n") + content[k:]
+        if not content:
+            continue
+        i = rng.randrange(len(content))
+        search = content[i : rng.randint(i + 1, len(content))]
+        if rng.random() < 0.3:  # extend to start with "\n", when the content allows
+            extended = "\n" + search
+            if extended in content:
+                search = extended
+        if rng.random() < 0.3:  # extend to end with "\r", when the content allows
+            extended = search + "\r"
+            if extended in content:
+                search = extended
+        index = content.find(search)
+        new_string = rng.choice(["", "X", "A\r\nB", "Y\r"])
+        old_string = rng.choice([search, "x", "\\r", "q\r"])
+        for replace_all in (False, True):
+            assert new._substitute(  # pyright: ignore[reportPrivateUsage]
+                content, search, index, new_string, old_string, replace_all
+            ) == _substitute(content, search, index, new_string, old_string, replace_all), (
+                content,
+                search,
+                index,
+                new_string,
+                old_string,
+                replace_all,
+            )
 
 
 def test_multi_occurrence_replacer_is_not_tried() -> None:
@@ -973,6 +1033,17 @@ def test_the_uniqueness_check_is_linear() -> None:
     begin = time.monotonic()
     assert new.replace(content, find, "q", timeout=30) == "q" + "xxxxx\n" * 400_000
     assert time.monotonic() - begin < 3
+
+
+def test_a_million_replace_all_occurrences_are_substituted_in_one_pass() -> None:
+    """A million occurrences of a fuzzy candidate (the line-trimmed ``"x\\r"`` for the find ``"  x"``): the
+    ``starts`` and ``pieces`` lists of the old ``_substitute`` cost ~2.5 s and ~340 MB; one pass into an
+    ``io.StringIO`` is linear and small. The bound is generous: it guards against a quadratic regression, not a
+    benchmark."""
+    content = "x\r\n" * 1_000_000
+    begin = time.monotonic()
+    assert new.replace(content, "  x", "y", True) == "y\r\n" * 1_000_000
+    assert time.monotonic() - begin < 5
 
 
 def test_words_in_a_long_line_are_found_in_one_pass() -> None:
