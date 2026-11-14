@@ -14,7 +14,7 @@ import pytest
 from psycopg import AsyncConnection
 
 from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO, errno_name
-from minifs.vfs.core import CONTROL_CHARACTERS
+from minifs.vfs.core import CONTROL_CHARACTERS, VFSError
 
 Kind = str
 
@@ -935,3 +935,11 @@ async def test_control_character_class_matches_the_client(conn: AsyncConnection)
     with pytest.raises(psycopg.Error) as info:
         await create(conn, None, "a/\nb")
     assert info.value.diag.message_detail == "name contains the control character U+000A"
+
+    # The constraint's own violation (a raw INSERT) has the failing row in its DETAIL: the client escapes it.
+    with pytest.raises(psycopg.errors.CheckViolation) as raw:
+        await conn.execute("INSERT INTO vfs_nodes (name, kind) VALUES (%s, 'file')", ("a\x1b[31m\nb",))
+    assert "\n" in (raw.value.diag.message_detail or "")
+    error = VFSError.from_db(raw.value, "/x")
+    assert error is not None and error.errno == "EINVAL"
+    assert "u001b[31m" in error.detail and not CONTROL_CHARACTERS.search(error.detail)

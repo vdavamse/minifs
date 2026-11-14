@@ -56,7 +56,17 @@ import psycopg
 from minifs.vfs import glob as globbing
 from minifs.vfs import search as searching
 from minifs.vfs.client import DEFAULT_LINE_BYTES, DEFAULT_LINE_LIMIT, DEFAULT_READ_LIMIT, MAX_TIMEOUT, VFSClient
-from minifs.vfs.core import Entry, FileVersion, GlobResult, LineReadResult, ReadResult, VFSError, join, split
+from minifs.vfs.core import (
+    Entry,
+    FileVersion,
+    GlobResult,
+    LineReadResult,
+    ReadResult,
+    VFSError,
+    join,
+    split,
+    split_trusted,
+)
 from minifs.vfs.policy import Action, Policy
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
@@ -397,7 +407,7 @@ class VFSView:
         assert mount is not None
 
         def keep(real: str) -> bool:
-            segments = split(real)
+            segments = split_trusted(real)
             if segments[: len(mount.real)] != mount.real:
                 return False
             visible = join(*mount.visible, *segments[len(mount.real) :])
@@ -540,7 +550,7 @@ class VFSView:
     def _visible(self, real: str, *targets: _Target) -> str:
         """The visible path of ``real``, a path the operation on ``targets`` reported: one of their real paths, or
         a path below or above one in its mount. A path above a mount point is reported as the mount point."""
-        segments = split(real)
+        segments = split_trusted(real)
         for target in targets:
             if real == target.real:
                 return target.visible

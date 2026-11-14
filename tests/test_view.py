@@ -228,6 +228,16 @@ async def test_uncounted_reads_are_refused_but_not_counted(vfs: VFSClient, caplo
     assert policy.denials == {("agent", "read"): 1}
 
 
+def test_policy_matches_a_legacy_name_and_check_refuses_it(policy: Policy) -> None:
+    """``allows`` filters paths the server listed, so a name from before migration 016 is matched, not an error
+    that fails the whole listing; ``check``, for a caller's path, is EINVAL before EACCES."""
+    assert policy.allows("agent", "read", "/workspace/a\nb") is True
+    assert policy.allows_any("agent", "read", "/workspace/a\nb") is True
+    with pytest.raises(VFSError) as info:
+        policy.check("agent", "write", "/elsewhere/a\nb")
+    assert info.value.errno == "EINVAL" and "\n" not in str(info.value)
+
+
 async def test_ingestion_policy(vfs: VFSClient, policy: Policy) -> None:
     ingestion = view(vfs, policy, "ingestion")
     await ingestion.create("/docs/new.md", b"x")

@@ -23,7 +23,7 @@
 --
 -- Deploying: the new constraint is validated, so this migration scans vfs_nodes once, holding an ACCESS
 -- EXCLUSIVE lock on it (reads and writes of the tree wait; vfs_extents isn't touched), and fails if an existing
--- name contains one of these characters (a pre-check, under the same lock, names the count and this header). That is deliberate: once
+-- name contains one of these characters (the error names the count and this header). That is deliberate: once
 -- the client refuses such paths, a row with such a name could no longer be reached to be renamed. Find them first
 -- with
 --
@@ -47,22 +47,18 @@ BEGIN
     END IF;
 END $$;
 
--- Before the constraint scans the table: the count and where the fix is, rather than a bare check violation.
--- The lock the ALTER below takes anyway, taken first so no such name can be committed between the two scans.
-LOCK TABLE vfs_nodes IN ACCESS EXCLUSIVE MODE;
-
+-- One scan of the table, by the constraint's own validation. If it fails, the count and where the fix is, rather
+-- than a bare check violation (the count is taken after the failed ALTER's lock is gone: it is for the message).
 DO $$
 DECLARE v_n bigint;
 BEGIN
+    ALTER TABLE vfs_nodes
+        DROP CONSTRAINT vfs_nodes_name_check,
+        ADD CONSTRAINT vfs_nodes_name_check
+            CHECK (name <> '' AND name NOT IN ('.', '..') AND strpos(name, '/') = 0 AND octet_length(name) <= 255
+                   AND name !~ '[\u0001-\u001F\u007F-\u009F\u2028-\u202E\u2066-\u2069]');
+EXCEPTION WHEN check_violation THEN
     SELECT count(*) INTO v_n FROM vfs_nodes WHERE name ~ '[\u0001-\u001F\u007F-\u009F\u2028-\u202E\u2066-\u2069]';
-    IF v_n > 0 THEN
-        RAISE EXCEPTION '% name(s) in vfs_nodes contain control characters; rename them first (see the header of '
-            '016_name_control_chars.sql), then run the migration again', v_n;
-    END IF;
+    RAISE EXCEPTION '% name(s) in vfs_nodes contain control characters; rename them first (see the header of '
+        '016_name_control_chars.sql), then run the migration again', v_n;
 END $$;
-
-ALTER TABLE vfs_nodes
-    DROP CONSTRAINT vfs_nodes_name_check,
-    ADD CONSTRAINT vfs_nodes_name_check
-        CHECK (name <> '' AND name NOT IN ('.', '..') AND strpos(name, '/') = 0 AND octet_length(name) <= 255
-               AND name !~ '[\u0001-\u001F\u007F-\u009F\u2028-\u202E\u2066-\u2069]');

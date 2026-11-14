@@ -3,7 +3,17 @@
 import psycopg
 import pytest
 
-from minifs.vfs.core import CONTROL_CHARACTERS, Entry, VFSError, basename, escape_controls, join, normalize, split
+from minifs.vfs.core import (
+    CONTROL_CHARACTERS,
+    Entry,
+    VFSError,
+    basename,
+    escape_controls,
+    join,
+    normalize,
+    split,
+    split_trusted,
+)
 
 
 @pytest.mark.parametrize(
@@ -75,6 +85,33 @@ def test_control_characters_are_einval(path: str) -> None:
 @pytest.mark.parametrize("path", ["/ a b /<x>", "/é/😀", "/a\\b", "/\u200emark"])
 def test_printable_characters_are_names(path: str) -> None:
     assert split(path) == tuple(path.split("/")[1:])
+
+
+@pytest.mark.parametrize("path", ["a\nb", "x\x1b]0;t\x07", "\x85/a"])
+def test_relative_path_with_a_control_character_is_not_echoed(path: str) -> None:
+    """The control character is reported, not "path must be absolute" with the raw path."""
+    with pytest.raises(VFSError) as info:
+        split(path)
+    assert info.value.errno == "EINVAL"
+    assert not CONTROL_CHARACTERS.search(str(info.value))
+    assert info.value.message.startswith("path contains a control character U+")
+
+
+def test_split_trusted_takes_a_legacy_name() -> None:
+    """A path the server reported isn't refused for a name from before migration 016; a relative one still is,
+    without echoing the character."""
+    assert split_trusted("/dir/a\nb/./x") == ("dir", "a\nb", "x")
+    assert split_trusted("/a/../b") == split("/a/../b") == ("b",)
+    with pytest.raises(VFSError) as info:
+        split_trusted("a\nb")
+    assert info.value.errno == "EINVAL" and not CONTROL_CHARACTERS.search(str(info.value))
+
+
+def test_escape_controls_doubles_backslashes_when_it_escapes() -> None:
+    literal = "/a" + chr(92) + "u000ab"  # backslash, then the text u000a: a legal name
+    assert escape_controls(literal) == literal
+    assert escape_controls(literal + "\n") == "/a" + chr(92) * 2 + "u000ab" + chr(92) + "u000a"
+    assert escape_controls("/a\nb") != escape_controls(literal + "\n")
 
 
 def test_escape_controls() -> None:

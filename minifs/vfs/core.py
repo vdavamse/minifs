@@ -67,7 +67,8 @@ class VFSError(Exception):
         errno = errno_name(error)
         if errno is None:
             return None
-        return cls(errno, path, detail=error.diag.message_detail or "")
+        # Escaped: a constraint's DETAIL is PostgreSQL's "Failing row contains (...)", with the name as it is.
+        return cls(errno, path, detail=escape_controls(error.diag.message_detail or ""))
 
 
 @dataclass(frozen=True)
@@ -177,11 +178,20 @@ def normalize(path: str) -> str:
 
 
 def split(path: str) -> tuple[str, ...]:
-    """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``."""
-    if not path.startswith("/"):
-        raise VFSError("EINVAL", path, "path must be absolute")
+    """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``.
+
+    For a path from a caller. The control characters are checked first, so no refusal echoes one."""
     if found := CONTROL_CHARACTERS.search(path):
         raise VFSError("EINVAL", escape_controls(path), f"path contains a control character U+{ord(found[0]):04X}")
+    return split_trusted(path)
+
+
+def split_trusted(path: str) -> tuple[str, ...]:
+    """``split`` without the control-character check, for a path the server reported or one ``split`` has been
+    through: a listing or a search with a name from before migration 016 is filtered and mapped rather than
+    failed, and those hot paths skip the scan."""
+    if not path.startswith("/"):
+        raise VFSError("EINVAL", escape_controls(path), "path must be absolute")
     parts: list[str] = []
     for part in path.split("/"):
         if part in ("", "."):
@@ -196,8 +206,11 @@ def split(path: str) -> tuple[str, ...]:
 
 def escape_controls(path: str) -> str:
     """``path`` with each control character (``CONTROL_CHARACTERS``) spelled as ``\\uXXXX``, for an error message: a
-    refused path is reported without the newline or escape sequence it was refused for."""
-    return CONTROL_CHARACTERS.sub(lambda c: f"\\u{ord(c[0]):04x}", path)
+    refused path is reported without the newline or escape sequence it was refused for. Unchanged without one;
+    with one, a backslash is doubled, so the result reads back one way only."""
+    if not CONTROL_CHARACTERS.search(path):
+        return path
+    return CONTROL_CHARACTERS.sub(lambda c: f"\\u{ord(c[0]):04x}", path.replace("\\", "\\\\"))
 
 
 def join(*segments: str) -> str:
