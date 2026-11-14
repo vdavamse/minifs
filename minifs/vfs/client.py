@@ -45,11 +45,13 @@ from minifs.db.pool import retry_serializable
 from minifs.vfs import glob as globbing
 from minifs.vfs import search as searching
 from minifs.vfs.core import (
+    MAX_FILE_SIZE,
     Entry,
     FileVersion,
     Kind,
     LineReadResult,
     PageRead,
+    Quota,
     ReadResult,
     VFSError,
     join,
@@ -671,7 +673,8 @@ class VFSClient:
 
     async def create(self, path: str, data: bytes | None = None, *, parents: bool = False) -> FileVersion:
         """Creates file ``path`` with ``data``, like open(O_CREAT|O_EXCL). With ``parents``, creates the missing
-        directories too (in the same transaction). EEXIST, ENOENT, ENOTDIR, EINVAL, ENAMETOOLONG."""
+        directories too (in the same transaction). EEXIST, ENOENT, ENOTDIR, EINVAL, ENAMETOOLONG; EFBIG for more
+        than ``MAX_FILE_SIZE`` bytes (before any round trip), EDQUOT over a quota."""
         return await self._create(path, "file", data, parents)
 
     async def mkdir(self, path: str, *, parents: bool = False) -> UUID:
@@ -697,10 +700,12 @@ class VFSClient:
 
     async def append(self, path: str, data: bytes) -> int:
         """Appends ``data`` to file ``path``, like write(2) with O_APPEND, and returns the offset it landed at.
-        ENOENT, EISDIR."""
+        ENOENT, EISDIR; EFBIG if the file would pass ``MAX_FILE_SIZE`` bytes (``data`` alone over it before any
+        round trip), EDQUOT over a quota."""
         segments = split(path)
         if not segments:
             raise VFSError("EISDIR", "/")
+        _check_size(segments, len(data))
         ref = self._ref(segments)
         rows = await self._call(path, [ref], "vfs_append({0}, %s)", [data], write=True)
         self._checked(ref, rows[0][0])
@@ -711,10 +716,12 @@ class VFSClient:
 
         With ``expect``, it is a compare-and-swap: it writes node ``expect.id`` only if that node is still at
         ``path`` (same parent directory and name) with ``expect``'s generation and size, and raises ESTALE
-        otherwise. ENOENT, EISDIR."""
+        otherwise. ENOENT, EISDIR; EFBIG for more than ``MAX_FILE_SIZE`` bytes (before any round trip), EDQUOT if
+        the file grows over a quota."""
         segments = split(path)
         if not segments:
             raise VFSError("EISDIR", "/")
+        _check_size(segments, len(data))
         if expect is None:
             ref = self._ref(segments)
             rows = await self._call(path, [ref], "vfs_write({0}, %s)", [data], write=True)
@@ -729,6 +736,44 @@ class VFSClient:
             write=True,
         )
         return FileVersion(expect.id, *rows[0][3:5])
+
+    # Quotas (operator calls: an actor's view doesn't offer them)
+
+    async def quota(self, path: str) -> Quota | None:
+        """The quota of directory ``path``, None if it has none. ENOENT, ENOTDIR; EINVAL for the root."""
+        ref = self._quota_ref(path)
+        rows = await self._call(path, [ref], "vfs_quota({0})", [])
+        max_bytes, max_nodes, used_bytes, used_nodes = rows[0][3:7]
+        if used_bytes is None:
+            return None
+        return Quota(max_bytes, max_nodes, used_bytes, used_nodes)
+
+    async def set_quota(self, path: str, *, max_bytes: int | None = None, max_nodes: int | None = None) -> Quota | None:
+        """Sets the quota of directory ``path``: at most ``max_bytes`` bytes of files and ``max_nodes`` nodes below
+        it (None: no limit on that one); both None removes it, and returns None. Recounts the usage and returns
+        the quota. Usage already over a new limit stays; only increases are refused from then on. Quotas nest.
+        ENOENT, ENOTDIR; EINVAL for the root or a negative limit."""
+        ref = self._quota_ref(path)
+        rows = await self._call(path, [ref], "vfs_set_quota({0}, %s, %s)", [max_bytes, max_nodes], write=True)
+        used_bytes, used_nodes = rows[0][3:5]
+        if used_bytes is None:
+            return None
+        return Quota(max_bytes, max_nodes, used_bytes, used_nodes)
+
+    async def set_child_quota(self, path: str, *, max_bytes: int | None = None, max_nodes: int | None = None) -> int:
+        """Gives every directory created directly in directory ``path`` from now on a quota of ``max_bytes`` and
+        ``max_nodes`` (as ``set_quota``), and every existing child directory without a quota now; returns how
+        many existing ones got it. Both None stops it (the quotas given stay). Set it on ``/workspaces`` and every
+        workspace gets a quota at its first mkdir. ENOENT, ENOTDIR; EINVAL for the root or a negative limit."""
+        ref = self._quota_ref(path)
+        rows = await self._call(path, [ref], "vfs_set_child_quota({0}, %s, %s)", [max_bytes, max_nodes], write=True)
+        return rows[0][3]
+
+    def _quota_ref(self, path: str) -> _Ref:
+        segments = split(path)
+        if not segments:
+            raise VFSError("EINVAL", "/", "the root can't have a quota")
+        return self._ref(segments)
 
     async def rename(self, src: str, dst: str, *, expect: UUID | None = None) -> None:
         """Moves ``src`` to ``dst``, like rename(2) with RENAME_NOREPLACE. ENOENT, ENOTDIR (on ``src`` or ``dst``,
@@ -773,6 +818,8 @@ class VFSClient:
         segments = split(path)
         if not segments:
             raise VFSError("EEXIST", "/")
+        if data is not None:
+            _check_size(segments, len(data))
         parent = (
             _Ref(_MKDIR_P, [list(segments[:-1])], segments=segments[:-1]) if parents else self._dir_ref(segments[:-1])
         )
@@ -1174,3 +1221,9 @@ async def _mapped[T](path: str, call: Callable[[], Awaitable[T]]) -> T:
             _log.warning("%s on %r: %s", error.errno, error.path, e.diag.message_primary)
         error.db_error = e
         raise error from None  # the psycopg error's text has the server DETAIL
+
+
+def _check_size(segments: tuple[str, ...], size: int) -> None:
+    """EFBIG at ``segments`` if a file of ``size`` bytes would be over ``MAX_FILE_SIZE``, as the server would say."""
+    if size > MAX_FILE_SIZE:
+        raise VFSError("EFBIG", join(*segments), f"{size} bytes, over the {MAX_FILE_SIZE}-byte limit")
