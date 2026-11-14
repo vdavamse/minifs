@@ -76,11 +76,12 @@ async def _write(vfs: VFSView, path: str, content: str, max_diff_bytes: int) -> 
     text is None for a file over ``max_diff_bytes``, which isn't read. ``_Lost`` where another writer got in
     between: a create beaten to the file, a file changed, removed or replaced by a directory after its stat."""
     next_bom, content_new = split_bom(content)
-    if not vfs.policy.allows(vfs.actor, "read", path):
+    if not vfs.allows("read", path):
         # ladderframe checks the write permission first. Allowed to write but not read: a new file needs no old
         # text, but an existing one can't be diffed. Over the diff cap its text isn't needed either, but its BOM
-        # still is, and which writes the policy allows shouldn't depend on a file's size. (Asked with ``allows``,
-        # so only the refusal that decides counts as a denial.)
+        # still is, and which writes the policy allows shouldn't depend on a file's size. (Asked with
+        # ``VFSView.allows``, which maps the path first and counts nothing, so only the refusal that decides
+        # counts as a denial.)
         vfs.policy.check(vfs.actor, "write", path)
         try:
             await create_file(vfs, path, encode_text(content_new, next_bom))

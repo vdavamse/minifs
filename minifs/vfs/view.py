@@ -68,7 +68,7 @@ from minifs.vfs.core import (
     split,
     split_trusted,
 )
-from minifs.vfs.policy import Action, Policy
+from minifs.vfs.policy import Action, Policy, PolicyDenied
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
 MAX_GLOB_LIMIT = _MAX_LIMIT - 1
@@ -538,6 +538,16 @@ class VFSView:
         target = self._movable(path)
         await self._mapped(self._client.unlink(_real(target)), target)
 
+    def allows(self, action: Action, path: str) -> bool:
+        """Whether the actor may ``action`` at ``path`` as the view's operations decide it: ENOENT outside every
+        mount (raised, as the operations report it), a virtual directory readable where something below it is.
+        A refusal isn't counted in ``policy.denials``: for a tool deciding which check to make first."""
+        try:
+            self._target(path, action, count_denials=False)
+        except PolicyDenied:
+            return False
+        return True
+
     # Mapping
 
     def _target(self, path: str, action: Action | None = None, *, count_denials: bool = True) -> _Target:
@@ -553,7 +563,11 @@ class VFSView:
         if target is None:
             raise VFSError("ENOENT", join(*segments))
         if action is not None:
-            self.policy.check(self.actor, action, target.visible, count_denials=count_denials)
+            # A virtual directory (the root, or one above a mount point) shows only the mount points below it, each
+            # filtered by the policy: it may be read where something below it may be. No rule names it.
+            virtual_read = target.real is None and action == "read"
+            if not (virtual_read and self.policy.allows_any(self.actor, "read", target.visible)):
+                self.policy.check(self.actor, action, target.visible, count_denials=count_denials)
         return target
 
     def _creatable(self, path: str, parents: bool) -> _Target:

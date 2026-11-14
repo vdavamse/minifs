@@ -319,6 +319,65 @@ def test_policy_matches_a_legacy_name_and_check_refuses_it(policy: Policy) -> No
     assert info.value.errno == "EINVAL" and "\n" not in str(info.value)
 
 
+def test_a_path_no_rule_matches_is_refused() -> None:
+    """A path no rule matches is refused, unless the policy is built with ``read_unmatched=True``, which lets it be
+    read (not written)."""
+    p = Policy({"a": [Rule("/w/**", "read", "write")]})
+    assert p.allows("a", "read", "/other") is False
+    assert p.allows("a", "write", "/other") is False
+    assert p.allows_any("a", "read", "/other") is False
+    assert p.allows("a", "read", "/w/x") is True
+    old = Policy(p.rules, read_unmatched=True)
+    assert old.allows("a", "read", "/other") is True
+    assert old.allows("a", "write", "/other") is False
+    assert old.allows_any("a", "read", "/other") is True
+
+
+async def test_a_mount_no_rule_covers_is_hidden(vfs: VFSClient, policy: Policy) -> None:
+    """A mount the rules don't cover is refused, and so left out of the root's listing; ``read_unmatched=True``
+    restores the old default, where every actor of the policy may read it."""
+    mounts = {"/workspace": f"/workspaces/{W1}", "/shared": "/docs"}
+    agent = VFSView(vfs, mounts, policy, "agent")
+    assert [e.path for e in await agent.readdir("/")] == ["/workspace"]
+    await raises("EACCES", agent.stat("/shared"), "/shared")
+    await raises("EACCES", agent.pread("/shared/guide.md"), "/shared/guide.md")
+    old = VFSView(vfs, mounts, Policy(policy.rules, read_unmatched=True), "agent")
+    assert [e.path for e in await old.readdir("/")] == ["/shared", "/workspace"]
+    assert (await old.pread("/shared/guide.md")).content == b"guide"
+
+
+async def test_a_virtual_directory_is_readable_where_something_below_is(vfs: VFSClient) -> None:
+    """A virtual directory (the root, or one above a mount point) may be read where something below it may be;
+    where nothing below it is readable, the refusal is counted."""
+    only_ws = VFSView(vfs, workspace_mounts(W1), Policy({"x": [Rule("/workspace/**", "read")]}), "x")
+    assert (await only_ws.stat("/")).kind == "dir"
+    assert [e.path for e in await only_ws.readdir("/")] == ["/workspace"]
+    nothing = VFSView(vfs, workspace_mounts(W1), Policy({"x": [Rule("/workspace/**")]}), "x")
+    await raises("EACCES", nothing.stat("/"), "/")
+    await raises("EACCES", nothing.readdir("/"), "/")
+    assert nothing.policy.denials == {("x", "read"): 2}
+
+
+async def test_the_default_policy_still_reads_the_root(vfs: VFSClient, policy: Policy) -> None:
+    """Each actor of ``DEFAULT_POLICY`` may read the root, and nothing is counted as denied."""
+    for actor in ("agent", "ingestion", "operator"):
+        await view(vfs, policy, actor).stat("/")
+    assert policy.denials == {}
+
+
+async def test_view_allows_maps_the_path_first(vfs: VFSClient, policy: Policy) -> None:
+    """``VFSView.allows`` decides as the view's operations do: a path outside every mount is ENOENT, and a refusal
+    it reports isn't counted."""
+    agent = view(vfs, policy)
+    assert agent.allows("read", "/workspace/notes.md") is True
+    assert agent.allows("write", "/docs/guide.md") is False
+    assert agent.allows("read", "/") is True
+    with pytest.raises(VFSError) as info:
+        agent.allows("read", "/elsewhere/x.md")
+    assert info.value.errno == "ENOENT"
+    assert policy.denials == {}
+
+
 async def test_a_legacy_name_is_listed_escaped(vfs: VFSClient, db: str) -> None:
     """A name from before migration 016 (here: the constraint dropped and the node renamed in SQL) doesn't fail the
     listing or the search it is in, is matched by the policy as stored and reported with its control characters
@@ -763,14 +822,15 @@ def test_rules() -> None:
     p = Policy(
         {
             "a": [Rule("/w/keep.md", "read"), Rule("/w/**", "read", "write"), Rule("/w/*/*.log"), Rule("/hidden/**")],
-        }
+        },
+        read_unmatched=True,
     )
     assert p.allows("a", "write", "/w") and p.allows("a", "write", "/w/x/y.md")  # ** matches the directory too
     assert not p.allows("a", "write", "/w/keep.md")  # the first match wins
     assert p.allows("a", "write", "/w/x/y.log")  # shadowed by /w/**
     assert p.allows("a", "append", "/w/z")  # write implies append
     assert not p.allows("a", "read", "/hidden") and not p.allows("a", "read", "/hidden/a/b")
-    assert p.allows("a", "read", "/other") and not p.allows("a", "write", "/other")  # the default
+    assert p.allows("a", "read", "/other") and not p.allows("a", "write", "/other")  # read_unmatched
     assert not p.allows("a", "write", "/w/x/../keep.md")
     assert Rule("/**/x.md").matches("/x.md") and Rule("/a/*.md").matches("/a/b.md")
     assert not Rule("/a/*.md").matches("/a/b/c.md") and not Rule("/a").matches("/a/b")

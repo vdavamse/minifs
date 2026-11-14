@@ -177,7 +177,7 @@ Every write is visible to the next search at once, with no index lag. The transl
 | `/workspace/**` | read, write | — | read, write |
 | `/docs/**` | read | read, write | read |
 
-Rules are ordered and the first match wins. A rule with no actions hides a path, so `Policy({"agent": [Rule("/workspace/**/.env"), Rule("/workspace/**", "read", "write"), ...]})` makes `.env` files invisible to `Read`, `Glob` and `Grep`. The policy is the tools' only permission gate.
+Rules are ordered and the first match wins. A rule with no actions hides a path, so `Policy({"agent": [Rule("/workspace/**/.env"), Rule("/workspace/**", "read", "write"), ...]})` makes `.env` files invisible to `Read`, `Glob` and `Grep`. A path no rule matches is refused (`Policy(rules, read_unmatched=True)` lets it be read, as before 0.1.0), so a mount needs a rule for each actor that should see it. The policy is the tools' only permission gate.
 
 ## Configuration
 
