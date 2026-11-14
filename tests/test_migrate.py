@@ -111,14 +111,17 @@ async def test_concurrent_runners_apply_each_migration_once(empty_db: str) -> No
     assert sorted(m.version for applied in results for m in applied) == [1, 2]
 
 
-def test_cli_migrate_and_status(empty_db: str, capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["db", "status", "--dsn", empty_db]) == 0
+def test_cli_migrate_and_status(
+    empty_db: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MINIFS_DSN", empty_db)  # never in argv: the conninfo holds the password
+    assert main(["db", "status"]) == 0
     assert "pending 001_baseline.sql" in capsys.readouterr().out
-    assert main(["db", "migrate", "--dsn", empty_db]) == 0
+    assert main(["db", "migrate"]) == 0
     assert "applied 001_baseline.sql" in capsys.readouterr().out
-    assert main(["db", "migrate", "--dsn", empty_db]) == 0
+    assert main(["db", "migrate"]) == 0
     assert "up to date" in capsys.readouterr().out
-    assert main(["db", "status", "--dsn", empty_db]) == 0
+    assert main(["db", "status"]) == 0
     assert "applied 001_baseline.sql" in capsys.readouterr().out
 
 
@@ -176,17 +179,21 @@ async def test_refuses_pending_migration_older_than_applied(empty_db: str) -> No
             await migrate(conn, [Migration(1, "a", ""), Migration(3, "c", "")])
 
 
-def test_cli_status_reports_modified_and_unknown(empty_db: str, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_status_reports_modified_and_unknown(
+    empty_db: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MINIFS_DSN", empty_db)  # never in argv: the conninfo holds the password
+
     async def record() -> None:
         async with await AsyncConnection.connect(empty_db, autocommit=True) as conn:
             await migrate(conn, [Migration(1, "baseline", "-- edited"), Migration(99, "future", "")])
 
     asyncio.run(record())
-    assert main(["db", "status", "--dsn", empty_db]) == 0
+    assert main(["db", "status"]) == 0
     out = capsys.readouterr().out
     assert "modified 001_baseline.sql" in out
     assert "unknown 099" in out
-    assert main(["db", "migrate", "--dsn", empty_db]) == 1
+    assert main(["db", "migrate"]) == 1
     assert "checksum mismatch" in capsys.readouterr().err
 
 

@@ -374,6 +374,13 @@ def test_short_password_hides_the_error(monkeypatch: pytest.MonkeyPatch, capsysb
         (["ls", "--dns"], "unrecognized arguments: ****", ("dns",)),
         # One of the CLI's own options (here glob's, given to ls) is still named.
         (["ls", "--hidden"], "unrecognized arguments: --hidden", ()),
+        (["put", "/x", "-W", "-p", "-PH7f3a"], "unrecognized arguments: ****", ("7f3a",)),
+        # A value given to a flag that takes none.
+        (["glob", "x", "--hidden=PH-7f3a"], "ignored explicit argument '****'", ("7f3a",)),
+        # -W taken for an option with a value, before the subcommand: the password is in the command slot.
+        (["-W", "PH-7f3a", "ls"], "invalid choice: '****'", ("7f3a",)),
+        # A mistyped command name is still shown.
+        (["lss"], "invalid choice: 'lss'", ()),
     ],
 )
 def test_argparse_errors_mask_passwords(
@@ -443,4 +450,29 @@ def test_unreadable_dsn_file_is_not_named(capsysbinary: Capture) -> None:
     assert main(["ls", "--dsn-file", "host=h password=PH-7f3a"]) == 1
     err = capsysbinary.readouterr().err.decode()
     assert "can't read --dsn-file: No such file or directory" in err
+    assert "PH-7f3a" not in err
+
+
+def test_dsn_file_limits(tmp_path: Path, capsysbinary: Capture) -> None:
+    """A NUL (libpq would stop reading there) and an oversized file (``/dev/zero``) are refused."""
+    with_nul = tmp_path / "nul"
+    with_nul.write_bytes(b"postgresql://127.0.0.1:PH-7f3a\0@127.0.0.1:1/x\n")
+    assert main(["ls", "--dsn-file", str(with_nul)]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert "invalid connection string (not shown" in err
+    assert "7f3a" not in err
+
+    big = tmp_path / "big"
+    big.write_bytes(b"host=h " * 10_000)
+    assert main(["ls", "--dsn-file", str(big)]) == 1
+    assert "--dsn-file is over 65536 bytes" in capsysbinary.readouterr().err.decode()
+
+
+def test_sslpassword_is_a_password(monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    """``sslpassword`` (the client key's passphrase) warns in --dsn and is masked like the password."""
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", "2")
+    assert main(["ls", "--dsn", "host=127.0.0.1 port=1 sslmode=PH-7f3a sslpassword=PH-7f3a"]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert "warning: --dsn holds a password" in err
+    assert 'invalid sslmode value: "****"' in err
     assert "PH-7f3a" not in err

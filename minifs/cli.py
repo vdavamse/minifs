@@ -132,33 +132,41 @@ class _Parser(argparse.ArgumentParser):
         prefix = "unrecognized arguments: "
         if message.startswith(prefix):
             # Any word may be a password (``-Wsecret`` leaves ``-secret`` over, ``-W --secret`` leaves ``--secret``):
-            # show only (prefixes of) the CLI's own long option names.
-            known = self._long_options()
-            words = (w.partition("=") for w in message.removeprefix(prefix).split())
-            message = prefix + " ".join(
-                f"{n}{'=****' if eq else ''}" if any(k.startswith(n) for k in known) and n.startswith("--") else "****"
-                for n, eq, _ in words
-            )
+            # show only the CLI's own option names.
+            options = self._options()
+            message = prefix + " ".join(_shown(w, options) for w in message.removeprefix(prefix).split())
+        # ``minifs -W secret ls``: the word in the subcommand slot is shown only if it looks like a command name.
+        message = _INVALID_CHOICE.sub(lambda m: m[0] if re.fullmatch(r"'[a-z]+'", m[2]) else m[1] + "'****'", message)
         for pattern, repl in _ARGV_PASSWORDS:
             message = pattern.sub(repl, message)
         super().error(message)
 
-    def _long_options(self) -> set[str]:
-        """The ``--`` option strings of this parser and its subparsers."""
+    def _options(self) -> set[str]:
+        """The option strings of this parser and its subparsers."""
         found: set[str] = set()
         for action in self._actions:
-            found.update(o for o in action.option_strings if o.startswith("--"))
+            found.update(action.option_strings)
             if isinstance(action, argparse._SubParsersAction):  # pyright: ignore[reportPrivateUsage]
                 for sub in action.choices.values():  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
                     if isinstance(sub, _Parser):
-                        found |= sub._long_options()
+                        found |= sub._options()
         return found
 
 
+def _shown(word: str, options: set[str]) -> str:
+    """An unrecognized argv word as an error may show it: one of the CLI's options as is, an abbreviation of a long
+    one too (its ``=value`` masked); anything else, which may be a password, as ``****``."""
+    name, eq, _ = word.partition("=")
+    if name in options or (name.startswith("--") and any(o.startswith(name) for o in options)):
+        return f"{name}=****" if eq else name
+    return "****"
+
+
+_INVALID_CHOICE = re.compile(r"(invalid choice: )(.*?)(?= \(choose from|$)")
 # Where an argparse error can quote a password: a URI's userinfo (up to the last @ of the message, since the
 # password may hold an unescaped @ or a space), a ``password=`` keyword (also ``--password=...``; to the end of the
 # message, as argparse's repr of a quoted value escapes it unpredictably), and the value given to a flag that takes
-# none (``-Wsecret``). Argparse messages are one line.
+# none (``--hidden=secret``). Argparse messages are one line.
 _ARGV_PASSWORDS = (
     (re.compile(r"(://[^:/@]*:).*@"), r"\1****@"),
     (re.compile(r"(password\s*=).*"), r"\1****"),
@@ -188,6 +196,7 @@ _INVALID = "invalid connection string (not shown: it may hold a password)"
 _URI_SCHEMES = ("postgresql://", "postgres://")
 # Shorter forms of a password aren't masked (see main).
 _MIN_MASKED = 4
+_MAX_DSN_FILE = 64 * 1024
 
 
 def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
@@ -198,7 +207,11 @@ def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
         dsn = args.dsn
     elif args.dsn_file is not None:
         try:
-            dsn = args.dsn_file.read_bytes().decode("utf-8-sig").strip()
+            with args.dsn_file.open("rb") as f:  # bounded: not /dev/zero or put's stdin to the end
+                raw = f.read(_MAX_DSN_FILE + 1)
+            if len(raw) > _MAX_DSN_FILE:
+                raise _Refused(f"--dsn-file is over {_MAX_DSN_FILE} bytes")
+            dsn = raw.decode("utf-8-sig").strip()
         except UnicodeDecodeError:
             raise _Refused(f"{_INVALID}: --dsn-file is not UTF-8 text") from None
         except OSError as e:  # not its text: the name, which may be a mistyped connection string
@@ -209,14 +222,16 @@ def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
         params = conninfo_to_dict(dsn)
     except (psycopg.Error, UnicodeError):  # UnicodeError: undecodable argv bytes, kept as surrogates
         raise _Refused(_INVALID) from None
+    if "\0" in dsn:  # libpq stops reading at a NUL, so it and these checks would see different strings
+        raise _Refused(_INVALID)
     if _misread_uri(dsn):
         raise _Refused(
             f"{_INVALID}: in a postgresql:// URI, write @ as %40 and / as %2F"
             " (in the user, password, database name and query values)"
         )
-    password = params.get("password")
-    secrets = _forms(str(password), dsn) if password else []
-    if password and args.dsn is not None:
+    passwords = [str(params[k]) for k in ("password", "sslpassword") if params.get(k)]  # sslpassword: key passphrase
+    secrets = [s for p in passwords for s in _forms(p, dsn)]
+    if passwords and args.dsn is not None:
         print(
             f"minifs {label}: warning: --dsn holds a password, which other users can see in the process list and"
             " which stays in your shell history; use $MINIFS_DSN, PGPASSWORD or ~/.pgpass, --dsn-file, or -W",
