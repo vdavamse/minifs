@@ -45,7 +45,7 @@ from psycopg import AsyncConnection, errors, sql
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import ConnectionFactory
-from minifs.vfs.core import CONTROL_CHARACTERS, VFSError, escape_controls
+from minifs.vfs.core import VFSError, refuse_controls
 
 logger = logging.getLogger(__name__)
 
@@ -565,7 +565,8 @@ class Watcher:
         Subscribes before resolving the path, so a change committed after this returns is delivered, or covered by
         a later ``rescan`` if the connection drops. A change committed just before the call may be delivered too,
         if its notification was still on its way: events err towards repeating a change, never towards missing one.
-        Raises ``VFSError`` ENOENT or ENOTDIR if the path doesn't resolve.
+        Raises ``VFSError`` ENOENT or ENOTDIR if the path doesn't resolve, EINVAL if it holds a control character
+        (as ``core.split``).
 
         This is the operator's API: ``path`` is a real path, no policy applies, and events carry node ids and names
         from anywhere in the tree. Code acting for an actor watches through its view, ``VFSView.watch``, which
@@ -577,8 +578,7 @@ class Watcher:
     @contextlib.asynccontextmanager
     async def _watch(self, path: str, *, ancestors: bool = False, fence: bool = False) -> AsyncGenerator[PathWatch]:
         """``watch``, with ``PathWatch``'s ``ancestors`` and ``fence`` options."""
-        if found := CONTROL_CHARACTERS.search(path):  # as core.split refuses a caller's path (#92), escaped
-            raise VFSError("EINVAL", escape_controls(path), f"path contains a control character U+{ord(found[0]):04X}")
+        refuse_controls(path)  # as core.split does for a caller's path (#92); not split itself: relative paths work
         segments = [s for s in path.split("/") if s]
         watch = PathWatch(self, segments, self._maxsize, self._rescan_interval, ancestors=ancestors, fence=fence)
         watch = self._add(watch)

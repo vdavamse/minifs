@@ -47,7 +47,9 @@ class VFSError(Exception):
         self.errno = errno
         self.path = path
         self.message = message
-        self.detail = detail
+        # Escaped wherever it comes from (a returned outcome, a constraint's "Failing row contains (...)", a lookup
+        # quoting the segments): logs and the CLI show it. Idempotent, so an error copied with ``at`` stays as is.
+        self.detail = escape_controls(detail)
         self.db_error: psycopg.Error | None = None
 
     def __reduce__(self) -> tuple[type[VFSError], tuple[str, str, str, str]]:
@@ -67,8 +69,7 @@ class VFSError(Exception):
         errno = errno_name(error)
         if errno is None:
             return None
-        # Escaped: a constraint's DETAIL is PostgreSQL's "Failing row contains (...)", with the name as it is.
-        return cls(errno, path, detail=escape_controls(error.diag.message_detail or ""))
+        return cls(errno, path, detail=error.diag.message_detail or "")
 
 
 @dataclass(frozen=True)
@@ -181,9 +182,14 @@ def split(path: str) -> tuple[str, ...]:
     """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``.
 
     For a path from a caller. The control characters are checked first, so no refusal echoes one."""
+    refuse_controls(path)
+    return split_trusted(path)
+
+
+def refuse_controls(path: str) -> None:
+    """EINVAL, with ``path`` escaped, if ``path`` holds a control character (``CONTROL_CHARACTERS``)."""
     if found := CONTROL_CHARACTERS.search(path):
         raise VFSError("EINVAL", escape_controls(path), f"path contains a control character U+{ord(found[0]):04X}")
-    return split_trusted(path)
 
 
 def split_trusted(path: str) -> tuple[str, ...]:
