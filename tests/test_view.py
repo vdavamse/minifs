@@ -229,6 +229,40 @@ def test_bad_configuration(vfs: VFSClient, policy: Policy) -> None:
         VFSView(vfs, workspace_mounts(W1), policy, "intruder")
 
 
+@pytest.mark.parametrize(
+    ("mounts", "match"),
+    [
+        # A prefix formatted by hand with an empty or climbing id: each would be normalised into other workspaces.
+        ({"/workspace": "/workspaces/"}, "isn't normalised"),
+        ({"/workspace": "/workspaces/x/../../docs"}, "isn't normalised"),
+        ({"/workspace": f"/workspaces/{W1}/."}, "isn't normalised"),
+        ({"/workspace": f"/workspaces//{W1}"}, "isn't normalised"),
+        ({"/workspace/": f"/workspaces/{W1}"}, "visible prefix '/workspace/' isn't normalised"),
+        ({"/a/../workspace": f"/workspaces/{W1}"}, "visible prefix '/a/../workspace' isn't normalised"),
+        ({"/workspace": f"workspaces/{W1}"}, "real prefix 'workspaces/.*' isn't a valid absolute path"),
+        ({"/workspace": ""}, "real prefix '' isn't a valid absolute path"),
+        ({"/workspace": "/workspaces/a\n"}, r"prefix '/workspaces/a\\u000a' isn't a valid absolute path"),
+        # The whole tree, the directory that holds every workspace, and less or more than one whole workspace.
+        ({"/everything": "/"}, "every workspace"),
+        ({"/workspace": "/workspaces"}, "one whole workspace"),
+        ({"/workspace": f"/workspaces/{W2}/private"}, "one whole workspace"),  # an id containing '/'
+        ({"/workspace": "/workspaces/none"}, "one whole workspace"),
+        (
+            {"/workspace": "/workspaces/AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"},
+            "one whole workspace",
+        ),  # not as workspace_mounts writes it
+    ],
+)
+def test_hand_built_mounts_are_refused(vfs: VFSClient, policy: Policy, mounts: dict[str, str], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        VFSView(vfs, mounts, policy, "agent")  # each alone, as in the issue
+
+
+def test_hand_built_mounts_in_normal_form_are_accepted(vfs: VFSClient, policy: Policy) -> None:
+    VFSView(vfs, {"/workspace": f"/workspaces/{W1}", "/docs": "/docs"}, policy, "agent")
+    VFSView(vfs, {"/w": "/data/w", "/x": "/other", "/ws": "/workspacesX/a"}, policy, "agent")
+
+
 # The policy
 
 
@@ -639,7 +673,7 @@ async def test_grep_stops_at_its_limit(vfs: VFSClient, policy: Policy) -> None:
 
 
 async def test_grep_skips_a_missing_mount_root(vfs: VFSClient, policy: Policy) -> None:
-    agent = VFSView(vfs, {"/workspace": "/workspaces/none", "/docs": "/docs"}, policy, "agent")
+    agent = VFSView(vfs, workspace_mounts("44444444-4444-4444-4444-444444444444"), policy, "agent")
     assert [h.path for h in (await agent.grep("guide", "/")).hits] == ["/docs/guide.md"]
 
 
