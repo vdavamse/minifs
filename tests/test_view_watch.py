@@ -273,9 +273,21 @@ async def test_a_moved_workspaces_root_ends_a_mount_point_watch(vfs: VFSClient, 
         assert await drained(w) == []
 
 
-async def test_forged_moves_change_nothing(vfs: VFSClient, watcher: Watcher, conn: AsyncConnection) -> None:
-    """Forged moves (of an ancestor, of the node elsewhere, of the node to an empty name) are checked against the
-    database and change nothing; a real create is still delivered at the unchanged watched path."""
+def move(node: UUID, parent: UUID, name: str, old_parent: UUID, old_name: str) -> dict[str, str]:
+    return {
+        "op": "move",
+        "id": str(node),
+        "parent": str(parent),
+        "name": name,
+        "old_parent": str(old_parent),
+        "old_name": old_name,
+        "kind": "dir",
+    }
+
+
+async def test_forged_moves_in_place_change_nothing(vfs: VFSClient, watcher: Watcher, conn: AsyncConnection) -> None:
+    """Forged moves to where the watch already has the node (of an ancestor, of the node itself) are checked
+    against the database and change nothing; a real create is still delivered at the unchanged watched path."""
     await vfs.mkdir_p(f"{R1}/pub/d")
     agent = view(vfs, watcher)
     async with agent.watch("/workspace/pub/d") as w:
@@ -283,39 +295,33 @@ async def test_forged_moves_change_nothing(vfs: VFSClient, watcher: Watcher, con
         d = (await vfs.stat(f"{R1}/pub/d")).id
         root = (await vfs.stat(R1)).id
         assert pub is not None and d is not None and root is not None
-        for payload in (
-            {
-                "op": "move",
-                "id": str(pub),
-                "parent": str(root),
-                "name": "pub",
-                "old_parent": str(root),
-                "old_name": "pub",
-                "kind": "dir",
-            },
-            {
-                "op": "move",
-                "id": str(d),
-                "parent": str(root),
-                "name": "d",
-                "old_parent": str(pub),
-                "old_name": "d",
-                "kind": "dir",
-            },
-            {
-                "op": "move",
-                "id": str(d),
-                "parent": str(pub),
-                "name": "ghost",
-                "old_parent": str(pub),
-                "old_name": "d",
-                "kind": "dir",
-            },
-        ):
+        for payload in (move(pub, root, "pub", root, "old"), move(d, pub, "d", root, "x")):
             await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps(payload),))
         await agent.create("/workspace/pub/d/marker", b"")
         assert await next_seen(w) == WatchEvent("create", "/workspace/pub/d/marker", kind="file")
         assert w.path == "/workspace/pub/d"
+
+
+@pytest.mark.parametrize("which", ["ancestor", "elsewhere", "ghost"])
+async def test_a_forged_move_elsewhere_ends_the_watch(
+    vfs: VFSClient, watcher: Watcher, conn: AsyncConnection, which: str
+) -> None:
+    """A forged move to anywhere but where the watch has the node ends the watch with a delete (forging takes
+    EXECUTE on vfs_channel()); it never moves the watch's path."""
+    await vfs.mkdir_p(f"{R1}/pub/d")
+    agent = view(vfs, watcher)
+    async with agent.watch("/workspace/pub/d") as w:
+        pub = (await vfs.stat(f"{R1}/pub")).id
+        d = (await vfs.stat(f"{R1}/pub/d")).id
+        root = (await vfs.stat(R1)).id
+        assert pub is not None and d is not None and root is not None
+        payload = {
+            "ancestor": move(pub, root, "pub2", root, "pub"),
+            "elsewhere": move(d, root, "d", pub, "d"),
+            "ghost": move(d, pub, "ghost", pub, "d"),
+        }[which]
+        await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps(payload),))
+        assert await drained(w) == [WatchEvent("delete", "/workspace/pub/d", kind="dir")]
 
 
 async def test_a_rescan_after_a_missed_move_ends_the_watch(
@@ -383,14 +389,21 @@ async def test_a_move_just_before_the_watch_is_not_a_delete(
 
 
 async def test_impossible_names_are_dropped(vfs: VFSClient, watcher: Watcher, conn: AsyncConnection) -> None:
-    """Forged creates with names no node can have (a path, '..', empty) are dropped; a real create follows."""
+    """Forged events with names no node can have (a path, '..', empty, over 255 bytes, a lone surrogate) are
+    dropped, whatever the op, the old name of a move included; a real create follows."""
     agent = view(vfs, watcher)
     d = (await vfs.stat(f"{R1}/d")).id
-    assert d is not None
+    root = (await vfs.stat(R1)).id
+    assert d is not None and root is not None
     async with agent.watch("/workspace/d") as w:
-        for name in ("../../docs/x", "a/b", "..", ""):
-            payload = {"op": "create", "id": str(uuid4()), "parent": str(d), "name": name, "kind": "file"}
-            await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps(payload),))
+        for name in ("../../docs/x", "a/b", "..", "", "x" * 256, "\ud800"):
+            for payload in (
+                {"op": "create", "id": str(uuid4()), "parent": str(d), "name": name, "kind": "file"},
+                {"op": "delete", "id": str(uuid4()), "parent": str(d), "name": name, "kind": "file"},
+                {"op": "modify", "id": str(uuid4()), "parent": str(d), "name": name, "size": 1, "gen": 1},
+                {**move(uuid4(), root, "x", d, name), "kind": "file"},
+            ):
+                await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps(payload),))
         await agent.create("/workspace/d/marker", b"")
         assert await next_seen(w) == WatchEvent("create", "/workspace/d/marker", kind="file")
 
@@ -413,7 +426,7 @@ async def test_a_parent_swapped_for_a_same_named_one_ends_the_watch(vfs: VFSClie
 
 
 async def test_the_final_event_survives_a_timed_out_get(
-    vfs: VFSClient, watcher: Watcher, monkeypatch: pytest.MonkeyPatch
+    vfs: VFSClient, watcher: Watcher, conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A get() that times out while the watch checks its path does not lose the event that ends the watch:
     the next get() still returns it."""
@@ -427,7 +440,14 @@ async def test_the_final_event_survives_a_timed_out_get(
     await vfs.mkdir_p(f"{R1}/pub/d")
     agent = view(vfs, watcher)
     async with agent.watch("/workspace/pub/d") as w:
-        await vfs.rename(f"{R1}/pub", f"{R1}/moved")
+        pub = (await vfs.stat(f"{R1}/pub")).id
+        assert pub is not None
+        await conn.execute("ALTER TABLE vfs_nodes DISABLE TRIGGER USER")  # a move the watch misses
+        try:
+            await conn.execute("UPDATE vfs_nodes SET name = 'moved' WHERE id = %s", (pub,))
+        finally:
+            await conn.execute("ALTER TABLE vfs_nodes ENABLE TRIGGER USER")
+        watcher._broadcast(RESCAN, now=True)  # pyright: ignore[reportPrivateUsage]
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(w.get(), 0.1)
         assert await next_seen(w) == WatchEvent("delete", "/workspace/pub/d", kind="dir")
@@ -463,42 +483,73 @@ async def test_a_forged_own_delete_changes_nothing(vfs: VFSClient, watcher: Watc
     assert event.path == "/workspace/notes.md"
 
 
-async def test_two_quick_renames_are_followed_to_the_last_name(vfs: VFSClient, watcher: Watcher) -> None:
-    """Two renames before any event is read end at the last name: a move is judged by where the node is now,
-    and the watch carries on there."""
+async def test_a_rename_left_again_ends_the_watch(vfs: VFSClient, watcher: Watcher) -> None:
+    """Two renames before the first is read end the watch: the node isn't at the first name any more, so the
+    events queued after that move happened under a path the watch never had."""
     agent = view(vfs, watcher)
     async with agent.watch("/workspace/notes.md") as w:
         await vfs.rename(f"{R1}/notes.md", f"{R1}/a.md")
         await vfs.rename(f"{R1}/a.md", f"{R1}/b.md")
-        await vfs.append(f"{R1}/b.md", b"more\n")
-        events: list[WatchEvent] = []
-        while True:
-            event = await next_seen(w)
-            events.append(event)
-            if event.op == "modify":
-                break
-        assert w.path == "/workspace/b.md"
-        assert event.path == "/workspace/b.md"
-        moves = [e for e in events if e.op == "move"]
-        assert moves and all(e.path == "/workspace/b.md" for e in moves)
-        await vfs.append(f"{R1}/b.md", b"again\n")
-        assert (await next_seen(w)).op == "modify"  # the watch did not end
+        assert await drained(w) == [WatchEvent("delete", "/workspace/notes.md", kind="file")]
 
 
-async def test_leaving_the_block_closes_the_watch(
+VAULT = Policy({"agent": [Rule("/workspace/vault/*"), Rule("/workspace/**", "read", "write")]})
+
+
+@pytest.mark.parametrize("back", ["inbox", "inbox2"])
+async def test_events_under_a_hidden_name_are_not_reported_after_a_rename_back(
+    vfs: VFSClient, watcher: Watcher, back: str
+) -> None:
+    """A watched directory renamed to a hidden name, changed there, then renamed back (or on to a readable name)
+    reports nothing that happened under the hidden name: the first move ends the watch."""
+    await vfs.mkdir_p(f"{R1}/inbox")
+    agent = view(vfs, watcher, VAULT)
+    async with agent.watch("/workspace/inbox") as w:
+        await vfs.rename(f"{R1}/inbox", f"{R1}/vault")
+        await vfs.create(f"{R1}/vault/payroll.csv", b"x" * 1234)
+        await vfs.rename(f"{R1}/vault", f"{R1}/{back}")
+        assert await drained(w) == [WatchEvent("delete", "/workspace/inbox", kind="dir")]
+
+
+async def test_events_under_a_hidden_ancestor_are_not_reported_after_it_moves_back(
+    vfs: VFSClient, watcher: Watcher
+) -> None:
+    """An ancestor moved under a hidden name and back: nothing from while it was hidden is reported."""
+    await vfs.mkdir_p(f"{R1}/pub/d")
+    agent = view(vfs, watcher, private_policy())
+    async with agent.watch("/workspace/pub/d") as w:
+        await vfs.rename(f"{R1}/pub", f"{R1}/private")
+        await vfs.create(f"{R1}/private/d/salaries.csv", b"x" * 99)
+        await vfs.rename(f"{R1}/private", f"{R1}/pub")
+        assert await drained(w) == [WatchEvent("delete", "/workspace/pub/d", kind="dir")]
+
+
+async def test_a_mount_point_moved_in_just_before_the_watch_is_not_a_delete(
     vfs: VFSClient, watcher: Watcher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """VFSView.watch closes its ViewWatch when the block exits."""
-    calls = 0
-    original = ViewWatch.close
+    """A workspace renamed into place just before a watch of its mount point resolves: the move put it where the
+    watch has it, so it is dropped and the watch carries on."""
+    await vfs.rename(R1, "/workspaces/staging")
+    await asyncio.sleep(0.5)  # let the watcher dispatch this setup move first: a stale move elsewhere ends a watch
+    original_open = PathWatch._open  # pyright: ignore[reportPrivateUsage]
 
-    def counting(self: ViewWatch) -> None:
-        nonlocal calls
-        calls += 1
-        original(self)
+    async def open_with_move(self: PathWatch) -> None:
+        await vfs.rename("/workspaces/staging", R1)
+        await asyncio.sleep(0.3)
+        await original_open(self)
 
-    monkeypatch.setattr(ViewWatch, "close", counting)
+    monkeypatch.setattr(PathWatch, "_open", open_with_move)
     agent = view(vfs, watcher)
-    async with agent.watch("/workspace/d"):
-        pass
-    assert calls == 1
+    async with agent.watch("/workspace") as w:
+        await agent.create("/workspace/marker", b"")
+        assert await next_seen(w) == WatchEvent("create", "/workspace/marker", kind="file")
+
+
+async def test_leaving_the_block_closes_the_watch(vfs: VFSClient, watcher: Watcher) -> None:
+    """Leaving the VFSView.watch block ends the ViewWatch and unsubscribes its PathWatch."""
+    agent = view(vfs, watcher)
+    before = len(watcher._subscriptions)  # pyright: ignore[reportPrivateUsage]
+    async with agent.watch("/workspace/d") as w:
+        assert len(watcher._subscriptions) == before + 1  # pyright: ignore[reportPrivateUsage]
+    assert len(watcher._subscriptions) == before  # pyright: ignore[reportPrivateUsage]
+    assert await drained(w) == []
