@@ -95,11 +95,14 @@ _NULL = (
 # The parent of a create with parents, and mkdir_p: the directories vfs_mkdir_p found or made, every one in chain.
 _MKDIR_P = "(SELECT id, 'dir'::text AS kind, chain, err, err_detail FROM vfs_mkdir_p(%s))"
 # pread_page's lines join: the vfs_pread_lines of read 1 (its file), placed before the p join and, like it, a
-# one-time filter, so the function runs at most once. It returns exactly one row, so the row count doesn't change.
-# Its 4 parameters come after the 4 unnest arrays, which is their order in the SQL text.
+# one-time filter, so the function runs at most once. LIMIT 1 (the function returns exactly one row, so the row
+# count doesn't change) keeps the subquery from being flattened, as OFFSET 0 does, and caps the planner's
+# estimate, which for a function without ROWS is 1000 rows: without it the statement's estimated cost passes
+# ``jit_above_cost``, and every Read would JIT-compile. Its 4 parameters come after the 4 unnest arrays, which is
+# their order in the SQL text.
 _LINES_JOIN = (
     " LEFT JOIN LATERAL (SELECT * FROM vfs_pread_lines(vfs_gate(w.id, w.err), %s::bigint, %s::int, %s::int, %s::int)"
-    "                    WHERE w.err IS NULL AND w.i = 1 OFFSET 0) l ON true"
+    "                    WHERE w.err IS NULL AND w.i = 1 LIMIT 1) l ON true"
 )
 # l's columns, appended to the SELECT list and sent only on read 1's first row (as the walk column is): the file's
 # extents give it as many rows as p has, and l is the same one row of them all.
@@ -351,7 +354,9 @@ class VFSClient:
         """``pread(path, 0, sample)`` and ``pread_lines(path, first_line, max_lines, max_bytes,
         max_line_bytes=...)`` of the same file, and ``pread_many(also, groups=groups)``, in one statement: one
         round trip, one connection, one snapshot. The file's outcome (ENOENT, ENOTDIR, EISDIR) raises, as ``pread``
-        does; the other reads' stay in place. EINVAL for bad limits, as the three calls check them."""
+        does; the other reads' stay in place. EINVAL for bad limits, as the three calls check them. The paths are
+        walked on the server without the cache, which stores the walks, and a file found gone evicts its cached
+        links, as ``pread`` does."""
         segments = split(path)
         if not segments:
             raise VFSError("EISDIR", "/")
@@ -376,18 +381,31 @@ class VFSClient:
                 raise VFSError("EINVAL", also_path, f"invalid offset {offset}")
         if groups is not None and len(groups) != len(also):
             raise ValueError(f"{len(groups)} groups for {len(also)} reads")
-        # The file is read 1, in a group of its own (the others shifted by one), so it never shadows and is never
-        # shadowed. An also read that is "/" isn't sent, as in pread_many, and never stands in for its group's file.
+        # The file is read 1, in group 0 of its own, so it never shadows and is never shadowed: the caller's group
+        # ids are remapped to dense ids from 1, in order of first appearance among the sent reads, so none can land
+        # in the file's group or overflow bigint (without groups, each sent read gets its own id). An also read
+        # that is "/" isn't sent, as in pread_many, and never stands in for its group's file.
         sent = [j for j, also_path in enumerate(also_paths) if also_path != "/"]
+        dense: dict[int, int] = {}
+        group_ids = [0]
+        for j in sent:
+            asked = groups[j] if groups is not None else j
+            if asked not in dense:
+                dense[asked] = len(dense) + 1
+            group_ids.append(dense[asked])
         found, l_row = await self._pread_rows(
             [normalized, *(also_paths[j] for j in sent)],
             [0, *(also[j][1] for j in sent)],
             [sample, *(also[j][2] for j in sent)],
-            [0, *((groups[j] if groups is not None else j) + 1 for j in sent)],
+            group_ids,
             (first_line, max_lines, max_bytes, max_line_bytes),
         )
         first = found[0]
         if isinstance(first, VFSError):
+            if first.errno in ("ENOENT", "ENOTDIR"):
+                ref = self._ref(segments)  # a fully cached path to a file that is gone: evict its stale links,
+                if ref.cached is not None:  # as _outcome does for pread, so a retry doesn't reuse them
+                    await self._await_eviction([ref])
             raise first  # the file's outcome raises, at its normalized path; the walks were stored (_pread_rows)
         assert l_row is not None
         size, generation, lines, _, start, content, end, cut, err, detail = l_row

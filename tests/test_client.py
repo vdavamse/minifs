@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import contextlib
+import json
 import pickle
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -251,6 +252,85 @@ async def test_pread_page_is_one_statement(vfs: VFSClient, monkeypatch: pytest.M
     monkeypatch.setattr(AsyncConnection, "execute", counting)
     await vfs.pread_page("/a/f", 4096, 1, 10, 1000, also=[("/a/AGENTS.md", 0, 100), ("/a/x", 0, 1)])
     assert len(statements) == 1, statements
+
+
+async def test_pread_page_plan_stays_cheap(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plan's estimate stays under ``jit_above_cost``: with OFFSET 0 the planner put ``vfs_pread_lines`` (no
+    ROWS) at 1000 rows, and every Read JIT-compiled. LIMIT 1 keeps the one-time filter, so the function still
+    runs once per statement, not once per extent row of the file."""
+    await vfs.create("/a/b/f", b"one\ntwo\n", parents=True)
+    for i in range(8):
+        await vfs.append("/a/b/f", b"line %d\n" % i)  # several extents: read 1 has several rows
+    await vfs.create("/a/AGENTS.md", b"rules")
+    calls: list[tuple[str, Any]] = []
+    execute = AsyncConnection.execute
+
+    async def capturing(self: AsyncConnection[Any], query: Any, params: Any = None, *args: Any, **kwargs: Any) -> Any:
+        if "vfs_pread_lines" in str(query):
+            calls.append((str(query), params))
+        return await execute(self, query, params, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", capturing)
+    await vfs.pread_page(
+        "/a/b/f",
+        4096,
+        1,
+        1000,
+        100000,
+        also=[
+            ("/a/b/AGENTS.md", 0, 100),
+            ("/a/b/CLAUDE.md", 0, 100),
+            ("/a/AGENTS.md", 0, 100),
+            ("/a/CLAUDE.md", 0, 100),
+            ("/x/AGENTS.md", 0, 1),
+            ("/x/CLAUDE.md", 0, 1),
+        ],
+        groups=[0, 0, 1, 1, 2, 2],
+    )
+    monkeypatch.undo()
+    assert len(calls) == 1, calls
+    query, params = calls[0]
+    async with vfs.pool.connection() as conn:
+        cur = await conn.execute(cast(Any, "EXPLAIN (FORMAT JSON) " + query), params)
+        row = await cur.fetchone()
+        assert row is not None
+        plan = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        cost = float(plan[0]["Plan"]["Total Cost"])
+        assert cost < 100_000, f"estimated cost {cost} passes jit_above_cost: every Read would JIT-compile"
+        async with conn.transaction():
+            # Refused for a non-superuser, which fails the test rather than skip it silently.
+            await conn.execute("SET LOCAL track_functions = 'pl'")
+            cur = await conn.execute(cast(Any, query), params)
+            await cur.fetchall()
+            cur = await conn.execute("SELECT calls FROM pg_stat_xact_user_functions WHERE funcname = 'vfs_pread_lines'")
+            row = await cur.fetchone()
+        assert row is not None, "vfs_pread_lines was not tracked: SET track_functions must have been refused"
+        assert row[0] == 1, f"vfs_pread_lines ran {row[0]} times, not once"
+
+
+async def test_pread_page_group_ids_never_reach_the_files_group(vfs: VFSClient) -> None:
+    """A caller's group id is remapped to a dense id from 1: -1 shifted by one would land in the file's group 0
+    and shadow the also read, and bigint's max shifted by one would overflow."""
+    await vfs.create("/a/f", b"one\ntwo\n", parents=True)
+    await vfs.create("/a/AGENTS.md", b"rules")
+    for groups in ([-1], [2**63 - 1]):
+        page = await vfs.pread_page("/a/f", 4096, 1, 10, 1000, also=[("/a/AGENTS.md", 0, 100)], groups=groups)
+        result = page.also[0]
+        assert isinstance(result, ReadResult), result
+        assert result.content == b"rules", result
+
+
+async def test_pread_page_evicts_a_stale_cached_path(pool: Pool) -> None:
+    """A file found gone evicts its cached links, as ``pread``'s ``_outcome`` does (the ``DictCache`` pattern of
+    ``test_stale_cached_node_is_enoent``): the statement resolves without the cache, so nothing else drops them."""
+    cache = DictCache()
+    vfs, other = VFSClient(pool, cache=cache), VFSClient(pool)
+    f = await vfs.create("/d/f", b"data", parents=True)
+    await vfs.stat("/d/f")  # the whole path is cached
+    assert any(v[0] == f.id for v in cache.entries.values())
+    await other.unlink("/d/f")  # another client, invisible to this cache
+    await raises("ENOENT", vfs.pread_page("/d/f", 4096, 1, 10, 1000), "/d/f")
+    assert all(v[0] != f.id for v in cache.entries.values())  # the stale link was evicted
 
 
 async def test_write_and_compare_and_swap(vfs: VFSClient) -> None:
