@@ -51,6 +51,12 @@ fn error(message: impl Into<String>, syntax: bool) -> Error {
     }
 }
 
+/// An error that is a bug here or in globset, not the pattern's fault. Never echoes the regex,
+/// which can be as long as the pattern.
+fn internal(what: &str) -> Error {
+    error(format!("internal error: {what}"), false)
+}
+
 /// Compiles `pattern` as `rg -g` does. Errors carry globset's message (as rg prints it after
 /// `error parsing glob '<pattern>': `), with `syntax` set, or a reason of our own. An include
 /// with a leading `!` or `#` is refused, since rg would read a negation or a comment. An
@@ -82,9 +88,9 @@ pub fn compile(pattern: &str, exclude: bool) -> Result<GlobPlan, Error> {
     let hir = ParserBuilder::new()
         .dot_matches_new_line(true)
         .build()
-        .parse(&unicode_regex(glob.regex()))
-        // globset writes valid regexes; never echo one, it can be as long as the pattern.
-        .map_err(|_| error("internal error: globset's regex doesn't parse", false))?;
+        .parse(&unicode_regex(glob.regex())?)
+        // globset writes valid regexes.
+        .map_err(|_| internal("globset's regex doesn't parse"))?;
     let atoms = translate::atoms(&hir, false);
     if atoms > MAX_ATOMS {
         return Err(error(
@@ -202,7 +208,11 @@ fn gitignore_glob(pattern: &str, exclude: bool) -> Result<(String, bool), Error>
 /// decoded back into characters: `[é-ö]` is then a range of characters, not of bytes, and
 /// `?` (`[^/]`) matches one character. Every class also loses `/`, which globset leaves in
 /// negated classes and ranges such as `[+-0]`.
-fn unicode_regex(regex: &str) -> String {
+///
+/// A regex globset isn't known to write (one ending in a backslash, or a `\x` without two hex
+/// digits) is an internal error, not a panic: through pyo3 a panic is a `BaseException`, which
+/// no caller's `except` would catch.
+fn unicode_regex(regex: &str) -> Result<String, Error> {
     let regex = regex.strip_prefix("(?-u)").unwrap_or(regex);
     let mut out = String::with_capacity(regex.len());
     let mut chars = regex.chars().peekable();
@@ -212,10 +222,17 @@ fn unicode_regex(regex: &str) -> String {
     let mut class: Option<bool> = None;
     while let Some(c) = chars.next() {
         if c == '\\' {
-            let escaped = chars.next().expect("globset never ends a regex with '\\'");
+            let Some(escaped) = chars.next() else {
+                return Err(internal("globset's regex ends in a backslash"));
+            };
             if escaped == 'x' {
                 let hex: String = chars.by_ref().take(2).collect();
-                bytes.push(u8::from_str_radix(&hex, 16).expect("globset writes \\xHH"));
+                // from_str_radix alone would take "+f" and a single digit.
+                let byte = (hex.len() == 2 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| u8::from_str_radix(&hex, 16).ok())
+                    .flatten()
+                    .ok_or_else(|| internal("globset's regex has a \\x without two hex digits"))?;
+                bytes.push(byte);
                 if chars.peek() == Some(&'\\') {
                     let mut ahead = chars.clone();
                     ahead.next();
@@ -237,7 +254,8 @@ fn unicode_regex(regex: &str) -> String {
                 out.push('[');
                 let negated = chars.peek() == Some(&'^');
                 if negated {
-                    out.push(chars.next().expect("peeked"));
+                    chars.next();
+                    out.push('^');
                 }
                 class = Some(negated);
             }
@@ -248,7 +266,7 @@ fn unicode_regex(regex: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
+    Ok(out)
 }
 
 /// The literal leading directories every match starts with.
@@ -420,15 +438,52 @@ mod tests {
     }
 
     #[test]
+    fn a_regex_globset_would_not_write_is_an_error_not_a_panic() {
+        // No glob is known to produce these (#100); the rewriter must still not panic on them.
+        for (regex, message) in [
+            (
+                "(?-u)^a\\",
+                "internal error: globset's regex ends in a backslash",
+            ),
+            (
+                "(?-u)^\\xzz$",
+                "internal error: globset's regex has a \\x without two hex digits",
+            ),
+            (
+                "(?-u)^\\x+f$",
+                "internal error: globset's regex has a \\x without two hex digits",
+            ),
+            (
+                "(?-u)^\\xc",
+                "internal error: globset's regex has a \\x without two hex digits",
+            ),
+            (
+                "(?-u)^\\x",
+                "internal error: globset's regex has a \\x without two hex digits",
+            ),
+        ] {
+            let err = unicode_regex(regex).unwrap_err();
+            assert_eq!(
+                (err.message.as_str(), err.span, err.syntax),
+                (message, None, false),
+                "{regex}"
+            );
+        }
+        // Unfinished classes are passed on for the parser to refuse.
+        assert_eq!(unicode_regex("(?-u)^[").unwrap(), "^[");
+        assert_eq!(unicode_regex("(?-u)^[^").unwrap(), "^[^");
+    }
+
+    #[test]
     fn byte_regexes_become_unicode() {
-        assert_eq!(unicode_regex(r"(?-u)^\xc3\xa9$"), "^é$");
+        assert_eq!(unicode_regex(r"(?-u)^\xc3\xa9$").unwrap(), "^é$");
         assert_eq!(
-            unicode_regex(r"(?-u)^[\xc3\xa9-\xc3\xb6]\\x$"),
+            unicode_regex(r"(?-u)^[\xc3\xa9-\xc3\xb6]\\x$").unwrap(),
             r"^[é-ö&&[^/]]\\x$"
         );
-        assert_eq!(unicode_regex(r"(?-u)^[^a][^/]*$"), "^[^a/][^//]*$");
+        assert_eq!(unicode_regex(r"(?-u)^[^a][^/]*$").unwrap(), "^[^a/][^//]*$");
         assert_eq!(
-            unicode_regex(r"(?-u)^[\[\]\^]\xf0\x9f\x98\x80$"),
+            unicode_regex(r"(?-u)^[\[\]\^]\xf0\x9f\x98\x80$").unwrap(),
             r"^[\[\]\^&&[^/]]😀$"
         );
     }
