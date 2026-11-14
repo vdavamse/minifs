@@ -18,7 +18,14 @@ import pytest
 
 import minifs.tools.edit as new
 from minifs.tools.deps import EditSettings, ToolSettings
-from minifs.tools.edit import EMPTY_OLD_STRING, MULTIPLE_MATCHES, Edit, ReplaceTimeout, timeout_message
+from minifs.tools.edit import (
+    BLOCK_LEAVES_OUT_LINES,
+    EMPTY_OLD_STRING,
+    MULTIPLE_MATCHES,
+    Edit,
+    ReplaceTimeout,
+    timeout_message,
+)
 from tests.tools.conftest import Deps, retry_message
 
 Replacer = Callable[[str, str], Iterator[str]]
@@ -104,36 +111,47 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
     first, last = search[0].strip(), search[-1].strip()
     max_delta = max(1, len(search) // 4)
 
-    candidates: list[tuple[int, int]] = []
+    candidates_list: list[tuple[int, int]] = []
     for i, line in enumerate(original):
         if line.strip() != first:
             continue
         for j in range(i + 2, len(original)):
             if original[j].strip() == last:
-                # departs from ladderframe (#117): a block may be shorter than the find (the find has a line the
-                # file doesn't) but not longer; the middle is scored by position over the shorter of the two, so a
-                # longer block's extra lines were never compared and the replacement deleted them.
-                if -max_delta <= (j - i + 1) - len(search) <= 0:
-                    candidates.append((i, j))
+                if abs(j - i + 1 - len(search)) <= max_delta:
+                    candidates_list.append((i, j))
                 break  # only the first occurrence of the last line
-    if not candidates:
+    if not candidates_list:
         return
 
-    if len(candidates) == 1:
-        start, end = candidates[0]
+    if len(candidates_list) == 1:
+        start, end = candidates_list[0]
         if _middle_similarity(original, start, end - start + 1, search, True) >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD:
+            # departs from ladderframe (#117): a block longer than the find has lines the find doesn't include;
+            # the middle is scored by position over the shorter of the two, so those lines were never compared
+            # and the replacement deleted them. Refused with a retry rather than dropped: dropping it let a
+            # weaker block elsewhere win the scoring.
+            if end - start + 1 > len(search):
+                raise ValueError(
+                    BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=end - start + 1 - len(search))
+                )
             begin, finish = _span(original, start, end)
             yield content[begin:finish]
         return
 
     best: tuple[int, int] | None = None
     best_similarity = -1.0
-    for start, end in candidates:
+    for start, end in candidates_list:
         similarity = _middle_similarity(original, start, end - start + 1, search, False)
         if similarity > best_similarity:
             best_similarity, best = similarity, (start, end)
     if best is not None and best_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD:
-        begin, finish = _span(original, *best)
+        start, end = best
+        # departs from ladderframe (#117): as above, for the best of several candidates.
+        if end - start + 1 > len(search):
+            raise ValueError(
+                BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=end - start + 1 - len(search))
+            )
+        begin, finish = _span(original, start, end)
         yield content[begin:finish]
 
 
@@ -405,6 +423,14 @@ def outcome(replace: Callable[..., str], content: str, find: str, new_string: st
         return ("error", str(e))
 
 
+def candidates(replacer: Replacer, content: str, find: str) -> object:
+    """A replacer's candidates, or the retry it raises instead (#117): both replacers must give the same."""
+    try:
+        return list(replacer(content, find))
+    except ValueError as e:
+        return ("error", str(e))
+
+
 @pytest.mark.parametrize("seed", range(4))
 def test_replacers_give_ladderframes_candidates(seed: int) -> None:
     rng = random.Random(seed)
@@ -412,7 +438,7 @@ def test_replacers_give_ladderframes_candidates(seed: int) -> None:
         content = random_text(rng, 10)
         find = random_find(rng, content) or "x"  # replace() rejects an empty find before any replacer runs
         for name, rewritten, reference in PAIRS:
-            assert list(rewritten(content, find)) == list(reference(content, find)), (name, content, find)
+            assert candidates(rewritten, content, find) == candidates(reference, content, find), (name, content, find)
         replace_all = rng.random() < 0.2
         assert outcome(new.replace, content, find, "R", replace_all) == outcome(
             replace, content, find, "R", replace_all
@@ -537,27 +563,41 @@ def test_block_anchors_alone_dont_take_the_line_between() -> None:
     ]
 
 
-def test_block_anchors_dont_take_a_longer_block() -> None:
-    """A block longer than the find was accepted when within ``max_delta``: the middle is scored by position over
-    the shorter of the two, so the block's extra lines were never compared and the replacement deleted them (#117).
-    A block may only be shorter than the find (the find has a line the file doesn't)."""
+def test_block_anchors_refuse_a_longer_block() -> None:
+    """A block longer than the find has lines the find doesn't include: the middle is scored by position over the
+    shorter of the two, so those lines were never compared and the replacement deleted them (#117). Such a block is
+    refused with a retry rather than dropped: dropping it let a weaker block elsewhere win the scoring. A shorter
+    block is still taken."""
     content = "def f():\n    keep_me()\n    delete_me()\n    return 1\n"
     find = "def f():\n    keep_me()\n    return 1\n"
-    assert list(new.block_anchor_replacer(content, find)) == []
+    message = re.escape(BLOCK_LEAVES_OUT_LINES.format(first=1, last=4, extra=1))
+    with pytest.raises(ValueError, match=message):
+        next(islice(new.block_anchor_replacer(content, find), 1))
     for search in (new.replace, replace):
-        with pytest.raises(ValueError, match="Could not find oldString"):
+        with pytest.raises(ValueError, match=message):
             search(content, find, "def f():\n    keep_me()\n    return 2\n")
-    # A longer find whose extra block line sits at the end of the middle, where the positional scoring would
-    # still accept the block (max_delta is 1 for 6 lines).
-    assert (
-        list(
-            new.block_anchor_replacer(
-                "def f():\n    a()\n    b()\n    c()\n    d()\n    x()\n    return 1\n",
-                "def f():\n    a()\n    b()\n    c()\n    d()\n    return 1\n",
+    # A longer block whose extra line sits at the end of the middle, where the positional scoring would still
+    # accept the block (max_delta is 1 for 6 lines).
+    with pytest.raises(ValueError, match=re.escape(BLOCK_LEAVES_OUT_LINES.format(first=1, last=7, extra=1))):
+        next(
+            islice(
+                new.block_anchor_replacer(
+                    "def f():\n    a()\n    b()\n    c()\n    d()\n    x()\n    return 1\n",
+                    "def f():\n    a()\n    b()\n    c()\n    d()\n    return 1\n",
+                ),
+                1,
             )
         )
-        == []
+    # Dropping the longer block let the second block (b = 9) win and be overwritten; the raise propagates out
+    # of ``replace``, so ``context_aware_replacer`` never gets to pick it either.
+    sibling = (
+        "if ready:\n    a = 1\n    b = 2\n    extra()\n    return a\n\nif ready:\n    a = 1\n    b = 9\n    return a\n"
     )
+    sibling_find = "if ready:\n    a = 1\n    b = 2\n    return a"
+    sibling_message = re.escape(BLOCK_LEAVES_OUT_LINES.format(first=1, last=5, extra=1))
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match=sibling_message):
+            search(sibling, sibling_find, "if ready:\n    a = 1\n    b = 3\n    return a")
     # Positive control: a SHORTER block is still found.
     assert list(
         new.block_anchor_replacer(

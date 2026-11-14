@@ -192,8 +192,8 @@ def test_replace_fallback_matchers() -> None:
 
 
 def test_replace_refuses_a_disproportionate_match() -> None:
-    # the block anchors match a block as long as oldString whose middle line is huge (a longer block is not
-    # taken at all (#117)), and the matched span's text is much larger than oldString's
+    # the block anchors match a block as long as oldString whose middle line is huge (a longer block would be
+    # refused with a retry (#117)), and the matched span's text is much larger than oldString's
     content = "first\nm1\nm2\n" + "z" * 700 + "\nlast\n"
     with pytest.raises(ValueError, match="much larger than oldString"):
         replace(content, "first\nm1\nm2\nm3\nlast", "x")

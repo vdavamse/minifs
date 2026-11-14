@@ -6,8 +6,9 @@ O(n·m) in the content's and ``oldString``'s sizes, in lines and in characters (
 ladderframe's block scans were O(n²) in lines and its searches within a line O(n·m) per call that nothing could
 interrupt. ``replace`` departs from ladderframe on purpose where it edited the wrong text and reported success (#110,
 #122, #117, marked in the oracle): a whitespace-only ``oldString`` matches only exactly, an ambiguous exact
-``oldString`` is reported, block anchors alone don't take the line between them, block anchors don't take a block
-longer than ``oldString``, and with ``replaceAll`` a whitespace candidate of a non-blank ``oldString`` is refused.
+``oldString`` is reported, block anchors alone don't take the line between them, block anchors refuse a block
+longer than ``oldString`` with a retry, and with ``replaceAll`` a whitespace candidate of a non-blank ``oldString``
+is refused.
 ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker thread that
 can't be cancelled and holds the GIL while it works (#80).
 
@@ -69,6 +70,10 @@ BOM = "\ufeff"
 EMPTY_OLD_STRING = (
     "oldString cannot be empty when editing an existing file. Provide the exact text to replace, "
     "or use write for an intentional full-file replacement."
+)
+BLOCK_LEAVES_OUT_LINES = (
+    "oldString looks like lines {first}-{last} of the file, but {extra} of those lines are not in oldString and "
+    "the replacement would delete them. Read those lines again and include every one of them in oldString."
 )
 
 
@@ -373,10 +378,12 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
         if line.strip() != first:
             continue
         j = _next_line(last_at, i + 2, n)  # only the first occurrence of the last line
-        # A block may be shorter than the find (the find has a line the file doesn't) but not longer: the middle
-        # is scored by position over the shorter of the two, so a longer block's extra lines were never compared
-        # and the replacement deleted them (#117).
-        if j < n and -max_delta <= (j - i + 1) - len(search) <= 0:
+        # ladderframe's window: the block may differ from the find by at most max_delta lines; a shorter block is
+        # still taken. A block longer than the find has lines the find doesn't include: the middle is scored by
+        # position over the shorter of the two, so those lines were never compared and the replacement deleted
+        # them (#117). Such a block is refused with a retry where it would be yielded, not dropped here: dropping
+        # it let a weaker block elsewhere win the scoring.
+        if j < n and abs((j - i + 1) - len(search)) <= max_delta:
             candidates.append((i, j))
     if not candidates:
         return
@@ -385,6 +392,10 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
     if len(candidates) == 1:
         start, end = candidates[0]
         if _middle_similarity(original, start, end - start + 1, search, True) >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD:
+            if end - start + 1 > len(search):  # the block's extra lines were never compared (#117): refuse
+                raise ValueError(
+                    BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=end - start + 1 - len(search))
+                )
             yield content[starts[start] : starts[end + 1] - 1]
         return
 
@@ -396,6 +407,10 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
             best_similarity, best = similarity, (start, end)
     if best is not None and best_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD:
         start, end = best
+        if end - start + 1 > len(search):  # the block's extra lines were never compared (#117): refuse
+            raise ValueError(
+                BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=end - start + 1 - len(search))
+            )
         yield content[starts[start] : starts[end + 1] - 1]
 
 
@@ -432,11 +447,15 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
     words = normalized_find.split(" ") if normalized_find else []
     lines = content.split("\n")
     deadline = _deadline.get()
-    normalized_lines: list[str] = []  # each line's normalisation, kept for the block loop below
+    find_lines = find.split("\n")
+    # Each line's normalisation, kept for the block loop below: only a multi-line find reaches that loop, and
+    # building the list for every find would double the peak memory on a large file.
+    normalized_lines: list[str] | None = [] if len(find_lines) > 1 else None
     for line in lines:
         deadline.tick()
         normalized_line = normalize(line)
-        normalized_lines.append(normalized_line)
+        if normalized_lines is not None:
+            normalized_lines.append(normalized_line)
         if normalized_line == normalized_find:
             yield line
         elif words and len(normalized_line) > len(normalized_find):
@@ -447,8 +466,7 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
                 deadline.check()  # a long line: the pass over its tokens costs the line
                 yield _words_in_line(line, at, words)
 
-    find_lines = find.split("\n")
-    if len(find_lines) > 1:
+    if normalized_lines is not None:
         m = len(find_lines)
         for i in range(len(lines) - m + 1):
             deadline.tick()
