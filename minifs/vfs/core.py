@@ -204,7 +204,9 @@ def split(path: str) -> tuple[str, ...]:
     refuse_controls(path)
     parts = split_trusted(path)
     if len(parts) > MAX_COMPONENTS:
-        raise VFSError("ENAMETOOLONG", path, f"{len(parts)} components, over the {MAX_COMPONENTS} limit")
+        # No count in the message: under a view, ``path`` is the real path, longer than the visible one by the mount
+        # prefix, and a view keeps the message while it maps the path back.
+        raise VFSError("ENAMETOOLONG", path, f"over the {MAX_COMPONENTS}-component limit")
     return parts
 
 

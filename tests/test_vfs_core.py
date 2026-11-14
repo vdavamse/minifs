@@ -57,11 +57,11 @@ def test_split_caps_the_components() -> None:
     with pytest.raises(VFSError) as info:
         split("/" + "/".join(["a"] * (MAX_COMPONENTS + 1)))
     assert info.value.errno == "ENAMETOOLONG"
-    assert "1025 components" in info.value.message
+    assert "over the 1024-component limit" in info.value.message
     with pytest.raises(VFSError) as info:
         normalize("/" + "/".join(["a"] * (MAX_COMPONENTS + 1)))
     assert info.value.errno == "ENAMETOOLONG"
-    assert "1025 components" in info.value.message
+    assert "over the 1024-component limit" in info.value.message
 
 
 @pytest.mark.parametrize("path", ["", "a", "a/b", "./a", "../a", "~/a"])

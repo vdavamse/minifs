@@ -18,7 +18,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.migrate import load_migrations, migrate
-from minifs.vfs.core import VFSError
+from minifs.vfs.core import MAX_COMPONENTS, VFSError
 from minifs.vfs.watch import RESCAN, ConnectionFactory, Event, Op, PathWatch, Subscription, Watcher
 from tests.test_tree import create, mkdir_p, rename, unlink
 
@@ -1242,3 +1242,11 @@ async def test_watch_refuses_a_control_character_escaped(watcher: Watcher) -> No
     assert info.value.errno == "EINVAL"
     assert "\n" not in str(info.value)
     assert info.value.path == "/a\\u000aINFO forged"
+
+
+async def test_watch_refuses_an_over_long_path(watcher: Watcher) -> None:
+    """#89: ENAMETOOLONG before any lookup, as core.split does, not vfs_lookup's raise as a database error."""
+    with pytest.raises(VFSError) as info:
+        async with watcher.watch("/" + "/".join(["d"] * (MAX_COMPONENTS + 1))):
+            pass
+    assert info.value.errno == "ENAMETOOLONG" and info.value.db_error is None

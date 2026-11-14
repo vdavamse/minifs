@@ -1087,8 +1087,17 @@ async def test_rename_a_moved_directory_caps_its_subtree(conn: AsyncConnection) 
     assert errno_name(info.value) == "ENAMETOOLONG"
     assert "subtree" in (info.value.diag.message_detail or "")
     assert await resolve(conn, "b") == (b, "dir")
-    # 993 + 1 + 30 = 1024: the deepest B and its subtree may go.
-    room = (await resolve(conn, *(["d"] * 993)))[0]
+    # 994 + 1 + 30 = 1025: one level over, refused too (the boundary from the refusing side).
+    with raises_db_errno("ENAMETOOLONG"):
+        await rename(conn, b, (await resolve(conn, *(["d"] * 994)))[0], "b")
+    # A file is the deepest node: B's subtree is 31 levels below it now. 993 + 1 + 31 = 1025 is refused, 992 fits.
+    room, one_up = (await resolve(conn, *(["d"] * 993)))[0], (await resolve(conn, *(["d"] * 992)))[0]
+    file = await create(conn, leaf, "f")
+    with raises_db_errno("ENAMETOOLONG"):
+        await rename(conn, b, room, "b")
+    assert await rename(conn, b, one_up, "b")
+    # Without the file, 993 + 1 + 30 = 1024: the deepest B and its subtree may go (a deeper move, scanned).
+    await unlink(conn, file)
     assert await rename(conn, b, room, "b")
     assert await resolve(conn, *(["d"] * 993), "b") == (b, "dir")
     assert await resolve(conn, *(["d"] * 993), "b", *(["d"] * 30)) == (leaf, "dir")
@@ -1140,11 +1149,17 @@ async def test_a_legacy_tree_deeper_than_the_cap(conn: AsyncConnection) -> None:
         await rename(conn, z, deepest, "z")  # the destination is too deep, not a cycle
     assert errno_name(info.value) == "ENAMETOOLONG"
     assert "deeper than" in (info.value.diag.message_detail or "")
-    # The repair: move the directory at depth 600 to the root, with the 500 levels below it. Its old parent is
-    # within the cap, so the move doesn't count as deeper and the subtree is never scanned.
-    assert await rename(conn, await dir_at(600), None, "moved")
-    # The moved part's deepest path is now 501 components and resolves.
-    assert await resolve(conn, "moved", *(["d"] * 500)) == (deepest, "dir")
+    # A partial repair, out of the over-deep region: the directory at depth 1050 moves under the one at 1000.
+    # Its old parent is past the cap, so the move is up and isn't scanned, though its subtree is still too deep.
+    assert await rename(conn, await dir_at(1050), await dir_at(1000), "up")  # the deepest is now at 1051
+    # Moving up from depth 2 to the root: the subtree still reaches 1050 levels, and a scan would refuse it.
+    assert await rename(conn, await dir_at(2), None, "top")
+    # Now top (1), the original 3..1000 as d (2..999), up (1000) and its 50 levels (1001..1050). The full repair:
+    # the directory at depth 600 moves to the root, and the deepest path is 451 components that resolve.
+    at_600 = (await resolve(conn, "top", *(["d"] * 599)))[0]
+    assert at_600 is not None
+    assert await rename(conn, at_600, None, "moved")
+    assert await resolve(conn, "moved", *(["d"] * 399), "up", *(["d"] * 50)) == (deepest, "dir")
 
 
 async def test_a_sideways_move_never_scans_the_subtree(conn: AsyncConnection) -> None:

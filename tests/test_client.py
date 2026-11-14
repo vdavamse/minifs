@@ -476,7 +476,7 @@ async def test_over_deep_paths_are_refused(vfs: VFSClient) -> None:
     too_long = "/" + "/".join(["d"] * (MAX_COMPONENTS + 1))
     error = await raises("ENAMETOOLONG", vfs.mkdir_p(too_long), too_long)
     assert error.db_error is None and not error.detail  # split raised it: no round trip happened
-    assert "1025 components" in error.message
+    assert "over the 1024-component limit" in error.message and "1025" not in error.message
     # The same cap on the server: a chain of 1000, and /b holding a chain of 30; 1000 + 1 + 30 is over 1024.
     await vfs.mkdir_p("/" + "/".join(["d"] * 1000))
     await vfs.mkdir_p("/b/" + "/".join(["d"] * 30))

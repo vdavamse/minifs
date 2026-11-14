@@ -116,9 +116,8 @@ DECLARE
     v_k int := coalesce(cardinality(p_cached), 0);
     v_i int := 0;
 BEGIN
-    IF coalesce(cardinality(p_segments), 0) > vfs_max_components() THEN
-        PERFORM vfs_raise('ENAMETOOLONG',
-                          format('%s components, over the %s limit', cardinality(p_segments), vfs_max_components()));
+    IF v_n > vfs_max_components() THEN
+        PERFORM vfs_raise('ENAMETOOLONG', format('%s components, over the %s limit', v_n, vfs_max_components()));
     END IF;
     chain := '{}';
     -- Nested, so a call without p_cached tests a simple expression and runs no query. p_cached[0] is NULL: the
@@ -180,9 +179,8 @@ DECLARE
     v_i int := 0;
     v_n int := coalesce(cardinality(p_segments), 0);
 BEGIN
-    IF coalesce(cardinality(p_segments), 0) > vfs_max_components() THEN
-        PERFORM vfs_raise('ENAMETOOLONG',
-                          format('%s components, over the %s limit', cardinality(p_segments), vfs_max_components()));
+    IF v_n > vfs_max_components() THEN
+        PERFORM vfs_raise('ENAMETOOLONG', format('%s components, over the %s limit', v_n, vfs_max_components()));
     END IF;
     chain := '{}';
     FOREACH v_seg IN ARRAY coalesce(p_segments, '{}') LOOP
@@ -233,8 +231,8 @@ END $$;
 -- ENAMETOOLONG for a bad name and, since 022, for the depth cap: a destination deeper than vfs_max_components(),
 -- a move that would land p_node over it, or, for a directory that moves deeper, a subtree that would go over it.
 --
--- Cycles: a move locks every ancestor of the destination FOR KEY SHARE while it checks them, a file's move too,
--- since the walk counts the destination's depth (022). A concurrent move of one of those ancestors needs FOR
+-- Cycles: a directory's move locks every ancestor of the destination FOR KEY SHARE while it checks them (a file's
+-- move walks them without locks, to count the destination's depth (022)). A concurrent move of one of those ancestors needs FOR
 -- UPDATE on it, so the two moves are ordered (or, if they lock in opposite orders, one gets a deadlock error),
 -- and the later one sees the earlier one's result. Under REPEATABLE READ, locking an ancestor that moved after
 -- the snapshot raises a serialization failure instead. The walk locks only directories, so it never waits on a
@@ -243,7 +241,8 @@ END $$;
 -- cycle the old 10,000-step guess reported.
 --
 -- The subtree check of a directory that moves deeper reads the descendants without locking them, so it is best
--- effort: a concurrent mkdir inside the moved subtree can slip one over the cap. Moving sideways or up never
+-- effort: a concurrent mkdir inside the moved subtree can slip one over the cap; so is a file's depth check. The
+-- scan reads every directory of the subtree down to the room left, so moving a wide tree deeper costs more. Moving sideways or up never
 -- scans the subtree, so an over-deep legacy subtree can always be moved up.
 CREATE OR REPLACE FUNCTION vfs_rename(p_node uuid, p_new_parent uuid, p_new_name text, p_expect_parent uuid DEFAULT NULL)
 RETURNS TABLE (err text, err_detail text) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
@@ -278,9 +277,11 @@ BEGIN
         RETURN NEXT;
         RETURN;
     END IF;
-    -- Walk the destination's ancestors, for every kind (022): the same FOR KEY SHARE lock as before, and a count
-    -- of the destination's depth (the root is 0). A walk over the cap stops: a real cycle is EINVAL as before,
-    -- a chain merely deeper than the cap is ENAMETOOLONG.
+    -- Walk the destination's ancestors, for every kind (022), counting the destination's depth (the root is 0).
+    -- A directory's move locks each one FOR KEY SHARE, as before, for the cycle check. A file can't close a
+    -- cycle, so its walk takes no locks, as before: renames of files (Maildir claims) don't lock every ancestor
+    -- up to the root, and their depth check is best effort, like the subtree check below. A walk over the cap
+    -- stops: a real cycle is EINVAL as before, a chain merely deeper than the cap is ENAMETOOLONG.
     v_up := p_new_parent;
     WHILE v_up IS NOT NULL LOOP
         IF v_up = p_node THEN
@@ -294,19 +295,25 @@ BEGIN
             PERFORM vfs_raise('ENAMETOOLONG',
                               format('%s is deeper than %s levels', p_new_parent, vfs_max_components()));
         END IF;
-        SELECT n.parent_id INTO v_up FROM vfs_nodes n WHERE n.id = v_up FOR KEY SHARE;
+        IF v_kind = 'dir' THEN
+            SELECT n.parent_id INTO v_up FROM vfs_nodes n WHERE n.id = v_up FOR KEY SHARE;
+        ELSE
+            SELECT n.parent_id INTO v_up FROM vfs_nodes n WHERE n.id = v_up;
+        END IF;
     END LOOP;
     IF v_depth + 1 > vfs_max_components() THEN
         PERFORM vfs_raise('ENAMETOOLONG', format('%s would be %s levels deep, over the %s limit',
                                                  p_node, v_depth + 1, vfs_max_components()));
     END IF;
     -- A directory that moves deeper takes its subtree with it. The old parent's depth comes from vfs_depth,
-    -- without locks; past the cap it is unknown, so the move counts as deeper too. v_room is the deepest
-    -- relative level allowed below p_node, p_node itself at level 0: the scan (directories only, no locks on
-    -- the descendants) looks for any child, file or directory, of a directory at level v_room.
+    -- without locks; past the cap it is cap + 1, more than v_depth (at most cap - 1 here), so a move out of an
+    -- over-deep region is a move up and is never scanned, even when its subtree stays over the cap. v_room is
+    -- the deepest relative level allowed below p_node, p_node itself at level 0: the scan (directories only, no
+    -- locks on the descendants; it reads every directory of the subtree down to v_room) looks for any child,
+    -- file or directory, of a directory at level v_room.
     IF v_kind = 'dir' THEN
         v_old := vfs_depth(v_parent, vfs_max_components());
-        IF v_depth > v_old OR v_old > vfs_max_components() THEN
+        IF v_depth > v_old THEN
             v_room := vfs_max_components() - v_depth - 1;
             WITH RECURSIVE down(id, level) AS (
                 SELECT p_node, 0
