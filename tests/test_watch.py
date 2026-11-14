@@ -536,14 +536,23 @@ async def test_the_trigger_functions_refuse_another_table(conn: AsyncConnection,
 
 
 async def test_a_function_in_the_schema_cannot_stand_in_for_a_builtin(conn: AsyncConnection) -> None:
-    """The trigger functions run as the owner, so they call pg_catalog's functions by name: a closer-matching
-    json_build_object in the schema (which a role with CREATE on it could add) is not what they run. Nor does the
-    table take a name that pg_notify would refuse, which would fail every write."""
+    """The trigger functions run as the owner, so they call pg_catalog's functions and operators by name: a
+    closer-matching json_build_object or <> in the schema (which a role with CREATE on it could add) is not what
+    they run. Nor does the table take a name that pg_notify would refuse, which would fail every write."""
     await conn.execute(
         "CREATE FUNCTION json_build_object(text, text, text, uuid, text, uuid, text, text, text, text) RETURNS json"
         " LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'hijacked as %', current_user; END $$"
     )
-    await create(conn, None, "f")
+    await conn.execute(
+        "CREATE FUNCTION evil(oid, regclass) RETURNS boolean"
+        " LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'hijacked as %', current_user; END $$"
+    )
+    await conn.execute("CREATE OPERATOR <> (LEFTARG = oid, RIGHTARG = regclass, FUNCTION = evil)")
+    d = await mkdir_p(conn, "d")
+    f = await create(conn, d, "f")
+    await rename(conn, f, None, "g")
+    await unlink(conn, f)
+    await conn.execute("TRUNCATE vfs_nodes CASCADE")
     for bad in ("", "x" * 64):
         with pytest.raises(errors.CheckViolation):
             await conn.execute("UPDATE vfs_channel_name SET channel = %s", (bad,))
@@ -950,7 +959,7 @@ def test_rescan_interval_must_be_a_finite_non_negative_number(interval: float) -
 def test_channel_argument_is_validated(db: str) -> None:
     """A given channel must be one LISTEN and pg_notify take: LISTEN cuts a longer name silently, and the watcher
     would then drop every notification."""
-    for bad in ("", "x" * 64):
+    for bad in ("", "x" * 64, "é" * 32):  # bytes, not characters: 32 of these are 64 bytes
         with pytest.raises(ValueError):
             Watcher(factory(db), channel=bad)
     Watcher(factory(db), channel="x" * 63)  # the longest name it takes; not started, so nothing listens on it

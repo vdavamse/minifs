@@ -61,7 +61,7 @@ COMMENT ON FUNCTION vfs_channel() IS
 CREATE OR REPLACE FUNCTION vfs_notify() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE v_payload json;
 BEGIN
-    IF TG_RELID <> 'vfs_nodes'::regclass THEN  -- before NEW or OLD is touched: see the note below
+    IF TG_RELID OPERATOR(pg_catalog.<>) 'vfs_nodes'::regclass THEN  -- before NEW or OLD is touched: see the note below
         RAISE EXCEPTION 'vfs_notify() is the trigger function of vfs_nodes alone';
     END IF;
     IF TG_OP = 'INSERT' THEN
@@ -84,7 +84,7 @@ END $$;
 
 CREATE OR REPLACE FUNCTION vfs_notify_truncate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
-    IF TG_RELID <> 'vfs_nodes'::regclass THEN
+    IF TG_RELID OPERATOR(pg_catalog.<>) 'vfs_nodes'::regclass THEN
         RAISE EXCEPTION 'vfs_notify_truncate() is the trigger function of vfs_nodes alone';
     END IF;
     PERFORM pg_catalog.pg_notify((SELECT channel FROM vfs_channel_name), '{"op": "rescan"}');
@@ -102,9 +102,11 @@ END $$;
 -- EXECUTE, so roles that write through table grants are unaffected) and the TG_RELID checks in the bodies, which
 -- hold even where the ACL is lost (see pg_dump --no-acl above) or EXECUTE is granted by mistake.
 --
--- For the same reason the bodies name pg_catalog for the functions they call: called unqualified, a function of
--- the same name with a closer signature in this schema would be chosen over pg_catalog's (json_build_object is
--- VARIADIC "any"), and a role with CREATE on the schema could have its code run as the owner. They read the name
+-- For the same reason the bodies name pg_catalog for the functions and the operator they call: called
+-- unqualified, a function or operator of the same name with a closer signature in this schema would be chosen over
+-- pg_catalog's (json_build_object is VARIADIC "any"; pg_catalog has no <> (oid, regclass), only <> (oid, oid)), and
+-- a role with CREATE on the schema could have its code run as the owner. The other operators in the bodies have
+-- exact matches in pg_catalog, which is searched first. They read the name
 -- from the table themselves, as the owner, which also spares a call of vfs_channel() per changed row.
 REVOKE EXECUTE ON FUNCTION vfs_notify(), vfs_notify_truncate() FROM PUBLIC;
 DO $$
