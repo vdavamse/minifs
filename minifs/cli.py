@@ -7,9 +7,11 @@ import argparse
 import asyncio
 import getpass
 import os
+import re
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import quote, unquote
 
 import psycopg
@@ -52,7 +54,7 @@ def _timeout(text: str) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="minifs")
+    parser = _Parser(prog="minifs")
     commands = parser.add_subparsers(dest="command", required=True)
     db = commands.add_parser("db", help="database administration")
     db_commands = db.add_subparsers(dest="db_command", required=True)
@@ -110,12 +112,43 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_migrate(dsn) if args.db_command == "migrate" else _status(dsn))
         return asyncio.run(_with_client(dsn, _VFS_COMMANDS[args.command], args))
     except (MigrationError, VFSError, GlobError, RegexError, SearchRefused, psycopg.Error, OSError) as e:
+        if isinstance(e, psycopg.Error) and any(len(s) < _MIN_MASKED for s in secrets):
+            # Masking a password this short would garble the message and show where it matched.
+            print(f"minifs {label}: database error (not shown: the password is too short to mask)", file=sys.stderr)
+            return 1
         detail = f" ({e.detail})" if isinstance(e, VFSError) and e.detail else ""
         print(_mask(f"minifs {label}: {e}{detail}", secrets), file=sys.stderr)
         return 1
-    except _BadConninfo as e:
+    except _Refused as e:
         print(f"minifs {label}: {e}", file=sys.stderr)
         return 1
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse's parser, but its errors, which quote argv (``unrecognized arguments: --dns=postgresql://...``),
+    have connection-string passwords masked. Subparsers are made with the same class."""
+
+    def error(self, message: str) -> NoReturn:
+        prefix = "unrecognized arguments: "
+        if message.startswith(prefix):
+            # Any word may be a password (``-Wsecret`` leaves ``-secret`` over): show option names only.
+            words = (w.partition("=") for w in message.removeprefix(prefix).split())
+            message = prefix + " ".join(
+                f"{n}{'=****' if eq else ''}" if n.startswith("--") else "****" for n, eq, _ in words
+            )
+        for pattern, repl in _ARGV_PASSWORDS:
+            message = pattern.sub(repl, message)
+        super().error(message)
+
+
+# Where an argparse error can quote a password: a URI's userinfo (up to the last @ of the word, since an unescaped
+# @ may be in the password), a ``password=`` keyword (also ``--password=...``), and the value given to a flag that
+# takes none (``-Wsecret``).
+_ARGV_PASSWORDS = (
+    (re.compile(r"(://[^:/@\s]*:)\S*@"), r"\1****@"),
+    (re.compile(r"(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)"), r"\1****"),
+    (re.compile(r"(ignored explicit argument )'.*'"), r"\1'****'"),
+)
 
 
 def _add_dsn(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -126,13 +159,20 @@ def _add_dsn(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "Don't put a password here: other users see it in the process list, and it stays in your shell history",
     )
     source.add_argument("--dsn-file", type=Path, metavar="PATH", help="read the connection string from this file")
-    parser.add_argument("-W", "--password", dest="ask_password", action="store_true", help="prompt for the password")
+    # No long --password: it reads like an option that takes the password as its value.
+    parser.add_argument("-W", dest="ask_password", action="store_true", help="prompt for the password")
     return parser
 
 
-class _BadConninfo(Exception):
-    """A connection string libpq can't parse. Its own message may quote the string, password included, so the
-    CLI says only this."""
+class _Refused(Exception):
+    """A connection setting the CLI won't use. The message is the CLI's own fixed text: libpq's may quote the
+    connection string, password included."""
+
+
+_INVALID = "invalid connection string (not shown: it may hold a password)"
+_URI_SCHEMES = ("postgresql://", "postgres://")
+# Shorter forms of a password aren't masked (see main).
+_MIN_MASKED = 4
 
 
 def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
@@ -142,13 +182,19 @@ def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
     if args.dsn is not None:
         dsn = args.dsn
     elif args.dsn_file is not None:
-        dsn = args.dsn_file.read_text().strip()
+        try:
+            dsn = args.dsn_file.read_bytes().decode("utf-8-sig").strip()
+        except UnicodeDecodeError:
+            raise _Refused(f"{_INVALID}: --dsn-file is not UTF-8 text") from None
     else:
         dsn = os.environ.get("MINIFS_DSN", "")
     try:
-        password = conninfo_to_dict(dsn).get("password")
-    except psycopg.Error:
-        raise _BadConninfo("invalid connection string (not shown: it may hold a password)") from None
+        params = conninfo_to_dict(dsn)
+    except (psycopg.Error, UnicodeError):  # UnicodeError: undecodable argv bytes, kept as surrogates
+        raise _Refused(_INVALID) from None
+    if _misread_uri(dsn, params):
+        raise _Refused(f"{_INVALID}: in a postgresql:// URI, write @ as %40 and / as %2F in the user and password")
+    password = params.get("password")
     secrets = _forms(str(password), dsn) if password else []
     if password and args.dsn is not None:
         print(
@@ -157,10 +203,50 @@ def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
             file=sys.stderr,
         )
     if args.ask_password:
-        typed = getpass.getpass("Password: ")
-        dsn = make_conninfo(dsn, password=typed)
+        typed = _ask_password()
+        try:
+            dsn = make_conninfo(dsn, password=typed)
+        except (psycopg.Error, UnicodeError):
+            raise _Refused("the password typed can't be used in a connection string") from None
         secrets += _forms(typed, dsn)
     return dsn, secrets
+
+
+def _misread_uri(dsn: str, params: Mapping[str, object]) -> bool:
+    """Whether libpq split a URI's unescaped ``@`` or ``/`` elsewhere than its writer meant, so that part of the
+    password lands in a field an error message quotes (``failed to resolve host "rest-of-password@host"``)
+    without being parsed as the password, hence unmasked. libpq ends the userinfo at the first ``@`` before the
+    first ``/``: a second ``@`` ends up in the host; a ``/`` before the ``@`` leaves no userinfo, the user and the
+    start of the password become host and port, and the ``@`` lands in the database name."""
+    scheme = next((s for s in _URI_SCHEMES if dsn.startswith(s)), None)
+    if scheme is None:
+        return False
+    if "@" in str(params.get("host", "")):
+        return True
+    authority, _, path = dsn[len(scheme) :].partition("?")[0].partition("/")
+    return "@" not in authority and "@" in path
+
+
+def _ask_password() -> str:
+    """The password, typed at the terminal. Without one, getpass would read it from stdin, which is ``put``'s
+    data, so this refuses instead."""
+    if not _has_terminal():
+        raise _Refused("-W needs a terminal to ask for the password; use PGPASSWORD, ~/.pgpass or --dsn-file")
+    try:
+        return getpass.getpass("Password: ")
+    except (EOFError, KeyboardInterrupt):
+        raise _Refused("no password entered") from None
+
+
+def _has_terminal() -> bool:
+    """Whether getpass can prompt at a terminal (on POSIX it opens ``/dev/tty``)."""
+    if os.name != "posix":
+        return True
+    try:
+        with open("/dev/tty"):
+            return True
+    except OSError:
+        return False
 
 
 def _forms(password: str, dsn: str) -> list[str]:
@@ -170,9 +256,9 @@ def _forms(password: str, dsn: str) -> list[str]:
 
 
 def _mask(text: str, secrets: list[str]) -> str:
-    """``text`` with each of ``secrets`` replaced by ``****``, longest first (the conninfo before the password
-    inside it)."""
-    for secret in sorted(set(secrets), key=len, reverse=True):
+    """``text`` with each of ``secrets`` of ``_MIN_MASKED`` characters or more replaced by ``****``, longest
+    first (the conninfo before the password inside it)."""
+    for secret in sorted({s for s in secrets if len(s) >= _MIN_MASKED}, key=len, reverse=True):
         text = text.replace(secret, "****")
     return text
 
