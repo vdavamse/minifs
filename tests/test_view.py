@@ -197,7 +197,7 @@ async def test_a_readdir_page_reads_past_a_long_hidden_run(vfs: VFSClient, monke
 
     monkeypatch.setattr(VFSClient, "readdir", spy)
     assert [e.name for e in await agent.readdir("/workspace/run", limit=1)] == ["z"]
-    assert asked == [2, 4, 8]  # the batch doubles: 2 + 4 hidden entries, then the last hidden one and z
+    assert asked == [1, 2, 4, 8]  # 1 + 2 + 4 hidden entries, then z
     monkeypatch.setattr("minifs.vfs.view._READDIR_MAX_BATCH", 2)
     asked.clear()
     assert [e.name for e in await agent.readdir("/workspace/run", limit=3)] == ["z"]

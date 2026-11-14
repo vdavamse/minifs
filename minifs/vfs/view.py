@@ -74,7 +74,7 @@ _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
 MAX_GLOB_LIMIT = _MAX_LIMIT - 1
 """The largest ``limit`` ``VFSView.glob`` takes (it asks for ``limit + 1``)."""
 _REFETCH_FACTOR = 8
-_READDIR_BATCH = 256  # the fewest entries a paged readdir asks the server for at first
+_READDIR_BATCH = 256  # the fewest entries a paged readdir asks for after its first round
 _READDIR_MAX_BATCH = 8192  # and what that grows to, doubling each round, while it reads past hidden entries
 _NO_NODE = UUID(int=0)  # never a node id: a pin that nothing matches
 _log = logging.getLogger(__name__)
@@ -158,11 +158,12 @@ class VFSView:
             virtual = [e for e in await self._virtual_entries(target.path) if after is None or e.name > after]
             return self._readable(virtual)[:limit]
         entries: list[Entry] = []
-        batch = _READDIR_BATCH
+        batch = 0  # the first round asks for just what is wanted
         while True:
-            # At least a batch, twice as large each round, so a long run of hidden entries is few statements.
+            # After a round that met hidden entries: at least a batch, twice as large each round, so a long run
+            # of them is few statements.
             asked = None if limit is None else min(max(limit - len(entries), batch), _MAX_LIMIT)
-            batch = min(2 * batch, _READDIR_MAX_BATCH)
+            batch = min(max(2 * batch, _READDIR_BATCH), _READDIR_MAX_BATCH)
             listing = await self._mapped(self._client.readdir(_real(target), after=after, limit=asked), target)
             entries.extend(self._readable([self._entry(e, target) for e in listing]))
             if limit is None or asked is None or len(listing) < asked or len(entries) >= limit:

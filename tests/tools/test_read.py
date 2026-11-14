@@ -377,7 +377,6 @@ async def test_a_directory_over_the_cap_is_never_fetched_whole(
         return await readdir(self, path, after=after, limit=limit)
 
     monkeypatch.setattr(VFSClient, "readdir", spy)
-    monkeypatch.setattr("minifs.vfs.view._READDIR_BATCH", 1)
     small = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(max_entries=3)))
     out = await run_tool(Read, small, filePath="big", offset=9, limit=2**40)
     assert "<entries>\nf08\nf09\nf10\n\n(Showing 3 of more than 3 entries" in out and "beyond entry 12)" in out
@@ -419,11 +418,12 @@ def test_read_settings_are_checked() -> None:
         ReadSettings(max_entries=0)
     with pytest.raises(ValueError, match="read max_entries must be from 1"):
         ReadSettings(max_entries=2**31 - 1)  # a directory Read asks for one more, and the limit is an int
-    with pytest.raises(ValueError, match="read max_bytes must be from 0 to 2147483647"):
+    with pytest.raises(ValueError, match="read max_bytes must be at least 0"):
         ReadSettings(max_bytes=-1)
     with pytest.raises(ValueError, match="read instruction_bytes"):
         ReadSettings(instruction_bytes=2**31)
     ReadSettings(max_entries=2**31 - 2, instruction_bytes=2**31 - 1)
+    ReadSettings(default_limit=2**40, max_line_length=2**63, max_bytes=2**40)  # no upper bound on these three
     with pytest.raises(TypeError, match="read instruction_bytes"):
         ReadSettings(instruction_bytes=True)
 
