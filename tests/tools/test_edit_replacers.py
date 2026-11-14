@@ -524,8 +524,8 @@ def test_replace_stops_between_replacers(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_replace_stops_on_a_scan_that_would_take_tens_of_seconds() -> None:
     """Window scans whose cheap gates pass everywhere (every line equals the find's first and last lines) and
     whose block test fails late (the middle differs 1,000 lines in) are still O(n·m), tens of seconds here: the
-    search ends soon after the timeout. (Where it stops depends on the machine; the test below is the one that
-    holds each replacer to looking at the clock.)"""
+    search ends soon after the timeout. (Where it stops depends on the machine; the tests below are the ones that
+    hold each replacer to looking at the clock.)"""
     content = "x\n" * 200_000
     find = "x\n" * 1_000 + "y\n" + "x\n" * 999 + "x"
     begin = time.monotonic()
@@ -545,7 +545,24 @@ LOOPS: list[tuple[Replacer, str, str]] = [
     (new.multi_occurrence_replacer, "a" * 10_000, "a"),
 ]
 """A replacer, and an input whose lines all fail its cheap test (or, for the two that only loop over hits, all
-hit), so nothing but the clock looked at inside its loop over lines can stop it."""
+hit), so nothing but the clock looked at in a pass over the lines can stop it: for the two anchor replacers that
+is the pass that finds the last anchor's lines, which comes before their main loop."""
+
+STEPS: list[tuple[str, Replacer, str, str]] = [
+    ("block score", new.block_anchor_replacer, "a\nb\nc\n", "a\nq\nc"),
+    ("block scores", new.block_anchor_replacer, "a\nb\nc\n" * 2, "a\nq\nc"),
+    ("words in a line", new.whitespace_normalized_replacer, "a b  c d\n", "b c"),
+    ("costly find", new.whitespace_normalized_replacer, "a" * 400 + "\n", "a" * 200 + "b"),
+    ("whitespace block", new.whitespace_normalized_replacer, "x\n" * 100, "x\ny\nx"),
+    ("indentation block", new.indentation_flexible_replacer, "x\n" * 100, " x\n y\n x"),
+    ("escape block", new.escape_normalized_replacer, "x\n" * 100, "x\ny\nx"),
+    ("escapes", new.escape_normalized_replacer, "\\t" * 5_000 + "\n", "zzz"),
+    ("trimmed block", new.trimmed_boundary_replacer, "x\n" * 100, " x\ny\nx "),
+    ("context block", new.context_aware_replacer, "a\nb\nc\n" * 30, "a\nq\nc"),
+]
+"""A replacer's step that costs more than a line (a distance, a block test, a search that can be quadratic, a
+call per escape), and an input of under ``_TICK`` lines that reaches it: no tick fires, so only the look at the
+clock before that step (or, for the escapes, the ticks inside it) can stop the replacer."""
 
 
 @pytest.mark.parametrize(("replacer", "content", "find"), LOOPS, ids=[loop[0].__name__ for loop in LOOPS])
@@ -553,6 +570,16 @@ def test_each_replacer_looks_at_the_clock_in_its_loop(replacer: Replacer, conten
     """Under a deadline that has already passed, each replacer stops inside its own loop over the file (no
     ``replace`` around it to stop between replacers, and no timing: the deadline is in the past from the start);
     with none it runs to the end."""
+    stops_when_late(replacer, content, find)
+
+
+@pytest.mark.parametrize(("replacer", "content", "find"), [step[1:] for step in STEPS], ids=[s[0] for s in STEPS])
+def test_each_replacer_looks_at_the_clock_before_a_costly_step(replacer: Replacer, content: str, find: str) -> None:
+    assert content.count("\n") < new._TICK  # pyright: ignore[reportPrivateUsage]
+    stops_when_late(replacer, content, find)
+
+
+def stops_when_late(replacer: Replacer, content: str, find: str) -> None:
     for _ in replacer(content, find):  # runs to the end without a deadline
         pass
     late = new._Deadline(1.0)  # pyright: ignore[reportPrivateUsage]

@@ -201,6 +201,9 @@ MAX_SCORED_LINE_LENGTH = 200
 
 _TICK = 4096
 """Loop iterations between two looks at the clock in ``_Deadline.tick``."""
+_COSTLY_FIND = 1 << 16
+"""Haystack × needle characters past which one ``str.find`` gets its own look at the clock: under CPython's
+two-way threshold the search can cost that product, and 4,096 such lines are a whole file."""
 
 
 class ReplaceTimeout(ValueError):
@@ -426,6 +429,8 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
         if normalized_line == normalized_find:
             yield line
         elif words and len(normalized_line) > len(normalized_find):
+            if len(normalized_line) * len(normalized_find) > _COSTLY_FIND:
+                deadline.check()  # str.find on a short line can cost line × find, and a tick is 4,096 lines away
             at = normalized_line.find(normalized_find)
             if at != -1:
                 deadline.check()  # a long line: the pass over its tokens costs the line
@@ -484,7 +489,15 @@ _ESCAPE = re.compile(r"\\(n|t|r|'|\"|`|\\|\n|\$)")
 
 
 def _unescape(text: str) -> str:
-    return _ESCAPE.sub(lambda m: _ESCAPES[m.group(1)], text)
+    """``text`` with its escapes replaced, ticked per escape: a call per escape, so megabytes of them (one long
+    line, or a few thousand lines the window loop hasn't ticked for yet) are seconds of work."""
+    tick = _deadline.get().tick
+
+    def unescaped(m: re.Match[str]) -> str:
+        tick()
+        return _ESCAPES[m.group(1)]
+
+    return _ESCAPE.sub(unescaped, text)
 
 
 def escape_normalized_replacer(content: str, find: str) -> Iterator[str]:
