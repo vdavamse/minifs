@@ -3,8 +3,8 @@
 The ``reference`` section is ladderframe's matcher code as minifs shipped it before #80 (ladderframe's
 ``packages/harness/src/ladderframe/tools/edit.py``), kept here as the oracle: for random content and finds, each
 rewritten replacer must yield the same candidates in the same order, and ``replace`` the same result or error. The
-oracle is ladderframe's code with three deliberate departures (#110), marked in the code. Then the cost bounds: the
-cases that were quadratic finish in linear time, and a search that runs past ``timeout`` is a retry, from inside a
+oracle is ladderframe's code with four deliberate departures (#110, #122), marked in the code. Then the cost bounds:
+the cases that were quadratic finish in linear time, and a search that runs past ``timeout`` is a retry, from inside a
 replacer's loop too."""
 
 import math
@@ -18,7 +18,7 @@ import pytest
 
 import minifs.tools.edit as new
 from minifs.tools.deps import EditSettings, ToolSettings
-from minifs.tools.edit import EMPTY_OLD_STRING, Edit, ReplaceTimeout, timeout_message
+from minifs.tools.edit import EMPTY_OLD_STRING, MULTIPLE_MATCHES, Edit, ReplaceTimeout, timeout_message
 from tests.tools.conftest import Deps, retry_message
 
 Replacer = Callable[[str, str], Iterator[str]]
@@ -269,15 +269,18 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
         raise ValueError(EMPTY_OLD_STRING)
 
     not_found = True
-    ambiguous = False
-    for replacer in REPLACERS:
-        if ambiguous:
-            break
+    # departs from ladderframe (#110): a whitespace-only oldString may match only its exact text; the fuzzy
+    # matchers would only yield blank lines to throw away (a blank line of spaces for a tab rewrote every
+    # indentation run).
+    replacers = (simple_replacer,) if not old_string.strip() else REPLACERS
+    for replacer in replacers:
         for search in replacer(content, old_string):
-            if not search or (not old_string.strip() and search != old_string):
-                # departs from ladderframe (#110): an empty candidate is found at 0 and with replace_all inserts
-                # new_string between every character; a whitespace-only oldString matched loosely (a blank line of
-                # spaces for a tab) rewrote every indentation run; only its exact text may match.
+            # departs from ladderframe (#110, #122): an empty candidate is never a match (it is "found" at 0 and
+            # with replace_all inserts new_string between every character); with replace_all, neither is a
+            # whitespace candidate of a non-blank oldString (an escaped `\n` unescaped to a newline would replace
+            # every newline in the file). Without replace_all it may still match once (an escaped `\t` for a real
+            # tab).
+            if not search or (replace_all and search != old_string and not search.strip()):
                 continue
             index = content.find(search)
             if index == -1:
@@ -295,8 +298,7 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
                     # departs from ladderframe (#110): an ambiguous exact oldString is reported, not skipped in
                     # favour of a later fuzzy candidate elsewhere. A whole-line candidate can be the one meant, but
                     # it replaces text the model left out of oldString (its indentation, say): an error is safer.
-                    ambiguous = True
-                    break
+                    raise ValueError(MULTIPLE_MATCHES)
                 continue
             return content[:index] + new_string + content[index + len(search) :]
 
@@ -305,7 +307,7 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
             "and line endings."
         )
-    raise ValueError("Found multiple matches for oldString. Provide more surrounding context to make the match unique.")
+    raise ValueError(MULTIPLE_MATCHES)
 
 
 def _is_disproportionate_match(search: str, old_string: str) -> bool:
@@ -463,7 +465,9 @@ def test_a_blank_candidate_is_never_a_match() -> None:
     """A whitespace-only find made the fallback matchers yield blank lines (empty or spaces): an empty one was
     "found" at 0 and, with ``replace_all``, inserted the new string between every character, and a run of spaces
     rewrote every indentation run. Only the exact text of a whitespace-only find may match then; a non-blank find
-    (an escaped tab) still matches whitespace through the escape matcher."""
+    (an escaped tab) still matches whitespace through the escape matcher, but with ``replace_all`` a whitespace
+    candidate of a non-blank find is refused too: an escaped ``\\n`` unescaped to a newline would replace every
+    newline in the file (#122)."""
     blanks = [
         ("def f():\n    return 1\n\nx = 2\n", "\t", "    ", False),
         ("def f():\n    return 1\n\nx = 2\n", "\t", "    ", True),
@@ -483,6 +487,26 @@ def test_a_blank_candidate_is_never_a_match() -> None:
     # A non-blank find whose candidate is blank (an escaped tab) still matches through the escape matcher.
     for search in (new.replace, replace):
         assert search("a\tb\n", "\\t", " ") == "a b\n"
+    # The same candidate with replace_all is refused (#122): an escaped newline, unescaped to a real one, would
+    # replace every newline in the file. Without replace_all a single newline still matches once.
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match="Could not find oldString"):
+            search("a\nb\nc\n", "\\n", " ", True)
+        assert search("a\nb", "\\n", " ") == "a b"
+
+
+def test_a_whitespace_find_runs_only_the_exact_matcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A whitespace-only oldString may match only its exact text (#110), so the fuzzy matchers after the exact one
+    never run: they would only yield blank lines to throw away, which on a large file costs seconds and can end in
+    a timeout instead of "Could not find"."""
+
+    def boom(content: str, find: str) -> Iterator[str]:
+        raise AssertionError("a fuzzy matcher ran for a whitespace-only find")
+
+    monkeypatch.setattr(new, "REPLACERS", (new.simple_replacer, boom))
+    with pytest.raises(ValueError, match="Could not find oldString"):
+        new.replace("x\n\n", "\t", " ")
+    assert new.replace("x\n\t\n", "\t", " ") == "x\n \n"
 
 
 def test_an_ambiguous_exact_match_is_reported() -> None:
@@ -701,13 +725,13 @@ def test_a_timeout_after_an_ambiguous_match_says_so(monkeypatch: pytest.MonkeyPa
 
 
 def test_an_ambiguous_exact_match_fails_before_a_slow_matcher(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An ambiguous exact oldString is reported at once, without trying the later matchers until the deadline."""
-    monkeypatch.setattr(new, "REPLACERS", (new.simple_replacer, slow_replacer))
-    begin = time.monotonic()
+    """An ambiguous exact oldString is reported at once, without trying the later matchers until the deadline: had
+    the search continued past it, the slow matchers would run to the timeout, whose retry also says "Found
+    multiple matches", so the error's type is what proves the raise happens at the ambiguity."""
+    monkeypatch.setattr(new, "REPLACERS", (new.simple_replacer, slow_replacer, slow_replacer))
     with pytest.raises(ValueError, match="Found multiple matches") as caught:
-        new.replace("a\na\n", "a", "c", timeout=0.5)
+        new.replace("a\na\n", "a", "c", timeout=0.01)
     assert not isinstance(caught.value, ReplaceTimeout)
-    assert time.monotonic() - begin < 0.4
 
 
 def test_replace_stops_between_block_scores() -> None:

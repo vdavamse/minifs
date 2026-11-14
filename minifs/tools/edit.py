@@ -1,13 +1,14 @@
 """``Edit``: exact string replacement with opencode's fallback matchers (trimmed lines, block anchors, whitespace,
 indentation, escapes, ...). Keeps the file's BOM and line endings. ladderframe's ``Edit`` (``ladderframe.tools.edit``,
 which follows opencode's edit tool), over a ``VFSView``; the replacers below give ladderframe's answers (the same
-candidates in the same order, checked by ``tests/tools/test_edit_replacers.py`` against its code), except for the
-deliberate departures of #110 (a whitespace-only ``oldString`` matches only exactly, an ambiguous exact ``oldString`` is
-reported, and block anchors alone don't take the line between them), marked in the oracle; but each is at most
+candidates in the same order, checked by ``tests/tools/test_edit_replacers.py`` against its code), but each is at most
 O(n·m) in the content's and ``oldString``'s sizes, in lines and in characters (a file can be one line), where
 ladderframe's block scans were O(n²) in lines and its searches within a line O(n·m) per call that nothing could
-interrupt. ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker
-thread that can't be cancelled and holds the GIL while it works (#80).
+interrupt. ``replace`` departs from ladderframe on purpose where it edited the wrong text and reported success (#110,
+#122, marked in the oracle): a whitespace-only ``oldString`` matches only exactly, an ambiguous exact ``oldString`` is
+reported, block anchors alone don't take the line between them, and with ``replaceAll`` a whitespace candidate of a
+non-blank ``oldString`` is refused. ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole
+search runs in a worker thread that can't be cancelled and holds the GIL while it works (#80).
 
 ladderframe serialises editors of a path with a thread lock; here an edit reads the whole file and its version,
 replaces in memory, and writes back with a compare-and-swap on that version, so a concurrent writer anywhere is
@@ -567,10 +568,10 @@ def trimmed_boundary_replacer(content: str, find: str) -> Iterator[str]:
 
 def context_aware_replacer(content: str, find: str) -> Iterator[str]:
     find_lines = find.split("\n")
-    if len(find_lines) < 3:
-        return  # needs at least 3 lines to have meaningful context
     if find_lines[-1] == "":
         find_lines.pop()
+    if len(find_lines) < 3:
+        return  # needs at least 3 lines to have meaningful context
     content_lines = content.split("\n")
     wanted = [line.strip() for line in find_lines]
     first, last = wanted[0], wanted[-1]
@@ -616,6 +617,9 @@ _SEEN_BYTES = 1 << 20
 the repeats of a few candidates, bounded so a flood of distinct ones doesn't pile up in memory."""
 
 
+MULTIPLE_MATCHES = "Found multiple matches for oldString. Provide more surrounding context to make the match unique."
+
+
 def timeout_message(timeout: float, ambiguous: bool = False) -> str:
     """The retry for a ``replace`` that ran past ``timeout`` seconds; ``ambiguous`` where a candidate had been
     found by then, in more than one place (a later matcher could still have found a unique one)."""
@@ -645,18 +649,22 @@ def replace(
     deadline = _Deadline(timeout)
     token = _deadline.set(deadline)
     not_found = True
-    ambiguous = False
     try:
         seen: set[str] = set()  # a candidate already tried gave its answer: the same find, the same ambiguity
         seen_size = 0
-        for replacer in REPLACERS:
-            if ambiguous:
-                break
+        # a whitespace-only oldString may match only its exact text (#110): the fuzzy matchers would only yield
+        # blank lines to throw away, which on a large file costs seconds and can end in a timeout instead of
+        # "Could not find"
+        replacers = (simple_replacer,) if not old_string.strip() else REPLACERS
+        for replacer in replacers:
             deadline.check()
             for search in replacer(content, old_string):
                 deadline.check()  # each candidate costs two scans of the file
-                # empty, or a whitespace-only oldString matched loosely: only its exact text may match (#110)
-                if not search or (not old_string.strip() and search != old_string):
+                # an empty candidate is never a match (#110); with replaceAll, neither is a whitespace candidate
+                # of a non-blank oldString, e.g. an escaped `\n` unescaped to a newline would replace every
+                # newline in the file (#122). Without replaceAll it may still match once (an escaped `\t` for a
+                # real tab).
+                if not search or (replace_all and search != old_string and not search.strip()):
                     continue
                 if search in seen:
                     continue
@@ -680,8 +688,8 @@ def replace(
                 # on a repetitive file ran for seconds that no deadline could interrupt.
                 if content.find(search, index + 1) != -1:
                     if search == old_string:
-                        ambiguous = True  # the exact oldString is ambiguous: report it, don't fuzzy past it (#110)
-                        break
+                        # the exact oldString is ambiguous: a looser match elsewhere is not what was meant (#110)
+                        raise ValueError(MULTIPLE_MATCHES)
                     continue
                 return content[:index] + new_string + content[index + len(search) :]
     except ReplaceTimeout:
@@ -696,7 +704,7 @@ def replace(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
             "and line endings."
         )
-    raise ValueError("Found multiple matches for oldString. Provide more surrounding context to make the match unique.")
+    raise ValueError(MULTIPLE_MATCHES)
 
 
 def _is_disproportionate_match(search: str, old_string: str) -> bool:
