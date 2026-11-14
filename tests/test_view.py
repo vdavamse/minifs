@@ -813,6 +813,54 @@ async def test_pread_many(vfs: VFSClient, policy: Policy) -> None:
     assert isinstance(only, VFSError) and only.errno == "EISDIR"
 
 
+async def test_pread_page(vfs: VFSClient, policy: Policy) -> None:
+    ingestion = view(vfs, policy, "ingestion")
+    await vfs.write("/docs/guide.md", b"one\ntwo\n")
+    page = await ingestion.pread_page(
+        "/docs/guide.md",
+        4096,
+        2,
+        1,
+        1000,
+        also=[
+            ("/workspace/notes.md", 0, 1),  # denied
+            (f"/workspaces/{W2}/secret.md", 0, 1),  # outside every mount
+            ("/", 0, 1),  # a virtual directory
+            ("/docs/guide.md", 1, 3),  # readable
+        ],
+    )
+    assert page.sample.content == b"one\ntwo\n"
+    assert (page.lines.content, page.lines.first_line, page.lines.lines) == (b"two\n", 2, 2)
+    denied, outside, virtual, guide = page.also
+    expected = [
+        ("EACCES", "/workspace/notes.md"),
+        ("ENOENT", f"/workspaces/{W2}/secret.md"),
+        ("EISDIR", "/"),
+    ]
+    for error, (errno, path) in zip((denied, outside, virtual), expected, strict=True):
+        assert isinstance(error, VFSError) and (error.errno, error.path, error.detail) == (errno, path, "")
+    assert isinstance(guide, ReadResult) and guide.content == b"ne\n"
+    assert policy.denials == {}  # the also reads are speculative: their refusals aren't counted
+    page = await ingestion.pread_page(
+        "/docs/guide.md",
+        4096,
+        1,
+        10,
+        1000,
+        also=[("/workspace/notes.md", 0, 100), ("/docs/guide.md", 0, 100)],
+        groups=[0, 0],
+    )
+    denied, guide = page.also  # a read the policy refused isn't sent, so it shadows nothing in its group
+    assert isinstance(denied, VFSError) and denied.errno == "EACCES"
+    assert isinstance(guide, ReadResult) and guide.content == b"one\ntwo\n"
+    assert policy.denials == {}
+    await raises("EACCES", ingestion.pread_page("/workspace/notes.md", 4096, 1, 10, 1000), "/workspace/notes.md")
+    assert policy.denials == {("ingestion", "read"): 1}  # the file's refusal is
+    agent = view(vfs, policy)
+    await raises("EISDIR", agent.pread_page("/", 4096, 1, 10, 1000), "/")
+    await raises("ENOENT", agent.pread_page(f"/workspaces/{W2}/secret.md", 4096, 1, 10, 1000))
+
+
 async def test_grep_in_visible_paths(vfs: VFSClient, policy: Policy) -> None:
     agent = view(vfs, policy)
     await vfs.create(f"/workspaces/{W1}/src/a.py", b"x = 1\nmine = 2\n", parents=True)
