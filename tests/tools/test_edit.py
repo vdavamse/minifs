@@ -10,8 +10,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import pytest
+from psycopg import AsyncConnection
 
+import minifs.tools._text as text
 import minifs.tools.edit as edit_module
 from minifs.tools import TOOLS, Edit
 from minifs.tools.deps import EditSettings, ToolSettings
@@ -22,7 +25,7 @@ from minifs.tools.edit import (
     replace,
     trimmed_boundary_replacer,
 )
-from minifs.tools.errors import TIMED_OUT_READ, TIMED_OUT_WRITE
+from minifs.tools.errors import TIMED_OUT_EDIT_READ, TIMED_OUT_WRITE
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import FileVersion, ReadResult, VFSError
 from minifs.vfs.policy import Policy, Rule
@@ -405,7 +408,7 @@ async def test_a_read_that_times_out_says_the_read_was_slow(view: VFSView, monke
 
     monkeypatch.setattr(view, "pread_file", timing_out)
     message = await edit_retry(Deps(view), "notes.md", "mine", "ours")
-    assert message == TIMED_OUT_READ.format(path="/workspace/notes.md")
+    assert message == TIMED_OUT_EDIT_READ.format(path="/workspace/notes.md")
 
 
 async def test_a_write_that_times_out_still_says_to_write_less(view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -417,3 +420,36 @@ async def test_a_write_that_times_out_still_says_to_write_less(view: VFSView, mo
     monkeypatch.setattr(view, "write", failing)
     message = await edit_retry(Deps(view), "notes.md", "mine", "ours")
     assert message == TIMED_OUT_WRITE.format(path="/workspace/notes.md")
+
+
+async def test_a_cancelled_page_is_a_slow_read_not_a_lost_race(
+    view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real cancellation path: a ``statement_timeout`` that cancels a page of the whole-file read (57014)
+    reaches ``Edit`` as ``ReadTimedOut``, whose message says to use ``Write``, and isn't retried as a lost race
+    (``_Lost``): the file is read once."""
+    monkeypatch.setattr(text, "PAGE", 4)  # notes.md is then several pages
+    reads = 0
+    preads = 0
+    execute = AsyncConnection.execute
+
+    async def cancelling(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal preads
+        if "vfs_pread" in str(query):
+            preads += 1
+            if preads == 2:  # the 2nd page of the one read
+                raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+        return await execute(self, query, *args, **kwargs)
+
+    class Counting(VFSView):
+        async def pread_file(self, path: str, page: int, max_size: int | None = None) -> ReadResult:
+            nonlocal reads
+            reads += 1
+            return await super().pread_file(path, page, max_size)
+
+    counting = Counting(client, workspace_mounts(W1), view.policy, view.actor)
+    monkeypatch.setattr(AsyncConnection, "execute", cancelling)
+    message = await edit_retry(Deps(counting), "notes.md", "mine", "ours")
+    monkeypatch.undo()
+    assert message == TIMED_OUT_EDIT_READ.format(path="/workspace/notes.md")
+    assert (reads, preads) == (1, 2)  # one read: the timeout wasn't retried as a lost race

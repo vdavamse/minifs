@@ -596,19 +596,45 @@ async def test_a_write_that_times_out_is_a_retry_that_says_what_to_change(view: 
     assert not [e for e in await client.readdir(f"/workspaces/{W1}") if e.name == "big.txt"]
 
 
-async def test_a_read_that_times_out_is_a_slow_read_not_a_big_write(
-    view: VFSView, monkeypatch: pytest.MonkeyPatch
+async def test_a_read_that_times_out_writes_without_a_diff(
+    view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A server timeout that cancels the read of the old text says the read was slow, not that the model should
-    write less at once, which a smaller payload wouldn't change; the write's own timeout still says it."""
+    """The old text only feeds the diff, so a read of it that times out is treated like a file over the cap: the
+    write happens anyway, without a diff, and only the BOM head is read."""
 
     async def timing_out(path: str, page: int, max_size: int | None = None) -> ReadResult:
         raise VFSError("ETIMEDOUT", path)
 
     monkeypatch.setattr(view, "pread_file", timing_out)
-    message = await retry_message(Write, Deps(view), content="mine\n", filePath="notes.md")
-    assert message == TIMED_OUT_READ.format(path="/workspace/notes.md")
-    monkeypatch.undo()
+    result, meta = await write(Deps(view), "notes.md", "yours\n")
+    assert result == "Wrote file successfully."
+    assert meta == {
+        "filepath": "/workspace/notes.md",
+        "exists": True,
+        "diff": "",
+        "additions": None,
+        "deletions": None,
+    }
+    assert await content(client, "notes.md") == b"yours\n"
+
+
+async def test_a_bom_read_that_times_out_is_a_slow_read_not_a_big_write(
+    view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout of the BOM-head ``pread`` blocks the write itself: it says the read was slow, not that the model
+    should write less at once, which a smaller payload wouldn't change."""
+    await client.create(f"/workspaces/{W1}/big.txt", b"old line\n" * 50)
+
+    async def timing_out(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        raise VFSError("ETIMEDOUT", path)
+
+    monkeypatch.setattr(view, "pread", timing_out)
+    message = await retry_message(Write, capped(view), content="mine\n", filePath="big.txt")
+    assert message == TIMED_OUT_READ.format(path="/workspace/big.txt")
+
+
+async def test_a_write_that_times_out_still_says_to_write_less(view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The write's own ETIMEDOUT is still ``TIMED_OUT_WRITE``."""
 
     async def failing(path: str, data: bytes, *, expect: FileVersion | None = None) -> FileVersion:
         raise VFSError("ETIMEDOUT", path)

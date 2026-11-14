@@ -54,7 +54,7 @@ from minifs.tools._text import (
 )
 from minifs.tools.base import vfs_tool
 from minifs.tools.deps import HasVFS, resolve, settings
-from minifs.tools.errors import TIMED_OUT_READ, TIMED_OUT_WRITE, tool_error
+from minifs.tools.errors import TIMED_OUT_EDIT_READ, TIMED_OUT_WRITE, tool_error
 from minifs.vfs.core import VFSError
 from minifs.vfs.view import VFSView
 
@@ -125,7 +125,7 @@ async def edit(
         else:
             raise VFSError("ESTALE", path)
     except ReadTimedOut as e:
-        raise ModelRetry(TIMED_OUT_READ.format(path=e.path)) from None
+        raise ModelRetry(TIMED_OUT_EDIT_READ.format(path=e.path)) from None
     except VFSError as e:
         return tool_error(
             e, "write", ENOENT="File {path} not found", ENOTDIR="File {path} not found", ETIMEDOUT=TIMED_OUT_WRITE

@@ -292,10 +292,16 @@ class VFSClient:
         first page, which comes back with its ``size`` and ``eof`` False, for the caller to refuse without
         reading the rest.
 
-        No lock and no ``statement_timeout`` of its own; a server one applies to each page statement. ``page``
-        bounds what one statement holds on the server and in client memory: about 3x the page while it arrives,
-        since bytea comes as hex text. ENOENT, EISDIR; EINVAL for a ``page`` below 1 or a bad ``max_size``, as
-        ``pread``."""
+        No lock and no ``statement_timeout`` of its own; a server one applies to each page statement. The
+        connection and the snapshot are held for the whole read, so their hold time grows with the file: about
+        one round trip per page. A server ``transaction_timeout`` bounds the whole read, and
+        ``idle_in_transaction_session_timeout`` the gaps between pages; both are ETIMEDOUT, as a
+        ``statement_timeout`` on a page is. ``page`` bounds what one statement holds on the server and in client
+        memory: about 3x the page while it arrives, since bytea comes as hex text.
+
+        The walk is stored in the cache after the last page, so a rename committed while the read ran can be
+        undone by it; ``minifs.vfs.cache``'s checks make that only a slower resolution, never a wrong node.
+        ENOENT, EISDIR; EINVAL for a ``page`` below 1 or a bad ``max_size``, as ``pread``."""
         segments = split(path)
         if not segments:
             raise VFSError("EISDIR", "/")
@@ -307,14 +313,14 @@ class VFSClient:
         ref = self._ref(segments)
 
         async def more(conn: AsyncConnection[Any], rows: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
-            """The pages after the first, on the same connection and snapshot, as rows in the layout of the
-            gated ones once cut (``vfs_pread``'s columns after the ref's id, err and err_detail)."""
-            # A raw row here: the 3 walk columns, the ref's id, err and err_detail, then vfs_pread's columns
-            # (size, generation, byte_offset, data, err, err_detail), as ``pread`` reads them cut.
-            node, lookup_err, size, generation = rows[0][3], rows[0][4], rows[0][6], rows[0][7]
+            """The pages after the first, on the same connection and snapshot, as rows in the layout the hook
+            both gets and returns: the ref's id, err and err_detail, then ``vfs_pread``'s columns."""
+            # A row here is a gated one after ``_run`` cut the 3 walk columns: (id, err, err_detail, size,
+            # generation, byte_offset, data, err, err_detail), as ``pread`` reads it.
+            node, lookup_err, size, generation = rows[0][0], rows[0][1], rows[0][3], rows[0][4]
             if lookup_err is not None or rows[0][-2] is not None or node is None:
                 return []  # page 1 failed; ``_call`` reports it
-            offset = sum(len(row[9]) for row in rows if row[9] is not None)
+            offset = sum(len(row[6]) for row in rows if row[6] is not None)
             if offset >= size or (max_size is not None and size > max_size):
                 return []  # the whole file (or the page the caller refuses past) came in page 1
             extra: list[tuple[Any, ...]] = []
@@ -326,13 +332,15 @@ class VFSClient:
                 )
                 read = 0
                 for row in await cur.fetchall():
-                    assert (row[0], row[1]) == (size, generation)  # one snapshot: they can't change
+                    if (row[0], row[1]) != (size, generation):  # one snapshot: they can't change
+                        raise VFSError("EIO", normalized, "the file changed within one snapshot")
                     if row[4] is not None:  # impossible on one snapshot; never a page to drop silently
                         raise VFSError(row[4], normalized, detail=row[5] or "")
                     if row[3] is not None:
                         read += len(row[3])
                         extra.append((node, None, None, size, generation, row[2], row[3], None, None))
-                assert read > 0, "a page within the file's size read no bytes, on one snapshot"
+                if read <= 0:  # a page within the file's size read no bytes, on one snapshot
+                    raise VFSError("EIO", normalized, "its extents end before its size")
                 offset += read
             return extra
 
@@ -1152,15 +1160,19 @@ class VFSClient:
         transaction first (one more round trip; EAGAIN and ETIMEDOUT when they run out).
 
         With ``snapshot``, ``SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`` is the transaction's
-        first statement, so it and ``more`` read one snapshot (``pread_file``).
+        first statement, so it and ``more`` read one snapshot (``pread_file``). A ``write`` is refused with a
+        TypeError: the transaction can't run one.
 
         ``more`` is called inside the same transaction and connection once the query's rows are fetched, with
-        those rows (before the walk columns are cut); the rows it returns are appended to the returned ones,
-        after the cut. An error it raises, and a cancellation of a statement it runs, map as the query's own.
+        those rows after the walk columns are cut, so it sees the layout its own rows are appended in; the rows
+        it returns are appended to the returned ones. An error it raises, and a cancellation of a statement it
+        runs, map as the query's own.
 
         A query with ``refs`` starts with their ``_walks`` columns: they go to the cache (``_learn``) and are cut
         from the rows returned, which begin with the columns after them."""
 
+        if snapshot and write:
+            raise TypeError("a snapshot is read-only: it can't run a write")
         extra: list[tuple[Any, ...]] = []
 
         async def attempt() -> list[tuple[Any, ...]]:
@@ -1176,7 +1188,7 @@ class VFSClient:
                 rows = await cur.fetchall()
                 if more is not None:
                     extra.clear()  # a retried attempt starts over
-                    extra.extend(await more(conn, rows))
+                    extra.extend(await more(conn, [row[3 * len(refs) :] for row in rows]))
                 return rows
 
         try:

@@ -130,11 +130,11 @@ async def _write(vfs: VFSView, path: str, content: str, max_diff_bytes: int) -> 
 
 async def _read_old(vfs: VFSView, path: str, size: int, max_diff_bytes: int) -> tuple[bool, str | None, FileVersion]:
     """Whether the file of ``size`` bytes at ``path`` starts with a BOM, its text without it, and its version. Over
-    ``max_diff_bytes`` the text is None: only the bytes of a BOM are read."""
+    ``max_diff_bytes``, or when the read times out, the text is None: only the bytes of a BOM are read."""
     if size <= max_diff_bytes:
         try:
             data, version = await read_file(vfs, path, max_diff_bytes)
-        except TooLarge:  # grew past the cap since the stat
+        except (TooLarge, ReadTimedOut):  # grew past the cap, or too slow to read for a diff: write without one
             pass
         else:
             # The old text only feeds the diff, so an undecodable file is still overwritten.

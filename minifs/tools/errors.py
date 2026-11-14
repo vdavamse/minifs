@@ -41,11 +41,14 @@ ran too long): a retry later may succeed, so the model gets one, unlike the EIO 
 TIMED_OUT_WRITE = "Timed out on {path}. Try again; if it keeps timing out, write less at once."
 """The ETIMEDOUT message of ``Write`` and ``Edit``: a payload too big for ``write_timeout`` times out every time."""
 
-TIMED_OUT_READ = (
-    "Timed out reading {path}: it was too slow to read. Try again; if it keeps timing out, the file may be too large "
-    "to change with this tool."
+TIMED_OUT_READ = "Timed out reading {path}: the server was too slow to read it. Try again."
+"""What ``Write`` says when reading the old file timed out (``ReadTimedOut``), not the write."""
+
+TIMED_OUT_EDIT_READ = (
+    "Timed out reading {path}: the server was too slow to read it. Try again; if it keeps timing out, use the Write "
+    "tool to replace the whole file instead."
 )
-"""What ``Write`` and ``Edit`` say when reading the old file timed out (``ReadTimedOut``), not the write."""
+"""What ``Edit`` says when reading the file timed out: Write needs no read of the old text past its diff cap."""
 
 _OVERRIDABLE = frozenset(MESSAGES) | {"EINVAL"}
 
