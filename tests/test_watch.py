@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import random
 import re
 from collections.abc import AsyncIterator
 from typing import Any
@@ -17,7 +18,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.migrate import load_migrations, migrate
 from minifs.vfs.core import VFSError
-from minifs.vfs.watch import RESCAN, ConnectionFactory, Event, Subscription, Watcher
+from minifs.vfs.watch import RESCAN, ConnectionFactory, Event, Op, PathWatch, Subscription, Watcher
 from tests.test_tree import create, mkdir_p, rename, unlink
 
 
@@ -1033,3 +1034,172 @@ class Proxy:
                 await gate.wait()
                 writer.write(data)
                 await writer.drain()
+
+
+# The dispatch index
+
+
+def _random_event(rng: random.Random, pool: list[UUID]) -> Event:
+    """An event with fields drawn from ``pool`` (plus None), as forged or root-level payloads can have."""
+    ids: list[UUID | None] = [*pool, None]
+    op: Op = rng.choice(("create", "modify", "move", "delete"))
+    return Event(
+        op=op,
+        id=rng.choice(ids),
+        parent=rng.choice(ids),
+        name="".join(rng.choice("abcdefgh") for _ in range(rng.randint(1, 4))),
+        kind=rng.choice(("file", "dir")),
+        old_parent=rng.choice(ids) if op == "move" else None,
+        old_name="old" if op == "move" else None,
+    )
+
+
+def _mix(watcher: Watcher, pool: list[UUID]) -> list[Subscription]:
+    """A mix of subscriptions built in a fixed order, so two watchers' lists correspond pairwise: resolved and
+    indexed PathWatches of each shape, one unresolved, one fenced, plain ``subscribe()`` ones, and one closed
+    before any event. Seeded, so two calls with the same ``pool`` build the same mix. No database traffic: the
+    watches are put in the state ``PathWatch._open`` would leave them in, then indexed by hand."""
+    maxsize = watcher._maxsize  # pyright: ignore[reportPrivateUsage]
+    interval = watcher._rescan_interval  # pyright: ignore[reportPrivateUsage]
+    rng = random.Random(76)
+
+    def resolved(node: UUID | None, kind: str, chain: tuple[UUID, ...], *, fence: bool = False) -> PathWatch:
+        segments = [f"s{i}" for i in range(len(chain))]
+        watch = PathWatch(watcher, segments, maxsize, interval, ancestors=True, fence=fence)
+        watcher._add(watch)  # pyright: ignore[reportPrivateUsage]
+        watch.node, watch.kind, watch.chain = node, kind, chain
+        watch.ancestors = frozenset(chain[:-1])
+        watch._resolved = True  # pyright: ignore[reportPrivateUsage]
+        watcher._index(watch)  # pyright: ignore[reportPrivateUsage]
+        return watch
+
+    subs: list[Subscription] = [
+        resolved(pool[0], "file", (pool[0],)),
+        resolved(pool[1], "dir", (pool[1],)),
+        resolved(None, "dir", ()),  # the root
+    ]
+    for _ in range(2):  # watches with ancestors: chains of two or three pool ids
+        chain = tuple(rng.sample(pool, rng.choice((2, 3))))
+        subs.append(resolved(chain[-1], rng.choice(("dir", "file")), chain))
+    subs.append(resolved(pool[2], "file", (pool[3], pool[2]), fence=True))  # resolved, fence not reached
+    pending = PathWatch(watcher, ["x"], maxsize, interval)  # never resolved, so never indexed: buffers everything
+    watcher._add(pending)  # pyright: ignore[reportPrivateUsage]
+    subs.append(pending)
+    subs.append(watcher.subscribe())
+    subs.append(watcher.subscribe(lambda e: e.op in ("move", "delete")))
+    closed = watcher.subscribe()
+    closed.close()  # closed before any event
+    subs.append(closed)
+    return subs
+
+
+async def test_broadcast_reaches_the_same_subscribers_as_offering_to_all(db: str) -> None:
+    """The index only narrows who ``_offer`` is called on: over a seeded stream of random events, every
+    subscription receives exactly the events, in the order, it would receive were every event offered to every
+    subscription as before. Neither watcher is started; ``db`` only feeds the factories, so no event is lost
+    or deferred by anything but the dispatch itself (``rescan_interval=0``)."""
+    pool = [uuid4() for _ in range(6)]
+    indexed = Watcher(factory(db), rescan_interval=0)
+    naive = Watcher(factory(db), rescan_interval=0)
+    got_indexed = _mix(indexed, pool)
+    got_naive = _mix(naive, pool)
+    rng = random.Random(76)
+    events = [RESCAN if rng.random() < 0.05 else _random_event(rng, pool) for _ in range(2000)]
+    for event in events:
+        indexed._broadcast(event, now=True)  # pyright: ignore[reportPrivateUsage]
+        for subscription in list(naive._subscriptions):  # pyright: ignore[reportPrivateUsage]
+            try:  # the old loop, inline: the same offer, and the same rescue of a failed predicate
+                subscription._offer(event, now=True)  # pyright: ignore[reportPrivateUsage]
+            except Exception:
+                subscription._offer(RESCAN, now=True)  # pyright: ignore[reportPrivateUsage]
+    # Not vacuous: subscriptions did receive events.
+    assert any(sub._events for sub in got_indexed)  # pyright: ignore[reportPrivateUsage]
+    for a, b in zip(got_indexed, got_naive, strict=True):
+        assert list(a._events) == list(b._events)  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_broadcast_skips_unrelated_watches(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a thousand indexed file watches, a modify of one node is offered only to the watches the index
+    selects: ``matches`` runs a handful of times, not once per watch."""
+    watcher = Watcher(factory(db), rescan_interval=0)
+    maxsize = watcher._maxsize  # pyright: ignore[reportPrivateUsage]
+    interval = watcher._rescan_interval  # pyright: ignore[reportPrivateUsage]
+    node = uuid4()
+    watches: list[PathWatch] = []
+    for i in range(1001):
+        watch = PathWatch(watcher, ["f"], maxsize, interval)
+        watcher._add(watch)  # pyright: ignore[reportPrivateUsage]
+        watched = node if i == 0 else uuid4()
+        watch.node, watch.kind, watch.chain = watched, "file", (watched,)
+        watch._resolved = True  # pyright: ignore[reportPrivateUsage]
+        watcher._index(watch)  # pyright: ignore[reportPrivateUsage]
+        watches.append(watch)
+    calls = 0
+    matches = PathWatch.matches
+
+    def counting(self: PathWatch, event: Event) -> bool:
+        nonlocal calls
+        calls += 1
+        return matches(self, event)
+
+    monkeypatch.setattr(PathWatch, "matches", counting)
+    event = Event("modify", id=node, parent=None, name="f")
+    watcher._broadcast(event)  # pyright: ignore[reportPrivateUsage]
+    assert list(watches[0]._events) == [event]  # pyright: ignore[reportPrivateUsage]
+    # The target's own matches; nowhere near the ~1,000 an offer to all would run.
+    assert calls <= 3
+
+
+async def test_closed_watches_leave_the_index(conn: AsyncConnection, db: str, watcher: Watcher) -> None:
+    """Indexed, fenced, and never resolved (a lookup that raised): closing a watch removes it from every
+    structure, with no empty sets left behind, and ``aclose`` clears all of them."""
+    d = await mkdir_p(conn, "d")
+    assert d is not None
+    await create(conn, d, "f")
+    await catch_up(watcher, conn)
+    async with (
+        watcher.watch("/d"),
+        watcher._watch("/d/f", ancestors=True, fence=True),  # pyright: ignore[reportPrivateUsage]
+    ):
+        assert watcher._by_id and watcher._by_parent  # pyright: ignore[reportPrivateUsage]
+        assert not watcher._unindexed  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(VFSError):  # a lookup that raises: the watch is closed never having been indexed
+        async with watcher.watch("/missing"):
+            pass
+    assert watcher._subscriptions == set()  # pyright: ignore[reportPrivateUsage]
+    assert watcher._unindexed == set()  # pyright: ignore[reportPrivateUsage]
+    assert watcher._by_id == {} and watcher._by_parent == {}  # pyright: ignore[reportPrivateUsage]
+
+    other = Watcher(factory(db))
+    await other.start()
+    other.subscribe()
+    async with other.watch("/d"):
+        await other.aclose()  # with subscriptions open; exiting the block closes the watch on the cleared index
+    assert other._subscriptions == set()  # pyright: ignore[reportPrivateUsage]
+    assert other._unindexed == set()  # pyright: ignore[reportPrivateUsage]
+    assert other._by_id == {} and other._by_parent == {}  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_an_indexed_watch_still_sees_its_events_end_to_end(conn: AsyncConnection, watcher: Watcher) -> None:
+    """Through the real pipeline: a directory watch sees a child's create, a file watch its own modify, and a
+    watch with ``ancestors`` the move of a directory above it."""
+    p = await mkdir_p(conn, "p")
+    d = await mkdir_p(conn, "p", "d")
+    assert p is not None and d is not None
+    f = await create(conn, d, "f")
+    await catch_up(watcher, conn)
+    async with (
+        watcher.watch("/p/d") as dir_events,
+        watcher.watch("/p/d/f") as file_events,
+        watcher._watch("/p/d/f", ancestors=True) as heir_events,  # pyright: ignore[reportPrivateUsage]
+    ):
+        x = await create(conn, d, "x")
+        assert await next_event(dir_events) == Event("create", id=x, parent=d, name="x", kind="file")
+        await append(conn, f, 10)
+        modified = Event("modify", id=f, parent=d, name="f", size=10, generation=0)
+        assert await next_event(file_events) == modified
+        assert await next_event(dir_events) == modified  # a directory sees its child's modify too
+        assert await next_event(heir_events) == modified
+        assert await rename(conn, p, None, "p2")  # the watched path changes; the watches follow their nodes
+        moved = Event("move", id=p, parent=None, name="p2", kind="dir", old_parent=None, old_name="p")
+        assert await next_event(heir_events) == moved
