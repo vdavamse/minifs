@@ -417,11 +417,10 @@ class VFSClient:
         )
         first = found[0]
         if isinstance(first, VFSError):
-            if first.errno in ("ENOENT", "ENOTDIR"):
-                ref = self._ref(segments)  # a fully cached path to a file that is gone: evict its stale links,
-                if ref.cached is not None:  # as _outcome does for pread, so a retry doesn't reuse them
-                    await self._await_eviction([ref])
-            raise first  # the file's outcome raises, at its normalized path; the walks were stored (_pread_rows)
+            # The file's outcome raises, at its normalized path; the walks were stored (_pread_rows). A fully cached
+            # path to a file that is gone has its stale links evicted, as for pread, so a retry doesn't reuse them.
+            await self._outcome(normalized, [self._ref(segments)], (first.errno, first.detail))
+            raise first  # not reached: _outcome raised it
         assert l_row is not None
         size, generation, lines, _, start, content, end, cut, err, detail = l_row
         if err is not None:

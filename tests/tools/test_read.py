@@ -942,13 +942,12 @@ async def test_a_read_holds_one_connection(client: VFSClient, view: VFSView, mon
     assert peak == 1  # the sample, the first batch and the instruction files are one statement
 
 
-async def test_instruction_lookups_that_find_a_directory_or_fail(
+async def test_instruction_lookups_that_find_a_directory_or_fail_with_the_read(
     client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An AGENTS.md directory falls through to CLAUDE.md, as ladderframe's ``is_file``. A statement that fails
-    (EIO, ETIMEDOUT) while it carries the instruction lookups is sent again without them, and the Read goes on
-    without instructions, as when the lookups were a statement of their own: it never picks another name, which
-    could attach a file ladderframe never would. A failure of the file itself still fails the Read."""
+    """An AGENTS.md directory falls through to CLAUDE.md, as ladderframe's ``is_file``; a statement that fails
+    (EIO) fails the Read: the lookups share its statement, and picking another name then could attach a file
+    ladderframe never would."""
     await put(client, "/workspace/a/CLAUDE.md", b"from a")
     await client.mkdir(f"{WS}/a/b/AGENTS.md", parents=True)
     await put(client, "/workspace/a/b/CLAUDE.md", b"from b")
@@ -958,19 +957,6 @@ async def test_instruction_lookups_that_find_a_directory_or_fail(
         "<system-reminder>\nInstructions from: /workspace/a/b/CLAUDE.md\nfrom b\n\n"
         "Instructions from: /workspace/a/CLAUDE.md\nfrom a\n</system-reminder>"
     )
-    real = view.pread_page
-    sent: list[int] = []
-
-    async def failing_lookups(*args: Any, **kwargs: Any) -> PageRead:
-        sent.append(len(kwargs.get("also", ())))
-        if kwargs.get("also"):
-            raise VFSError("EIO", args[0], "database error")
-        return await real(*args, **kwargs)
-
-    monkeypatch.setattr(view, "pread_page", failing_lookups)
-    out = await run_tool(Read, Deps(view), filePath="a/b/f.txt")
-    assert "1: x" in out and "Instructions from" not in out, out
-    assert sent[0] > 0 and sent[1:] == [0], sent  # sent again once, without the lookups
 
     async def failing(*args: Any, **kwargs: Any) -> PageRead:
         raise VFSError("EIO", args[0], "database error")
