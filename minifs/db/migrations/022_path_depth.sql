@@ -20,9 +20,9 @@
 -- anyway, so only raw SQL can get over the cap.
 --
 -- Deploying: unlike 016, this migration applies on a tree that already has deeper nodes: a deep node can
--- still be moved up by id (a move that doesn't go deeper never scans the subtree), read by id and removed;
--- only the paths that name it are refused, as the lookups refuse them anyway. Find the nodes deeper than the
--- cap with
+-- still be moved up by id (a move that doesn't go deeper never scans the subtree), renamed in its directory,
+-- read by id and removed; only the paths that name it are refused, as the lookups refuse them anyway. Find
+-- the nodes deeper than the cap with
 --
 --   WITH RECURSIVE t(id, depth) AS (
 --       SELECT n.id, 1 FROM vfs_nodes n WHERE n.parent_id IS NULL
@@ -39,20 +39,22 @@
 CREATE FUNCTION vfs_max_components() RETURNS int LANGUAGE sql IMMUTABLE PARALLEL SAFE RETURN 1024;
 
 
--- The number of nodes from p_node up to the root, p_node included; 0 for NULL (the root). Walks parent_id
--- without locks and stops at p_limit + 1, so a cycle or an over-deep chain returns p_limit + 1: callers pass
--- the cap and read that as "over the cap, exact depth unknown".
+-- The number of nodes from p_node up to the root, p_node included; 0 for the root. Walks parent_id without
+-- locks and stops past p_limit, clamped to the cap, so a cycle or an over-deep chain returns that limit + 1:
+-- callers pass the cap and read that as "over the cap, exact depth unknown". Never more than cap + 1 probes,
+-- whatever the caller passes; a NULL p_limit is the cap.
 CREATE FUNCTION vfs_depth(p_node uuid, p_limit int) RETURNS int
 LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $$
 DECLARE
     v_id uuid := p_node;
     v_up uuid;
     v_depth int := 0;
+    v_limit int := least(coalesce(p_limit, vfs_max_components()), vfs_max_components());
 BEGIN
     WHILE v_id IS NOT NULL LOOP
         v_depth := v_depth + 1;
-        IF v_depth > p_limit THEN
-            RETURN p_limit + 1;
+        IF v_depth > v_limit THEN
+            RETURN v_limit + 1;
         END IF;
         SELECT n.parent_id INTO v_up FROM vfs_nodes n WHERE n.id = v_id;
         v_id := v_up;
@@ -63,8 +65,8 @@ END $$;
 
 -- Whether following parent_id from p_node loops, by Floyd's tortoise and hare: slow moves one step and fast
 -- two, and they meet only in a cycle; reaching NULL, or a missing row, ends the walk with false. No arrays,
--- no recursion, no locks: O(depth) probes. Only the rare vfs_rename whose (locking) ancestor walk went over
--- the cap pays for it.
+-- no recursion, no locks: O(depth) probes. Only the rare vfs_rename whose ancestor walk went over the cap
+-- pays for it.
 CREATE FUNCTION vfs_ancestors_cycle(p_node uuid) RETURNS boolean
 LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $$
 DECLARE
@@ -231,19 +233,21 @@ END $$;
 -- ENAMETOOLONG for a bad name and, since 022, for the depth cap: a destination deeper than vfs_max_components(),
 -- a move that would land p_node over it, or, for a directory that moves deeper, a subtree that would go over it.
 --
--- Cycles: a directory's move locks every ancestor of the destination FOR KEY SHARE while it checks them (a file's
--- move walks them without locks, to count the destination's depth (022)). A concurrent move of one of those ancestors needs FOR
--- UPDATE on it, so the two moves are ordered (or, if they lock in opposite orders, one gets a deadlock error),
--- and the later one sees the earlier one's result. Under REPEATABLE READ, locking an ancestor that moved after
--- the snapshot raises a serialization failure instead. The walk locks only directories, so it never waits on a
--- file's inode lock (appends hold it FOR UPDATE). A walk that goes over the cap stops there: a real cycle
--- (vfs_ancestors_cycle) is still EINVAL, and a chain merely deeper than the cap is ENAMETOOLONG, not the false
--- cycle the old 10,000-step guess reported.
+-- Cycles: a directory's move locks every ancestor of the destination FOR KEY SHARE while it checks them. A
+-- concurrent move of one of those ancestors needs FOR UPDATE on it, so the two moves are ordered (or, if they
+-- lock in opposite orders, one gets a deadlock error), and the later one sees the earlier one's result. Under
+-- REPEATABLE READ, locking an ancestor that moved after the snapshot raises a serialization failure instead.
+-- The walk locks only directories, so it never waits on a file's inode lock (appends hold it FOR UPDATE). A
+-- file's move walks the ancestors too since 022, without locks, only to count the destination's depth (one
+-- probe per level). A walk that goes over the cap stops there: a real cycle (vfs_ancestors_cycle) is still
+-- EINVAL, and a chain merely deeper than the cap is ENAMETOOLONG, not the false cycle the old 10,000-step
+-- guess reported; a rename that keeps the parent doesn't change any depth, so it isn't refused for one.
 --
--- The subtree check of a directory that moves deeper reads the descendants without locking them, so it is best
--- effort: a concurrent mkdir inside the moved subtree can slip one over the cap; so is a file's depth check. The
--- scan reads every directory of the subtree down to the room left, so moving a wide tree deeper costs more. Moving sideways or up never
--- scans the subtree, so an over-deep legacy subtree can always be moved up.
+-- The subtree check of a directory that moves deeper reads the descendants without locking them, so it is
+-- best effort: a concurrent mkdir inside the moved subtree can slip one over the cap; so is a file's depth
+-- check. The scan reads every directory of the subtree down to the room left, so moving a wide tree deeper
+-- costs more. Moving sideways or up never scans the subtree, so an over-deep legacy subtree can always be
+-- moved up.
 CREATE OR REPLACE FUNCTION vfs_rename(p_node uuid, p_new_parent uuid, p_new_name text, p_expect_parent uuid DEFAULT NULL)
 RETURNS TABLE (err text, err_detail text) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
@@ -279,9 +283,11 @@ BEGIN
     END IF;
     -- Walk the destination's ancestors, for every kind (022), counting the destination's depth (the root is 0).
     -- A directory's move locks each one FOR KEY SHARE, as before, for the cycle check. A file can't close a
-    -- cycle, so its walk takes no locks, as before: renames of files (Maildir claims) don't lock every ancestor
-    -- up to the root, and their depth check is best effort, like the subtree check below. A walk over the cap
-    -- stops: a real cycle is EINVAL as before, a chain merely deeper than the cap is ENAMETOOLONG.
+    -- cycle, so its walk (new in 022, only to count the depth) takes no locks: renames of files (Maildir claims)
+    -- still don't lock the ancestors or wait on them. It costs one probe per level, and its depth check is best
+    -- effort, like the subtree check below. A walk over the cap stops: a real cycle is EINVAL as before; a
+    -- rename that keeps the parent changes no depth and goes on (the old parent passed the same walk); anything
+    -- else is a destination merely deeper than the cap, ENAMETOOLONG.
     v_up := p_new_parent;
     WHILE v_up IS NOT NULL LOOP
         IF v_up = p_node THEN
@@ -292,6 +298,7 @@ BEGIN
             IF vfs_ancestors_cycle(p_new_parent) THEN
                 PERFORM vfs_raise('EINVAL', format('the ancestors of %s form a cycle', p_new_parent));
             END IF;
+            EXIT WHEN v_parent IS NOT DISTINCT FROM p_new_parent;
             PERFORM vfs_raise('ENAMETOOLONG',
                               format('%s is deeper than %s levels', p_new_parent, vfs_max_components()));
         END IF;
@@ -301,7 +308,7 @@ BEGIN
             SELECT n.parent_id INTO v_up FROM vfs_nodes n WHERE n.id = v_up;
         END IF;
     END LOOP;
-    IF v_depth + 1 > vfs_max_components() THEN
+    IF v_parent IS DISTINCT FROM p_new_parent AND v_depth + 1 > vfs_max_components() THEN
         PERFORM vfs_raise('ENAMETOOLONG', format('%s would be %s levels deep, over the %s limit',
                                                  p_node, v_depth + 1, vfs_max_components()));
     END IF;
@@ -310,8 +317,8 @@ BEGIN
     -- over-deep region is a move up and is never scanned, even when its subtree stays over the cap. v_room is
     -- the deepest relative level allowed below p_node, p_node itself at level 0: the scan (directories only, no
     -- locks on the descendants; it reads every directory of the subtree down to v_room) looks for any child,
-    -- file or directory, of a directory at level v_room.
-    IF v_kind = 'dir' THEN
+    -- file or directory, of a directory at level v_room. A rename that keeps the parent can't go deeper.
+    IF v_kind = 'dir' AND v_parent IS DISTINCT FROM p_new_parent THEN
         v_old := vfs_depth(v_parent, vfs_max_components());
         IF v_depth > v_old THEN
             v_room := vfs_max_components() - v_depth - 1;

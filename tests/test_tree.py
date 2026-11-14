@@ -1114,6 +1114,25 @@ async def test_rename_still_reports_a_real_cycle_as_einval(conn: AsyncConnection
         await rename(conn, z, x, "z")
     assert errno_name(info.value) == "EINVAL"  # not ENAMETOOLONG: the walk that never ends is a cycle
     assert "cycle" in (info.value.diag.message_detail or "")
+    # A file's walk (lock-free) tells the cycle apart too.
+    with pytest.raises(psycopg.Error) as info:
+        await rename(conn, await create(conn, None, "f"), x, "f")
+    assert errno_name(info.value) == "EINVAL" and "cycle" in (info.value.diag.message_detail or "")
+
+
+async def test_a_file_rename_does_not_lock_the_ancestors(db: str) -> None:
+    """A file's move walks the destination's ancestors only to count its depth (022), without locks: a Maildir
+    claim doesn't queue behind another session holding an ancestor FOR UPDATE (a move of it, in progress)."""
+    async with (
+        await AsyncConnection.connect(db, autocommit=True) as setup,
+        await AsyncConnection.connect(db, autocommit=True) as mover,
+    ):
+        c = await mkdir_p(setup, "a", "b", "c")
+        f = await create(setup, None, "f")
+        assert c is not None
+        async with holding_the_lock(db, "/a"):
+            await mover.execute("SET statement_timeout = '3s'")
+            assert await rename(mover, f, c, "f")
 
 
 async def test_a_legacy_tree_deeper_than_the_cap(conn: AsyncConnection) -> None:
@@ -1149,6 +1168,17 @@ async def test_a_legacy_tree_deeper_than_the_cap(conn: AsyncConnection) -> None:
         await rename(conn, z, deepest, "z")  # the destination is too deep, not a cycle
     assert errno_name(info.value) == "ENAMETOOLONG"
     assert "deeper than" in (info.value.diag.message_detail or "")
+    # A file's walk (lock-free) is refused the same way, not reported as a cycle.
+    f = await create(conn, None, "f")
+    with pytest.raises(psycopg.Error) as info:
+        await rename(conn, f, deepest, "f")
+    assert errno_name(info.value) == "ENAMETOOLONG" and "deeper than" in (info.value.diag.message_detail or "")
+    # A rename that keeps the parent changes no depth: allowed in an over-deep directory, a no-op too, for a file
+    # (created by id, which isn't depth-checked) and for the directory itself.
+    g = await create(conn, deepest, "g")
+    assert await rename(conn, g, deepest, "h")
+    assert await rename(conn, g, deepest, "h")
+    assert await rename(conn, deepest, await dir_at(1099), "d")
     # A partial repair, out of the over-deep region: the directory at depth 1050 moves under the one at 1000.
     # Its old parent is past the cap, so the move is up and isn't scanned, though its subtree is still too deep.
     assert await rename(conn, await dir_at(1050), await dir_at(1000), "up")  # the deepest is now at 1051
