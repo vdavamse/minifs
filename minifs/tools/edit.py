@@ -393,10 +393,13 @@ def _words_in_line(line: str, at: int, words: list[str]) -> str:
     such offset. What ladderframe's ``re.search(r"\\s+".join(map(re.escape, words)), line)`` matched: the pattern
     takes whole whitespace runs between the words, so its matches are the occurrences of the join in the normalised
     line, in the same order, and the leftmost of one is the leftmost of the other. That search restarted at every
-    character of the line, O(line × words) in one call; this is one pass over the line's tokens."""
+    character of the line, O(line × words) in one call; this is one pass over the line's tokens, ticked: on a
+    line of megabytes the pass is seconds of work."""
     tokens = re.finditer(r"\S+", line)
     token_at = 0  # the offset of `token` in the normalised line
+    tick = _deadline.get().tick
     for token in tokens:
+        tick()
         size = token.end() - token.start()
         if at < token_at + size:
             start = token.start() + at - token_at
@@ -509,7 +512,11 @@ def escape_normalized_replacer(content: str, find: str) -> Iterator[str]:
 
 
 def multi_occurrence_replacer(content: str, find: str) -> Iterator[str]:
-    """Every exact match, so `replace` can decide between unique and `replaceAll`."""
+    """Every exact match, so `replace` can decide between unique and `replaceAll`. None for an empty ``find``
+    (``replace`` never passes one): it matches at every offset without advancing, so ladderframe's loop never
+    ended."""
+    if not find:
+        return
     start = 0
     tick = _deadline.get().tick
     while (index := content.find(find, start)) != -1:

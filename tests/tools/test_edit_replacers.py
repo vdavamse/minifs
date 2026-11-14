@@ -11,6 +11,7 @@ import random
 import re
 import time
 from collections.abc import Callable, Iterator
+from itertools import islice
 
 import pytest
 
@@ -563,6 +564,31 @@ def test_each_replacer_looks_at_the_clock_in_its_loop(replacer: Replacer, conten
                 pass
     finally:
         new._deadline.reset(token)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_pass_over_a_long_lines_words_looks_at_the_clock() -> None:
+    """A find whose words are at the end of one line of megabytes (``"a " * 5_000_000 + "b c"``, find ``"b  c"``):
+    the pass over that line's tokens is seconds of work, which ran after the replacer's last look at the clock.
+    Under a deadline already passed it stops inside the pass; with none it gives the words' text."""
+    line = "a " * 10_000 + "b \t c"
+    assert new._words_in_line(line, 20_000, ["b", "c"]) == "b \t c"  # pyright: ignore[reportPrivateUsage]
+    late = new._Deadline(1.0)  # pyright: ignore[reportPrivateUsage]
+    late.at = time.monotonic() - 1
+    token = new._deadline.set(late)  # pyright: ignore[reportPrivateUsage]
+    try:
+        with pytest.raises(ReplaceTimeout, match=re.escape(timeout_message(1.0))):
+            new._words_in_line(line, 20_000, ["b", "c"])  # pyright: ignore[reportPrivateUsage]
+    finally:
+        new._deadline.reset(token)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_multi_occurrence_replacer_gives_nothing_for_an_empty_find() -> None:
+    """An empty find matches at every offset and the search never advanced past it, so the generator never ended
+    (``replace`` rejects an empty oldString before any replacer; a direct caller looped forever). ``islice``, so a
+    regression fails instead of hanging."""
+    assert list(islice(new.multi_occurrence_replacer("abc", ""), 5)) == []
+    assert list(islice(new.multi_occurrence_replacer("", ""), 5)) == []
+    assert list(islice(new.multi_occurrence_replacer("abab", "ab"), 5)) == ["ab", "ab"]
 
 
 def test_a_timeout_after_an_ambiguous_match_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
