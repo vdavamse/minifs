@@ -388,7 +388,14 @@ class VFSClient:
                             return error, None, []  # committed, not rolled back: nothing failed on the server
                         root = node
                     matches = await globbing.glob(
-                        conn, root, pattern, excludes=excludes, hidden=hidden, limit=limit, max_nodes=max_nodes
+                        conn,
+                        root,
+                        pattern,
+                        excludes=excludes,
+                        hidden=hidden,
+                        limit=limit,
+                        max_nodes=max_nodes,
+                        root_path=join(*segments),
                     )
                 except psycopg.errors.QueryCanceled:
                     raise searching.timed_out() from None

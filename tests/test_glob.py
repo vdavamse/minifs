@@ -698,6 +698,9 @@ async def test_bad_root(conn: AsyncConnection) -> None:
         # Returned by vfs_glob, not raised.
         assert (info.value.errno, info.value.path, info.value.db_error) == (errno, str(root), None)
         assert info.value.detail
+        with pytest.raises(VFSError) as info:
+            await glob(conn, root, "*", root_path="/some/dir")
+        assert (info.value.errno, info.value.path) == (errno, "/some/dir")
 
 
 async def test_classes_on_non_ascii_names(db_any_locale: str) -> None:

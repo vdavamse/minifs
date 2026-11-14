@@ -129,6 +129,7 @@ async def glob(
     limit: int | None = None,
     hints: bool = True,
     max_nodes: int | None = None,
+    root_path: str | None = None,
 ) -> list[GlobMatch]:
     """The files below directory ``root`` (None: ``/``) that match ``pattern``, newest first, as ``vfs_glob``
     returns them. ``.git`` directories are never walked. Without ``hints`` it walks the whole tree (for tests).
@@ -137,8 +138,9 @@ async def glob(
     match, see ``vfs_glob`` (migration 019). A wider one raises ``WalkTooWide`` and returns nothing, since a
     partial walk can't say which files are the newest.
 
-    Raises GlobError for a bad pattern, and ``VFSError`` ENOENT / ENOTDIR for a bad ``root`` (with the root's id
-    as its path).
+    Raises GlobError for a bad pattern, and ``VFSError`` ENOENT / ENOTDIR for a bad ``root``, reported at
+    ``root_path``, the path the caller resolved ``root`` from (without it, at the root's id: not a path, so pass
+    it wherever the error may be shown).
     """
     if limit is not None and limit < 0:
         raise ValueError(f"limit must not be negative, got {limit}")
@@ -168,7 +170,7 @@ async def glob(
         assert max_nodes is not None
         raise WalkTooWide(max_nodes)
     if rows and rows[0][4] is not None:
-        raise VFSError(rows[0][4], str(root), detail=rows[0][5] or "")
+        raise VFSError(rows[0][4], str(root) if root_path is None else root_path, detail=rows[0][5] or "")
     return [GlobMatch(*row[:4]) for row in rows]
 
 
