@@ -279,7 +279,7 @@ The tools follow opencode's file-tool contracts (which Claude Code's resemble): 
 
 **Write** creates the file (and missing parents) or replaces it as a new generation. It stats the file and reads the old text for the diff, then writes with a compare-and-swap. A lost race (the file changed, appeared or vanished in between) starts over once; a second loss is the retry `<path> was modified since it was read. Read it again before writing.` An existing UTF-8 BOM is kept. The metadata carries a unified diff and the added and deleted line counts. Old files over 1 MB aren't read or diffed. The diff runs in a worker thread so a large one doesn't stall the event loop.
 
-**Edit** reads the whole file with its version, replaces in Python with opencode's fallback replacers (exact, line-trimmed, block-anchored, whitespace- and indentation-flexible, and so on), and writes with a compare-and-swap. A lost race redoes the whole read-replace-write once. Files must be strict UTF-8 and at most 10 MB. The file's line endings and BOM are kept. An empty `oldString` creates a file. `Write` and `Edit` are `sequential` tools, so pydantic-ai runs nothing alongside them in the same response.
+**Edit** reads the whole file with its version, replaces in Python with opencode's fallback replacers (exact, line-trimmed, block-anchored, whitespace- and indentation-flexible, and so on), and writes with a compare-and-swap. A lost race redoes the whole read-replace-write once. Files must be strict UTF-8 and at most 10 MB. The search for `oldString` has a deadline (`EditSettings.timeout`, 10 seconds by default): the fuzzy replacers are linear in ordinary files but a large, repetitive one can still cost seconds, and past the deadline the model gets a retry that asks for the exact text. The file's line endings and BOM are kept. An empty `oldString` creates a file. `Write` and `Edit` are `sequential` tools, so pydantic-ai runs nothing alongside them in the same response.
 
 **Glob and Grep** are described above. Output: one absolute path per line for `Glob`, newest first; `Found N matches`, then hits grouped by file as `  Line N: text`, for `Grep`. Both return `No files found` when nothing matches, and a truncation footer past 100 results.
 
@@ -288,7 +288,7 @@ The tools follow opencode's file-tool contracts (which Claude Code's resemble): 
 **Where the tools differ from disk-based implementations of the same contracts:**
 - The view's policy is the only permission gate.
 - Writes are compare-and-swap checked in the database, not a per-path lock in one process.
-- `Edit` has a 10 MB cap, and `Write` skips the diff of an old file over 1 MB.
+- `Edit` has a 10 MB cap and a 10 second deadline on the search for `oldString`, and `Write` skips the diff of an old file over 1 MB.
 - There's no `.gitignore`: a default exclude list of unambiguous caches applies instead, configurable in `ToolSettings`.
 - `Glob` returns newest first, `Grep` by path then line, so results don't vary between runs.
 - Files that aren't UTF-8 aren't searched.
