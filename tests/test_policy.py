@@ -182,16 +182,19 @@ def test_a_negated_empty_range_matches_a_newline() -> None:
         assert not policy.allows("agent", "write", hidden), ascii(hidden)
 
 
-def _best_of(call: Callable[[], bool], runs: int = 5) -> tuple[bool, float]:
-    """``call()``'s answer and its fastest time over ``runs`` runs, so a preempted runner or a GC pause in one run
-    can't fail a timing bound."""
-    times: list[float] = []
+def _best_of(call: Callable[[], bool], runs: int = 5, bound: float = 0.05) -> tuple[bool, float]:
+    """``call()``'s answer and its fastest time over up to ``runs`` runs, so a preempted runner or a GC pause in one
+    run can't fail a timing bound. It stops at the first run under ``bound``, and after a run ten times over it
+    (backtracking, not noise), so a regression fails in one slow run instead of five."""
+    best = float("inf")
     answer = False
     for _ in range(runs):
         started = time.perf_counter()
         answer = call()
-        times.append(time.perf_counter() - started)
-    return answer, min(times)
+        best = min(best, time.perf_counter() - started)
+        if best < bound or best > 10 * bound:
+            break
+    return answer, best
 
 
 def test_deep_paths_dont_backtrack_across_segments() -> None:
@@ -307,23 +310,30 @@ def test_star_and_globstar_heavy_rules_agree_with_the_reference_matcher() -> Non
     as on near misses (#142)."""
     rng = random.Random(142)
     tokens = [*TOKENS, *(["*"] * 6), "a", "b", FW_SOLIDUS]
-    names = [*NAMES, "a", "b", "ab", FW_SOLIDUS, "x"]
-    checks = globstars = 0
+    # A small alphabet, so deep paths often match, and no control characters, which Rule.matches refuses.
+    names = ["a", "b", "ab", "A", FW_SOLIDUS, "x", SHARP_S]
+    checks = globstars = deep_matches = 0
     while checks < 20_000:
         segments = [
             "**" if rng.random() < 0.35 else "".join(rng.choice(tokens) for _ in range(rng.randint(1, 4)))
             for _ in range(rng.randint(1, 6))
         ]
         pattern = "/" + "/".join(segments)
-        globstars += segments.count("**") >= 2
-        for rule in _rules_for(pattern):
+        several = segments.count("**") >= 2
+        globstars += several
+        rules: list[Rule] = []
+        variants: tuple[tuple[Action, ...], ...] = ((), ("read",))  # Rule.matches ignores the actions: one grant
+        for actions in variants:
+            with contextlib.suppress(ValueError):
+                rules.append(Rule(pattern, *actions))
+        for rule in rules:
             for _ in range(20):
                 path = "/" + "/".join(
-                    "".join(rng.choice(names) for _ in range(rng.randint(1, 3))) for _ in range(rng.randint(0, 7))
+                    "".join(rng.choice(names) for _ in range(rng.randint(1, 2))) for _ in range(rng.randint(0, 7))
                 )
-                if CONTROL_CHARACTERS.search(path):
-                    continue
                 want = _matches_by_rests(rule, split_trusted(path))
                 assert rule.matches(path) == want, f"pattern {ascii(rule.pattern)} on path {ascii(path)}: rests {want}"
                 checks += 1
+                deep_matches += several and want
+    assert deep_matches >= 500, deep_matches  # matches through two or more **, where a middle ** must stop right
     assert globstars >= 100, globstars  # enough patterns with two or more ** to exercise the atomic lazy groups
