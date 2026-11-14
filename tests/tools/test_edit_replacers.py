@@ -311,7 +311,8 @@ def _substitute(content: str, search: str, index: int, new_string: str, model_cr
     unless ``new_string`` already ends in ``\r``, the next occurrence being replaced starts right there, or the
     candidate's run of trailing ``\r`` is no longer than ``model_crs``, the run the model's oldString ends with
     (only CRs beyond what the model wrote are the file's). START: a candidate starting with ``\n`` preceded by a
-    ``\r`` no previous replaced span claimed takes that ``\r`` into the span."""
+    ``\r`` no previous replaced span claimed takes that ``\r`` into the span, unless the candidate ends in the
+    model's own ``\r``."""
     if not search.endswith("\r") and not search.startswith("\n"):  # neither rule can fire
         if replace_all:
             return content.replace(search, new_string)
@@ -327,9 +328,11 @@ def _substitute(content: str, search: str, index: int, new_string: str, model_cr
 
     pieces: list[str] = []
     cursor = previous_end = 0  # previous_end: the end of the previous replaced span, for the START rule
+    # START not while the candidate ends in the model's own "\r": the "\r" before the span pairs with the "\n" after it
+    start_cr = search.startswith("\n") and (end_cr or not search.endswith("\r"))
     for k, s in enumerate(starts):
         e = s + size
-        if search.startswith("\n") and s > 0 and content[s - 1] == "\r" and s - 1 >= previous_end:
+        if start_cr and s > 0 and content[s - 1] == "\r" and s - 1 >= previous_end:
             s -= 1  # START: the pair's "\r" joins the span, since its "\n" is in the span
         if (
             end_cr
@@ -946,16 +949,30 @@ def test_a_candidate_starting_with_lf_takes_the_cr_of_its_pair() -> None:
 
 
 def test_the_crlf_rules_interleave_across_replace_all_occurrences() -> None:
-    """The two rules per occurrence with ``replaceAll`` (#127): in ``"a\\r\\nfoo\\r\\nfoo\\r\\n"`` the
-    candidate ``"\\nfoo\\r"`` (the escape matcher unescapes the literal ``\\nfoo\\r``) is at 2 and 7. First
-    occurrence: the START rule extends the span to [1, 7); the END rule is off, as the next occurrence starts
-    at 7. Second: the START rule is off (6 < the previous span's end, 7). The END rule would keep the ``\\r`` at
-    11, but that CR is one the model wrote (its oldString, unescaped, ends in one ``\\r``, as many as the
-    candidate), so it goes with the span: the model asked for ``\\nfoo\\r`` to be replaced, twice."""
+    """The rules per occurrence with ``replaceAll`` (#127): in ``"a\\r\\nfoo\\r\\nfoo\\r\\n"`` the candidate
+    ``"\\nfoo\\r"`` (the escape matcher unescapes the literal ``\\nfoo\\r``) is at 2 and 7. Its trailing ``\\r`` is
+    one the model wrote (oldString, unescaped, ends in one ``\\r``, as many as the candidate), so the END rule is
+    off, and with it the START rule: the model asked for ``\\nfoo\\r`` to be replaced, twice, and gets exactly
+    that, as an exact match of the unescaped text would. Before the Opus review the START rule still took the
+    ``\\r`` at 1, which gave ``"aXX\\n"``."""
     content = "a\r\nfoo\r\nfoo\r\n"
     assert next(islice(new.escape_normalized_replacer(content, "\\nfoo\\r"), 1)) == "\nfoo\r"
     for search in (new.replace, replace):
-        assert search(content, "\\nfoo\\r", "X", True) == "aXX\n"
+        assert search(content, "\\nfoo\\r", "X", True) == "a\rXX\n"
+        assert search(content, "\\nfoo\\r", "X", True) == content.replace("\nfoo\r", "X")
+
+
+def test_start_takes_no_cr_when_the_candidate_ends_in_the_models_own() -> None:
+    """Opus pre-merge review (#127): the START rule took the ``\\r`` before a candidate while the END rule left
+    the candidate's trailing ``\\r`` to the model, so the span covered both CRs and the ``\\n`` after it was left
+    bare. Here oldString ``\\n\\r`` (escaped) unescapes to the candidate ``"\\n\\r"`` at 3, in
+    ``"\\\\r\\r\\n\\r\\n"``; the old code gave ``"\\\\r\\n"``. Now the span is the model's text only, and the
+    ``\\r`` at 2 pairs with the ``\\n`` at 5."""
+    content = "\\r\r\n\r\n"
+    assert next(islice(new.escape_normalized_replacer(content, "\\n\\r"), 1)) == "\n\r"
+    for search in (new.replace, replace):
+        assert search(content, "\\n\\r", "") == "\\r\r\n"
+        assert search("b\r\n\r\nfoo \r\na", "\\n\\r", "") == "b\r\nfoo \r\na"
 
 
 def test_a_file_ending_in_a_lone_cr_keeps_it() -> None:

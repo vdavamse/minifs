@@ -543,13 +543,16 @@ _ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "'": "'", '"': '"', "`": "`", "\\":
 _ESCAPE = re.compile(r"\\(n|t|r|'|\"|`|\\|\n|\$)")
 
 
-def _unescape(text: str) -> str:
-    """``text`` with its escapes replaced, ticked per escape: a call per escape, so megabytes of them (one long
-    line, or a few thousand lines the window loop hasn't ticked for yet) are seconds of work."""
-    tick = _deadline.get().tick
+def _unescape(text: str, *, tick: bool = True) -> str:
+    """``text`` with its escapes replaced, ticked per escape (unless ``tick`` is false): a call per escape, so
+    megabytes of them (one long line, or a few thousand lines the window loop hasn't ticked for yet) are seconds
+    of work."""
+    if not tick:
+        return _ESCAPE.sub(lambda m: _ESCAPES[m.group(1)], text)
+    tick_deadline = _deadline.get().tick
 
     def unescaped(m: re.Match[str]) -> str:
-        tick()
+        tick_deadline()
         return _ESCAPES[m.group(1)]
 
     return _ESCAPE.sub(unescaped, text)
@@ -795,7 +798,8 @@ def _substitute(content: str, search: str, index: int, new_string: str, model_cr
       a real one a line matcher stripped as whitespace) removes it.
     - START: where the candidate starts with ``\\n`` and a ``\\r`` precedes the occurrence that no previous
       replaced span has claimed, that ``\\r`` is the pair's other half: it joins the span, since the ``\\n`` is
-      in it.
+      in it. Not when the candidate ends in the model's own ``\\r``: removing it leaves the ``\\n`` after the
+      span, which the ``\\r`` before the span then pairs with.
 
     The model's literal text (an exact match) is never adjusted, so ``replace`` calls this only for fuzzy
     candidates. Without ``replace_all`` the only occurrence is the one at ``index``; with it, the occurrences
@@ -804,10 +808,12 @@ def _substitute(content: str, search: str, index: int, new_string: str, model_cr
     for the END rule, and the output written into an ``io.StringIO`` — a fuzzy ``replace_all`` candidate is
     non-blank, so even millions of occurrences of a short one cost a second or two, after the search's
     deadline."""
-    starts_with_lf = search.startswith("\n")
     end_cr = False  # END can only fire on a trailing "\r" that is the file's, not the model's own
     if search.endswith("\r"):
         end_cr = len(search) - len(search.rstrip("\r")) > model_crs
+    # START only while END isn't holding back the model's own trailing "\r": removing that "\r" leaves the "\n"
+    # after the span, which the "\r" before it then pairs with, so taking that one too would leave a bare LF
+    starts_with_lf = search.startswith("\n") and (end_cr or not search.endswith("\r"))
     if not end_cr and not starts_with_lf:  # neither rule can fire
         if replace_all:
             return content.replace(search, new_string)
@@ -845,7 +851,7 @@ def _model_crs(old_string: str, replacer: Replacer) -> int:
     if replacer is not escape_normalized_replacer:
         return len(old_string) - len(old_string.rstrip("\r"))
     tail = old_string[len(old_string.rstrip("\r\\r")) :]
-    text = _ESCAPE.sub(lambda m: _ESCAPES[m.group(1)], tail)
+    text = _unescape(tail, tick=False)
     return len(text) - len(text.rstrip("\r"))
 
 
