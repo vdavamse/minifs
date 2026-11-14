@@ -229,6 +229,34 @@ def test_bad_configuration(vfs: VFSClient, policy: Policy) -> None:
         VFSView(vfs, workspace_mounts(W1), policy, "intruder")
 
 
+@pytest.mark.parametrize(
+    ("mounts", "match"),
+    [
+        # A prefix formatted by hand with an empty or climbing id: each would be normalised into other workspaces.
+        ({"/workspace": "/workspaces/"}, "isn't normalised"),
+        ({"/workspace": "/workspaces/x/../../docs"}, "isn't normalised"),
+        ({"/workspace": f"/workspaces/{W1}/."}, "isn't normalised"),
+        ({"/workspace": f"/workspaces//{W1}"}, "isn't normalised"),
+        ({"/workspace/": f"/workspaces/{W1}"}, "visible prefix '/workspace/' isn't normalised"),
+        ({"/a/../workspace": f"/workspaces/{W1}"}, "visible prefix '/a/../workspace' isn't normalised"),
+        ({"/workspace": f"workspaces/{W1}"}, "real prefix 'workspaces/.*' isn't a valid absolute path"),
+        ({"/workspace": ""}, "real prefix '' isn't a valid absolute path"),
+        ({"/workspace": "/workspaces/a\n"}, r"prefix '/workspaces/a\\u000a' isn't a valid absolute path"),
+        # The directories that hold every workspace.
+        ({"/workspace": "/workspaces"}, "every workspace"),
+        ({"/everything": "/"}, "every workspace"),
+    ],
+)
+def test_hand_built_mounts_are_refused(vfs: VFSClient, policy: Policy, mounts: dict[str, str], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        VFSView(vfs, {**mounts, "/docs": "/docs"}, policy, "agent")
+
+
+def test_hand_built_mounts_in_normal_form_are_accepted(vfs: VFSClient, policy: Policy) -> None:
+    VFSView(vfs, {"/workspace": f"/workspaces/{W1}", "/docs": "/docs"}, policy, "agent")
+    VFSView(vfs, {"/w": "/data/w", "/x": "/other"}, policy, "agent")
+
+
 # The policy
 
 
