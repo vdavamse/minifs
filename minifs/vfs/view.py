@@ -15,9 +15,9 @@ real path. The check needs no transaction of its own: it depends on the path alo
 same path in its one statement. Results and errors come back in visible paths: a ``VFSError`` keeps its errno and
 message, gets the visible path, and drops ``detail`` and ``db_error``, which name real paths and node ids. Entries
 the actor may not read are left out of listings, glob results and the files a grep searches. A virtual directory,
-which no rule names, may be read where the actor may read something below it (``Policy.allows_any``), and is refused
-(and counted) only where nothing below it is readable; its listing shows a virtual directory below it on the same
-terms and a mount point where the mount point itself may be read.
+which no rule names, may be read where the actor may read something in a mount below it (``Policy.allows_any`` on
+the mount point), and is refused (and counted) only where nothing below it is readable; its listing shows a virtual
+directory below it on the same terms and a mount point where the mount point itself may be read.
 
 What each operation needs:
 
@@ -328,12 +328,20 @@ class VFSView:
         policy as stored, then spelled without its control characters (``_reported``)."""
         return [_reported(e) for e in entries if self.policy.allows(self.actor, "read", e.path)]
 
+    def _virtual_readable(self, path: tuple[str, ...]) -> bool:
+        """Whether the actor may read virtual directory ``path``: where it may read something in a mount below it
+        (``allows_any`` on the mount point, as a glob or grep from ``path`` picks the mounts it searches)."""
+        return any(
+            mount.visible[: len(path)] == path and self.policy.allows_any(self.actor, "read", join(*mount.visible))
+            for mount in self._mounts
+        )
+
     def _listable(self, entry: Entry) -> bool:
-        """Whether a virtual directory's listing shows ``entry``: a virtual directory below it (id None) where the
-        actor may read something below that one, as ``_target`` decides it, and a mount point where it may read the
-        mount point itself."""
-        check = self.policy.allows_any if entry.id is None else self.policy.allows
-        return check(self.actor, "read", entry.path)
+        """Whether a virtual directory's listing shows ``entry``: a virtual directory below it (id None) on the terms
+        ``_target`` reads one (``_virtual_readable``), and a mount point where the mount point itself may be read."""
+        if entry.id is None:
+            return self._virtual_readable(split_trusted(entry.path))
+        return self.policy.allows(self.actor, "read", entry.path)
 
     async def _glob(
         self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
@@ -548,10 +556,10 @@ class VFSView:
         await self._mapped(self._client.unlink(_real(target)), target)
 
     def allows(self, action: Action, path: str) -> bool:
-        """Whether the actor may ``action`` at ``path``, by the policy check the view's operations make first (a
-        virtual directory may be read where something below it may, as in ``_target``). Raises the mapping errors the
-        operations would: ENOENT outside every mount, EINVAL for a bad path. Exact for ``read``; for another action
-        the operation may still refuse on its own (a mount point can't be removed, say). A refusal isn't counted in
+        """Whether the actor may ``action`` at ``path``, by the policy check the view's operations make first (a virtual
+        directory may be read where something in a mount below it may, as in ``_target``). Raises the mapping errors the
+        operations would: ENOENT outside every mount, EINVAL for a bad path. Exact for ``read``; for another action the
+        operation may still refuse on its own (a mount point can't be removed, say). A refusal isn't counted in
         ``policy.denials``: for a tool deciding which check to make first."""
         try:
             self._target(path, action, count_denials=False)
@@ -575,9 +583,9 @@ class VFSView:
             raise VFSError("ENOENT", join(*segments))
         if action is not None:
             # A virtual directory (the root, or one above a mount point) shows only the mount points below it, each
-            # filtered by the policy: it may be read where something below it may be. No rule names it.
+            # filtered by the policy: it may be read where something in a mount below it may be. No rule names it.
             virtual_read = target.real is None and action == "read"
-            if not (virtual_read and self.policy.allows_any(self.actor, "read", target.visible)):
+            if not (virtual_read and self._virtual_readable(target.path)):
                 self.policy.check(self.actor, action, target.visible, count_denials=count_denials)
         return target
 
@@ -695,6 +703,7 @@ class VFSView:
                 continue
             name = mount.visible[len(path)]
             if len(mount.visible) > len(path) + 1:
+                # id None: a virtual directory, which _listable tells from a mount point by it
                 children.setdefault(name, Entry(join(*path, name), None, "dir", 0, None))
                 continue
             target = _Target(mount.visible, mount)

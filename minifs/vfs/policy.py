@@ -92,9 +92,9 @@ class Policy:
     ``DEFAULT_POLICY``'s is process-wide: build a ``Policy`` of its ``rules`` for a counter of your own.
 
     ``read_unmatched=True`` lets a path no rule matches be read, as before 0.1.0: a mount the rules don't cover is then
-    readable by every actor of the policy. Without it, a directory is readable only where a rule matches it:
-    ``/workspace/**`` matches ``/workspace`` itself, while ``/workspace/src/**`` alone leaves ``/workspace``
-    unreadable."""
+    readable by every actor of the policy. Without it, a real directory, the mount point included, is readable only
+    where a rule matches it: ``/workspace/**`` matches ``/workspace`` itself, while ``/workspace/src/**`` alone leaves
+    ``/workspace`` unreadable."""
 
     def __init__(self, rules: Mapping[str, Sequence[Rule]], *, read_unmatched: bool = False) -> None:
         self.rules: dict[str, tuple[Rule, ...]] = {actor: tuple(r) for actor, r in rules.items()}
