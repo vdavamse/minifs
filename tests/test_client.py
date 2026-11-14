@@ -27,6 +27,7 @@ from minifs.vfs.client import (
 )
 from minifs.vfs.core import FileVersion, Kind, ReadResult, VFSError
 from minifs.vfs.glob import GlobError
+from minifs.vfs.search import SearchRefused
 from tests.test_tree import holding_the_lock, wait_until_blocked
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
@@ -683,6 +684,10 @@ async def test_glob(pool: Pool) -> None:
     await raises("EINVAL", vfs.glob("*", limit=-1))
     await raises("EINVAL", vfs.glob("*", limit=2**31))
     assert len(await vfs.glob("*.py", limit=1)) == 1
+    for max_nodes in (-1, 2**31):
+        await raises("EINVAL", vfs.glob("*", "/w", max_nodes=max_nodes), "/w")
+    for timeout in (0, -1, 1e10):
+        await raises("EINVAL", vfs.glob("*", "/w", timeout=timeout), "/w")
     # A cached root is used, and its stale links evicted.
     cache = DictCache()
     cached = VFSClient(pool, cache=cache)
@@ -920,6 +925,39 @@ async def test_a_lost_compare_and_swap_claim_raises_nothing(conn: AsyncConnectio
         assert row is not None and row[0] == "ESTALE" and row[1]
         cur = await conn.execute("SELECT 1")
         assert await cur.fetchone() == (1,)
+
+
+async def test_a_glob_wider_than_the_node_cap_is_refused(pool: Pool) -> None:
+    """#85: the walk under /w keeps src, a.py and b.py. Over the cap the glob is refused whole, and the search
+    connection is returned in a usable state."""
+    vfs = VFSClient(pool, search_pool=pool)
+    await vfs.create("/w/src/a.py", parents=True)
+    await vfs.create("/w/src/b.py")
+    assert len(await vfs.glob("**", "/w", max_nodes=3)) == 2
+    for limit in (None, 1):
+        with pytest.raises(SearchRefused) as info:
+            await vfs.glob("**", "/w", max_nodes=2, limit=limit)
+        assert info.value.reason == "nodes"
+        assert str(info.value) == "Glob scope is over 2 files and directories; narrow the path or pattern"
+    assert len(await vfs.glob("**", "/w", max_nodes=None)) == 2
+    assert len(await vfs.glob("**", "/w")) == 2  # the default cap is far above this
+    await raises("ENOENT", vfs.glob("**", "/missing", max_nodes=0), "/missing")  # the path comes first
+
+
+async def test_a_glob_runs_no_longer_than_its_timeout(pool: Pool, db: str) -> None:
+    """#85: a glob that can't finish (here it waits for a lock on the tree) is cancelled after ``timeout`` and
+    reported as a refused search, as a grep is."""
+    vfs = VFSClient(pool, search_pool=pool)
+    await vfs.create("/w/a.py", parents=True)
+    async with await AsyncConnection.connect(db) as locker:
+        await locker.execute("LOCK TABLE vfs_nodes IN ACCESS EXCLUSIVE MODE")
+        for path in ("/", "/w"):  # the walk, and the lookup of the path before it
+            with pytest.raises(SearchRefused) as info:
+                await asyncio.wait_for(vfs.glob("*.py", path, timeout=0.2), 10)
+            assert info.value.reason == "timeout"
+            assert str(info.value) == "Search timed out; narrow the pattern or path"
+        await locker.rollback()
+    assert [e.path for e in await vfs.glob("*.py", "/w")] == ["/w/a.py"]  # the connection is fine afterwards
 
 
 async def test_grep_and_glob_of_a_missing_path_return_the_error(vfs: VFSClient) -> None:

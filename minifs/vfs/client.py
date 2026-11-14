@@ -341,14 +341,28 @@ class VFSClient:
         excludes: Sequence[str] = (),
         hidden: bool = False,
         limit: int | None = None,
+        max_nodes: int | None = searching.MAX_NODES,
+        timeout: float = searching.TIMEOUT,
     ) -> list[Entry]:
         """The files below directory ``path`` that match glob ``pattern`` (``minifs.vfs.glob``), newest first, at
         most ``limit``. Resolving ``path`` and the walk share one snapshot on a search-pool connection, so the
-        returned paths describe the tree the walk saw. ``GlobError`` for a bad pattern; ENOENT, ENOTDIR for ``path``;
-        EINVAL for a bad ``limit``."""
+        returned paths describe the tree the walk saw.
+
+        The walk is bounded, since every match is collected before the newest ``limit`` are known and the search
+        pool is small: each statement runs under ``timeout`` seconds, and a walk that keeps more than
+        ``max_nodes`` files and directories (None: no cap; the files a ``*.py`` can't match aren't kept, see
+        ``vfs_glob``) is stopped. Either way the glob is a ``SearchRefused`` (``"timeout"``, ``"nodes"``) with
+        nothing returned: a partial walk can't say which files are the newest.
+
+        ``GlobError`` for a bad pattern; ENOENT, ENOTDIR for ``path``; EINVAL for a bad ``limit``, ``max_nodes`` or
+        ``timeout``."""
         segments = split(path)
         if limit is not None and not 0 <= limit <= _MAX_INT:
             raise VFSError("EINVAL", join(*segments), f"invalid limit {limit}")
+        if max_nodes is not None and not 0 <= max_nodes <= _MAX_INT:
+            raise VFSError("EINVAL", join(*segments), f"invalid node cap {max_nodes}")
+        if not 0 < timeout <= MAX_TIMEOUT:
+            raise VFSError("EINVAL", join(*segments), f"invalid timeout {timeout}")
         globbing.compile_glob(pattern)  # a bad pattern is reported before anything about the path
         globbing.compile_excludes(excludes)
         ref = self._dir_ref(segments)
@@ -356,15 +370,23 @@ class VFSClient:
         async def attempt() -> tuple[_Error, UUID | None, list[globbing.GlobMatch]]:
             async with self.search_pool.connection() as conn, conn.transaction():
                 await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")  # one snapshot for both
-                root: UUID | None = None
-                if segments:
-                    node, error, kind, _ = await _lookup(conn, ref)
-                    if error[0] is None and kind != "dir":
-                        error = ("ENOTDIR", "")
-                    if error[0] is not None:
-                        return error, None, []  # committed, not rolled back: nothing failed on the server
-                    root = node
-                matches = await globbing.glob(conn, root, pattern, excludes=excludes, hidden=hidden, limit=limit)
+                await searching.set_timeout(conn, timeout)
+                try:
+                    root: UUID | None = None
+                    if segments:
+                        node, error, kind, _ = await _lookup(conn, ref)
+                        if error[0] is None and kind != "dir":
+                            error = ("ENOTDIR", "")
+                        if error[0] is not None:
+                            return error, None, []  # committed, not rolled back: nothing failed on the server
+                        root = node
+                    matches = await globbing.glob(
+                        conn, root, pattern, excludes=excludes, hidden=hidden, limit=limit, max_nodes=max_nodes
+                    )
+                except psycopg.errors.QueryCanceled:
+                    raise searching.timed_out() from None
+                except globbing.WalkTooWide as e:
+                    raise searching.too_wide(e.max_nodes) from None
                 return (None, None), root, matches
 
         try:

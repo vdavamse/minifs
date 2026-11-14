@@ -7,10 +7,11 @@ from psycopg import AsyncConnection
 
 from minifs.tools import Glob
 from minifs.tools.deps import ALWAYS_EXCLUDED, GlobSettings, ToolSettings
-from minifs.vfs.client import VFSClient
+from minifs.vfs.client import MAX_TIMEOUT, VFSClient
 from minifs.vfs.core import GlobResult, VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.policy import Policy, Rule
+from minifs.vfs.search import SearchRefused
 from minifs.vfs.view import MAX_GLOB_LIMIT, VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
 
@@ -201,6 +202,38 @@ def test_bad_settings_fail_at_construction() -> None:
             GlobSettings(limit=bad)  # pyright: ignore[reportArgumentType]
     with pytest.raises(GlobError, match="error parsing glob 'a\\['"):
         GlobSettings(excludes=("a[",))
+    assert (GlobSettings().max_nodes, GlobSettings().timeout) == (200_000, 2.0)
+    for max_nodes in (-1, MAX_GLOB_LIMIT + 1):
+        with pytest.raises(ValueError, match="glob max_nodes"):
+            GlobSettings(max_nodes=max_nodes)
+    for bad in (1.5, True, None):
+        with pytest.raises(TypeError, match="glob max_nodes must be an int"):
+            GlobSettings(max_nodes=bad)  # pyright: ignore[reportArgumentType]
+    for timeout in (0, -1, MAX_TIMEOUT * 2, True):
+        with pytest.raises(ValueError, match="glob timeout"):
+            GlobSettings(timeout=timeout)
+
+
+async def test_a_glob_over_the_node_cap_is_a_retry(client: VFSClient, deps: Deps) -> None:
+    """#85: the refusal reaches the model as a retry that says what to change, and a narrower glob then works."""
+    await make(client, "wide/a.py", "wide/b.py", "wide/sub/c.py")
+    capped = Deps(deps.vfs, vfs_settings=ToolSettings(glob=GlobSettings(max_nodes=3)))
+    message = await retry_message(Glob, capped, pattern="**", path="wide")
+    assert message == "Glob scope is over 3 files and directories; narrow the path or pattern"
+    assert await run_tool(Glob, capped, pattern="**", path="wide/sub") == "/workspace/wide/sub/c.py"
+
+
+async def test_a_glob_past_its_timeout_is_a_retry(deps: Deps, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    async def glob(*args: object, **kwargs: object) -> GlobResult:
+        seen.update(kwargs)
+        raise SearchRefused("timeout", "Search timed out; narrow the pattern or path")
+
+    monkeypatch.setattr(deps.vfs, "glob", glob)
+    quick = Deps(deps.vfs, vfs_settings=ToolSettings(glob=GlobSettings(timeout=0.5, max_nodes=7)))
+    assert await retry_message(Glob, quick, pattern="**") == "Search timed out; narrow the pattern or path"
+    assert (seen["timeout"], seen["max_nodes"]) == (0.5, 7)
 
 
 @pytest.mark.parametrize(

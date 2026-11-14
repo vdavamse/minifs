@@ -36,6 +36,15 @@ class GlobError(ValueError):
         self.message = message
 
 
+class WalkTooWide(Exception):
+    """``glob``'s walk kept more than ``max_nodes`` files and directories and was stopped (``vfs_glob``'s
+    EOVERFLOW). ``VFSClient.glob`` reports it as a ``SearchRefused``."""
+
+    def __init__(self, max_nodes: int) -> None:
+        super().__init__(f"the walk is over {max_nodes} files and directories")
+        self.max_nodes = max_nodes
+
+
 @dataclass(frozen=True)
 class GlobPlan:
     """What ``vfs_glob`` needs for one pattern: the regex, and the hints that let it walk less of the tree."""
@@ -119,21 +128,28 @@ async def glob(
     hidden: bool = False,
     limit: int | None = None,
     hints: bool = True,
+    max_nodes: int | None = None,
 ) -> list[GlobMatch]:
     """The files below directory ``root`` (None: ``/``) that match ``pattern``, newest first, as ``vfs_glob``
     returns them. ``.git`` directories are never walked. Without ``hints`` it walks the whole tree (for tests).
+
+    ``max_nodes`` (None: no cap) bounds the walk: the directories it descends into and the files whose name can
+    match, see ``vfs_glob`` (migration 017). A wider one raises ``WalkTooWide`` and returns nothing, since a
+    partial walk can't say which files are the newest.
 
     Raises GlobError for a bad pattern, and ``VFSError`` ENOENT / ENOTDIR for a bad ``root`` (with the root's id
     as its path).
     """
     if limit is not None and limit < 0:
         raise ValueError(f"limit must not be negative, got {limit}")
+    if max_nodes is not None and max_nodes < 0:
+        raise ValueError(f"max_nodes must not be negative, got {max_nodes}")
     plan = compile_glob(pattern)
     ex = compile_excludes(excludes, prune=hints)  # before the query, so that a str is refused
     if not hints:
         plan = GlobPlan(plan.regex)
     cur = await conn.execute(
-        "SELECT id, path, size, mtime, err, err_detail FROM vfs_glob(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "SELECT id, path, size, mtime, err, err_detail FROM vfs_glob(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             root,
             plan.regex,
@@ -144,10 +160,14 @@ async def glob(
             limit,
             list(plan.prefix),
             list(ex.prune_dirs),
+            max_nodes,
         ),
     )
     rows = await cur.fetchall()
-    if rows and rows[0][4] is not None:  # the only row, then
+    if rows and rows[0][4] == "EOVERFLOW":  # the only row, then, as for the errors below
+        assert max_nodes is not None
+        raise WalkTooWide(max_nodes)
+    if rows and rows[0][4] is not None:
         raise VFSError(rows[0][4], str(root), detail=rows[0][5] or "")
     return [GlobMatch(*row[:4]) for row in rows]
 

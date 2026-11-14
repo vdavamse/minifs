@@ -53,6 +53,12 @@ tools in detail). Patterns are rg's ``-g '!...'`` excludes, matched relative to 
 class GlobSettings:
     limit: int = 100
     """Paths returned at most."""
+    timeout: float = 2.0
+    """Seconds each of a glob's statements may run. Past it the call is a retry that asks for a narrower glob."""
+    max_nodes: int = 200_000
+    """Files and directories one walk may keep before the call is that retry: every match is collected before
+    the newest ``limit`` are known, so a glob of a huge tree is refused instead of running to the timeout. Files
+    whose name the pattern rules out (the ``.md`` files, for ``**/*.py``) don't count."""
     excludes: tuple[str, ...] = DEFAULT_EXCLUDES
     """Skipped as well as ``ALWAYS_EXCLUDED``, which a caller can't turn off. A glob from a virtual directory
     (``/``) restates each exclude in every mount, so avoid the forms ``VFSView.glob`` can't restate there: a
@@ -66,6 +72,12 @@ class GlobSettings:
             raise TypeError(f"glob limit must be an int, not {self.limit!r}")
         if not 0 <= self.limit <= MAX_GLOB_LIMIT:
             raise ValueError(f"glob limit must be 0 to {MAX_GLOB_LIMIT}, not {self.limit}")
+        if isinstance(self.max_nodes, bool) or not isinstance(self.max_nodes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"glob max_nodes must be an int, not {self.max_nodes!r}")
+        if not 0 <= self.max_nodes <= MAX_GLOB_LIMIT:
+            raise ValueError(f"glob max_nodes must be 0 to {MAX_GLOB_LIMIT}, not {self.max_nodes}")
+        if isinstance(self.timeout, bool) or not 0 < self.timeout <= MAX_TIMEOUT:
+            raise ValueError(f"glob timeout must be over 0 and at most {MAX_TIMEOUT} seconds, not {self.timeout!r}")
         compile_excludes(self.excludes)  # GlobError
 
 

@@ -92,6 +92,9 @@ Errors come in two groups (migration 009):
 | **Outcomes**: the answer is "no" | ENOENT, ENOTDIR, EISDIR, EEXIST, ESTALE, ENOTEMPTY | **Returned** in two result columns, `err` (the errno name, or NULL) and `err_detail` |
 | **Faults**: bad input or a broken invariant | EINVAL, ENAMETOOLONG, and anything not errno-coded (`data_corrupted`, ...) | **Raised** with `PERFORM vfs_raise('EINVAL', detail)` |
 
+`vfs_glob` has one outcome of its own, EOVERFLOW (the walk is over `p_max_nodes`), which the client reports as a
+refused search (`SearchRefused`), not a `VFSError`.
+
 An outcome is something a correct caller meets in normal use: a path an agent guessed, a name already taken, a
 lost Maildir claim or compare-and-swap, a non-empty directory. Raising it would cost a server log entry each time
 (an ERROR with DETAIL, CONTEXT and the statement, which name real paths, and which a non-superuser can't silence

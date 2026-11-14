@@ -10,12 +10,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
+import psycopg
 import pytest
 from psycopg import AsyncConnection
 
 from minifs import _regex
+from minifs.db.errors import errno_name
 from minifs.vfs.core import VFSError
-from minifs.vfs.glob import GlobError, GlobPlan, compile_excludes, compile_glob, glob, glob_to_regex
+from minifs.vfs.glob import GlobError, GlobPlan, WalkTooWide, compile_excludes, compile_glob, glob, glob_to_regex
 from tests.test_tree import create, mkdir_p
 
 # The oracle exists only in development builds; test_regex_extension.py fails without it.
@@ -607,6 +609,48 @@ async def test_newest_first_and_limit(conn: AsyncConnection) -> None:
     assert [m.path for m in await glob(conn, None, "**", limit=2)] == ["a", "d/e"]
     with pytest.raises(ValueError):
         await glob(conn, None, "**", limit=-1)
+
+
+async def test_node_cap(conn: AsyncConnection) -> None:
+    """``max_nodes`` counts the rows the walk keeps: the directories it descends into and the files whose name can
+    match. One row over, the glob is refused whole, whatever the limit."""
+    await _tree(conn, None, ["a.py", "b.md", "d/c.py", "d/e/f.py"])
+    # "**" keeps a.py, b.md, d, d/c.py, d/e and d/e/f.py.
+    assert len(await glob(conn, None, "**", max_nodes=6)) == 4
+    assert len(await glob(conn, None, "**", max_nodes=2**31 - 1)) == 4
+    for limit in (None, 1, 0):
+        with pytest.raises(WalkTooWide) as info:
+            await glob(conn, None, "**", max_nodes=5, limit=limit)
+        assert info.value.max_nodes == 5
+    # "*.py" doesn't keep b.md, unless the hints are off.
+    assert compile_glob("*.py").name_like is not None
+    assert len(await glob(conn, None, "*.py", max_nodes=5)) == 3
+    with pytest.raises(WalkTooWide):
+        await glob(conn, None, "*.py", max_nodes=4)
+    with pytest.raises(WalkTooWide):
+        await glob(conn, None, "*.py", max_nodes=5, hints=False)
+    # The walk starts below the pattern's literal prefix: "d/**" keeps d/c.py, d/e and d/e/f.py.
+    assert compile_glob("d/**").prefix == ("d",)
+    assert len(await glob(conn, None, "d/**", max_nodes=3)) == 2
+    with pytest.raises(WalkTooWide):
+        await glob(conn, None, "d/**", max_nodes=2)
+    # A cap of 0 allows only an empty directory.
+    with pytest.raises(WalkTooWide):
+        await glob(conn, None, "**", max_nodes=0)
+    empty = await mkdir_p(conn, "empty")
+    assert await glob(conn, empty, "**", max_nodes=0) == []
+    with pytest.raises(ValueError):
+        await glob(conn, None, "**", max_nodes=-1)
+    with pytest.raises(psycopg.Error) as raised:  # a fault: raised by the function, not returned
+        async with conn.transaction():
+            await conn.execute("SELECT * FROM vfs_glob(NULL, '', p_max_nodes => -1)")
+    assert errno_name(raised.value) == "EINVAL"
+
+
+async def test_a_bad_root_comes_before_the_node_cap(conn: AsyncConnection) -> None:
+    with pytest.raises(VFSError) as info:
+        await glob(conn, uuid.uuid4(), "*", max_nodes=0)
+    assert info.value.errno == "ENOENT"
 
 
 async def test_bad_root(conn: AsyncConnection) -> None:
