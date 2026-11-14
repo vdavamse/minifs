@@ -78,6 +78,17 @@ async def test_readdir(vfs: VFSClient) -> None:
     expected = [("/w/A", "file", 0), ("/w/b", "file", 2), ("/w/sub", "dir", 0)]
     assert [(e.path, e.kind, e.size) for e in entries] == expected
     assert [e.path for e in await vfs.readdir("/")] == ["/w"]
+    # Pages: the entries after a name, at most ``limit``.
+    assert [e.path for e in await vfs.readdir("/w", limit=2)] == ["/w/A", "/w/b"]
+    assert [e.path for e in await vfs.readdir("/w", after="A", limit=1)] == ["/w/b"]
+    assert [e.path for e in await vfs.readdir("/w", after="b")] == ["/w/sub"]
+    assert await vfs.readdir("/w", after="sub", limit=5) == []
+    assert await vfs.readdir("/w", limit=0) == []
+    assert await vfs.readdir("/", after="w") == []
+    await raises("EINVAL", vfs.readdir("/w", limit=-1), "/w")
+    await raises("EINVAL", vfs.readdir("/w", limit=2**31), "/w")
+    await raises("EINVAL", vfs.readdir("/w", after="a\0"), "/w")
+    await raises("ENOENT", vfs.readdir("/missing", after="a", limit=1), "/missing")
 
 
 async def test_pread_ranges(vfs: VFSClient) -> None:
