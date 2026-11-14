@@ -8,7 +8,7 @@ from __future__ import annotations
 import mimetypes
 from collections.abc import Sequence
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from pydantic_ai import ModelRetry, RunContext
@@ -71,7 +71,7 @@ async def read(
     vfs = ctx.deps.vfs
     start = offset or 1
     count = limit if limit is not None else config.default_limit
-    instructions: list[str] | None = None  # looked up with the first attempt's sample
+    instructions: list[tuple[str, str]] | None = None  # (path, block), looked up with the first attempt's sample
     try:
         for attempt in range(_PAGE_ATTEMPTS):
             settle = attempt + 1 == _PAGE_ATTEMPTS
@@ -150,9 +150,11 @@ async def read(
     else:
         output += f"\n\n(End of file - total {total} lines)"
     if instructions:
-        output += _REMINDER + "\n\n".join(instructions) + _REMINDER_END
-    else:
-        output += "\n</content>"
+        output += _REMINDER + "\n\n".join(block for _, block in instructions) + _REMINDER_END
+        # The shown paths travel in the result's metadata, which pydantic-ai copies to the ``ToolReturnPart``
+        # and never sends to the model; ``already_loaded`` reads them back from there, not from the text.
+        return ToolReturn(return_value=output, metadata={"instructions": [path for path, _ in instructions]})
+    output += "\n</content>"
     return output
 
 
@@ -375,10 +377,11 @@ def _instruction_reads(ctx: RunContext[HasVFS], path: str) -> tuple[list[tuple[s
 
 def _instruction_texts(
     reads: Sequence[tuple[str, int, int]], found: Sequence[ReadResult | VFSError], cap: int
-) -> list[str]:
-    """The reminder blocks of the results ``found`` of the reads ``_instruction_reads`` built: each directory's
-    wanted file, read with ``cap`` bytes (``_instruction_text``)."""
-    texts: list[str] = []
+) -> list[tuple[str, str]]:
+    """``(path, block)`` pairs for the results ``found`` of the reads ``_instruction_reads`` built: each
+    directory's wanted file, read with ``cap`` bytes (``_instruction_text``), as its reminder block. The paths
+    go in the result's metadata, the blocks in its text, from this one source (``already_loaded``)."""
+    pairs: list[tuple[str, str]] = []
     for i in range(0, len(reads), len(INSTRUCTION_FILES)):
         group = slice(i, i + len(INSTRUCTION_FILES))
         for (candidate, _, limit), result in zip(reads[group], found[group], strict=True):
@@ -388,9 +391,9 @@ def _instruction_texts(
                 break  # any other outcome: skip the directory, as for EIO
             text = _instruction_text(result, cap)
             if limit and text:
-                texts.append(f"{_FROM}{candidate}\n{text}")
+                pairs.append((candidate, f"{_FROM}{candidate}\n{text}"))
             break
-    return texts
+    return pairs
 
 
 def _instruction_text(result: ReadResult, cap: int) -> str:
@@ -421,17 +424,16 @@ _ABSENT = frozenset({"ENOENT", "ENOTDIR", "EISDIR", "EACCES"})
 """What a lookup of an instruction file says when it's missing, a directory or the actor may not read it."""
 
 _FROM = "Instructions from: "
-"""The marker that opens the first line of every block of a reminder: ``_instruction_texts`` writes it and
-``already_loaded`` reads it back."""
+"""The marker that opens the first line of every block of a reminder, as ``_instruction_texts`` writes it. It is
+text for the model only: nothing reads it back."""
 
 _REMINDER = "\n</content>\n\n<system-reminder>\n"
-"""The end of a file result's content and the start of its reminder, as ``read`` writes them and
-``already_loaded`` finds them: inside ``<content>`` every ``\\n`` is followed by a line number, an empty line, the
-footer or the closing tag, so in a result that ends with ``_REMINDER_END`` the first occurrence of this is the
-real closing tag and the reminder that follows it."""
+"""The end of a file result's content and the start of its reminder, as ``read`` writes them."""
 
 _REMINDER_END = "\n</system-reminder>"
-"""The end of a reminder, and of the result that carries it: nothing follows it."""
+"""The end of a reminder, and of the result that carries it: nothing follows it, so a result whose reminder the
+model still sees ends with it, which ``already_loaded`` checks (up to trailing whitespace) before it counts the
+result's metadata."""
 
 
 def _loaded_instructions(ctx: RunContext[HasVFS]) -> set[str]:
@@ -444,30 +446,38 @@ def _loaded_instructions(ctx: RunContext[HasVFS]) -> set[str]:
 
 
 def already_loaded(messages: list[Any]) -> set[str]:
-    """Instruction files that earlier Read results in the conversation already included.
+    """Instruction files that earlier Read results in the conversation already showed the model.
 
-    Only the reminder that ends a result is read: a file result carries instruction blocks if and only if it
-    ends with ``_REMINDER_END``, and any other result (a directory listing, an error message, an attachment's
-    message, or one whose reminder a compacted or edited history cut off) is skipped by that one check, so a
-    marker line in the file text (printed raw, stray ``\\r`` included) never counts, and the cost of a call is a
-    check per earlier result plus a scan of the few that carry a reminder.
+    What counts is the results' metadata, never their text: ``read`` records the paths it attached under
+    ``{"instructions": [...]}`` of its ``ToolReturn``, which pydantic-ai copies to the ``ToolReturnPart`` and
+    never sends to the model, so neither instruction text nor file text (both printed raw) can mark a file as
+    shown or hide one. A part counts only for ``Read``, only the ``str`` items of a ``list`` under
+    ``"instructions"`` of a ``dict`` metadata, and only while the result still carries its reminder: its content
+    ends with ``_REMINDER_END``, up to trailing whitespace (``rstrip``), which tolerates a history a store
+    rewrote with CRLF line ends or padded.
 
-    It reads this module's own format, built from the same constants: a result in another layout (a history
-    rewritten with CRLF line ends, another tool's Read) counts nothing, so its instructions are attached again.
-    One ambiguity remains: the blocks hold the instruction files' own text, so a line of an AGENTS.md that
-    starts with ``Instructions from: <path>`` counts that path as shown too (as before). Telling them apart
-    would need the shown paths recorded outside the text."""
+    A result whose reminder was cut off (a compacted or edited history) no longer shows the model those
+    instructions, and a history from before the metadata existed records nothing: both re-attach them, the safe
+    direction. The cost of a call is a metadata check per earlier result part, and one end-of-string check on
+    the few that say they showed instructions."""
     loaded: set[str] = set()
     for message in messages:
         for part in getattr(message, "parts", []):
-            if isinstance(part, ToolReturnPart) and part.tool_name == "Read" and isinstance(part.content, str):
-                content = part.content
-                if not content.endswith(_REMINDER_END):
-                    continue  # the only thing looked at in a result that carries no reminder
-                start = content.find(_REMINDER)
-                if start == -1:
-                    continue
-                for line in content[start + len(_REMINDER) :].split("\n"):
-                    if line.startswith(_FROM):
-                        loaded.add(line.removeprefix(_FROM))
+            if not (isinstance(part, ToolReturnPart) and part.tool_name == "Read"):
+                continue
+            paths = _recorded_instructions(part.metadata)
+            if paths and isinstance(part.content, str) and part.content.rstrip().endswith(_REMINDER_END):
+                loaded.update(paths)
     return loaded
+
+
+def _recorded_instructions(metadata: Any) -> list[str]:
+    """The ``str`` paths recorded under ``"instructions"`` of a result's metadata; ``[]`` for any other metadata
+    (not a dict, no list there, or no ``str`` in it): a result that attached nothing, a history from before the
+    metadata, or a record a store broke, all count nothing, without an exception."""
+    if not isinstance(metadata, dict):
+        return []
+    paths = cast(dict[str, Any], metadata).get("instructions")
+    if not isinstance(paths, list):
+        return []
+    return [path for path in cast(list[Any], paths) if isinstance(path, str)]
