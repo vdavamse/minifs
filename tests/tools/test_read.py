@@ -5,6 +5,7 @@ import asyncio
 import io
 import random
 from collections.abc import Iterator
+from pathlib import PurePosixPath
 from typing import Any
 
 import pytest
@@ -25,7 +26,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from minifs.tools import TOOLS, Read
 from minifs.tools import read as read_module
 from minifs.tools.deps import ReadSettings, ToolSettings
-from minifs.tools.read import DESCRIPTION, MAX_ATTACHMENT_BYTES, SAMPLE_BYTES, already_loaded
+from minifs.tools.read import BINARY_EXTENSIONS, DESCRIPTION, MAX_ATTACHMENT_BYTES, SAMPLE_BYTES, already_loaded
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import Entry, LineReadResult, ReadResult, VFSError
 from minifs.vfs.policy import Policy, Rule
@@ -1020,3 +1021,76 @@ async def test_a_file_deleted_mid_page(client: VFSClient, view: VFSView, monkeyp
     monkeypatch.setattr(view, "pread_lines", deleting)
     message = await retry_message(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="f.txt")
     assert message == "File not found: /workspace/f.txt\n\nDid you mean one of these?\n/workspace/f.txt.bak"
+
+
+_is_binary = read_module._is_binary  # pyright: ignore[reportPrivateUsage]
+
+
+def _old_is_binary(path: str, sample: bytes) -> bool:
+    """``_is_binary`` before #79, which counted the control bytes in Python: the reference for the tests below. A
+    deliberate change to the rule changes this copy too (or drops it, with the literal expectations left)."""
+    if PurePosixPath(path).suffix.lower() in BINARY_EXTENSIONS:
+        return True
+    if not sample:
+        return False
+    if 0 in sample:
+        return True
+    non_printable = sum(1 for b in sample if b < 9 or 13 < b < 32)
+    return non_printable / len(sample) > 0.3
+
+
+@pytest.mark.parametrize(
+    ("path", "sample", "expected"),
+    [
+        pytest.param("f.txt", b"", False, id="empty"),
+        pytest.param("x.zip", b"", True, id="empty-binary-extension"),
+        pytest.param("X.ZIP", b"plain text\n", True, id="extension-is-lower-cased"),
+        pytest.param("f", b"text", False, id="no-suffix"),
+        pytest.param("f.txt", b"\x00" + b"a" * 10, True, id="nul-at-start"),
+        pytest.param("f.txt", b"aaa\x00aaa", True, id="nul-in-middle"),
+        pytest.param("f.txt", b"a" * 4095 + b"\x00", True, id="nul-as-last-byte"),
+        pytest.param("f.txt", b"\t\n\x0b\x0c\r" * 100, False, id="tab-to-cr-not-counted"),
+        pytest.param("f.txt", b"\x7f" * 100, False, id="del-not-counted"),
+        pytest.param("f.txt", bytes(range(128, 256)) * 4, False, id="high-bytes-not-counted"),
+        pytest.param("f.txt", b"\x01" * 3 + b"a" * 7, False, id="exactly-30-percent"),
+        pytest.param("f.txt", b"\x01" * 4 + b"a" * 6, True, id="40-percent"),
+        pytest.param("f.txt", b"\x1b" * 1228 + b"a" * 2868, False, id="just-under-30-percent-at-full-size"),
+        pytest.param("f.txt", b"\x1b" * 1229 + b"a" * 2867, True, id="just-over-30-percent-at-full-size"),
+        pytest.param("f.txt", (b"a" * 4095 + "é".encode())[:SAMPLE_BYTES], False, id="utf-8-cut-at-boundary"),
+        pytest.param("f.txt", b"\xff\xfe\xfd" * 1365 + b"\x80", False, id="invalid-utf-8-high-bytes"),
+        pytest.param("f.txt", "\ufeffhello\n".encode("utf-8"), False, id="utf-8-bom"),
+        pytest.param("f.txt", "hello\n".encode("utf-16"), True, id="utf-16-bom-nuls"),
+        pytest.param("f.txt", "hello\n".encode("utf-16-le"), True, id="utf-16-le-nuls"),
+        pytest.param("f.txt", "hello\n".encode("utf-16-be"), True, id="utf-16-be-nuls"),
+        pytest.param("f.txt", "hello\n".encode("utf-32"), True, id="utf-32-nuls"),
+    ],
+)
+def test_is_binary_matches_the_python_count_on_edge_cases(path: str, sample: bytes, expected: bool) -> None:
+    """The C count gives what the Python count gave, and the expected answer, at each edge: NUL, the 30% threshold,
+    bytes 9-13, 0x7F and 0x80+, UTF-8 cut at the sample boundary, BOMs, binary extensions."""
+    assert _is_binary(path, sample) == expected == _old_is_binary(path, sample)
+
+
+def test_is_binary_matches_the_python_count_on_every_byte_value() -> None:
+    """Each byte value alone, filling the sample, and just under and over the threshold."""
+    for b in range(256):
+        for sample in (bytes([b]), bytes([b]) * SAMPLE_BYTES, bytes([b]) * 3 + b"a" * 7, bytes([b]) * 4 + b"a" * 6):
+            assert _is_binary("f.txt", sample) == _old_is_binary("f.txt", sample), f"byte {b}, length {len(sample)}"
+
+
+def test_is_binary_matches_the_python_count_on_random_samples() -> None:
+    """A smoke test on seeded random samples up to the sample size, from byte pools on both sides of the threshold.
+    The every-byte test is the proof: the count is a sum over bytes."""
+    rng = random.Random(79)
+    pools = [
+        bytes(range(256)),
+        bytes(range(1, 256)),
+        bytes(range(1, 32)) + b"a" * 64,
+        b"abc\t\n\r\x1b\x01",
+        bytes(range(128, 256)) + b"\x02",
+    ]
+    for _ in range(200):
+        i = rng.randrange(len(pools))
+        n = rng.randint(0, SAMPLE_BYTES)
+        sample = bytes(rng.choices(pools[i], k=n))
+        assert _is_binary("f.txt", sample) == _old_is_binary("f.txt", sample), f"pool {i}, length {n}"
