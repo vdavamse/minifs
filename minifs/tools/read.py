@@ -159,10 +159,10 @@ async def read(
         output += f"\n\n(Showing lines {start}-{last} of {total}. Use offset={last + 1} to continue.)"
     else:
         output += f"\n\n(End of file - total {total} lines)"
-    output += "\n</content>"
-
     if instructions:
-        output += "\n\n<system-reminder>\n" + "\n\n".join(instructions) + "\n</system-reminder>"
+        output += _REMINDER + "\n\n".join(instructions) + _REMINDER_END
+    else:
+        output += "\n</content>"
     return output
 
 
@@ -423,9 +423,13 @@ _FROM = "Instructions from: "
 ``already_loaded`` reads it back."""
 
 _REMINDER = "\n</content>\n\n<system-reminder>\n"
-"""Where the reminder of a file result begins: inside ``<content>`` every ``\\n`` is followed by a line number,
-an empty line, the footer or the closing tag, so in a result that ends with ``\\n</system-reminder>`` the first
-occurrence of this is the real closing tag and the reminder that follows it."""
+"""The end of a file result's content and the start of its reminder, as ``read`` writes them and
+``already_loaded`` finds them: inside ``<content>`` every ``\\n`` is followed by a line number, an empty line, the
+footer or the closing tag, so in a result that ends with ``_REMINDER_END`` the first occurrence of this is the
+real closing tag and the reminder that follows it."""
+
+_REMINDER_END = "\n</system-reminder>"
+"""The end of a reminder, and of the result that carries it: nothing follows it."""
 
 
 def _loaded_instructions(ctx: RunContext[HasVFS]) -> set[str]:
@@ -441,12 +445,13 @@ def already_loaded(messages: list[Any]) -> set[str]:
     """Instruction files that earlier Read results in the conversation already included.
 
     Only the reminder that ends a result is read: a file result carries instruction blocks if and only if it
-    ends with ``\\n</system-reminder>``, and any other result — a directory listing, an error message, an
-    attachment, or one whose reminder a compacted or edited history cut off — is skipped by that one check, so
-    a marker line in the file text (printed raw, stray ``\\r`` included) never counts. Each Read used to rescan
-    every earlier result line by line, which made a session quadratic on the event loop; now only the results
-    that carry a reminder are read, and each instruction file is attached once per conversation.
+    ends with ``_REMINDER_END``, and any other result (a directory listing, an error message, an attachment's
+    message, or one whose reminder a compacted or edited history cut off) is skipped by that one check, so a
+    marker line in the file text (printed raw, stray ``\\r`` included) never counts, and the cost of a call is a
+    check per earlier result plus a scan of the few that carry a reminder.
 
+    It reads this module's own format, built from the same constants: a result in another layout (a history
+    rewritten with CRLF line ends, another tool's Read) counts nothing, so its instructions are attached again.
     One ambiguity remains: the blocks hold the instruction files' own text, so a line of an AGENTS.md that
     starts with ``Instructions from: <path>`` counts that path as shown too (as before). Telling them apart
     would need the shown paths recorded outside the text."""
@@ -455,7 +460,7 @@ def already_loaded(messages: list[Any]) -> set[str]:
         for part in getattr(message, "parts", []):
             if isinstance(part, ToolReturnPart) and part.tool_name == "Read" and isinstance(part.content, str):
                 content = part.content
-                if not content.endswith("\n</system-reminder>"):
+                if not content.endswith(_REMINDER_END):
                     continue  # the only thing looked at in a result that carries no reminder
                 start = content.find(_REMINDER)
                 if start == -1:

@@ -260,6 +260,7 @@ def test_already_loaded_reads_the_reminder() -> None:
             tool_call_id="2",
         ),
         ToolReturnPart(tool_name="Read", content=[BinaryContent(data=PNG, media_type="image/png")], tool_call_id="3"),
+        ToolReturnPart(tool_name="Read", content="Image read successfully", tool_call_id="3b"),  # what an image gives
         ToolReturnPart(tool_name="Read", content=listing, tool_call_id="4"),
         ToolReturnPart(tool_name="Read", content="File not found: /workspace/pkg/g.py", tool_call_id="5"),
         ToolReturnPart(tool_name="Read", content=result[: result.index("Use spaces")], tool_call_id="6"),
