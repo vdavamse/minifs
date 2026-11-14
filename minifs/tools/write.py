@@ -19,10 +19,19 @@ from typing import Any
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ToolReturn
 
-from minifs.tools._text import BOM, TooLarge, create_file, diff_metadata, encode_text, read_file, split_bom
+from minifs.tools._text import (
+    BOM,
+    ReadTimedOut,
+    TooLarge,
+    create_file,
+    diff_metadata,
+    encode_text,
+    read_file,
+    split_bom,
+)
 from minifs.tools.base import vfs_tool
 from minifs.tools.deps import HasVFS, resolve, settings
-from minifs.tools.errors import TIMED_OUT_WRITE, tool_error
+from minifs.tools.errors import TIMED_OUT_READ, TIMED_OUT_WRITE, tool_error
 from minifs.vfs.core import FileVersion, VFSError
 from minifs.vfs.view import VFSView
 
@@ -61,6 +70,8 @@ async def write(ctx: RunContext[HasVFS], content: str, filePath: str) -> str | T
                 continue
         else:
             raise VFSError("ESTALE", path)
+    except ReadTimedOut as e:
+        raise ModelRetry(TIMED_OUT_READ.format(path=e.path)) from None
     except VFSError as e:
         return tool_error(e, "write", ETIMEDOUT=TIMED_OUT_WRITE)
     if content_old is None:
@@ -129,7 +140,12 @@ async def _read_old(vfs: VFSView, path: str, size: int, max_diff_bytes: int) -> 
             # The old text only feeds the diff, so an undecodable file is still overwritten.
             source_bom, content_old = split_bom(data.decode("utf-8", errors="replace"))
             return source_bom, content_old, version
-    head = await vfs.pread(path, 0, len(_BOM_BYTES))
+    try:
+        head = await vfs.pread(path, 0, len(_BOM_BYTES))
+    except VFSError as e:
+        if e.errno == "ETIMEDOUT":
+            raise ReadTimedOut(path) from None
+        raise
     return head.content == _BOM_BYTES, None, FileVersion(head.id, head.generation, head.size)
 
 

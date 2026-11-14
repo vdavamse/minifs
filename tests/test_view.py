@@ -861,6 +861,23 @@ async def test_pread_page(vfs: VFSClient, policy: Policy) -> None:
     await raises("ENOENT", agent.pread_page(f"/workspaces/{W2}/secret.md", 4096, 1, 10, 1000))
 
 
+async def test_pread_file(vfs: VFSClient, policy: Policy) -> None:
+    ingestion = view(vfs, policy, "ingestion")
+    await raises("EACCES", ingestion.pread_file("/workspace/notes.md", 4), "/workspace/notes.md")
+    assert policy.denials == {("ingestion", "read"): 1}  # the refusal is counted
+    agent = view(vfs, policy)
+    await raises("EISDIR", agent.pread_file("/", 4), "/")  # a virtual directory
+    await vfs.write("/docs/guide.md", b"one\ntwo\n")
+    result = await ingestion.pread_file("/docs/guide.md", 4)  # a readable file, in two pages
+    assert (result.content, result.offset, result.next_offset, result.size, result.eof) == (
+        b"one\ntwo\n",
+        0,
+        8,
+        8,
+        True,
+    )
+
+
 async def test_grep_in_visible_paths(vfs: VFSClient, policy: Policy) -> None:
     agent = view(vfs, policy)
     await vfs.create(f"/workspaces/{W1}/src/a.py", b"x = 1\nmine = 2\n", parents=True)

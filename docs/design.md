@@ -130,6 +130,8 @@ CREATE INDEX vfs_extents_not_utf8_idx ON vfs_extents (node_id, generation) WHERE
 
 **Reading several files at once.** `VFSClient.pread_many(reads, groups=)` resolves and reads several paths in one statement and one snapshot. `VFSClient.pread_page` is that statement plus the page's first `vfs_pread_lines`: `Read` uses it to fetch the 4 KB sample, the page and the nearby `AGENTS.md` / `CLAUDE.md` files together. With `groups`, only the first existing file of each group is read: `AGENTS.md`, else `CLAUDE.md`.
 
+**Reading a whole file.** `VFSClient.pread_file(path, page)` reads every page of a file on one pooled connection, in one read-only `REPEATABLE READ` transaction: one snapshot at any size, so the pages can't mix two versions and no `ESTALE` check between them is needed. `Write` and `Edit` read the old text through it, in pages of at most 1 MiB. It takes no lock and sets no `statement_timeout` of its own; a server one applies to each page statement, and `page` bounds what one statement holds on the server and in client memory: about 3x the page while it arrives, since bytea comes as hex text.
+
 ## Writes
 
 **Appends serialize on the inode.** `vfs_append` locks the file's row until commit, so concurrent appenders take turns, and **offset order always equals commit order**. A reader that has seen up to offset N can never miss bytes that commit late below N. That is what makes incremental reads correct, for any number of writers.

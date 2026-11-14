@@ -67,6 +67,9 @@ MAX_TIMEOUT = _MAX_INT / 1000  # seconds: statement_timeout is an int of millise
 DEFAULT_LOCK_TIMEOUT = 5.0  # seconds a write waits for a lock another writer holds
 DEFAULT_WRITE_TIMEOUT = 30.0  # seconds a write statement may run (locally a write costs about 60-80 ms per MB)
 _SET_WRITE_TIMEOUTS = "SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)"
+_SET_SNAPSHOT = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+# The type of ``_run``'s ``more`` hook: extra rows to append to a statement's, fetched on the same connection.
+type _More = Callable[[AsyncConnection[Any], list[tuple[Any, ...]]], Awaitable[list[tuple[Any, ...]]]]
 _log = logging.getLogger(__name__)
 _EVICT_TIMEOUT = 1.0  # seconds to wait for a connection to find stale cache links
 
@@ -281,6 +284,63 @@ class VFSClient:
         content = b"".join(row[6] for row in rows if row[6] is not None)
         end = start + len(content)
         return ReadResult(node, content, start, end, size, generation, end >= size)
+
+    async def pread_file(self, path: str, page: int, max_size: int | None = None) -> ReadResult:
+        """The whole file ``path``, ``page`` bytes at a time, on one pool connection in one read-only REPEATABLE
+        READ transaction: one snapshot at any size, so every page is the same node and version, and no check
+        between pages is needed. With ``max_size`` (None: no bound), a file that turns out larger stops after the
+        first page, which comes back with its ``size`` and ``eof`` False, for the caller to refuse without
+        reading the rest.
+
+        No lock and no ``statement_timeout`` of its own; a server one applies to each page statement. ``page``
+        bounds what one statement holds on the server and in client memory: about 3x the page while it arrives,
+        since bytea comes as hex text. ENOENT, EISDIR; EINVAL for a ``page`` below 1 or a bad ``max_size``, as
+        ``pread``."""
+        segments = split(path)
+        if not segments:
+            raise VFSError("EISDIR", "/")
+        normalized = join(*segments)
+        if not 1 <= page <= _MAX_INT:
+            raise VFSError("EINVAL", normalized, f"invalid page {page}")
+        if max_size is not None and not 0 <= max_size <= _MAX_BIGINT:
+            raise VFSError("EINVAL", normalized, f"invalid max size {max_size}")
+        ref = self._ref(segments)
+
+        async def more(conn: AsyncConnection[Any], rows: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+            """The pages after the first, on the same connection and snapshot, as rows in the layout of the
+            gated ones once cut (``vfs_pread``'s columns after the ref's id, err and err_detail)."""
+            # A raw row here: the 3 walk columns, the ref's id, err and err_detail, then vfs_pread's columns
+            # (size, generation, byte_offset, data, err, err_detail), as ``pread`` reads them cut.
+            node, lookup_err, size, generation = rows[0][3], rows[0][4], rows[0][6], rows[0][7]
+            if lookup_err is not None or rows[0][-2] is not None or node is None:
+                return []  # page 1 failed; ``_call`` reports it
+            offset = sum(len(row[9]) for row in rows if row[9] is not None)
+            if offset >= size or (max_size is not None and size > max_size):
+                return []  # the whole file (or the page the caller refuses past) came in page 1
+            extra: list[tuple[Any, ...]] = []
+            while offset < size:
+                cur = await conn.execute(
+                    "SELECT size, generation, byte_offset, data, err, err_detail"
+                    " FROM vfs_pread(%s::uuid, %s::bigint, %s::int)",
+                    [node, offset, page],
+                )
+                read = 0
+                for row in await cur.fetchall():
+                    assert (row[0], row[1]) == (size, generation)  # one snapshot: they can't change
+                    if row[4] is not None:  # impossible on one snapshot; never a page to drop silently
+                        raise VFSError(row[4], normalized, detail=row[5] or "")
+                    if row[3] is not None:
+                        read += len(row[3])
+                        extra.append((node, None, None, size, generation, row[2], row[3], None, None))
+                assert read > 0, "a page within the file's size read no bytes, on one snapshot"
+                offset += read
+            return extra
+
+        rows = await self._call(path, [ref], "vfs_pread({0}, %s::bigint, %s::int)", [0, page], snapshot=True, more=more)
+        node, size, generation = rows[0][0], rows[0][3], rows[0][4]
+        self._checked(ref, node)
+        content = b"".join(row[6] for row in rows if row[6] is not None)
+        return ReadResult(node, content, 0, len(content), size, generation, len(content) >= size)
 
     async def pread_lines(
         self,
@@ -1025,12 +1085,27 @@ class VFSClient:
             self.cache.evict(resolved)
 
     async def _call(
-        self, path: str, refs: Sequence[_Ref], call: str, params: Sequence[object], *, write: bool = False
+        self,
+        path: str,
+        refs: Sequence[_Ref],
+        call: str,
+        params: Sequence[object],
+        *,
+        write: bool = False,
+        snapshot: bool = False,
+        more: _More | None = None,
     ) -> list[tuple[Any, ...]]:
         """Runs ``_gated(refs, call)`` with ``params`` (the call's own) and raises the error it returned, if any:
-        the first failed lookup's, else the call's. Returns the rows (see ``_gated``). ``write``: see ``_run``."""
+        the first failed lookup's, else the call's. Returns the rows (see ``_gated``). ``write``, ``snapshot`` and
+        ``more``: see ``_run``."""
         rows = await self._run(
-            path, _gated(refs, call), [*(p for ref in refs for p in ref.params), *params], refs, write=write
+            path,
+            _gated(refs, call),
+            [*(p for ref in refs for p in ref.params), *params],
+            refs,
+            write=write,
+            snapshot=snapshot,
+            more=more,
         )
         lookups = _lookup_errors(rows[0], len(refs))
         self._vanished(rows[0], lookups, rows[0][-2])
@@ -1066,6 +1141,8 @@ class VFSClient:
         refs: Sequence[_Ref] = (),
         *,
         write: bool = False,
+        snapshot: bool = False,
+        more: _More | None = None,
     ) -> list[tuple[Any, ...]]:
         """Runs ``query`` in its own transaction, retrying serialization failures; maps raised SQL errors (faults,
         the constraints' backstop, and the server's timeouts) to VFSError. A path that no longer resolves evicts
@@ -1074,18 +1151,33 @@ class VFSClient:
         A ``write`` runs under the client's ``lock_timeout`` and ``write_timeout``, ``SET LOCAL`` in the same
         transaction first (one more round trip; EAGAIN and ETIMEDOUT when they run out).
 
+        With ``snapshot``, ``SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`` is the transaction's
+        first statement, so it and ``more`` read one snapshot (``pread_file``).
+
+        ``more`` is called inside the same transaction and connection once the query's rows are fetched, with
+        those rows (before the walk columns are cut); the rows it returns are appended to the returned ones,
+        after the cut. An error it raises, and a cancellation of a statement it runs, map as the query's own.
+
         A query with ``refs`` starts with their ``_walks`` columns: they go to the cache (``_learn``) and are cut
         from the rows returned, which begin with the columns after them."""
 
+        extra: list[tuple[Any, ...]] = []
+
         async def attempt() -> list[tuple[Any, ...]]:
             async with self.pool.connection() as conn, conn.transaction():
+                if snapshot:
+                    await conn.execute(_SET_SNAPSHOT)
                 if write:
                     await conn.execute(_SET_WRITE_TIMEOUTS, self._write_timeouts)
                 cur = await conn.execute(cast(Any, query), params)
                 if refs:  # a query that forgot the prefix would shift every column the caller reads
                     names = [column.name for column in cur.description or ()]
                     assert names[: 3 * len(refs)] == ["chain", "kind", "err"] * len(refs), names
-                return await cur.fetchall()
+                rows = await cur.fetchall()
+                if more is not None:
+                    extra.clear()  # a retried attempt starts over
+                    extra.extend(await more(conn, rows))
+                return rows
 
         try:
             rows = await _mapped(path, attempt)
@@ -1094,12 +1186,12 @@ class VFSClient:
                 await self._await_eviction(refs)
             raise
         if not refs:
-            return rows
+            return rows + extra
         for i, ref in enumerate(refs):
             ref.walk = cast(_Walk, tuple(rows[0][3 * i : 3 * i + 3]))
             ref.kind = ref.walk[1]
         self._learn(refs)
-        return [row[3 * len(refs) :] for row in rows]
+        return [row[3 * len(refs) :] for row in rows] + extra
 
 
 type _Error = tuple[str | None, str | None]  # a returned (err, err_detail); (None, None) for success

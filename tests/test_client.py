@@ -111,6 +111,142 @@ async def test_pread_ranges(vfs: VFSClient) -> None:
     assert (await vfs.pread("/f", -(2**63))).offset == 0
 
 
+async def test_pread_file_reads_every_page_on_one_snapshot(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every page is read on one connection, in one read-only REPEATABLE READ transaction: a file overwritten
+    while the read is in flight still comes back whole, as the version the read started on, with no ESTALE."""
+    vfs, other = VFSClient(pool), VFSClient(pool)
+    data = b"0123456789" * 4  # 40 bytes: 10 pages of 4 bytes
+    version = await vfs.create("/f", data)
+    statements: list[tuple[str, int]] = []  # (the statement's text, the id of the connection that ran it)
+    execute = AsyncConnection.execute
+    overwritten = False
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal overwritten
+        text = str(query)
+        if "vfs_pread" in text or "SET TRANSACTION" in text:
+            statements.append((text, id(self)))
+        result = await execute(self, query, *args, **kwargs)
+        if "vfs_pread" in text and not overwritten:
+            overwritten = True
+            await other.write("/f", b"abcdefghij" * 4)  # during the read, on the other client's connection
+        return result
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    result = await vfs.pread_file("/f", 4)
+    monkeypatch.undo()
+    assert result.content == data  # the old content, not the overwrite's and no mix of the two
+    assert (result.id, result.generation, result.size, result.eof) == (version.id, version.generation, 40, True)
+    assert (await vfs.stat("/f")).generation == version.generation + 1  # the overwrite committed during the read
+    assert len([s for s in statements if "vfs_pread" in s[0]]) == -(-len(data) // 4)  # ceil(size / page)
+    assert len([s for s in statements if "SET TRANSACTION" in s[0]]) == 1
+    assert len({conn for _, conn in statements}) == 1  # every statement on the same connection
+
+
+async def test_pread_file_stops_after_a_page_over_max_size(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A file over ``max_size`` is refused on its first page's size: the rest isn't read."""
+    await vfs.create("/f", b"x" * 100)
+    statements: list[str] = []
+    execute = AsyncConnection.execute
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        if "vfs_pread" in str(query):
+            statements.append(str(query))
+        return await execute(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    result = await vfs.pread_file("/f", 10, max_size=50)
+    assert (result.content, result.eof, result.size) == (b"x" * 10, False, 100)
+    assert len(statements) == 1
+    statements.clear()
+    whole = await vfs.pread_file("/f", 10, max_size=100)
+    assert (whole.content, whole.eof, whole.size) == (b"x" * 100, True, 100)
+    assert len(statements) == 10
+
+
+async def test_pread_file_outcomes_and_einval(pool: Pool) -> None:
+    """The outcomes ``pread`` reports, and a fully cached stale path evicted, as ``pread_page`` checks it."""
+    cache = DictCache()
+    vfs, other = VFSClient(pool, cache=cache), VFSClient(pool)
+    f = await vfs.create("/d/f", b"data", parents=True)
+    await vfs.stat("/d/f")  # the whole path is cached
+    assert any(v[0] == f.id for v in cache.entries.values())
+    await other.unlink("/d/f")  # another client, invisible to this cache
+    await raises("ENOENT", vfs.pread_file("/d/f", 4), "/d/f")
+    assert all(v[0] != f.id for v in cache.entries.values())  # the stale link was evicted
+    await raises("ENOENT", vfs.pread_file("/missing", 4), "/missing")
+    await vfs.mkdir("/dir")
+    await raises("EISDIR", vfs.pread_file("/dir", 4), "/dir")
+    await raises("EISDIR", vfs.pread_file("/", 4), "/")
+    await vfs.create("/f", b"data")
+    await raises("EINVAL", vfs.pread_file("/f", 0), "/f")
+    await raises("EINVAL", vfs.pread_file("/f", 2**31), "/f")
+    await raises("EINVAL", vfs.pread_file("/f", 4, max_size=-1), "/f")
+    await vfs.create("/empty", b"")
+    result = await vfs.pread_file("/empty", 4)
+    assert (result.content, result.eof, result.size) == (b"", True, 0)
+
+
+async def test_pread_file_plan_stays_cheap(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both statements of a whole-file read, the gated first page and a direct later one, stay under
+    ``jit_above_cost`` and sort nothing, so reading a file neither JIT-compiles nor spills a page."""
+    await vfs.create("/a/b/f", b"0123456789" * 4, parents=True)
+    calls: list[tuple[str, Any]] = []
+    execute = AsyncConnection.execute
+
+    async def capturing(self: AsyncConnection[Any], query: Any, params: Any = None, *args: Any, **kwargs: Any) -> Any:
+        if "vfs_pread" in str(query):
+            calls.append((str(query), params))
+        return await execute(self, query, params, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", capturing)
+    await vfs.pread_file("/a/b/f", 4)
+    monkeypatch.undo()
+    assert len(calls) == 10, calls  # the gated first page and the 9 pages after it
+    assert {"vfs_pread(%s::uuid" in query for query, _ in calls} == {True, False}  # both shapes were captured
+
+    def walk(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        yield node
+        for child in node.get("Plans", []):
+            yield from walk(child)
+
+    async with vfs.pool.connection() as conn:
+        for query, params in calls:
+            cur = await conn.execute(cast(Any, "EXPLAIN (FORMAT JSON) " + query), params)
+            row = await cur.fetchone()
+            assert row is not None
+            plan = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            cost = float(plan[0]["Plan"]["Total Cost"])
+            assert cost < 100_000, f"estimated cost {cost} passes jit_above_cost, of: {query[:70]}"
+            for node in walk(plan[0]["Plan"]):
+                assert node.get("Node Type") != "Sort", f"a Sort in the plan, of: {query[:70]}"
+
+
+async def test_pread_file_holds_one_connection(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A read of many pages checks one connection out of the pool, once, and holds it for the whole read (the
+    page-per-pread reads before #124 checked one out per page)."""
+    await vfs.create("/f", b"0123456789" * 10)  # 100 bytes: 25 pages of 4 bytes
+    in_flight = peak = checkouts = 0
+    connection = vfs.pool.connection
+
+    @contextlib.asynccontextmanager
+    async def counted(*args: Any, **kwargs: Any) -> AsyncGenerator[AsyncConnection[Any]]:
+        nonlocal in_flight, peak, checkouts
+        checkouts += 1
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            async with connection(*args, **kwargs) as conn:
+                yield conn
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(vfs.pool, "connection", counted)
+    result = await vfs.pread_file("/f", 4)
+    assert result.content == b"0123456789" * 10
+    assert (checkouts, peak) == (1, 1)
+
+
 async def test_pread_lines(vfs: VFSClient) -> None:
     version = await vfs.create("/f", b"one\ntwo\n")
     await vfs.append("/f", b"three\nfour")
