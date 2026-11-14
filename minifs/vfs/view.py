@@ -65,6 +65,7 @@ from minifs.vfs.core import (
     FileVersion,
     GlobResult,
     LineReadResult,
+    PageRead,
     ReadResult,
     VFSError,
     escape_controls,
@@ -296,6 +297,53 @@ class VFSView:
             for (i, target, *_), read in zip(asked, await self._mapped(call, *targets), strict=True):
                 results[i] = VFSError(read.errno, target.visible, read.message) if isinstance(read, VFSError) else read
         return results
+
+    async def pread_page(
+        self,
+        path: str,
+        sample: int,
+        first_line: int,
+        max_lines: int,
+        max_bytes: int,
+        *,
+        max_line_bytes: int | None = None,
+        also: Sequence[tuple[str, int, int]] = (),
+        groups: Sequence[int] | None = None,
+    ) -> PageRead:
+        """``VFSClient.pread_page`` of ``path``, the file checked as ``pread`` checks it (a refusal counted) and
+        ``also`` as ``pread_many(also, groups=groups, count_denials=False)`` checks them: speculative lookups, such
+        as Read's instruction files, whose denials, paths outside every mount and virtual directories are outcomes
+        in place, not sent, and not counted."""
+        target = self._target(path, "read")
+        if target.real is None:
+            raise VFSError("EISDIR", target.visible)
+        if groups is not None and len(groups) != len(also):
+            raise ValueError(f"{len(groups)} groups for {len(also)} reads")
+        results: list[ReadResult | VFSError] = []
+        asked: list[tuple[int, _Target, int, int, int]] = []  # (index in results, target, offset, limit, group)
+        for n, (also_path, offset, limit) in enumerate(also):
+            try:
+                also_target = self._target(also_path, "read", count_denials=False)
+            except VFSError as e:
+                results.append(e)
+                continue
+            results.append(VFSError("EISDIR", also_target.visible))  # replaced below unless virtual
+            if also_target.real is not None:
+                asked.append((len(results) - 1, also_target, offset, limit, groups[n] if groups is not None else n))
+        call = self._client.pread_page(
+            _real(target),
+            sample,
+            first_line,
+            max_lines,
+            max_bytes,
+            max_line_bytes=max_line_bytes,
+            also=[(_real(t), offset, limit) for _, t, offset, limit, _ in asked],
+            groups=[a[4] for a in asked],
+        )
+        found = await self._mapped(call, target, *(a[1] for a in asked))
+        for (i, also_target, *_), read in zip(asked, found.also, strict=True):
+            results[i] = VFSError(read.errno, also_target.visible, read.message) if isinstance(read, VFSError) else read
+        return PageRead(found.sample, found.lines, results)
 
     async def glob(
         self,

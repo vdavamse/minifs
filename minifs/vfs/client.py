@@ -49,6 +49,7 @@ from minifs.vfs.core import (
     FileVersion,
     Kind,
     LineReadResult,
+    PageRead,
     ReadResult,
     VFSError,
     join,
@@ -93,6 +94,49 @@ _NULL = (
 )
 # The parent of a create with parents, and mkdir_p: the directories vfs_mkdir_p found or made, every one in chain.
 _MKDIR_P = "(SELECT id, 'dir'::text AS kind, chain, err, err_detail FROM vfs_mkdir_p(%s))"
+# pread_many's columns, one row per extent read (a read without extents has one row of NULL p columns): the read,
+# its lookup's outcome, the extent, and, on a read's first row only, its walk (chain, kind).
+_FIRST_OF_READ = "row_number() OVER (PARTITION BY w.i ORDER BY p.byte_offset) = 1"
+_READ_COLUMNS = (
+    "w.i",
+    "w.id",
+    "w.err",
+    "w.err_detail",
+    "p.size",
+    "p.generation",
+    "p.byte_offset",
+    "p.data",
+    "p.err",
+    "p.err_detail",
+    f"CASE WHEN {_FIRST_OF_READ} THEN w.chain END",
+    "w.kind",
+)
+# vfs_pread_lines' columns (migration 012), appended to pread_page's rows after _READ_COLUMNS.
+_LINES_NAMES = (
+    "size",
+    "generation",
+    "lines",
+    "first_line",
+    "byte_offset",
+    "data",
+    "next_offset",
+    "cut",
+    "err",
+    "err_detail",
+)
+_LINES = slice(len(_READ_COLUMNS), len(_READ_COLUMNS) + len(_LINES_NAMES))
+# pread_page's lines join: the vfs_pread_lines of read 1 (its file), joined to pread_many's rows r after the window
+# that numbers each read's rows, and only to read 1's first row: joined below the window, the page (up to a few
+# hundred KB) would go through the window's sort once per extent row, and a file of many small appends spilled
+# tens of MB to disk per Read. The quals name only r's columns, so they're a one-time filter and the function runs
+# once. LIMIT 1 (the function returns exactly one row) keeps the subquery from being flattened and caps the
+# planner's estimate, which for a function without ROWS is 1000 rows: without it the statement's estimated cost
+# passes ``jit_above_cost``, and every Read would JIT-compile. Its 4 parameters come after the 4 unnest arrays,
+# which is their order in the SQL text.
+_LINES_JOIN = (
+    " LEFT JOIN LATERAL (SELECT * FROM vfs_pread_lines(vfs_gate(r.c1, r.c2), %s::bigint, %s::int, %s::int, %s::int)"
+    "                    WHERE r.c2 IS NULL AND r.c0 = 1 AND r.first LIMIT 1) l ON true"
+)
 
 
 class DirCache(Protocol):
@@ -303,42 +347,156 @@ class VFSClient:
         if not asked:
             return results
         group_ids = [groups[i] if groups is not None else i for i in asked]
+        found, _ = await self._pread_rows(
+            [paths[i] for i in asked], [reads[i][1] for i in asked], [reads[i][2] for i in asked], group_ids
+        )
+        for i, result in zip(asked, found, strict=True):
+            results[i] = result
+        return results
+
+    async def pread_page(
+        self,
+        path: str,
+        sample: int,
+        first_line: int,
+        max_lines: int,
+        max_bytes: int,
+        *,
+        max_line_bytes: int | None = None,
+        also: Sequence[tuple[str, int, int]] = (),
+        groups: Sequence[int] | None = None,
+    ) -> PageRead:
+        """``pread(path, 0, sample)`` and ``pread_lines(path, first_line, max_lines, max_bytes,
+        max_line_bytes=...)`` of the same file, and ``pread_many(also, groups=groups)``, in one statement: one
+        round trip, one connection, one snapshot. The file's outcome (ENOENT, ENOTDIR, EISDIR) raises, as ``pread``
+        does; the other reads' stay in place. EINVAL for bad limits, as the three calls check them. The paths are
+        walked on the server without the cache, which stores the walks, and a file found gone evicts its cached
+        links, as ``pread`` does."""
+        segments = split(path)
+        if not segments:
+            raise VFSError("EISDIR", "/")
+        normalized = join(*segments)
+        if not 0 <= sample <= _MAX_INT:
+            raise VFSError("EINVAL", normalized, f"invalid limit {sample}")
+        if not 1 <= first_line <= _MAX_BIGINT:
+            raise VFSError("EINVAL", normalized, f"invalid first line {first_line}")
+        if not (0 <= max_lines <= _MAX_INT and 0 <= max_bytes <= _MAX_INT) or not (
+            max_line_bytes is None or 0 <= max_line_bytes <= _MAX_INT
+        ):
+            raise VFSError(
+                "EINVAL",
+                normalized,
+                f"invalid limits {max_lines} lines, {max_bytes} bytes, {max_line_bytes} bytes a line",
+            )
+        also_paths = [join(*split(also_path)) for also_path, _, _ in also]
+        for also_path, offset, limit in zip(also_paths, (r[1] for r in also), (r[2] for r in also), strict=True):
+            if not 0 <= limit <= _MAX_INT:
+                raise VFSError("EINVAL", also_path, f"invalid limit {limit}")
+            if not -_MAX_BIGINT - 1 <= offset <= _MAX_BIGINT:
+                raise VFSError("EINVAL", also_path, f"invalid offset {offset}")
+        if groups is not None and len(groups) != len(also):
+            raise ValueError(f"{len(groups)} groups for {len(also)} reads")
+        # The file is read 1, in group 0 of its own, so it never shadows and is never shadowed: the caller's group
+        # ids are remapped to dense ids from 1, in order of first appearance among the sent reads, so none can land
+        # in the file's group or overflow bigint (without groups, each sent read gets its own id). An also read
+        # that is "/" isn't sent, as in pread_many, and never stands in for its group's file.
+        sent = [j for j, also_path in enumerate(also_paths) if also_path != "/"]
+        dense: dict[int, int] = {}
+        group_ids = [0]
+        for j in sent:
+            asked = groups[j] if groups is not None else j
+            if asked not in dense:
+                dense[asked] = len(dense) + 1
+            group_ids.append(dense[asked])
+        found, l_row = await self._pread_rows(
+            [normalized, *(also_paths[j] for j in sent)],
+            [0, *(also[j][1] for j in sent)],
+            [sample, *(also[j][2] for j in sent)],
+            group_ids,
+            (first_line, max_lines, max_bytes, max_line_bytes),
+        )
+        first = found[0]
+        if isinstance(first, VFSError):
+            # The file's outcome raises, at its normalized path; the walks were stored (_pread_rows). A fully cached
+            # path to a file that is gone has its stale links evicted, as for pread, so a retry doesn't reuse them.
+            await self._outcome(normalized, [self._ref(segments)], (first.errno, first.detail))
+            raise first  # not reached: _outcome raised it
+        assert l_row is not None
+        size, generation, lines, _, start, content, end, cut, err, detail = l_row
+        if err is not None:
+            raise VFSError(err, normalized, detail=detail or "")
+        results: list[ReadResult | VFSError] = [VFSError("EISDIR", "/") for _ in also]
+        for j, result in zip(sent, found[1:], strict=True):
+            results[j] = result
+        page = LineReadResult(
+            first.id, content, first_line, start, end, size, generation, lines, end >= size, frozenset(cut)
+        )
+        return PageRead(first, page, results)
+
+    async def _pread_rows(
+        self,
+        paths: Sequence[str],
+        offsets: Sequence[int],
+        limits: Sequence[int],
+        group_ids: Sequence[int],
+        lines: tuple[int, int, int, int | None] | None = None,
+    ) -> tuple[list[ReadResult | VFSError], tuple[Any, ...] | None]:
+        """The pread_many statement over the sent reads (``paths`` normalized, none of them "/", one group id per
+        read), and, with ``lines`` (``first_line``, ``max_lines``, ``max_bytes``, ``max_line_bytes``), the
+        ``vfs_pread_lines`` of the first read in the same statement, on the same snapshot. Returns each read's
+        result or outcome, in order, and that row's columns (None without ``lines``). Paths are resolved on the
+        server, without the cache, which then stores each walk."""
         # A path is "/" and names joined by "/", which no name contains, so the server splits it back.
-        rows = await self._run(
-            paths[asked[0]],
+        reads = (
             "WITH q AS (SELECT q.i, q.off, q.lim, q.grp, l.id, l.kind, l.chain, l.err, l.err_detail"
             "             FROM unnest(%s::text[], %s::bigint[], %s::int[], %s::bigint[])"
             "                  WITH ORDINALITY AS q(path, off, lim, grp, i)"
             "            CROSS JOIN LATERAL vfs_lookup(string_to_array(substr(q.path, 2), '/')) l),"
             " w AS (SELECT q.*, coalesce(bool_or(q.kind = 'file') OVER (PARTITION BY q.grp ORDER BY q.i"
             "                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), false) AS shadowed FROM q)"
-            " SELECT w.i, w.id, w.err, w.err_detail, p.size, p.generation, p.byte_offset, p.data, p.err, p.err_detail,"
-            "        CASE WHEN row_number() OVER (PARTITION BY w.i ORDER BY p.byte_offset) = 1 THEN w.chain END, w.kind"
-            " FROM w LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(w.id, w.err), w.off,"
+            " SELECT "
+            + ", ".join(f"{column} AS c{k}" for k, column in enumerate(_READ_COLUMNS))
+            + (f", {_FIRST_OF_READ} AS first" if lines is not None else "")
+            + " FROM w"
+            " LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(w.id, w.err), w.off,"
             "                                                   CASE WHEN w.shadowed THEN 0 ELSE w.lim END)"
             "                           WHERE w.err IS NULL OFFSET 0) p ON true"
-            " ORDER BY w.i, p.byte_offset",
-            [[paths[i] for i in asked], [reads[i][1] for i in asked], [reads[i][2] for i in asked], group_ids],
         )
+        if lines is None:
+            query = reads + " ORDER BY c0, c6"
+        else:  # r keeps the window below it (a subquery with a window isn't flattened); l joins its rows
+            query = (
+                "SELECT "
+                + ", ".join(f"r.c{k}" for k in range(len(_READ_COLUMNS)))
+                + "".join(f", l.{name}" for name in _LINES_NAMES)
+                + f" FROM ({reads}) r"
+                + _LINES_JOIN
+                + " ORDER BY r.c0, r.c6"
+            )
+        params: list[object] = [list(paths), list(offsets), list(limits), list(group_ids)]
+        if lines is not None:
+            params.extend(lines)
+        rows = await self._run(paths[0], query, params)
         by_read: dict[int, list[tuple[Any, ...]]] = {}
         for row in rows:
             by_read.setdefault(row[0], []).append(row)
         walked: list[_Ref] = []
-        for n, i in enumerate(asked, 1):
-            ref = _Ref(_LOOKUP, [], segments=split(paths[i]))
+        for n, path in enumerate(paths, 1):
+            ref = _Ref(_LOOKUP, [], segments=split(path))
             ref.walk = (by_read[n][0][10], by_read[n][0][11], by_read[n][0][2])
             walked.append(ref)
         self._learn(walked)
-        for n, i in enumerate(asked, 1):
+        results: list[ReadResult | VFSError] = []
+        for n, path in enumerate(paths, 1):
             node, lookup_err, lookup_detail, size, generation, start, _, err, detail = by_read[n][0][1:10]
             if lookup_err is not None or err is not None:
                 failed = lookup_err or err
-                results[i] = VFSError(failed, paths[i], detail=(lookup_detail if lookup_err else detail) or "")
+                results.append(VFSError(failed, path, detail=(lookup_detail if lookup_err else detail) or ""))
                 continue
             content = b"".join(row[7] for row in by_read[n] if row[7] is not None)
             end = start + len(content)
-            results[i] = ReadResult(node, content, start, end, size, generation, end >= size)
-        return results
+            results.append(ReadResult(node, content, start, end, size, generation, end >= size))
+        return results, by_read[1][0][_LINES] if lines is not None else None
 
     async def glob(
         self,

@@ -1,7 +1,6 @@
 """``Read``: ladderframe's Read tests over the view, VFS cases (policy, chroot, virtual root), and its output checked
 against a copy of ladderframe's line reader."""
 
-import asyncio
 import io
 import random
 from collections.abc import Iterator
@@ -28,7 +27,7 @@ from minifs.tools import read as read_module
 from minifs.tools.deps import ReadSettings, ToolSettings
 from minifs.tools.read import BINARY_EXTENSIONS, DESCRIPTION, MAX_ATTACHMENT_BYTES, SAMPLE_BYTES, already_loaded
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import Entry, LineReadResult, ReadResult, VFSError
+from minifs.vfs.core import Entry, LineReadResult, PageRead, ReadResult, VFSError
 from minifs.vfs.policy import Policy, Rule
 from minifs.vfs.view import VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
@@ -682,19 +681,19 @@ async def test_a_page_replaced_between_batches_is_read_again(
     await put(client, "/workspace/f.txt", old)
     await put(client, "/workspace/tmp.txt", new)
     calls = 0
-    pread_lines = view.pread_lines
+    pread_page = view.pread_page
 
-    async def replacing(*args: Any, **kwargs: Any) -> LineReadResult:
+    async def replacing(*args: Any, **kwargs: Any) -> PageRead:
         nonlocal calls
         calls += 1
-        result = await pread_lines(*args, **kwargs)
+        result = await pread_page(*args, **kwargs)
         if calls == 1:
             await view.unlink("/workspace/f.txt")
             await view.rename("/workspace/tmp.txt", "/workspace/f.txt")
-            assert (await pread_lines("/workspace/f.txt")).generation == result.generation  # only the id differs
-        return result
+            assert (await view.pread_lines("/workspace/f.txt")).generation == result.lines.generation
+        return result  # only the id differs
 
-    monkeypatch.setattr(view, "pread_lines", replacing)
+    monkeypatch.setattr(view, "pread_page", replacing)
     out = await run_tool(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="f.txt")
     assert out == ladderframe_output("/workspace/f.txt", new, None, None, settings)
 
@@ -702,36 +701,38 @@ async def test_a_page_replaced_between_batches_is_read_again(
 async def test_instructions_already_shown_are_looked_up_not_read(
     client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every candidate goes in the one ``pread_many``, a group per directory, so a CLAUDE.md behind an AGENTS.md file
-    is never read; an instruction file already in the conversation, or the file being read, is read with limit 0,
-    and still keeps CLAUDE.md out of its directory."""
+    """Every candidate goes in the file's one ``pread_page``, a group per directory, so a CLAUDE.md behind an
+    AGENTS.md file is never read; an instruction file already in the conversation, or the file being read, is read
+    with limit 0, and still keeps CLAUDE.md out of its directory."""
     await put(client, "/workspace/pkg/AGENTS.md", b"Use tabs.")
     await put(client, "/workspace/pkg/CLAUDE.md", b"not used: AGENTS.md is first")
     await put(client, "/workspace/pkg/f.py", b"x\n")
     asked: list[list[tuple[str, int, int]]] = []
+    grouped: list[list[int]] = []
     transferred: list[list[bytes]] = []
-    pread_many = view.pread_many
+    pread_page = view.pread_page
 
-    async def recording(
-        reads: list[tuple[str, int, int]], *, groups: list[int] | None = None, count_denials: bool = True
-    ) -> list[ReadResult | VFSError]:
-        asked.append(list(reads))
-        assert groups == [0, 0] and not count_denials
-        found = await pread_many(reads, groups=groups, count_denials=count_denials)
-        transferred.append([r.content for r in found if isinstance(r, ReadResult)])
+    async def recording(*args: Any, **kwargs: Any) -> PageRead:
+        found = await pread_page(*args, **kwargs)
+        asked.append(list(kwargs["also"]))
+        if kwargs["also"]:
+            grouped.append(list(kwargs["groups"]))
+        transferred.append([r.content for r in found.also if isinstance(r, ReadResult)])
         return found
 
-    monkeypatch.setattr(view, "pread_many", recording)
+    monkeypatch.setattr(view, "pread_page", recording)
     first, again = await read_twice(Deps(view), {"filePath": "pkg/f.py"}, {"filePath": "pkg/f.py"})
     assert "Use tabs." in first and "not used" not in first
     assert again.endswith("</content>")
     agents, claude = "/workspace/pkg/AGENTS.md", "/workspace/pkg/CLAUDE.md"
     cap = ReadSettings().instruction_bytes
     assert asked == [[(agents, 0, cap), (claude, 0, cap)], [(agents, 0, 0), (claude, 0, cap)]]
+    assert grouped == [[0, 0], [0, 0]]
     assert transferred == [[b"Use tabs.", b""], [b"", b""]]
     asked.clear()
     assert "<system-reminder>" not in await run_tool(Read, Deps(view), filePath="pkg/AGENTS.md")
     assert asked == [[(agents, 0, 0), (claude, 0, cap)]]
+    assert grouped == [[0, 0]] * 3
 
 
 async def test_directory_paging_edges(deps: Deps) -> None:
@@ -797,15 +798,18 @@ async def test_an_attachment_that_grew_past_the_limit(
     client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await put(client, "/workspace/a.png", PNG + b"\x00" * 5000)
-    pread = view.pread
+    pread_page = view.pread_page
+    calls = 0
 
-    async def growing(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
-        result = await pread(path, offset, limit)
-        if limit == SAMPLE_BYTES:
-            await view.append(path, b"\x00" * MAX_ATTACHMENT_BYTES)
+    async def growing(*args: Any, **kwargs: Any) -> PageRead:
+        nonlocal calls
+        calls += 1
+        result = await pread_page(*args, **kwargs)
+        if calls == 1:
+            await view.append("/workspace/a.png", b"\x00" * MAX_ATTACHMENT_BYTES)  # keeps the generation
         return result
 
-    monkeypatch.setattr(view, "pread", growing)
+    monkeypatch.setattr(view, "pread_page", growing)
     message = await retry_message(Read, Deps(view), filePath="a.png")
     assert message == (
         f"/workspace/a.png is too large to attach ({len(PNG) + 5000 + MAX_ATTACHMENT_BYTES} bytes, "
@@ -813,29 +817,22 @@ async def test_an_attachment_that_grew_past_the_limit(
     )
 
 
-async def test_a_page_from_another_file_than_the_sample(
+async def test_the_sample_and_the_first_batch_are_one_statement(
     client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The file becomes binary between the sample and the page: the tool samples again, and refuses it."""
-    await put(client, "/workspace/f.txt", b"text\n")
-    replaced = asyncio.Event()
-    pread, pread_lines = view.pread, view.pread_lines
+    """A page of another file than the sample can't happen any more: the sample and the page's first batch, and
+    the instruction files with them, come from one ``pread_page``, and nothing else reads them."""
+    await put(client, "/workspace/pkg/AGENTS.md", b"Use tabs.")
+    await put(client, "/workspace/pkg/f.txt", b"one\ntwo\n")
 
-    async def sampling(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
-        result = await pread(path, offset, limit)
-        if not replaced.is_set():
-            await view.unlink(path)
-            await view.create(path, b"\x00binary\n")
-            replaced.set()
-        return result
+    async def unused(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the sample, the first batch and the instruction files are one pread_page")
 
-    async def paging(*args: Any, **kwargs: Any) -> LineReadResult:
-        await replaced.wait()
-        return await pread_lines(*args, **kwargs)
-
-    monkeypatch.setattr(view, "pread", sampling)
-    monkeypatch.setattr(view, "pread_lines", paging)
-    assert await retry_message(Read, Deps(view), filePath="f.txt") == "Cannot read binary file: /workspace/f.txt"
+    for name in ("pread", "pread_lines", "pread_many"):
+        monkeypatch.setattr(view, name, unused)
+    out = await run_tool(Read, Deps(view), filePath="pkg/f.txt")
+    assert "1: one\n2: two\n" in out
+    assert "Instructions from: /workspace/pkg/AGENTS.md\nUse tabs." in out
 
 
 async def test_a_page_that_never_settles(client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -844,30 +841,30 @@ async def test_a_page_that_never_settles(client: VFSClient, view: VFSView, monke
     settings = ReadSettings(max_line_length=100, max_bytes=1024)  # one long line per batch, 7 lines a page
     data = b"".join(b"a" * 1000 + b"\n" for _ in range(10))
     await put(client, "/workspace/f.txt", data)
-    sampled = asyncio.Event()
-    calls = 0
-    pread, pread_lines = view.pread, view.pread_lines
+    pages = batches = 0
+    pread_page, pread_lines = view.pread_page, view.pread_lines
 
-    async def sampling(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
-        result = await pread(path, offset, limit)
-        sampled.set()
-        return result
-
-    async def rewriting(*args: Any, **kwargs: Any) -> LineReadResult:
-        nonlocal calls
-        await sampled.wait()  # the sample sees the generation the page starts at
-        sampled.clear()
-        calls += 1
-        result = await pread_lines(*args, **kwargs)
+    async def rewriting_page(*args: Any, **kwargs: Any) -> PageRead:
+        nonlocal pages
+        result = await pread_page(*args, **kwargs)
+        pages += 1
         await view.write("/workspace/f.txt", data)  # same bytes, a new generation
-        sampled.set()
         return result
 
-    monkeypatch.setattr(view, "pread", sampling)
-    monkeypatch.setattr(view, "pread_lines", rewriting)
+    async def rewriting_batch(*args: Any, **kwargs: Any) -> LineReadResult:
+        nonlocal batches
+        result = await pread_lines(*args, **kwargs)
+        batches += 1
+        await view.write("/workspace/f.txt", data)
+        return result
+
+    monkeypatch.setattr(view, "pread_page", rewriting_page)
+    monkeypatch.setattr(view, "pread_lines", rewriting_batch)
     out = await run_tool(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="f.txt")
     assert out == ladderframe_output("/workspace/f.txt", data, None, None, settings)
-    assert calls == 2 + 2 + 8  # two batches per failed attempt, then lines 1 to 8 (the cap falls in line 8)
+    # One page an attempt: attempts 1 and 2 stop at batch 2, which is from another generation; attempt 3 settles and
+    # reads batches 2 to 8 (the cap falls in line 8).
+    assert (pages, batches) == (3, 1 + 1 + 7)
 
 
 async def test_an_attachment_replaced_after_the_sample(
@@ -876,19 +873,19 @@ async def test_an_attachment_replaced_after_the_sample(
     """A PNG (by its magic bytes alone) replaced by text between the sample and the whole read: the tool samples
     again and reads the text, rather than attach it as an image."""
     await put(client, "/workspace/a", PNG + b"\x01" * 5000)
-    pread = view.pread
+    pread_page = view.pread_page
     replaced = False
 
-    async def replacing(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+    async def replacing(*args: Any, **kwargs: Any) -> PageRead:
         nonlocal replaced
-        result = await pread(path, offset, limit)
+        result = await pread_page(*args, **kwargs)
         if not replaced:
             replaced = True
-            await view.unlink(path)
-            await view.create(path, b"now text\n")
+            await view.unlink("/workspace/a")
+            await view.create("/workspace/a", b"now text\n")
         return result
 
-    monkeypatch.setattr(view, "pread", replacing)
+    monkeypatch.setattr(view, "pread_page", replacing)
     out = await run_tool(Read, Deps(view), filePath="a")
     assert out.endswith("<content>\n1: now text\n\n(End of file - total 1 lines)\n</content>")
 
@@ -896,36 +893,29 @@ async def test_an_attachment_replaced_after_the_sample(
 async def test_a_file_that_became_a_directory(
     client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The page's first batch fails after the sample succeeded: the tool reads the path again."""
-    await put(client, "/workspace/f", b"text\n")
-    sampled = asyncio.Event()
-    pread, pread_lines = view.pread, view.pread_lines
+    """The file becomes a directory between the page's batches: the next batch fails, and the tool reads the path
+    again."""
+    one_line_batches(monkeypatch)
+    settings = ReadSettings(max_line_length=100, max_bytes=1024)  # one long line per batch
+    await put(client, "/workspace/f", b"".join(b"a" * 1000 + b"\n" for _ in range(10)))
+    pread_page = view.pread_page
     swapped = False
 
-    async def sampling(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
-        try:
-            return await pread(path, offset, limit)
-        finally:
-            sampled.set()
-
-    async def swapping(*args: Any, **kwargs: Any) -> LineReadResult:
+    async def swapping(*args: Any, **kwargs: Any) -> PageRead:
         nonlocal swapped
-        await sampled.wait()
+        result = await pread_page(*args, **kwargs)
         if not swapped:
             swapped = True
             await view.unlink("/workspace/f")
             await view.mkdir("/workspace/f")
-        return await pread_lines(*args, **kwargs)
+        return result
 
-    monkeypatch.setattr(view, "pread", sampling)
-    monkeypatch.setattr(view, "pread_lines", swapping)
-    out = await run_tool(Read, Deps(view), filePath="f")
+    monkeypatch.setattr(view, "pread_page", swapping)
+    out = await run_tool(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="f")
     assert out == "<path>/workspace/f</path>\n<type>directory</type>\n<entries>\n\n\n(0 entries)\n</entries>"
 
 
-async def test_a_read_holds_at_most_three_connections(
-    client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_a_read_holds_one_connection(client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
     """Calls in flight at once, for a file five directories deep with instruction files on the way."""
     for d in ("a", "a/b/c"):
         await put(client, f"/workspace/{d}/CLAUDE.md", b"rules")
@@ -944,19 +934,20 @@ async def test_a_read_holds_at_most_three_connections(
 
         return call
 
-    for name in ("stat", "readdir", "pread", "pread_lines", "pread_many"):
+    for name in ("stat", "readdir", "pread", "pread_lines", "pread_many", "pread_page"):
         monkeypatch.setattr(view, name, counted(getattr(view, name)))
     settings = ReadSettings(max_bytes=1024)
     out = await run_tool(Read, Deps(view, vfs_settings=ToolSettings(read=settings)), filePath="a/b/c/d/e/f.txt")
     assert "Instructions from: /workspace/a/b/c/CLAUDE.md" in out and "Instructions from: /workspace/a/CLAUDE.md" in out
-    assert peak == 3  # the sample, the first batch and the instruction files
+    assert peak == 1  # the sample, the first batch and the instruction files are one statement
 
 
-async def test_instruction_lookups_that_fail_or_find_a_directory(
+async def test_instruction_lookups_that_find_a_directory_or_fail_with_the_read(
     client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An AGENTS.md directory falls through to CLAUDE.md, as ladderframe's ``is_file``; a lookup that fails (EIO)
-    attaches nothing, rather than guess which names are there."""
+    """An AGENTS.md directory falls through to CLAUDE.md, as ladderframe's ``is_file``; a statement that fails
+    (EIO) fails the Read: the lookups share its statement, and picking another name then could attach a file
+    ladderframe never would."""
     await put(client, "/workspace/a/CLAUDE.md", b"from a")
     await client.mkdir(f"{WS}/a/b/AGENTS.md", parents=True)
     await put(client, "/workspace/a/b/CLAUDE.md", b"from b")
@@ -967,22 +958,22 @@ async def test_instruction_lookups_that_fail_or_find_a_directory(
         "Instructions from: /workspace/a/CLAUDE.md\nfrom a\n</system-reminder>"
     )
 
-    async def failing(
-        reads: list[tuple[str, int, int]], *, groups: list[int] | None = None, count_denials: bool = True
-    ) -> list[ReadResult | VFSError]:
-        raise VFSError("EIO", reads[0][0], "database error")
+    async def failing(*args: Any, **kwargs: Any) -> PageRead:
+        raise VFSError("EIO", args[0], "database error")
 
-    monkeypatch.setattr(view, "pread_many", failing)
-    out = await run_tool(Read, Deps(view), filePath="a/b/f.txt")
-    assert out.endswith("<content>\n1: x\n\n(End of file - total 1 lines)\n</content>")
+    monkeypatch.setattr(view, "pread_page", failing)
+    assert await retry_message(Read, Deps(view), filePath="a/b/f.txt") == (
+        "Internal error reading /workspace/a/b/f.txt"
+    )
 
 
 @pytest.mark.parametrize("depth", [0, 1, 5])
-async def test_a_read_costs_three_statements_at_any_depth(
+async def test_a_read_costs_one_statement_at_any_depth(
     client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch, depth: int
 ) -> None:
     """The sample, the page (one batch, even of long lines) and the instruction files, wherever the file is; a file
-    in the working directory has no directories to look in. (Before #50: 4, 7 and 17 statements.)"""
+    in the working directory has no directories to look in. (Before #50: 4, 7 and 17 statements; before #69: 3, or
+    2 in the working directory.)"""
     dirs = "".join(f"d{i}/" for i in range(depth))
     for i in range(0, depth, 2):
         await put(client, f"/workspace/{''.join(f'd{j}/' for j in range(i + 1))}CLAUDE.md", b"rules")
@@ -999,7 +990,7 @@ async def test_a_read_costs_three_statements_at_any_depth(
     out = await run_tool(Read, Deps(view), filePath=f"{dirs}f.txt")
     assert "... (line truncated to 2000 chars)" in out and "(Output capped at 50 KB. Showing lines 1-25." in out
     assert out.count("Instructions from: ") == (depth + 1) // 2
-    assert len(statements) == (3 if depth else 2), statements
+    assert len(statements) == 1, statements
 
 
 async def test_a_file_deleted_mid_page(client: VFSClient, view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1014,7 +1005,7 @@ async def test_a_file_deleted_mid_page(client: VFSClient, view: VFSView, monkeyp
     async def deleting(*args: Any, **kwargs: Any) -> LineReadResult:
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls == 1:  # the page's batch 2: the first batch came with the sample
             await view.unlink("/workspace/f.txt")
         return await pread_lines(*args, **kwargs)
 
