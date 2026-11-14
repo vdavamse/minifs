@@ -293,7 +293,8 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
             if index != content.rfind(search):
                 if search == old_string:
                     # departs from ladderframe (#110): an ambiguous exact oldString is reported, not skipped in
-                    # favour of a later fuzzy candidate that replaces different text.
+                    # favour of a later fuzzy candidate elsewhere. A whole-line candidate can be the one meant, but
+                    # it replaces text the model left out of oldString (its indentation, say): an error is safer.
                     ambiguous = True
                     break
                 continue
