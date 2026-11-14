@@ -50,7 +50,7 @@ Two tables. `vfs_nodes` holds inodes and directory entries; `vfs_extents` holds 
 CREATE TABLE vfs_nodes (                         -- inode + directory entry (no hard links)
     id          uuid PRIMARY KEY DEFAULT uuidv7(),
     parent_id   uuid,                            -- NULL for root entries
-    name        text NOT NULL,
+    name        text NOT NULL,                   -- no '/', no control or bidi-override characters, <= 255 bytes (016)
     kind        text NOT NULL CHECK (kind IN ('file','dir')),   -- never changes after create
     size        bigint NOT NULL DEFAULT 0,       -- exact, maintained under the inode lock; 0 for dirs
     lines       bigint NOT NULL DEFAULT 0,       -- line count, updated with size
