@@ -69,6 +69,34 @@ pub struct Error {
     pub syntax: bool,
 }
 
+/// Longest panic message quoted in an error: a message can echo its input.
+const MAX_PANIC_MESSAGE: usize = 200;
+
+/// Runs `f`, reporting a panic as an internal [`Error`]. Every entry point of the Python
+/// binding goes through it: pyo3 raises a panic as `PanicException`, a `BaseException`, which
+/// no `except RegexError` or `except Exception` catches, so one pattern would end the caller's
+/// whole run instead of failing one call. (The panic hook still prints the panic to stderr.)
+pub fn guarded<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let reason = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("no message");
+        // One line, as every message is: a panic message can hold anything.
+        let reason: String = reason
+            .chars()
+            .take(MAX_PANIC_MESSAGE)
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        Err(Error {
+            message: format!("internal error: the pattern translator panicked ({reason})"),
+            span: None,
+            syntax: false,
+        })
+    })
+}
+
 impl Error {
     fn unsupported(message: impl Into<String>) -> Error {
         Error {
@@ -500,6 +528,47 @@ pub fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_is_an_internal_error() {
+        assert_eq!(guarded(|| Ok(1)), Ok(1));
+        let refused = Error::unsupported("no");
+        assert_eq!(guarded(|| Err::<(), _>(refused.clone())), Err(refused));
+        let panicked = |f: fn() -> Result<(), Error>| {
+            let err = guarded(f).unwrap_err();
+            assert_eq!((err.span, err.syntax), (None, false));
+            err.message
+        };
+        assert_eq!(
+            panicked(|| panic!("boom")),
+            "internal error: the pattern translator panicked (boom)"
+        );
+        // A formatted message, cut: it can echo the pattern.
+        assert_eq!(
+            panicked(|| panic!("{}", "x".repeat(500))),
+            format!(
+                "internal error: the pattern translator panicked ({})",
+                "x".repeat(MAX_PANIC_MESSAGE)
+            )
+        );
+        assert_eq!(
+            panicked(|| panic!("two\nlines\tand a tab")),
+            "internal error: the pattern translator panicked (two lines and a tab)"
+        );
+        assert_eq!(
+            panicked(|| std::panic::panic_any(7)),
+            "internal error: the pattern translator panicked (no message)"
+        );
+        // What a slip in the code would be: a slice out of range.
+        let message = panicked(|| {
+            let _ = "a"[std::hint::black_box(2)..].len();
+            Ok(())
+        });
+        assert!(
+            message.contains("panicked (") && message.contains("out of"),
+            "{message}"
+        );
+    }
 
     fn line(pattern: &str) -> String {
         translate(pattern, false).unwrap().line_form

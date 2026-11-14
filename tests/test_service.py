@@ -70,3 +70,16 @@ async def test_listen_needs_something_to_listen() -> None:
     with pytest.raises(ValueError, match="listen= needs a cache or watch=True"):
         async with open_vfs(Connector(""), listen=Connector("")):
             pass
+
+
+async def test_the_write_timeouts_reach_the_client(db: str) -> None:
+    async with open_vfs(Connector(db), min_size=0, lock_timeout=1.5, write_timeout=2.5) as vfs:
+        assert (vfs.client.lock_timeout, vfs.client.write_timeout) == (1.5, 2.5)
+
+
+async def test_a_bad_timeout_fails_before_anything_opens(db: str) -> None:
+    connector = Counting(db)
+    with pytest.raises(ValueError, match="write_timeout must be over 0"):
+        async with open_vfs(connector, write_timeout=0):
+            pass
+    assert connector.opened == 0

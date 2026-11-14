@@ -157,7 +157,7 @@ Found 1 matches
   Line 2:     return a - b
 ```
 
-Mistakes the model can fix (a missing path, an offset past the end, a bad regex) come back as pydantic-ai retries with a hint, such as `File not found` with similar names. A policy denial comes back as the tool's result, `Permission denied: write /docs/guide.md`, since retrying won't help.
+Mistakes the model can fix (a missing path, an offset past the end, a bad regex) come back as pydantic-ai retries with a hint, such as `File not found` with similar names. A policy denial comes back as the tool's result, `Permission denied: write /docs/guide.md`, since retrying won't help. An internal error in `Grep` is reported to the model too, and logged, instead of ending the run.
 
 ### How `Grep` runs in Postgres
 
@@ -200,6 +200,8 @@ class Deps:
 | `Write` | diffs old files up to 1 MB (larger ones are replaced without a diff) |
 
 **The directory cache.** Use one `DirEntryCache` per long-running process; leave it out for one-shot scripts. It maps `(parent id, name)` to a node, follows other processes' renames and deletes through `NOTIFY`, and expires entries after 60 s. Every use is checked in the statement that uses it, so a stale entry costs a slower lookup, never the wrong file. `cache.stats()` reports the hit rate.
+
+**Write timeouts.** A write waits at most 5 s for a lock another writer holds (the file, or a directory on its path) and runs at most 30 s, so one long write of a hot file can't stall every other agent in the process. A write that runs out tells the model to try again. `open_vfs(..., lock_timeout=5.0, write_timeout=30.0)` changes them; they replace the server's own defaults for the write's transaction, so a deployment with a tighter policy passes smaller values.
 
 **Lakebase and other token-auth Postgres.** `Connector(conninfo, password=fetch_token)` calls `fetch_token` (sync or async) for every new connection. `LISTEN` needs a direct connection: behind a transaction-mode pooler, pass `open_vfs(..., listen=Connector(direct_conninfo))`. `min_size=0` lets idle pools hold no connections.
 

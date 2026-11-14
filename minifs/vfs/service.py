@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from minifs.db.pool import Connector, Pools
 from minifs.vfs.cache import DirEntryCache
-from minifs.vfs.client import VFSClient
+from minifs.vfs.client import DEFAULT_LOCK_TIMEOUT, DEFAULT_WRITE_TIMEOUT, VFSClient, check_timeout
 from minifs.vfs.watch import Watcher
 
 
@@ -42,10 +42,12 @@ async def open_vfs(
     write_size: int = 5,
     search_size: int = 2,
     min_size: int = 1,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+    write_timeout: float = DEFAULT_WRITE_TIMEOUT,
 ) -> AsyncGenerator[VFS]:
     """A ``VFSClient`` over the write and search pools (see ``Pools``), with ``cache`` if given. A cache, or
     ``watch``, opens the process's ``Watcher`` on ``listen`` (default: ``connector``), which the cache follows until
-    the block exits.
+    the block exits. ``lock_timeout`` and ``write_timeout`` (seconds) bound every write, see ``VFSClient``.
 
     ``listen`` is for a deployment whose ``connector`` goes through a transaction-mode pooler, which drops LISTEN: give
     it a direct connection. ValueError if nothing would listen on it. The watcher keeps that connection open, and its
@@ -54,6 +56,8 @@ async def open_vfs(
     """
     if listen is not None and cache is None and not watch:
         raise ValueError("listen= needs a cache or watch=True: nothing would listen")
+    check_timeout("lock_timeout", lock_timeout)  # before any connection is opened
+    check_timeout("write_timeout", write_timeout)
     async with contextlib.AsyncExitStack() as stack:
         pools = await stack.enter_async_context(
             Pools(connector, write_size=write_size, search_size=search_size, min_size=min_size)
@@ -64,7 +68,13 @@ async def open_vfs(
         if cache is not None:
             assert watcher is not None
             await stack.enter_async_context(cache.follow(watcher))
-        client = VFSClient(pools.write, search_pool=pools.search, cache=cache)
+        client = VFSClient(
+            pools.write,
+            search_pool=pools.search,
+            cache=cache,
+            lock_timeout=lock_timeout,
+            write_timeout=write_timeout,
+        )
         try:
             yield VFS(client, pools, watcher, cache)
         finally:

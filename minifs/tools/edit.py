@@ -46,7 +46,7 @@ from minifs.tools._text import (
 )
 from minifs.tools.base import vfs_tool
 from minifs.tools.deps import HasVFS, resolve, settings
-from minifs.tools.errors import tool_error
+from minifs.tools.errors import TIMED_OUT_WRITE, tool_error
 from minifs.vfs.core import VFSError
 from minifs.vfs.view import VFSView
 
@@ -101,7 +101,9 @@ async def edit(
         else:
             raise VFSError("ESTALE", path)
     except VFSError as e:
-        return tool_error(e, "write", ENOENT="File {path} not found", ENOTDIR="File {path} not found")
+        return tool_error(
+            e, "write", ENOENT="File {path} not found", ENOTDIR="File {path} not found", ETIMEDOUT=TIMED_OUT_WRITE
+        )
     diff = await asyncio.to_thread(
         diff_metadata, path, normalize_line_endings(content_old), normalize_line_endings(content_new)
     )

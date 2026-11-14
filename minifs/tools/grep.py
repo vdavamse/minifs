@@ -5,6 +5,8 @@ then line."""
 
 from __future__ import annotations
 
+import logging
+
 from pydantic_ai import ModelRetry, RunContext
 
 from minifs._regex import RegexError
@@ -13,7 +15,10 @@ from minifs.tools.deps import ALWAYS_EXCLUDED, HasVFS, resolve, settings
 from minifs.tools.errors import tool_error
 from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError
+from minifs.vfs.regex import RegexTranslationBug, UnsupportedDatabase, clipped
 from minifs.vfs.search import GrepHit, SearchRefused
+
+logger = logging.getLogger(__name__)
 
 DESCRIPTION = """- Fast content search tool that works with any codebase size
 - Searches file contents using regular expressions
@@ -52,6 +57,19 @@ async def grep(ctx: RunContext[HasVFS], pattern: str, path: str | None = None, i
         # A missing path, one below a file, and one outside the view all look alike, as on disk.
         missing = "No such file or directory: {path}"
         return tool_error(e, "read", ENOENT=missing, ENOTDIR=missing)
+    except RegexTranslationBug:
+        # A bug in minifs's translator, which validate() has logged: another pattern may well translate.
+        raise ModelRetry("Internal error translating this pattern; try a simpler one") from None
+    except UnsupportedDatabase as e:
+        # No pattern can work, so this is the result, not a retry: the model reads it and moves on.
+        logger.error("Grep is unavailable: %s", e)
+        return "Grep is unavailable: internal error. Use the other tools instead."
+    except RuntimeError:
+        # Anything else that isn't the model's doing mustn't end the run either. The cause is unknown and may not
+        # be the pattern, so this is a result too: a retry that fails again would end the run. The pattern may
+        # quote file contents, so the log carries it cut short.
+        logger.exception("Grep failed on the pattern %s", clipped(pattern))
+        return "Grep failed: internal error. Try a different pattern or use the other tools."
 
     if not result.hits:
         return "No files found"

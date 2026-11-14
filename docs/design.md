@@ -249,7 +249,7 @@ So the translator never relies on ARE's classes, word boundaries or case folding
 | `*`, `+`, `?`, `{n,m}`, lazy forms | The same quantifier (counts up to 255, ARE's limit) |
 | Groups, alternation | `(?:...)`, `|` |
 
-**Rejected, with an rg-style message:** lookaround and backreferences (as rg without `-P`), a literal `\n` (as rg without `-U`), byte classes outside ASCII, counts above 255, and a translation over the size cap. Rejecting is always better than a silent zero-match. Each translation is also compiled once in Postgres (`SELECT '' ~ $1`); a failure there is reported as a translator bug, never as the model's mistake.
+**Rejected, with an rg-style message:** lookaround and backreferences (as rg without `-P`), a literal `\n` (as rg without `-U`), byte classes outside ASCII, counts above 255, and a translation over the size cap. Rejecting is always better than a silent zero-match. Each translation is also compiled once in Postgres (`SELECT '' ~ $1`); a failure there is reported as a translator bug, never as the model's mistake. The log line carries the pattern and the translation cut to 200 characters, with the full length and the start of the pattern's SHA-256, since a pattern can quote file contents, and `Grep` asks the model for a simpler pattern instead of ending the run.
 
 **Cost of explicit classes**, on PG 18 over 200,000 lines:
 
@@ -283,7 +283,7 @@ The tools follow opencode's file-tool contracts (which Claude Code's resemble): 
 
 **Glob and Grep** are described above. Output: one absolute path per line for `Glob`, newest first; `Found N matches`, then hits grouped by file as `  Line N: text`, for `Grep`. Both return `No files found` when nothing matches, and a truncation footer past 100 results.
 
-**Errors.** A mistake the model can fix by calling again raises `ModelRetry` with a message that says what to change: `File not found` (with up to three similar names from inside the view), an offset past the end, a bad pattern (rg's message), a scope over the cap, a timeout. A path outside the view gets each tool's not-found error, so errors never reveal what exists beyond the chroot. A policy denial is returned as the result, `Permission denied: <action> <path>`, since retrying won't help. `minifs.tools.errors.tool_error` does the mapping at each tool's boundary.
+**Errors.** A mistake the model can fix by calling again raises `ModelRetry` with a message that says what to change: `File not found` (with up to three similar names from inside the view), an offset past the end, a bad pattern (rg's message), a scope over the cap, a timeout. A path outside the view gets each tool's not-found error, so errors never reveal what exists beyond the chroot. A policy denial is returned as the result, `Permission denied: <action> <path>`, since retrying won't help. An internal error in `Grep` never ends the run: a translator bug is a retry that asks for a simpler pattern, and anything else (a database that isn't UTF8, an unforeseen `RuntimeError`) is a result, `Grep failed: internal error...`, with the cause in the log. `minifs.tools.errors.tool_error` does the mapping at each tool's boundary.
 
 **Where the tools differ from disk-based implementations of the same contracts:**
 - The view's policy is the only permission gate.
@@ -300,15 +300,15 @@ The tools follow opencode's file-tool contracts (which Claude Code's resemble): 
 | --- | --- |
 | Credentials | Managed services use short-lived tokens as the password. `Connector(conninfo, password=fetch_token)` fetches one for every new connection: pools and watcher reconnects alike. |
 | LISTEN | Use a direct connection, never a transaction-mode pooler (`open_vfs(..., listen=...)`). Its keepalive probe keeps a Lakebase compute from scaling to zero while a watcher runs. A listener that stops reading holds back the shared NOTIFY queue. |
-| Pools | Per process: one `LISTEN` connection, a write pool (about 5) and a smaller search pool, so searches don't starve writes. A tool call holds one to three connections while it runs. |
+| Pools | Per process: one `LISTEN` connection, a write pool (about 5) and a smaller search pool, so searches don't starve writes. A tool call holds one to three connections while it runs. A write waits at most `lock_timeout` (5 s) for a lock another writer holds (the file, or a directory on its path) and runs at most `write_timeout` (30 s), so one long write of a hot file can't queue the whole pool behind it (`open_vfs(..., lock_timeout=, write_timeout=)`). |
 | NOTIFY volume | A transaction that notifies takes a database-wide lock at commit, so every append commits through it. If a hot log makes that a bottleneck, consider not emitting `modify` for it. |
 | Vacuum | Appends leave a dead `vfs_nodes` version each, mostly pruned in place thanks to HOT; overwrites and compaction leave dead extents. Watch `n_dead_tup` on both tables. Long-open transactions block pruning. |
 | Compaction | Run `vfs_compact` periodically on files with many extents (say over 1,000). It holds each inode lock only while merging that file. |
 | Versions and extensions | PG 16 to 18 are tested (the schema needs 15+ for `UNIQUE NULLS NOT DISTINCT`). No extensions are required. |
 
-**Protecting the database.** Every search statement runs under a timeout. Scope caps (files and bytes, from `vfs_nodes`) refuse an oversized search before any content is read. Output is capped at 100 results with a hint to narrow. Search has its own pool. A read replica would also isolate search load, at the price of read-your-writes consistency.
+**Protecting the database.** Every search statement runs under a timeout. Scope caps (files and bytes, from `vfs_nodes`) refuse an oversized search before any content is read. Output is capped at 100 results with a hint to narrow. Search has its own pool. A read replica would also isolate search load, at the price of read-your-writes consistency. Every write runs under `lock_timeout` and `statement_timeout`: a lock wait that runs out (EAGAIN) or a cancelled write (ETIMEDOUT) is a retry for the model, and the connection goes back to the pool instead of waiting behind the write that holds the file.
 
-**What to watch:** tool latency and calls per run; search duration, bytes scanned, timeouts, refusals and translator rejections by construct; the directory cache's hit rate (`cache.stats()`); extents per file; policy denials (`Policy.denials`, by actor and action).
+**What to watch:** tool latency and calls per run; search duration, bytes scanned, timeouts, refusals and translator rejections by construct; writes that run out of their lock wait (EAGAIN) or are cancelled (ETIMEDOUT), each a warning in the `minifs.vfs.client` log; the directory cache's hit rate (`cache.stats()`); extents per file; policy denials (`Policy.denials`, by actor and action).
 
 ## Testing
 
