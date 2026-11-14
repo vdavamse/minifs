@@ -40,7 +40,7 @@ class ReadSettings:
     """Output cap per call."""
     instruction_bytes: int = 64 * 1024
     """Bytes read of each ``AGENTS.md`` / ``CLAUDE.md`` attached to a result; a longer one is cut there, with a
-    note (ladderframe reads them whole)."""
+    note (ladderframe reads them whole). 0 attaches none."""
     max_entries: int = 10_000
     """Entries of a directory ``Read`` fetches to sort and page as ladderframe does. A directory with more is paged
     in byte order of name, at most this many entries a page, and no names are suggested for a missing path in

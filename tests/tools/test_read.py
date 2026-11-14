@@ -295,6 +295,15 @@ async def test_instruction_files_are_cut_at_the_cap(client: VFSClient, deps: Dep
         "(Instructions truncated at 1001 bytes of 1200)\n</system-reminder>"
     )
     assert "�" not in out
+    # A cut that leaves no text (here, half a character) attaches nothing: a note alone isn't worth it.
+    tiny = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(instruction_bytes=1)))
+    out = await run_tool(Read, tiny, filePath="pkg/sub/f.txt")
+    assert out.endswith(
+        "<system-reminder>\nInstructions from: /workspace/pkg/sub/CLAUDE.md\ns\n\n"
+        "(Instructions truncated at 1 bytes of 5)\n</system-reminder>"
+    )
+    off = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(instruction_bytes=0)))
+    assert "<system-reminder>" not in await run_tool(Read, off, filePath="pkg/sub/f.txt")
     whole = await run_tool(Read, deps, filePath="pkg/sub/f.txt")  # the default cap, 64 KB, takes it whole
     assert "Instructions from: /workspace/pkg/AGENTS.md\n" + "é" * 600 + "\n</system-reminder>" in whole
 
@@ -336,6 +345,19 @@ async def test_a_directory_over_the_cap_is_paged_in_byte_order(client: VFSClient
         assert f"<entries>\n\n\n(Showing 0 of 5 entries, {order})" in await run_tool(
             Read, small, filePath="big", offset=offset
         )
+    # One entry over the cap: the page that ends at the last entry learns the count from an empty probe.
+    over = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(max_entries=4)))
+    order = "in byte order of name: the directory is over the 4 entries Read sorts"
+    assert await run_tool(Read, over, filePath="big") == (
+        f"{head}B\na\nc\nd/\n\n(Showing 4 of more than 4 entries, {order}. "
+        "Use 'offset' parameter to read beyond entry 5)\n</entries>"
+    )
+    assert await run_tool(Read, over, filePath="big", offset=2, limit=4) == (
+        f"{head}a\nc\nd/\né\n\n(Showing 4 of 5 entries, {order})\n</entries>"
+    )
+    assert await run_tool(Read, over, filePath="big", offset=5) == (
+        f"{head}é\n\n(Showing 1 of 5 entries, {order})\n</entries>"
+    )
     # With the cap at 5 the same directory is listed as ladderframe lists it.
     sorted_deps = Deps(deps.vfs, vfs_settings=ToolSettings(read=ReadSettings(max_entries=5)))
     assert "<entries>\na\nB\nc\nd/\né\n\n(5 entries)\n</entries>" in await run_tool(Read, sorted_deps, filePath="big")

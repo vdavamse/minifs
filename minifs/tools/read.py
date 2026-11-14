@@ -393,10 +393,13 @@ async def _nearby_instructions(ctx: RunContext[HasVFS], path: str) -> list[str]:
 
 def _instruction_text(result: ReadResult, cap: int) -> str:
     """The text of an instruction file read with ``cap`` bytes: whole when the read reached its end, else the first
-    ``cap`` bytes cut back to a character boundary, with a note saying how much there is."""
+    ``cap`` bytes cut back to a character boundary, with a note saying how much there is ("" when that leaves no
+    text: a note alone isn't worth attaching)."""
     if result.eof:
         return result.content.decode("utf-8", errors="replace").strip()
     text = _whole_characters(result.content).decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
     return f"{text}\n\n(Instructions truncated at {cap} bytes of {result.size})"
 
 
