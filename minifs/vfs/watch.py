@@ -45,7 +45,7 @@ from psycopg import AsyncConnection, errors, sql
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import ConnectionFactory
-from minifs.vfs.core import VFSError, refuse_controls
+from minifs.vfs.core import MAX_COMPONENTS, VFSError, refuse_controls
 
 logger = logging.getLogger(__name__)
 
@@ -580,6 +580,8 @@ class Watcher:
         """``watch``, with ``PathWatch``'s ``ancestors`` and ``fence`` options."""
         refuse_controls(path)  # as core.split does for a caller's path (#92); not split itself: relative paths work
         segments = [s for s in path.split("/") if s]
+        if len(segments) > MAX_COMPONENTS:  # as core.split does; vfs_lookup would raise it as a database error
+            raise VFSError("ENAMETOOLONG", path, f"over the {MAX_COMPONENTS}-component limit")
         watch = PathWatch(self, segments, self._maxsize, self._rescan_interval, ancestors=ancestors, fence=fence)
         watch = self._add(watch)
         try:
