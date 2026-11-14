@@ -8,7 +8,7 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Sequence
 from functools import cache
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -16,9 +16,10 @@ from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import Connector, open_pool
+from minifs.vfs import glob as globbing
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import Entry, GlobResult, ReadResult, VFSError
-from minifs.vfs.glob import GlobError, compile_excludes, compile_glob
+from minifs.vfs.glob import GlobError, GlobMatch, compile_excludes, compile_glob
 from minifs.vfs.policy import DEFAULT_POLICY, Policy, PolicyDenied, Rule
 from minifs.vfs.search import GrepResult, SearchRefused
 from minifs.vfs.view import VFSView, _below, workspace_mounts  # pyright: ignore[reportPrivateUsage]
@@ -934,3 +935,39 @@ async def test_glob_from_a_virtual_directory_matches_globbing_the_tree(vfs: VFSC
             real = await vfs.glob(pattern, _MIRROR + directory.rstrip("/"), excludes=excludes, hidden=hidden)
             expected = sorted(e.path.removeprefix(_MIRROR) for e in real)
             assert sorted(e.path for e in seen) == expected, (directory, pattern, excludes)
+
+
+async def test_glob_reports_a_bad_root_at_its_path(
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A vfs_glob that reports ENOENT for its root (here faked; elsewhere a race with the client's lookup) is
+    reported at the path the root was resolved from, not at the root's id, and the view strips id and detail."""
+    real_glob = globbing.glob
+    fake_root = uuid4()  # vfs_glob returns ENOENT for a root that isn't there
+
+    async def broken_glob(conn: AsyncConnection, root: UUID | None, pattern: str, **kwargs: Any) -> list[GlobMatch]:
+        return await real_glob(conn, fake_root, pattern, **kwargs)
+
+    monkeypatch.setattr(globbing, "glob", broken_glob)
+    await raises("ENOENT", vfs.glob("*", f"/workspaces/{W1}"), f"/workspaces/{W1}")
+    error = await raises("ENOENT", view(vfs, policy).glob("*", "/workspace"), "/workspace")
+    assert str(fake_root) not in str(error)
+    assert error.detail == ""
+
+
+async def test_an_error_path_that_is_not_a_path_is_reported_at_the_target(
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client error whose path isn't an absolute path (a node id, say) is reported at the target: the view
+    neither shows the string nor fails on it."""
+    agent = view(vfs, policy)
+    for bad in [str(uuid4()), "None", ""]:
+
+        async def broken_stat(path: str, bad: str = bad) -> Entry:
+            raise VFSError("ENOENT", bad, detail="real detail")
+
+        monkeypatch.setattr(vfs, "stat", broken_stat)
+        error = await raises("ENOENT", agent.stat("/workspace/notes.md"), "/workspace/notes.md")
+        assert "real detail" not in str(error)
+        if bad:
+            assert bad not in str(error)

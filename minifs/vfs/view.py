@@ -552,7 +552,10 @@ class VFSView:
 
     def _visible(self, real: str, *targets: _Target) -> str:
         """The visible path of ``real``, a path the operation on ``targets`` reported: one of their real paths, or
-        a path below or above one in its mount. A path above a mount point is reported as the mount point."""
+        a path below or above one in its mount. A path above a mount point is reported as the mount point, and a
+        string that isn't an absolute path as the first target."""
+        if not real.startswith("/"):
+            return targets[0].visible  # not a path (a node id, say): never shown, and no error from in here
         segments = split_trusted(real)
         for target in targets:
             if real == target.real:
