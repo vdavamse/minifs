@@ -16,27 +16,31 @@ as far as the actor may see it:
   can change the path ends the watch, after a ``delete`` at the old path: a move of the node to another directory
   or to a name the actor may not read, a rename it has already left again (even back to the watched name: the
   events in between happened under a path the watch never had), a move or removal of any directory above it (a
-  mount point's included, even one moved back), or a path that no longer leads to the node when the watch checks
-  after a ``rescan`` (a move may have been missed). Watch the new path again to follow it.
-- Events are hints: the node's own ``move`` and ``delete``, its ancestors' ``move`` and ``delete``, and a
-  ``rescan`` are checked against the database before the watch acts on them: the watched path must still lead to
-  the node through the same directories (the same ids) it resolved through when the watch started, so a directory
-  above it that was replaced by another of the same name counts as moved. A move to where the watch already has
-  the node (committed before the watch started, or forged) or a delete that removed nothing is dropped. A forged
-  move to anywhere else ends the watch: forging takes EXECUTE on ``vfs_channel()``. Each check costs a query on
-  the watcher's pool; when one fails, the watch delivers a ``rescan`` and ends.
+  mount point's included, even one moved back). Watch the new path again to follow it.
+- Every event is relative to the path the watch resolved. Nothing committed before the watch's fence is
+  delivered (``PathWatch`` ``fence``): no child event that happened before the watch returned, perhaps under
+  another path, and a move or delete above the node in that window that may have changed the path is a
+  ``rescan``. A ``rescan`` ends the watch, after it is delivered: events were lost, a move among them perhaps, and
+  no check made after the fact can vouch for the events queued meanwhile. Watch again, and re-list.
+- Events are hints: the node's own ``move`` and ``delete`` and its ancestors' ``delete`` are checked against the
+  database before the watch acts on them: the watched path must still lead to the node through the same
+  directories (the same ids) it resolved through when the watch started, so a directory above it that was
+  replaced by another of the same name counts as moved. A move to where the watch already has the node, or a
+  delete that removed nothing, can only be forged, and is dropped; a forged move to anywhere else ends the watch
+  (forging takes EXECUTE on ``vfs_channel()``). Each check costs a query on the watcher's pool; when one fails, the
+  watch delivers a ``rescan`` and ends.
 - Each child event is judged by the name in its own notification (the name the child had when it changed; the
   ``modify`` payload carries it since migration 021), so no name is remembered or looked up. A child ``modify``
   without a name (a schema before 021) is dropped. Postgres folds identical notifications within a transaction,
   so a child renamed back and forth in one transaction may be seen at a stale name: the actor gets ENOENT on it,
   never the hidden name.
-- A name that no node can have (empty, ``.``, ``..``, with a ``/``, or over 255 bytes) comes only from a forged
-  payload, and its event is dropped.
+- A name that no node can have (empty, ``.``, ``..``, with a ``/``, over 255 bytes, or not UTF-8) comes only
+  from a forged payload, and its event is dropped.
 - An event is never lost to a caller's timeout: if ``get()`` is cancelled while it checks the database, the event
   and the check are kept, and the next ``get()`` resumes them.
 
-The underlying ``PathWatch`` still does the rest: it subscribes before resolving the path, confirms a ``rescan``
-and the node's own ``delete`` against the database, rate-limits rescans and ends when its node is gone.
+The underlying ``PathWatch`` still does the rest: it subscribes before resolving the path, sends the fence,
+confirms the node's own ``delete`` against the database, rate-limits rescans and ends when its node is gone.
 """
 
 from __future__ import annotations
@@ -146,24 +150,15 @@ class ViewWatch:
 
     async def _seen(self, event: Event) -> WatchEvent | None:
         node = self._inner.node
-        if event.op == "rescan":
-            return await self._confirmed(WatchEvent("rescan", self.path))
+        if event.op == "rescan":  # events may have been lost, a move among them: no later check can vouch for
+            return self._end(WatchEvent("rescan", self.path))  # the events queued meanwhile, so the watch ends
         if event.id == node:
             return await self._own(event)
         if event.id in self._inner.ancestors:  # a move or delete of a directory above the node
-            if event.op == "move" and not self._ancestor_in_place(event):
+            if event.op == "move" and not self._inner.in_place(event):  # in place: forged, the fence drops real ones
                 return self._end(WatchEvent("delete", self.path, kind=self.kind))
             return await self._confirmed(None)
         return await self._child(event)
-
-    def _ancestor_in_place(self, event: Event) -> bool:
-        """Whether an ancestor's move put it where the watched path has it (before the watch started, or forged).
-        Any other move changed the path when it committed, even if a later one moved it back: the events queued
-        after it happened under that other path, so the watch can't judge them."""
-        chain = self._inner.chain
-        depth = chain.index(event.id)  # pyright: ignore[reportArgumentType]  # in ancestors, so in chain
-        parent = chain[depth - 1] if depth else None
-        return event.parent == parent and event.name == self._real[depth]
 
     async def _own(self, event: Event) -> WatchEvent | None:
         """An event of the watched node itself."""
@@ -183,8 +178,8 @@ class ViewWatch:
         watch never had, so it can't judge them)."""
         chain = self._inner.chain
         parent = chain[-2] if len(chain) > 1 else None
-        if event.parent == parent and event.name == self._real[-1]:
-            return await self._confirmed(None)
+        if event.parent == parent and event.name == self._real[-1]:  # to where the watch has it: forged (the fence
+            return await self._confirmed(None)  # dropped a real one committed before the watch)
         gone = WatchEvent("delete", self.path, kind=self.kind)
         if event.parent != parent or self._mount_point or not _valid(event.name):
             return self._end(gone)

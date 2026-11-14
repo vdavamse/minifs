@@ -546,7 +546,7 @@ class VFSView:
         if target.real is None:
             raise VFSError("EINVAL", target.visible, "a virtual directory can't be watched")
         async with contextlib.AsyncExitStack() as stack:
-            watch = self._watcher._watch(target.real, ancestors=True)  # pyright: ignore[reportPrivateUsage]
+            watch = self._watcher._watch(target.real, ancestors=True, fence=True)  # pyright: ignore[reportPrivateUsage]
             inner = await self._mapped(stack.enter_async_context(watch), target)
             view_watch = ViewWatch(
                 inner,

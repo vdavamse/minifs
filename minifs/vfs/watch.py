@@ -39,7 +39,7 @@ from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Literal, Self, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from psycopg import AsyncConnection, errors, sql
 from psycopg_pool import AsyncConnectionPool
@@ -53,6 +53,7 @@ DEFAULT_RESCAN_INTERVAL = 1.0
 """Seconds a subscription waits after delivering a ``rescan`` before it delivers the next (``Watcher``)."""
 _LOGGED_PAYLOAD_CHARS = 200
 _MALFORMED_LOG_INTERVAL = 10.0  # seconds between two warnings about malformed payloads
+_FENCE_PREFIX = "minifs-fence:"  # a watch's own fence notification (PathWatch fence=True), never an Event
 
 Op = Literal["create", "modify", "move", "delete", "rescan"]
 
@@ -250,6 +251,15 @@ class PathWatch(Subscription):
 
     With ``ancestors``, the ``move`` and ``delete`` events of the directories above the node are delivered too
     (``ancestors`` holds their ids), for a consumer that must know when the node's path changes (``VFSView.watch``).
+
+    With ``fence``, the watch sends a fence notification of its own on the channel right after resolving the path,
+    and nothing committed before it is delivered: notifications come in commit order, so whatever reaches the
+    watch ahead of its fence was committed before the watch returned, perhaps before the path was resolved,
+    perhaps after. Child events from then are dropped (``Watcher.watch`` only promises changes committed after it
+    returns). A move of the node or of a directory above it to where the resolved path has it is dropped too: it
+    happened before the lookup, which saw its result. Anything else that may have changed the resolved path (any
+    other move or delete of those, or a rescan) is delivered as a ``rescan``. The events a watch delivers are then
+    all relative to the path it resolved (``VFSView.watch``).
     """
 
     def __init__(
@@ -260,10 +270,13 @@ class PathWatch(Subscription):
         rescan_interval: float = DEFAULT_RESCAN_INTERVAL,
         *,
         ancestors: bool = False,
+        fence: bool = False,
     ) -> None:
         super().__init__(watcher, None, maxsize, rescan_interval)
         self._segments = segments
         self._follow_ancestors = ancestors
+        self._fence: str | None = None  # the payload of the fence notification, once sent
+        self._fenced = not fence  # whether events are delivered: after the fence, or without one
         self.node: UUID | None = None
         """The watched node; None is the root."""
         self.chain: tuple[UUID, ...] = ()
@@ -281,7 +294,29 @@ class PathWatch(Subscription):
         # subscribing and resolving.
         if self._resolved and event.op != "rescan" and not self.matches(event):
             return
+        if self._resolved and not self._fenced:
+            self._before_fence(event)
+            return
         super()._offer(event, now=now)
+
+    def _before_fence(self, event: Event) -> None:
+        """An event committed before the fence: dropped, unless it may have changed the resolved path (a rescan,
+        a move or delete of the node or a directory above it, except a move to where the path has it), which is
+        delivered as a rescan."""
+        if event.op == "rescan" or (
+            event.op in ("move", "delete") and event.id in self.chain and not self.in_place(event)
+        ):
+            super()._offer(RESCAN, now=True)
+
+    def in_place(self, event: Event) -> bool:
+        """Whether ``event`` moved the node, or a directory above it, to where the resolved path has it."""
+        if event.op != "move" or event.id is None or event.id not in self.chain:
+            return False
+        depth = self.chain.index(event.id)
+        return event.parent == (self.chain[depth - 1] if depth else None) and event.name == self._segments[depth]
+
+    def _fence_reached(self) -> None:
+        self._fenced = True
 
     def matches(self, event: Event) -> bool:
         if event.op == "rescan" or (self.node is not None and event.id == self.node):
@@ -296,15 +331,31 @@ class PathWatch(Subscription):
         async with self._watcher._query() as conn:  # pyright: ignore[reportPrivateUsage]
             cur = await conn.execute("SELECT id, kind, chain, err, err_detail FROM vfs_lookup(%s)", (self._segments,))
             row = await cur.fetchone()
-        assert row is not None
-        if row[3] is not None:
-            raise VFSError(row[3], "/" + "/".join(self._segments), detail=row[4] or "")
-        self.node, self.kind = row[0], row[1]
-        self.chain = tuple(row[2] or ())
-        if self._follow_ancestors:
-            self.ancestors = frozenset(self.chain[:-1])
-        self._resolved = True
-        self._events = deque(e for e in self._events if self.matches(e))
+            assert row is not None
+            if row[3] is not None:
+                raise VFSError(row[3], "/" + "/".join(self._segments), detail=row[4] or "")
+            self.node, self.kind = row[0], row[1]
+            self.chain = tuple(row[2] or ())
+            if self._follow_ancestors:
+                self.ancestors = frozenset(self.chain[:-1])
+            self._resolved = True
+            self._events = deque(e for e in self._events if self.matches(e))
+            if not self._fenced:
+                await self._send_fence(conn)
+
+    async def _send_fence(self, conn: AsyncConnection[Any]) -> None:
+        """Sends the fence, after judging the events buffered so far (all before it). Without a channel (the
+        watcher is reconnecting) there is no fence to send: a rescan, as for any gap."""
+        buffered, self._events = self._events, deque()
+        for event in buffered:
+            self._before_fence(event)
+        channel = self._watcher.channel
+        if channel is None:
+            super()._offer(RESCAN, now=True)
+            return
+        self._fence = f"{_FENCE_PREFIX}{uuid4()}"
+        self._watcher._fences[self._fence] = self  # pyright: ignore[reportPrivateUsage]
+        await conn.execute("SELECT pg_catalog.pg_notify(%s, %s)", (channel, self._fence))
 
     async def _still_there(self) -> bool:
         """Whether the node still exists. False if the check fails: the caller re-watches, which is safe."""
@@ -335,6 +386,8 @@ class PathWatch(Subscription):
         for check in list(self._checks):
             check.cancel()
         self._check = None
+        if self._fence is not None:
+            self._watcher._fences.pop(self._fence, None)  # pyright: ignore[reportPrivateUsage]
         super()._end()
 
     async def get(self) -> Event:
@@ -425,6 +478,7 @@ class Watcher:
         self._maxsize = maxsize
         self._rescan_interval = rescan_interval
         self._malformed_logged_at = -math.inf
+        self._fences: dict[str, PathWatch] = {}  # fence payload -> the watch waiting for it
         self._malformed_suppressed = 0
         self._subscriptions: set[Subscription] = set()
         self._conn: AsyncConnection[Any] | None = None
@@ -499,10 +553,11 @@ class Watcher:
             yield watch
 
     @contextlib.asynccontextmanager
-    async def _watch(self, path: str, *, ancestors: bool = False) -> AsyncGenerator[PathWatch]:
-        """``watch``, with ``PathWatch``'s ``ancestors`` option."""
+    async def _watch(self, path: str, *, ancestors: bool = False, fence: bool = False) -> AsyncGenerator[PathWatch]:
+        """``watch``, with ``PathWatch``'s ``ancestors`` and ``fence`` options."""
         segments = [s for s in path.split("/") if s]
-        watch = self._add(PathWatch(self, segments, self._maxsize, self._rescan_interval, ancestors=ancestors))
+        watch = PathWatch(self, segments, self._maxsize, self._rescan_interval, ancestors=ancestors, fence=fence)
+        watch = self._add(watch)
         try:
             await watch._open()  # pyright: ignore[reportPrivateUsage]
             yield watch
@@ -625,6 +680,11 @@ class Watcher:
             # notifies() returns after keepalive seconds, however many notifications arrived meanwhile.
             async for notify in conn.notifies(timeout=self._keepalive):
                 if notify.channel != self._channel:
+                    continue
+                if notify.payload.startswith(_FENCE_PREFIX):  # a watch's fence (maybe another process's): no event
+                    fenced = self._fences.pop(notify.payload, None)
+                    if fenced is not None:
+                        fenced._fence_reached()  # pyright: ignore[reportPrivateUsage]
                     continue
                 try:
                     event = Event.from_payload(notify.payload)

@@ -203,11 +203,11 @@ async def test_a_moved_mount_point_ends_the_watch(vfs: VFSClient, watcher: Watch
 
 
 async def test_a_rescan_is_reported_at_the_watched_path(vfs: VFSClient, watcher: Watcher) -> None:
-    """A rescan reaches the actor at its visible watched path, and nothing else on it."""
+    """A rescan reaches the actor at its visible watched path, and ends the watch: events were lost."""
     agent = view(vfs, watcher)
     async with agent.watch("/workspace/d") as w:
         watcher._broadcast(RESCAN, now=True)  # pyright: ignore[reportPrivateUsage]
-        assert await next_seen(w) == WatchEvent("rescan", "/workspace/d")
+        assert await drained(w) == [WatchEvent("rescan", "/workspace/d")]
 
 
 async def test_an_unreadable_docs_view(vfs: VFSClient, watcher: Watcher) -> None:
@@ -216,6 +216,9 @@ async def test_an_unreadable_docs_view(vfs: VFSClient, watcher: Watcher) -> None
     with pytest.raises(PolicyDenied):
         async with agent.watch("/docs"):
             pass
+
+
+VAULT = Policy({"agent": [Rule("/workspace/vault/*"), Rule("/workspace/**", "read", "write")]})
 
 
 def private_policy() -> Policy:
@@ -341,8 +344,49 @@ async def test_a_rescan_after_a_missed_move_ends_the_watch(
         finally:
             await conn.execute("ALTER TABLE vfs_nodes ENABLE TRIGGER USER")
         watcher._broadcast(RESCAN, now=True)  # pyright: ignore[reportPrivateUsage]
-        assert await next_seen(w) == WatchEvent("delete", "/workspace/pub/d", kind="dir")
-        assert await drained(w) == []
+        assert await drained(w) == [WatchEvent("rescan", "/workspace/pub/d")]
+
+
+async def test_events_after_a_missed_move_and_back_are_not_reported(
+    vfs: VFSClient, watcher: Watcher, conn: AsyncConnection
+) -> None:
+    """A move lost in a gap (the rescan stands for it), then changes under the hidden name, then a move back, all
+    before the actor reads the rescan: the rescan ends the watch, so nothing from under the hidden name follows."""
+    await vfs.mkdir_p(f"{R1}/inbox")
+    agent = view(vfs, watcher, VAULT)
+    async with agent.watch("/workspace/inbox") as w:
+        inbox = (await vfs.stat(f"{R1}/inbox")).id
+        assert inbox is not None
+        await conn.execute("ALTER TABLE vfs_nodes DISABLE TRIGGER USER")
+        try:
+            await conn.execute("UPDATE vfs_nodes SET name = 'vault' WHERE id = %s", (inbox,))
+        finally:
+            await conn.execute("ALTER TABLE vfs_nodes ENABLE TRIGGER USER")
+        watcher._broadcast(RESCAN, now=True)  # pyright: ignore[reportPrivateUsage]
+        await vfs.create(f"{R1}/vault/payroll.csv", b"x" * 1234)
+        await vfs.rename(f"{R1}/vault", f"{R1}/inbox")
+        assert await drained(w) == [WatchEvent("rescan", "/workspace/inbox")]
+
+
+async def test_events_from_before_the_watch_are_not_reported(
+    vfs: VFSClient, watcher: Watcher, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changes under a hidden name, then a move to the watched path, all committed while the watch starts (their
+    notifications still on their way): the fence drops them, so the first event is the marker."""
+    await vfs.mkdir_p(f"{R1}/vault")
+    original_open = PathWatch._open  # pyright: ignore[reportPrivateUsage]
+
+    async def open_after_changes(self: PathWatch) -> None:
+        await vfs.create(f"{R1}/vault/payroll.csv", b"x" * 1234)
+        await vfs.append(f"{R1}/vault/payroll.csv", b"more")
+        await vfs.rename(f"{R1}/vault", f"{R1}/inbox")
+        await original_open(self)
+
+    monkeypatch.setattr(PathWatch, "_open", open_after_changes)
+    agent = view(vfs, watcher, VAULT)
+    async with agent.watch("/workspace/inbox") as w:
+        await agent.create("/workspace/inbox/marker", b"")
+        assert await next_seen(w) == WatchEvent("create", "/workspace/inbox/marker", kind="file")
 
 
 async def test_a_cancelled_get_keeps_its_event(
@@ -358,11 +402,14 @@ async def test_a_cancelled_get_keeps_its_event(
 
     monkeypatch.setattr(ViewWatch, "_at", staticmethod(slow))
     agent = view(vfs, watcher)
-    async with agent.watch("/workspace/d") as w:
-        watcher._broadcast(RESCAN, now=True)  # pyright: ignore[reportPrivateUsage]
+    async with agent.watch("/workspace/notes.md") as w:
+        await vfs.rename(f"{R1}/notes.md", f"{R1}/renamed.md")
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(w.get(), 0.1)
-        assert await next_seen(w) == WatchEvent("rescan", "/workspace/d")
+        assert w._pending is not None  # pyright: ignore[reportPrivateUsage]
+        assert await next_seen(w) == WatchEvent(
+            "move", "/workspace/renamed.md", kind="file", old_path="/workspace/notes.md"
+        )
 
 
 async def test_a_move_just_before_the_watch_is_not_a_delete(
@@ -426,7 +473,7 @@ async def test_a_parent_swapped_for_a_same_named_one_ends_the_watch(vfs: VFSClie
 
 
 async def test_the_final_event_survives_a_timed_out_get(
-    vfs: VFSClient, watcher: Watcher, conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+    vfs: VFSClient, watcher: Watcher, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A get() that times out while the watch checks its path does not lose the event that ends the watch:
     the next get() still returns it."""
@@ -437,20 +484,12 @@ async def test_the_final_event_survives_a_timed_out_get(
         return await original(real, conn)
 
     monkeypatch.setattr(ViewWatch, "_at", staticmethod(slow))
-    await vfs.mkdir_p(f"{R1}/pub/d")
     agent = view(vfs, watcher)
-    async with agent.watch("/workspace/pub/d") as w:
-        pub = (await vfs.stat(f"{R1}/pub")).id
-        assert pub is not None
-        await conn.execute("ALTER TABLE vfs_nodes DISABLE TRIGGER USER")  # a move the watch misses
-        try:
-            await conn.execute("UPDATE vfs_nodes SET name = 'moved' WHERE id = %s", (pub,))
-        finally:
-            await conn.execute("ALTER TABLE vfs_nodes ENABLE TRIGGER USER")
-        watcher._broadcast(RESCAN, now=True)  # pyright: ignore[reportPrivateUsage]
+    async with agent.watch("/workspace/notes.md") as w:
+        await vfs.unlink(f"{R1}/notes.md")
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(w.get(), 0.1)
-        assert await next_seen(w) == WatchEvent("delete", "/workspace/pub/d", kind="dir")
+        assert await next_seen(w) == WatchEvent("delete", "/workspace/notes.md", kind="file")
         assert await drained(w) == []
 
 
@@ -491,9 +530,6 @@ async def test_a_rename_left_again_ends_the_watch(vfs: VFSClient, watcher: Watch
         await vfs.rename(f"{R1}/notes.md", f"{R1}/a.md")
         await vfs.rename(f"{R1}/a.md", f"{R1}/b.md")
         assert await drained(w) == [WatchEvent("delete", "/workspace/notes.md", kind="file")]
-
-
-VAULT = Policy({"agent": [Rule("/workspace/vault/*"), Rule("/workspace/**", "read", "write")]})
 
 
 @pytest.mark.parametrize("back", ["inbox", "inbox2"])

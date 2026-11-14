@@ -782,6 +782,26 @@ async def test_malformed_payloads_are_logged_cut_short_and_seldom(
     assert len(warnings) == 2 and len(warnings[1]) < 400 and "and 4 more since the last warning" in warnings[1]
 
 
+async def test_a_fence_reaches_only_its_watch(
+    conn: AsyncConnection, watcher: Watcher, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fenced watch's fence is no event: no other subscription gets it and it isn't logged as malformed; nor
+    is another process's fence (a payload with the prefix no watch here waits for). Once it arrives the watch
+    delivers what follows, and closing forgets it."""
+    caplog.set_level("WARNING", logger="minifs.vfs.watch")
+    await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ("minifs-fence:not-ours",))
+    with watcher.subscribe() as everything:
+        async with watcher._watch("/", fence=True) as w:  # pyright: ignore[reportPrivateUsage]
+            await catch_up(watcher, conn)
+            assert w._fenced  # pyright: ignore[reportPrivateUsage]
+            assert watcher._fences == {}  # pyright: ignore[reportPrivateUsage]
+            await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps({"op": "rescan"}),))
+            assert await next_event(w) is RESCAN
+        everything.close()
+        assert {e.op for e in await drain(everything)} <= {"modify", "rescan"}  # catch_up's marker, the rescan
+    assert not [r for r in caplog.records if "malformed" in r.getMessage()]
+
+
 async def test_consecutive_rescans_are_folded(db: str) -> None:
     async with Watcher(factory(db)) as watcher:
         events = watcher.subscribe()
