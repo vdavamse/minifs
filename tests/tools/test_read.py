@@ -1068,8 +1068,7 @@ def _old_is_binary(path: str, sample: bytes) -> bool:
 def test_is_binary_matches_the_python_count_on_edge_cases(path: str, sample: bytes, expected: bool) -> None:
     """The C count gives what the Python count gave, and the expected answer, at each edge: NUL, the 30% threshold,
     bytes 9-13, 0x7F and 0x80+, UTF-8 cut at the sample boundary, BOMs, binary extensions."""
-    assert _is_binary(path, sample) == expected
-    assert _is_binary(path, sample) == _old_is_binary(path, sample)
+    assert _is_binary(path, sample) == expected == _old_is_binary(path, sample)
 
 
 def test_is_binary_matches_the_python_count_on_every_byte_value() -> None:

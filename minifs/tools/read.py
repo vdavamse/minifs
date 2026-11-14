@@ -264,8 +264,8 @@ def _sniff_mime(sample: bytes, path: str) -> str:
 
 _PRINTABLE = bytes(b for b in range(256) if not (b < 9 or 13 < b < 32))
 """The bytes ``_is_binary`` doesn't count as control characters: tab to CR (0x09-0x0D) and space up (0x20-0xFF), so
-UTF-8 text counts nothing. ``sample.translate(None, _PRINTABLE)`` keeps only the counted ones, in C. NUL is in neither
-set, but ``_is_binary`` returns before counting when the sample has one."""
+UTF-8 text counts nothing. ``sample.translate(None, _PRINTABLE)`` keeps only the counted ones, in C. NUL would count,
+but ``_is_binary`` returns before counting when the sample has one."""
 
 
 def _is_binary(path: str, sample: bytes) -> bool:
