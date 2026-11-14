@@ -8,6 +8,8 @@ from __future__ import annotations
 import contextlib
 import random
 import time
+from collections.abc import Callable
+from functools import partial
 
 from minifs.vfs.core import CONTROL_CHARACTERS, split, split_trusted
 from minifs.vfs.policy import (
@@ -180,6 +182,41 @@ def test_a_negated_empty_range_matches_a_newline() -> None:
         assert not policy.allows("agent", "write", hidden), ascii(hidden)
 
 
+def _best_of(call: Callable[[], bool], runs: int = 5) -> tuple[bool, float]:
+    """``call()``'s answer and its fastest time over ``runs`` runs, so a preempted runner or a GC pause in one run
+    can't fail a timing bound."""
+    times: list[float] = []
+    answer = False
+    for _ in range(runs):
+        started = time.perf_counter()
+        answer = call()
+        times.append(time.perf_counter() - started)
+    return answer, min(times)
+
+
+def test_deep_paths_dont_backtrack_across_segments() -> None:
+    """Several ``**``, or many segments, against a deep path the agent picks that nearly matches: each segment is
+    an atomic group and each ``**`` but the last an atomic lazy one (``_rule_regex``), so the matcher doesn't try
+    every way of sharing the segments between the globstars, or both branches of every foldable hide segment.
+    ``/**/a/**/a/**/a/**/b`` against 200 ``/a`` took 47 s before (#142)."""
+    deep_a = "/a" * 200 + "/c"
+    cases = (
+        ("/**/a/**/a/**/a/**/b", deep_a),
+        ("/**/a/**/a/**/b", deep_a),
+        ("/w" + "/*" * 20 + "/x", "/w" + "/a" * 20 + "/y"),
+        ("/workspace/**/.git/**/config", "/workspace" + "/.git" * 200 + "/x"),
+        ("/**/*/*/*.env", "/a" * 200 + "/x"),
+    )
+    for pattern, path in cases:
+        for rule in (Rule(pattern), Rule(pattern, "read")):
+            name = f"{ascii(pattern)} hides={rule.hides}"
+            want = _matches_by_rests(rule, split_trusted(path))
+            policy = Policy({"agent": [rule]})
+            got, took = _best_of(partial(policy.matches, "agent", path))
+            assert got == want, name
+            assert took < 0.05, f"{name} took {took * 1000:.1f} ms"
+
+
 def test_many_stars_dont_backtrack() -> None:
     """Several stars and a long name that nearly matches: each star but the last goes in an atomic group with a
     lazy wildcard (``_segment_regex``, as ``fnmatch.translate`` spells it), so the matcher takes the leftmost
@@ -192,9 +229,7 @@ def test_many_stars_dont_backtrack() -> None:
         want = _matches_by_rests(rule, segments)
         assert not want, name  # the name holds neither a "b" nor a "_", so no rule matches it
 
-        started = time.perf_counter()
-        got = rule.matches(path)
-        took = time.perf_counter() - started
+        got, took = _best_of(partial(rule.matches, path))
         assert got == want, name
         assert took < 0.05, f"{name} took {took * 1000:.1f} ms"
 
@@ -203,9 +238,7 @@ def test_many_stars_dont_backtrack() -> None:
         first = next((other for other in rules if _matches_by_rests(other, segments)), None)
         for action in ACTIONS:
             want_allows = first.grants(action) if first is not None else False
-            started = time.perf_counter()
-            got_allows = policy.allows("agent", action, path)
-            took = time.perf_counter() - started
+            got_allows, took = _best_of(partial(policy.allows, "agent", action, path))
             assert got_allows == want_allows, f"{name} {action}"
             assert took < 0.05, f"{name} {action} took {took * 1000:.1f} ms"
 
@@ -266,3 +299,31 @@ def test_policy_lookups_agree_with_the_reference_matcher() -> None:
                     )
                 checks += 1
     assert checks >= 10_000, checks
+
+
+def test_star_and_globstar_heavy_rules_agree_with_the_reference_matcher() -> None:
+    """The differential again, with patterns heavy in ``*`` and ``**`` and deeper paths, so the atomic groups
+    (each star but the last, each ``**`` but the last, every segment) are exercised on paths that match as well
+    as on near misses (#142)."""
+    rng = random.Random(142)
+    tokens = [*TOKENS, *(["*"] * 6), "a", "b", FW_SOLIDUS]
+    names = [*NAMES, "a", "b", "ab", FW_SOLIDUS, "x"]
+    checks = globstars = 0
+    while checks < 20_000:
+        segments = [
+            "**" if rng.random() < 0.35 else "".join(rng.choice(tokens) for _ in range(rng.randint(1, 4)))
+            for _ in range(rng.randint(1, 6))
+        ]
+        pattern = "/" + "/".join(segments)
+        globstars += segments.count("**") >= 2
+        for rule in _rules_for(pattern):
+            for _ in range(20):
+                path = "/" + "/".join(
+                    "".join(rng.choice(names) for _ in range(rng.randint(1, 3))) for _ in range(rng.randint(0, 7))
+                )
+                if CONTROL_CHARACTERS.search(path):
+                    continue
+                want = _matches_by_rests(rule, split_trusted(path))
+                assert rule.matches(path) == want, f"pattern {ascii(rule.pattern)} on path {ascii(path)}: rests {want}"
+                checks += 1
+    assert globstars >= 100, globstars  # enough patterns with two or more ** to exercise the atomic lazy groups

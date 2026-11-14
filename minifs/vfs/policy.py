@@ -79,7 +79,7 @@ class Rule:
     segments: tuple[str, ...] = field(repr=False, compare=False)
     alternatives: tuple[tuple[str, ...], ...] = field(repr=False, compare=False)
     regex: re.Pattern[str] = field(repr=False, compare=False)
-    """The compiled ``alternatives`` (``_alt_regex``), whose ``fullmatch`` decides a lookup against the path
+    """The compiled ``alternatives`` (``_rule_regex``), whose ``fullmatch`` decides a lookup against the path
     string (``_path_string``) or, for a hide rule, its dual string (``_dual_string``)."""
 
     def __init__(self, pattern: str, *actions: Action) -> None:
@@ -97,7 +97,7 @@ class Rule:
         object.__setattr__(self, "actions", frozenset(actions))
         object.__setattr__(self, "segments", segments)
         object.__setattr__(self, "alternatives", alternatives)
-        object.__setattr__(self, "regex", re.compile("".join(_alt_regex(alt, not actions) for alt in alternatives)))
+        object.__setattr__(self, "regex", _rule_regex(alternatives, not actions))
 
     @property
     def hides(self) -> bool:
@@ -338,15 +338,38 @@ def _segment_regex(segment: str, exclude: str) -> str:
     return "".join(out)
 
 
+_SEGMENT_END = r"(?=/|\Z)"
+
+
+def _rule_regex(alternatives: tuple[tuple[str, ...], ...], hides: bool) -> re.Pattern[str]:
+    """A rule's compiled regex: its segments (``_alt_regex``) in order, with the ``**`` segments spelled as
+    ``_segment_regex`` spells stars, one level up. The runs of segments between two ``**`` match a fixed number of
+    segments each, so every ``**`` but the last is an atomic lazy group taking the leftmost place its run
+    matches, ``(?>(?:/[^/]+)*?run(?=/|\\Z))``, and only the last ``**`` stays greedy. The ``**`` after a run
+    absorbs whatever follows it, so nothing is lost, and a deep path that nearly matches can't make the regex try
+    every way of sharing its segments between the globstars."""
+    runs: list[str] = [""]
+    for alt in alternatives:
+        if alt == ("**",):
+            runs.append("")
+        else:
+            # Each segment's regex consumes exactly one whole segment, however it matches inside it, so it is
+            # atomic: a later failure can't retry another way of matching it (the other branch of a foldable hide
+            # segment, another split between its stars), which would multiply the work across segments.
+            runs[-1] += f"(?>{_alt_regex(alt, hides)}{_SEGMENT_END})"
+    if len(runs) == 1:
+        return re.compile(runs[0])
+    middle = "".join(f"(?>(?:/[^/]+)*?{run}{_SEGMENT_END})" for run in runs[1:-1])
+    return re.compile(f"{runs[0]}{middle}(?:/[^/]+)*{runs[-1]}")
+
+
 def _alt_regex(alt: tuple[str, ...], hides: bool) -> str:
     """The regex one segment of a rule's ``alternatives`` contributes, matching ``/name`` in the string a lookup
-    is fullmatched against (``_path_string``, or ``_dual_string`` for a hide rule): ``("**",)`` is zero or more
-    whole segments; a hide rule's foldable segment ``(s, f)`` matches a name's raw form against ``s`` or its
+    is fullmatched against (``_path_string``, or ``_dual_string`` for a hide rule), never ``**`` (``_rule_regex``
+    spells those): a hide rule's foldable segment ``(s, f)`` matches a name's raw form against ``s`` or its
     folded form against ``f`` (per segment, #93), where the ``/`` folding a fullwidth solidus gives is the NUL of
     the dual string; a hide rule's exact-only segment ``(s,)`` matches the raw form and skips the folded one; a
     grant rule's segment ``(s,)`` matches the raw form alone."""
-    if alt == ("**",):
-        return "(?:/[^/]+)*"
     if len(alt) == 2:
         raw = _segment_regex(alt[0], "/\x00")  # a raw name holds neither separator
         folded = _segment_regex(alt[1].replace("/", "\x00"), "/")  # a folded name can hold the NUL of a folded /
