@@ -17,10 +17,13 @@ Grant rules match names byte for byte, case-sensitively. A rule with no actions 
 pattern matches byte for byte and, in addition, the case and Unicode variants of the names it spells: the folded
 pattern against the folded name, where folding drops the format characters (Unicode category Cf, such as
 zero-width spaces), then applies NFKC normalisation, case folding and NFKC again, and a ``?`` or ``[...]`` of
-the pattern matches one character of the folded name. A hide rule that missed a variant would leak it, while a
+the pattern matches one character of the folded name. The byte-exact and the folded match are tried per
+segment, not per character, so one segment that needs both (``[!a-z]*.env`` against ``Config.ENV``) isn't
+hidden; spell such rules as two rules or with ``*``. A hide rule that missed a variant would leak it, while a
 loosened grant would grant more than written, so a rule with some actions is a grant and stays exact. A hide
 rule may not contain a character that folds to glob syntax, such as the fullwidth asterisk U+FF0A, which folds
-to ``*``. Suffixes and trailing spaces are other names: use ``*`` (``.env*``). Over-hiding is the trade-off:
+to ``*``, nor one in a ``[...]`` class that folds to more or fewer than one character, which would split the
+class. Suffixes and trailing spaces are other names: use ``*`` (``.env*``). Over-hiding is the trade-off:
 ``Rule("/workspace/Makefile")`` also hides ``MAKEFILE``.
 """
 
@@ -60,14 +63,15 @@ class Rule:
     """``actions`` granted on the paths ``pattern`` matches: ``Rule("/docs/**", "read")``. A rule with no actions
     hides those paths instead: it matches what ``pattern`` matches byte for byte (``segments``) and, in addition,
     the case and Unicode variants of the names it spells (``match_segments``, the folded pattern, against the
-    folded path), so it may not contain a character that folds to glob syntax. A rule that grants matches
-    ``segments`` byte for byte."""
+    folded path), the two tried per segment (``alternatives``), so it may not contain a character that folds to
+    glob syntax. A rule that grants matches ``segments`` byte for byte."""
 
     pattern: str
     actions: frozenset[Action]
     segments: tuple[str, ...] = field(repr=False, compare=False)
     hides: bool = field(repr=False, compare=False)
     match_segments: tuple[str, ...] = field(repr=False, compare=False)
+    alternatives: tuple[tuple[str, ...], ...] = field(repr=False, compare=False)
 
     def __init__(self, pattern: str, *actions: Action) -> None:
         unknown = set(actions) - _ACTIONS
@@ -82,11 +86,14 @@ class Rule:
         if hides:
             _no_folded_glob_syntax(pattern)
             _no_literal_globs(pattern, match_segments)  # the folded pattern is what matching uses
+            _no_folded_class_splits(pattern, segments)
+        alternatives = tuple(zip(segments, match_segments, strict=False)) if hides else tuple((s,) for s in segments)
         object.__setattr__(self, "pattern", pattern)
         object.__setattr__(self, "actions", frozenset(actions))
         object.__setattr__(self, "segments", segments)
         object.__setattr__(self, "hides", hides)
         object.__setattr__(self, "match_segments", match_segments)
+        object.__setattr__(self, "alternatives", alternatives)
 
     def matches(self, path: str) -> bool:
         """Whether the pattern matches ``path`` (normalised first)."""
@@ -230,6 +237,34 @@ def _no_folded_glob_syntax(pattern: str) -> None:
             )
 
 
+def _no_folded_class_splits(pattern: str, segments: tuple[str, ...]) -> None:
+    """Raises ValueError if a hide rule's ``pattern`` has a character inside a ``[...]`` class that folds to more
+    or fewer than one character: the folded class would gain or lose members, so fnmatch would read it as a
+    different class than the one spelled. E.g. the sharp s U+00DF folds to ``ss`` and the zero-width space U+200B
+    to nothing. Scans as ``_bad_class`` does: a ``]`` first in a class, after any ``!``, is literal. Grant rules
+    aren't folded, so they aren't checked."""
+    for segment in segments:
+        i, n = 0, len(segment)
+        while i < n:
+            c, i = segment[i], i + 1
+            if c != "[":
+                continue
+            j = i
+            if j < n and segment[j] == "!":
+                j += 1
+            if j < n and segment[j] == "]":
+                j += 1
+            while j < n and segment[j] != "]":
+                member = segment[j]
+                if len(_fold(member)) != 1:
+                    raise ValueError(
+                        f"rule pattern has {member!r} (U+{ord(member):04X}) in a class, which folds to"
+                        f" {len(_fold(member))} characters, splitting the class fnmatch would match: {pattern!r}"
+                    )
+                j += 1
+            i = j + 1
+
+
 @lru_cache(maxsize=4096)
 def _fold(name: str) -> str:
     """The form of ``name`` a hide rule matches by: the format characters (Unicode category Cf, such as the
@@ -246,34 +281,50 @@ def _folded(segments: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(_fold(segment) for segment in segments)
 
 
-def _rule_rests(rule: Rule, segments: tuple[str, ...]) -> frozenset[tuple[str, ...]]:
-    """What can remain of ``rule``'s pattern once ``segments`` is matched against its start. A hide rule matches
-    a path either byte for byte or folded (its ``match_segments`` against the folded ``segments``), so the rests
-    of the two matches are united in one frozenset; the callers only test the rests for emptiness and
-    ``_only_globstars``, which the union answers correctly. A grant rule matches byte for byte alone, and
-    nothing is folded for it."""
-    rests = _rests(rule.segments, segments)
-    if rule.hides:
-        return rests | _rests(rule.match_segments, _folded(segments))
-    return rests
+def _rule_rests(rule: Rule, segments: tuple[str, ...]) -> frozenset[tuple[tuple[str, ...], ...]]:
+    """What can remain of ``rule``'s pattern once ``segments`` is matched against its start. Each of the rule's
+    pattern segments carries the alternatives it matches by (``rule.alternatives``): the raw segment alone for a
+    grant rule, the raw and the folded segment for a hide rule, and the path segments are built in the same
+    shape, so ``_rests`` tries the byte-exact and the folded match per segment."""
+    path = _folded_alts(segments) if rule.hides else _exact_alts(segments)
+    return _rests(rule.alternatives, path)
 
 
 @lru_cache(maxsize=4096)
-def _rests(pattern: tuple[str, ...], path: tuple[str, ...]) -> frozenset[tuple[str, ...]]:
+def _exact_alts(segments: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    """The path form of a grant rule's match: every segment matches byte for byte alone."""
+    return tuple((segment,) for segment in segments)
+
+
+@lru_cache(maxsize=4096)
+def _folded_alts(segments: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    """The path form of a hide rule's match: every segment matches raw or folded."""
+    return tuple(zip(segments, _folded(segments), strict=False))
+
+
+@lru_cache(maxsize=4096)
+def _rests(
+    pattern: tuple[tuple[str, ...], ...], path: tuple[tuple[str, ...], ...]
+) -> frozenset[tuple[tuple[str, ...], ...]]:
     """What can remain of ``pattern`` once ``path`` is matched against its start: ``pattern`` matches ``path`` if
-    a remainder is empty or all ``**``, and may match a path below ``path`` if there is any remainder."""
+    a remainder is empty or all ``**``, and may match a path below ``path`` if there is any remainder. Segments
+    are tuples of alternatives, paired by position: a path segment matches a pattern segment if some form of it
+    matches the pattern's form at the same position (raw against raw, folded against folded), and ``**`` is a
+    whole segment (the same in every alternative)."""
     if not path:
         return frozenset([pattern])
     if not pattern:
         return frozenset()
     head = pattern[0]
-    if head == "**":
+    if head[0] == "**":
         return _rests(pattern[1:], path) | _rests(pattern, path[1:])
-    return _rests(pattern[1:], path[1:]) if fnmatchcase(path[0], head) else frozenset()
+    if any(fnmatchcase(p, q) for p, q in zip(path[0], head, strict=False)):
+        return _rests(pattern[1:], path[1:])
+    return frozenset()
 
 
-def _only_globstars(rest: tuple[str, ...]) -> bool:
-    return all(segment == "**" for segment in rest)
+def _only_globstars(rest: tuple[tuple[str, ...], ...]) -> bool:
+    return all(segment[0] == "**" for segment in rest)
 
 
 DEFAULT_POLICY = Policy(

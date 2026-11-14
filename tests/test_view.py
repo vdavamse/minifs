@@ -1063,6 +1063,31 @@ def test_hide_rules_match_variants() -> None:
     assert not below.allows("a", "read", "/w", subtree=True)  # and could match below /w
     composed = Policy({"a": [Rule("/w/" + chr(0xE9)), Rule("/w/**", "read")]})
     assert not composed.allows("a", "read", "/w/e" + zwsp + chr(0x301))  # Cf dropped before composing
+    # #130: the byte-exact and the folded match are tried per segment, so a path that needs the exact match in
+    # one segment and the folded match in another is hidden (matching only whole paths leaked it).
+    exact_folded = Policy({"a": [Rule("/w/[!a-z]*/.env"), Rule("/w/**", "read")]})
+    assert not exact_folded.allows("a", "read", "/w/Config/.ENV")  # Config byte for byte, .ENV folded
+    assert exact_folded.allows("a", "read", "/w/config/.env")  # config matches neither: [!a-z] folds to itself
+    sharp = Policy({"a": [Rule("/w/?/.env"), Rule("/w/**", "read")]})
+    assert not sharp.allows("a", "read", "/w/" + chr(0xDF) + "/.ENV")  # ? is the sharp s byte for byte
+    between = Policy({"a": [Rule("/w/[A-z]*/.env"), Rule("/w/**", "read")]})
+    assert not between.allows("a", "read", "/w/_p/.ENV")  # _ is between Z and a byte for byte
+    both_ways = Policy({"a": [Rule("/w/Secret/[!a-z]*"), Rule("/w/**", "read")]})
+    assert not both_ways.allows("a", "read", "/w/SECRET/README")  # SECRET folded, README byte for byte
+    deep = Policy({"a": [Rule("/w/[!a-z]*/.env/**"), Rule("/w/**", "read")]})
+    assert not deep.allows_any("a", "read", "/w/Config/.ENV")
+    assert not deep.allows("a", "read", "/w/Config", subtree=True)
+    outside = Policy({"a": [Rule("/w/stra" + chr(0xDF) + "e"), Rule("/w/**", "read")]})
+    assert not outside.allows("a", "read", "/w/STRASSE")  # a multi-character fold outside a class stays allowed
+    for member in (
+        "/w/stra[" + chr(0xDF) + "]e",  # the sharp s folds to "ss": two class members where one was spelled
+        "/w/[" + chr(0x1C5) + "]",  # the DZ digraph folds to two characters
+        "/w/[" + chr(0xFB01) + "]x",  # the fi ligature folds to "fi"
+        "/w/[a" + chr(0x200B) + "]",  # the zero-width space folds to nothing
+    ):
+        with pytest.raises(ValueError, match="fnmatch"):  # it would split the class the folded pattern matches
+            Rule(member)
+        Rule(member, "read")  # a grant rule isn't folded: each is an ordinary character
     for ch in (
         chr(0xFF0A),  # a fullwidth asterisk: it folds to *
         chr(0xFF1F),  # a fullwidth question mark: it folds to ?
@@ -1090,15 +1115,18 @@ async def test_a_hide_rule_hides_case_and_unicode_variants(vfs: VFSClient) -> No
 
 async def test_a_hide_rule_hides_variants_from_glob_grep_and_stat(vfs: VFSClient) -> None:
     """#130: Glob, Grep and Stat agree on the variants a hide rule covers: a glob with ``hidden`` (which would
-    otherwise list dotfiles) returns neither, a grep for their contents finds nothing and ``stat`` is EACCES."""
+    otherwise list dotfiles) returns neither, a grep for their contents finds only a readable control file and
+    ``stat`` is EACCES."""
     operator = view(vfs, Policy({"operator": [Rule("/**", "read", "write")]}), "operator")
     await operator.create("/workspace/.ENV", b"secret\n")
     await operator.create("/workspace/sub/.Env", b"secret\n", parents=True)
+    await operator.create("/workspace/visible.txt", b"secret\n")
     agent = view(vfs, Policy({"agent": [Rule("/workspace/**/.env"), Rule("/**", "read", "write")]}))
     paths = [e.path for e in (await agent.glob("**/*", "/workspace", hidden=True)).entries]
     assert "/workspace/.ENV" not in paths and "/workspace/sub/.Env" not in paths
     assert "/workspace/log.md" in paths  # the glob walked and matched the other files
-    assert (await agent.grep("secret", "/workspace")).hits == []
+    hits = (await agent.grep("secret", "/workspace")).hits  # the control proves the grep searched
+    assert [(h.path, h.line, h.text) for h in hits] == [("/workspace/visible.txt", 1, "secret")]
     await raises("EACCES", agent.stat("/workspace/.ENV"), "/workspace/.ENV")
 
 
