@@ -504,23 +504,35 @@ async def test_the_schema_is_where_vfs_nodes_resolves(conn: AsyncConnection, db:
         await Watcher(connect_empty).start()
 
 
-async def test_a_watcher_follows_a_changed_channel(conn: AsyncConnection, db: str) -> None:
-    """The name can change under a running watcher. A reconnect reads it again, and so does the keepalive probe,
-    which reconnects: either way the subscriber gets a rescan and then the events on the new channel."""
-    async with Watcher(factory(db), keepalive=0.2, retry_min=0.01) as watcher:
-        events = watcher.subscribe(lambda e: e.op == "create")  # and rescans; not the catch-up markers
+@pytest.mark.parametrize("how", ["probe", "reconnect"])
+async def test_a_watcher_follows_a_changed_channel(conn: AsyncConnection, db: str, how: str) -> None:
+    """The name can change under a running watcher. The keepalive probe notices and reconnects, and a reconnect
+    for any other reason reads the name again: either way the subscriber gets a rescan and then the events on the
+    new channel."""
+    keepalive = 0.2 if how == "probe" else 3600  # no probe in the reconnect case
+    async with Watcher(factory(db), keepalive=keepalive, retry_min=0.01) as watcher:
+        events = watcher.subscribe(lambda e: e.op == "create")  # and rescans; not the catch-up marker
         await catch_up(watcher, conn)
-        for how in ("probe", "reconnect"):
-            if how == "reconnect":
-                watcher._keepalive = 3600  # pyright: ignore[reportPrivateUsage]
-                await catch_up(watcher, conn)  # the next wait for notifications has the long keepalive
-            await conn.execute("UPDATE vfs_channel_name SET channel = %s", (name := f"vfs_{uuid4().hex}",))
-            if how == "reconnect":
-                await terminate(conn, watcher.backend_pid)
-            assert await next_event(events) == RESCAN
-            assert watcher.channel == name
-            f = await create(conn, None, how)
-            assert (await next_event(events)).id == f
+        await conn.execute("UPDATE vfs_channel_name SET channel = %s", (name := f"vfs_{uuid4().hex}",))
+        if how == "reconnect":
+            await terminate(conn, watcher.backend_pid)
+        assert await next_event(events) == RESCAN
+        assert watcher.channel == name
+        f = await create(conn, None, "f")
+        assert (await next_event(events)).id == f
+
+
+async def test_the_trigger_functions_refuse_another_table(conn: AsyncConnection, listener: AsyncConnection) -> None:
+    """They are SECURITY DEFINER, so they must act for vfs_nodes alone, whatever their ACL says: on another table
+    (here the owner's own, so EXECUTE is not what stops it) they raise before reading the row, and notify nothing."""
+    await conn.execute("CREATE TEMP TABLE other (id uuid, parent_id uuid, name text, kind text)")
+    await conn.execute("CREATE TRIGGER a AFTER INSERT ON other FOR EACH ROW EXECUTE FUNCTION vfs_notify()")
+    await conn.execute("CREATE TRIGGER b AFTER TRUNCATE ON other EXECUTE FUNCTION vfs_notify_truncate()")
+    for statement in ("INSERT INTO other (id) VALUES (gen_random_uuid())", "TRUNCATE other"):
+        with pytest.raises(errors.RaiseException, match="the trigger function of vfs_nodes alone"):
+            await conn.execute(statement)
+    f = await create(conn, None, "f")
+    assert [p["id"] for p in await payloads(listener, 1)] == [str(f)]
 
 
 async def test_an_empty_channel_table_fails_at_start(conn: AsyncConnection, db: str) -> None:
@@ -581,6 +593,17 @@ async def test_only_a_role_granted_the_function_learns_the_channel(db: str) -> N
             assert await cur.fetchone() == (0,)
             with pytest.raises(RuntimeError, match=r"GRANT EXECUTE ON FUNCTION \"public\".vfs_channel\(\)"):
                 await Watcher(connect_as_role).start()
+            # Nor may it put the trigger functions, which run as the owner, on a table of its own: that would
+            # forge events without the name, and run the role's own cast to json as the owner.
+            await admin.execute(
+                "CREATE TEMP TABLE forged (id uuid, parent_id uuid, name text, kind text, size bigint, generation int)"
+            )
+            for statement in (
+                "CREATE TRIGGER t AFTER INSERT ON forged FOR EACH ROW EXECUTE FUNCTION public.vfs_notify()",
+                "CREATE TRIGGER t AFTER TRUNCATE ON forged EXECUTE FUNCTION public.vfs_notify_truncate()",
+            ):
+                with pytest.raises(errors.InsufficientPrivilege):
+                    await admin.execute(statement)
             async with await AsyncConnection.connect(db, autocommit=True) as listener:
                 await listener.execute(sql.SQL("LISTEN {}").format(sql.Identifier(name)))
                 f = await create(admin, None, "f")

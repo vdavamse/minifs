@@ -9,13 +9,14 @@ credentials after an hour. So the watcher gets every connection from a factory, 
 reconnects with backoff, listens again, and then sends every subscription a ``rescan`` event: events may have
 been lost in the gap, so callers re-check whatever they watch (saved cursors make that cheap) and caches clear.
 
-A connection can also die without the socket closing. Every ``keepalive`` seconds the watcher runs ``SELECT 1``,
+A connection can also die without the socket closing. Every ``keepalive`` seconds the watcher runs a small query,
 and treats no answer within ``probe_timeout`` as a lost connection, which it closes without waiting for the
 server. The probe keeps a Lakebase compute awake while a watcher runs; that is the price of noticing a dead
 connection.
 
-The channel is the schema's own (``vfs_channel()``, migration 016): a random name, read from the database when the
-watcher connects, so two minifs schemas in one database don't see each other's events. Channels are database-wide,
+The channel is the schema's own (``vfs_channel()``, migration 016): a random name, read from the database on every
+connection and checked by each probe (a changed name is followed, with a ``rescan``), so two minifs schemas in one
+database don't see each other's events. Channels are database-wide,
 and anyone who knows a channel's name can LISTEN and NOTIFY on it, so the trust boundary is who can learn the name:
 a role with EXECUTE on ``vfs_channel()``, which is the schema's owner until it grants it. PostgreSQL also folds
 identical payloads within one transaction. So events are hints, not facts: react to one by reading the database,
@@ -529,7 +530,10 @@ class Watcher:
         )
         row = await cur.fetchone()
         if row is None:
-            raise RuntimeError("no vfs_nodes table on the connection's search_path: is the schema migrated?")
+            raise RuntimeError(
+                "no vfs_nodes table on the connection's search_path: the schema isn't migrated, "
+                "or the watcher's role lacks USAGE on it"
+            )
         schema, found = row
         if not found:
             raise RuntimeError(
@@ -636,7 +640,7 @@ class Watcher:
         if probe in done:
             channel = probe.result()
             if channel != self._channel:
-                raise ConnectionError(f"the schema's NOTIFY channel changed (it was {self._channel!r})")
+                raise ConnectionError("the schema's NOTIFY channel is no longer the one listened on")
             return
         await self._discard()
         probe.cancel()

@@ -29,7 +29,8 @@
 -- To change the name later: UPDATE vfs_channel_name SET channel = 'vfs_' || replace(gen_random_uuid()::text, '-', '')
 -- (one UPDATE, never a DELETE: with no row, every write fails in the trigger). Running watchers follow within
 -- their keepalive interval. A copy of this schema (dump and restore) in the same database shares the channel with
--- the original until that is done; a restore into another database doesn't matter.
+-- the original until that is done; a restore into another database doesn't matter. A restore without privileges
+-- (pg_dump --no-acl) loses the REVOKEs: every role can call vfs_channel() again until they are repeated.
 
 CREATE TABLE vfs_channel_name (
     one     boolean PRIMARY KEY DEFAULT true CHECK (one),  -- a single row
@@ -58,6 +59,9 @@ COMMENT ON FUNCTION vfs_channel() IS
 CREATE OR REPLACE FUNCTION vfs_notify() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE v_payload json;
 BEGIN
+    IF TG_RELID <> 'vfs_nodes'::regclass THEN  -- before NEW or OLD is touched: see the note below
+        RAISE EXCEPTION 'vfs_notify() is the trigger function of vfs_nodes alone';
+    END IF;
     IF TG_OP = 'INSERT' THEN
         v_payload := json_build_object('op', 'create', 'id', NEW.id, 'parent', NEW.parent_id,
                                        'name', NEW.name, 'kind', NEW.kind);
@@ -78,6 +82,9 @@ END $$;
 
 CREATE OR REPLACE FUNCTION vfs_notify_truncate() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
+    IF TG_RELID <> 'vfs_nodes'::regclass THEN
+        RAISE EXCEPTION 'vfs_notify_truncate() is the trigger function of vfs_nodes alone';
+    END IF;
     PERFORM pg_notify(vfs_channel(), '{"op": "rescan"}');
     RETURN NULL;
 END $$;
@@ -85,6 +92,14 @@ END $$;
 
 -- The triggers run as the owner, who may call vfs_channel(), whoever writes. Like vfs_channel(), they get the
 -- schema itself as their search_path (with pg_temp last) in place of the caller's, as SECURITY DEFINER wants.
+--
+-- A SECURITY DEFINER trigger function must not be PUBLIC's to execute: CREATE TRIGGER takes only EXECUTE on the
+-- function and a table of one's own (a temporary one will do), so any role could put these on its table and
+-- forge events without the name, or give its table a column type whose cast to json is its own function, which
+-- json_build_object would then run as this schema's owner. Hence the REVOKE (firing a trigger doesn't check
+-- EXECUTE, so roles that write through table grants are unaffected) and the TG_RELID checks in the bodies, which
+-- hold even where the ACL is lost (see pg_dump --no-acl above) or EXECUTE is granted by mistake.
+REVOKE EXECUTE ON FUNCTION vfs_notify(), vfs_notify_truncate() FROM PUBLIC;
 DO $$
 BEGIN
     EXECUTE format('ALTER FUNCTION vfs_notify() SECURITY DEFINER SET search_path = %I, pg_temp', current_schema());
