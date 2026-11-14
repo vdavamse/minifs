@@ -10,6 +10,7 @@ settings, which they read with ``getattr`` and a default, so the caller's own de
 
 from __future__ import annotations
 
+import math
 import posixpath
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -99,12 +100,27 @@ class GrepSettings:
 class EditSettings:
     max_bytes: int = 10 * 1024 * 1024
     """Largest file ``Edit`` takes, since it holds the whole file in memory; ``Write`` replaces larger ones."""
+    timeout: float | None = 10.0
+    """Seconds one search for ``oldString`` may take (the exact match and the fallback matchers after it) before
+    the call is a retry. It runs in a worker thread that holds the GIL and can't be cancelled, so this bounds what
+    it can cost the process; a call that lost a race with another writer searches once more, with the same limit.
+    None: no limit, for a caller that bounds the search some other way."""
 
     def __post_init__(self) -> None:
         if isinstance(self.max_bytes, bool) or not isinstance(self.max_bytes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(f"edit max_bytes must be an int, not {self.max_bytes!r}")
         if self.max_bytes < 0:
             raise ValueError(f"edit max_bytes must be at least 0, not {self.max_bytes}")
+        if self.timeout is None:
+            return
+        if isinstance(self.timeout, bool) or not isinstance(self.timeout, int | float):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"edit timeout must be a number or None, not {self.timeout!r}")
+        try:
+            seconds = float(self.timeout)
+        except OverflowError:  # an int past the largest float
+            seconds = math.inf
+        if not 0 < seconds < math.inf:
+            raise ValueError(f"edit timeout must be over 0 seconds and finite (None: no limit), not {self.timeout!r}")
 
 
 @dataclass(frozen=True)
