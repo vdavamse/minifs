@@ -228,6 +228,35 @@ async def test_uncounted_reads_are_refused_but_not_counted(vfs: VFSClient, caplo
     assert policy.denials == {("agent", "read"): 1}
 
 
+def test_policy_matches_a_legacy_name_and_check_refuses_it(policy: Policy) -> None:
+    """``allows`` filters paths the server listed, so a name from before migration 016 is matched, not an error
+    that fails the whole listing; ``check``, for a caller's path, is EINVAL before EACCES."""
+    assert policy.allows("agent", "read", "/workspace/a\nb") is True
+    assert policy.allows_any("agent", "read", "/workspace/a\nb") is True
+    with pytest.raises(VFSError) as info:
+        policy.check("agent", "write", "/elsewhere/a\nb")
+    assert info.value.errno == "EINVAL" and "\n" not in str(info.value)
+
+
+async def test_a_legacy_name_is_listed_escaped(vfs: VFSClient, db: str) -> None:
+    """A name from before migration 016 (here: the constraint dropped and the node renamed in SQL) doesn't fail the
+    listing or the search it is in, is matched by the policy as stored and reported with its control characters
+    escaped; the raw path is refused when it comes back."""
+    await vfs.create(f"/workspaces/{W1}/dir/f.md", b"needle\n", parents=True)
+    async with await AsyncConnection.connect(db, autocommit=True) as conn:
+        await conn.execute("ALTER TABLE vfs_nodes DROP CONSTRAINT vfs_nodes_name_check")
+        await conn.execute("UPDATE vfs_nodes SET name = %s WHERE name = 'dir'", ("le\ngacy",))
+        await conn.execute("UPDATE vfs_nodes SET name = %s WHERE name = 'log.md'", ("x\x1b[31m.md",))
+    # Not readable as a whole subtree, so grep filters each file by its (legacy) path.
+    rules = [Rule("/workspace/notes.md"), Rule("/workspace/le*/hidden.md"), Rule("/workspace/**", "read", "write")]
+    agent = view(vfs, Policy({"agent": rules}))
+    directory, file = r"/workspace/le\u000agacy", r"/workspace/x\u001b[31m.md"
+    assert [e.path for e in await agent.readdir("/workspace")] == [directory, file]
+    assert {e.path for e in (await agent.glob("**/*.md", "/workspace")).entries} == {directory + "/f.md", file}
+    assert [(h.path, h.line) for h in (await agent.grep("needle", "/workspace")).hits] == [(directory + "/f.md", 1)]
+    await raises("EINVAL", agent.readdir("/workspace/le\ngacy"))
+
+
 async def test_ingestion_policy(vfs: VFSClient, policy: Policy) -> None:
     ingestion = view(vfs, policy, "ingestion")
     await ingestion.create("/docs/new.md", b"x")

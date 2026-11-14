@@ -1,6 +1,7 @@
 """vfs_nodes and the tree operations: vfs_lookup, vfs_readdir, vfs_create, vfs_mkdir_p, vfs_rename, vfs_unlink."""
 
 import asyncio
+import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, Generator
@@ -13,6 +14,7 @@ import pytest
 from psycopg import AsyncConnection
 
 from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO, errno_name
+from minifs.vfs.core import CONTROL_CHARACTERS, VFSError
 
 Kind = str
 
@@ -195,12 +197,56 @@ async def test_kind_cannot_change(conn: AsyncConnection) -> None:
         await conn.execute("UPDATE vfs_nodes SET kind = 'dir' WHERE id = %s", (file,))
 
 
-@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "x" * 256])
+CONTROL_NAMES = [
+    "a\nb",  # a newline: a second line in a listing
+    "x\x1b[31m",  # an ANSI escape sequence
+    "tab\there",
+    "\x7f",  # DEL
+    "c1\x85",  # a C1 control (NEL)
+    "\u202eevil",  # right-to-left override
+    "\u2066x\u2069",  # bidi isolates
+    "line\u2028sep",  # LINE SEPARATOR: a line end to str.splitlines()
+]
+"""Names with the characters migration 016 refuses."""
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "x" * 256, *CONTROL_NAMES])
 async def test_invalid_names_are_rejected(conn: AsyncConnection, name: str) -> None:
     with raises_errno("ENAMETOOLONG" if len(name) > 255 else "EINVAL"):
         await create(conn, None, name)
     with raises_errno("EINVAL"):
         await conn.execute("INSERT INTO vfs_nodes (name, kind) VALUES (%s, 'file')", (name,))
+
+
+@pytest.mark.parametrize("name", CONTROL_NAMES)
+async def test_control_characters_are_rejected_everywhere(conn: AsyncConnection, name: str) -> None:
+    """Every way a name enters: rename and mkdir_p call vfs_check_name too, and the constraint backs raw updates."""
+    file = await create(conn, None, "f")
+    with raises_errno("EINVAL"):
+        await rename(conn, file, None, name)
+    with raises_errno("EINVAL"):
+        await mkdir_p(conn, "d", name)
+    with raises_db_errno("EINVAL"):
+        await conn.execute("UPDATE vfs_nodes SET name = %s WHERE id = %s", (name, file))
+    assert await readdir(conn, None) == [("f", "file")]  # nothing changed, and no "d" was made
+
+
+@pytest.mark.parametrize("name", CONTROL_NAMES)
+async def test_control_character_errors_name_the_code_point(conn: AsyncConnection, name: str) -> None:
+    """The DETAIL (which goes to the server log) names the code point, never the name with the character in it."""
+    with pytest.raises(psycopg.Error) as info:
+        await create(conn, None, name)
+    detail = info.value.diag.message_detail or ""
+    assert "control character U+" in detail and name not in detail
+    assert not any(ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or 0x2028 <= ord(c) <= 0x2069 for c in detail)
+
+
+@pytest.mark.parametrize("name", [" leading and trailing ", "<entries>", "a\\b", "é", "😀", "\u200eltr-mark"])
+async def test_printable_names_are_accepted(conn: AsyncConnection, name: str) -> None:
+    """Only control characters are refused: spaces, angle brackets, backslashes and any printable Unicode stay
+    legal, as on disk."""
+    node = await create(conn, None, name)
+    assert await resolve(conn, name) == (node, "file")
 
 
 async def test_longest_name_is_255_bytes(conn: AsyncConnection) -> None:
@@ -866,3 +912,34 @@ async def test_a_lookup_joins_as_an_index_lookup(conn: AsyncConnection) -> None:
         "EXPLAIN SELECT n.size FROM vfs_lookup(ARRAY['d', 'f7']) r LEFT JOIN vfs_nodes n ON n.id = r.id"
     )
     assert "Seq Scan on vfs_nodes" in "\n".join(line for (line,) in await cur.fetchall())
+
+
+async def test_control_character_class_matches_the_client(conn: AsyncConnection) -> None:
+    """The class in vfs_check_name and in the constraint is ``CONTROL_CHARACTERS`` exactly, over every code point
+    (NUL aside, which text can't hold): the pattern is written out in both languages, and an edit to one copy
+    must fail here. A name with a control character is refused even when it has a '/' too, by code point."""
+    constraint = await conn.execute(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'vfs_nodes_name_check'"
+    )
+    function = await conn.execute("SELECT prosrc FROM pg_proc WHERE proname = 'vfs_check_name'")
+    sources = [row[0] for row in await constraint.fetchall()] + [row[0] for row in await function.fetchall()]
+    patterns = [pattern for source in sources for pattern in re.findall(r"'(\[\\u0001[^']*\])'", source)]
+    assert len(patterns) == 3 and len(set(patterns)) == 1  # the constraint, and the test and substring in the function
+    cursor = await conn.execute(
+        "SELECT i FROM generate_series(1, 1114111) AS i WHERE i NOT BETWEEN 55296 AND 57343 AND chr(i) ~ %s",
+        (patterns[0],),
+    )
+    refused = {row[0] for row in await cursor.fetchall()}
+    assert refused == {i for i in range(1, 0x110000) if CONTROL_CHARACTERS.fullmatch(chr(i))}
+
+    with pytest.raises(psycopg.Error) as info:
+        await create(conn, None, "a/\nb")
+    assert info.value.diag.message_detail == "name contains the control character U+000A"
+
+    # The constraint's own violation (a raw INSERT) has the failing row in its DETAIL: the client escapes it.
+    with pytest.raises(psycopg.errors.CheckViolation) as raw:
+        await conn.execute("INSERT INTO vfs_nodes (name, kind) VALUES (%s, 'file')", ("a\x1b[31m\nb",))
+    assert "\n" in (raw.value.diag.message_detail or "")
+    error = VFSError.from_db(raw.value, "/x")
+    assert error is not None and error.errno == "EINVAL"
+    assert "u001b[31m" in error.detail and not CONTROL_CHARACTERS.search(error.detail)
