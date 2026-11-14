@@ -3,9 +3,9 @@
 The ``reference`` section is ladderframe's matcher code as minifs shipped it before #80 (ladderframe's
 ``packages/harness/src/ladderframe/tools/edit.py``), kept here as the oracle: for random content and finds, each
 rewritten replacer must yield the same candidates in the same order, and ``replace`` the same result or error. The
-oracle is ladderframe's code with four deliberate departures (#110, #122), marked in the code. Then the cost bounds:
-the cases that were quadratic finish in linear time, and a search that runs past ``timeout`` is a retry, from inside a
-replacer's loop too."""
+oracle is ladderframe's code with five deliberate departures (#110, #122, #117), marked in the code. Then the cost
+bounds: the cases that were quadratic finish in linear time, and a search that runs past ``timeout`` is a retry, from
+inside a replacer's loop too."""
 
 import math
 import random
@@ -110,7 +110,10 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
             continue
         for j in range(i + 2, len(original)):
             if original[j].strip() == last:
-                if abs((j - i + 1) - len(search)) <= max_delta:
+                # departs from ladderframe (#117): a block may be shorter than the find (the find has a line the
+                # file doesn't) but not longer; the middle is scored by position over the shorter of the two, so a
+                # longer block's extra lines were never compared and the replacement deleted them.
+                if -max_delta <= (j - i + 1) - len(search) <= 0:
                     candidates.append((i, j))
                 break  # only the first occurrence of the last line
     if not candidates:
@@ -532,6 +535,42 @@ def test_block_anchors_alone_dont_take_the_line_between() -> None:
     assert list(new.block_anchor_replacer(content, "def f():\n    keep_me( )\n    return 1\n")) == [
         "def f():\n    keep_me()\n    return 1"
     ]
+
+
+def test_block_anchors_dont_take_a_longer_block() -> None:
+    """A block longer than the find was accepted when within ``max_delta``: the middle is scored by position over
+    the shorter of the two, so the block's extra lines were never compared and the replacement deleted them (#117).
+    A block may only be shorter than the find (the find has a line the file doesn't)."""
+    content = "def f():\n    keep_me()\n    delete_me()\n    return 1\n"
+    find = "def f():\n    keep_me()\n    return 1\n"
+    assert list(new.block_anchor_replacer(content, find)) == []
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match="Could not find oldString"):
+            search(content, find, "def f():\n    keep_me()\n    return 2\n")
+    # A longer find whose extra block line sits at the end of the middle, where the positional scoring would
+    # still accept the block (max_delta is 1 for 6 lines).
+    assert (
+        list(
+            new.block_anchor_replacer(
+                "def f():\n    a()\n    b()\n    c()\n    d()\n    x()\n    return 1\n",
+                "def f():\n    a()\n    b()\n    c()\n    d()\n    return 1\n",
+            )
+        )
+        == []
+    )
+    # Positive control: a SHORTER block is still found.
+    assert list(
+        new.block_anchor_replacer(
+            "def f():\n    a()\n    b()\n    c()\n    return 1\n",
+            "def f():\n    a()\n    b()\n    c()\n    gone()\n    return 1\n",
+        )
+    ) == ["def f():\n    a()\n    b()\n    c()\n    return 1"]
+
+
+def test_multi_occurrence_replacer_is_not_tried() -> None:
+    """``multi_occurrence_replacer`` re-yields the oldString, which ``simple_replacer`` already tried, so it could
+    never change ``replace``'s outcome: it is not in ``REPLACERS`` (kept for the parity tests)."""
+    assert new.multi_occurrence_replacer not in new.REPLACERS
 
 
 # ---------------------------------------------------------------- bounded cost

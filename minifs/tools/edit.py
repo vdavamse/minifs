@@ -5,10 +5,11 @@ candidates in the same order, checked by ``tests/tools/test_edit_replacers.py`` 
 O(n·m) in the content's and ``oldString``'s sizes, in lines and in characters (a file can be one line), where
 ladderframe's block scans were O(n²) in lines and its searches within a line O(n·m) per call that nothing could
 interrupt. ``replace`` departs from ladderframe on purpose where it edited the wrong text and reported success (#110,
-#122, marked in the oracle): a whitespace-only ``oldString`` matches only exactly, an ambiguous exact ``oldString`` is
-reported, block anchors alone don't take the line between them, and with ``replaceAll`` a whitespace candidate of a
-non-blank ``oldString`` is refused. ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole
-search runs in a worker thread that can't be cancelled and holds the GIL while it works (#80).
+#122, #117, marked in the oracle): a whitespace-only ``oldString`` matches only exactly, an ambiguous exact
+``oldString`` is reported, block anchors alone don't take the line between them, block anchors don't take a block
+longer than ``oldString``, and with ``replaceAll`` a whitespace candidate of a non-blank ``oldString`` is refused.
+``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker thread that
+can't be cancelled and holds the GIL while it works (#80).
 
 ladderframe serialises editors of a path with a thread lock; here an edit reads the whole file and its version,
 replaces in memory, and writes back with a compare-and-swap on that version, so a concurrent writer anywhere is
@@ -372,7 +373,10 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
         if line.strip() != first:
             continue
         j = _next_line(last_at, i + 2, n)  # only the first occurrence of the last line
-        if j < n and abs((j - i + 1) - len(search)) <= max_delta:
+        # A block may be shorter than the find (the find has a line the file doesn't) but not longer: the middle
+        # is scored by position over the shorter of the two, so a longer block's extra lines were never compared
+        # and the replacement deleted them (#117).
+        if j < n and -max_delta <= (j - i + 1) - len(search) <= 0:
             candidates.append((i, j))
     if not candidates:
         return
@@ -428,9 +432,11 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
     words = normalized_find.split(" ") if normalized_find else []
     lines = content.split("\n")
     deadline = _deadline.get()
+    normalized_lines: list[str] = []  # each line's normalisation, kept for the block loop below
     for line in lines:
         deadline.tick()
         normalized_line = normalize(line)
+        normalized_lines.append(normalized_line)
         if normalized_line == normalized_find:
             yield line
         elif words and len(normalized_line) > len(normalized_find):
@@ -449,8 +455,8 @@ def whitespace_normalized_replacer(content: str, find: str) -> Iterator[str]:
             # A block's normalised text starts with its first line's and ends with its last line's (whitespace
             # runs collapse within a line as they do across one), so a block whose first line isn't a prefix of
             # the find, or whose last line isn't a suffix, can't match.
-            if not normalized_find.startswith(normalize(lines[i])) or not normalized_find.endswith(
-                normalize(lines[i + m - 1])
+            if not normalized_find.startswith(normalized_lines[i]) or not normalized_find.endswith(
+                normalized_lines[i + m - 1]
             ):
                 continue
             deadline.check()  # the block test below costs the whole block, not one line
@@ -532,7 +538,8 @@ def escape_normalized_replacer(content: str, find: str) -> Iterator[str]:
 def multi_occurrence_replacer(content: str, find: str) -> Iterator[str]:
     """Every exact match, so `replace` can decide between unique and `replaceAll`. None for an empty ``find``
     (``replace`` never passes one): it matches at every offset without advancing, so ladderframe's loop never
-    ended."""
+    ended. Not in ``REPLACERS``: it re-yields oldString, which ``simple_replacer`` already tried, so it could
+    never change ``replace``'s outcome; kept for the parity tests."""
     if not find:
         return
     start = 0
@@ -609,7 +616,6 @@ REPLACERS: tuple[Replacer, ...] = (
     escape_normalized_replacer,
     trimmed_boundary_replacer,
     context_aware_replacer,
-    multi_occurrence_replacer,
 )
 
 _SEEN_BYTES = 1 << 20
