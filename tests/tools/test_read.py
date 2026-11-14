@@ -26,14 +26,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from minifs.tools import TOOLS, Read
 from minifs.tools import read as read_module
 from minifs.tools.deps import ReadSettings, ToolSettings
-from minifs.tools.read import (
-    BINARY_EXTENSIONS,
-    DESCRIPTION,
-    MAX_ATTACHMENT_BYTES,
-    SAMPLE_BYTES,
-    _is_binary,  # pyright: ignore[reportPrivateUsage]
-    already_loaded,
-)
+from minifs.tools.read import BINARY_EXTENSIONS, DESCRIPTION, MAX_ATTACHMENT_BYTES, SAMPLE_BYTES, already_loaded
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import Entry, LineReadResult, ReadResult, VFSError
 from minifs.vfs.policy import Policy, Rule
@@ -1030,8 +1023,12 @@ async def test_a_file_deleted_mid_page(client: VFSClient, view: VFSView, monkeyp
     assert message == "File not found: /workspace/f.txt\n\nDid you mean one of these?\n/workspace/f.txt.bak"
 
 
+_is_binary = read_module._is_binary  # pyright: ignore[reportPrivateUsage]
+
+
 def _old_is_binary(path: str, sample: bytes) -> bool:
-    """``_is_binary`` before #79, which counted the control bytes in Python: the reference for the tests below."""
+    """``_is_binary`` before #79, which counted the control bytes in Python: the reference for the tests below. A
+    deliberate change to the rule changes this copy too (or drops it, with the literal expectations left)."""
     if PurePosixPath(path).suffix.lower() in BINARY_EXTENSIONS:
         return True
     if not sample:
@@ -1083,7 +1080,8 @@ def test_is_binary_matches_the_python_count_on_every_byte_value() -> None:
 
 
 def test_is_binary_matches_the_python_count_on_random_samples() -> None:
-    """Seeded random samples up to the sample size, from byte pools that land on both sides of the threshold."""
+    """A smoke test on seeded random samples up to the sample size, from byte pools on both sides of the threshold.
+    The every-byte test is the proof: the count is a sum over bytes."""
     rng = random.Random(79)
     pools = [
         bytes(range(256)),
@@ -1092,7 +1090,7 @@ def test_is_binary_matches_the_python_count_on_random_samples() -> None:
         b"abc\t\n\r\x1b\x01",
         bytes(range(128, 256)) + b"\x02",
     ]
-    for _ in range(2000):
+    for _ in range(200):
         i = rng.randrange(len(pools))
         n = rng.randint(0, SAMPLE_BYTES)
         sample = bytes(rng.choices(pools[i], k=n))
