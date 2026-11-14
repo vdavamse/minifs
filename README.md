@@ -231,7 +231,7 @@ minifs grep -i 'todo|fixme' /workspaces/<id> -g '*.py'
 minifs mv /docs/a.md /docs/b.md && minifs rm /docs/b.md
 ```
 
-`minifs glob` stops past 200,000 files and directories walked or 2 s per statement; `--max-nodes none` and `--timeout` lift them.
+`minifs glob` stops past 200,000 files and directories walked or 2 s per statement; `--max-nodes N` (or `none`, no cap) and `--timeout S` change them.
 
 ## Limits
 

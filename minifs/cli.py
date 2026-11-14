@@ -16,7 +16,7 @@ from psycopg import AsyncConnection
 from minifs._regex import RegexError
 from minifs.db.migrate import MigrationError, applied_versions, load_migrations, migrate
 from minifs.db.pool import Connector, open_pool
-from minifs.vfs.client import VFSClient
+from minifs.vfs.client import MAX_TIMEOUT, VFSClient
 from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.search import DEFAULT_LIMIT, MAX_NODES, TIMEOUT, SearchRefused
@@ -34,6 +34,17 @@ def _max_nodes(text: str) -> int | None:
         raise argparse.ArgumentTypeError(f"invalid max_nodes value: {text!r}") from None
     if value < 0:
         raise argparse.ArgumentTypeError(f"max_nodes must be >= 0 or 'none', not {value}")
+    return value
+
+
+def _timeout(text: str) -> float:
+    """The ``--timeout`` argument: seconds over 0 and at most ``MAX_TIMEOUT``."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid timeout: {text!r}") from None
+    if not 0 < value <= MAX_TIMEOUT:
+        raise argparse.ArgumentTypeError(f"timeout must be over 0 and at most {MAX_TIMEOUT:g}, not {text}")
     return value
 
 
@@ -68,7 +79,10 @@ def main(argv: list[str] | None = None) -> int:
         help=f'stop past this many files and directories walked (default {MAX_NODES}; "none": no cap)',
     )
     glob.add_argument(
-        "--timeout", type=float, default=TIMEOUT, help=f"seconds each statement may run (default {TIMEOUT:g})"
+        "--timeout",
+        type=_timeout,
+        default=TIMEOUT,
+        help=f"seconds each statement may run, over 0 and at most {MAX_TIMEOUT:g} (default {TIMEOUT:g})",
     )
     grep = _add_dsn(commands.add_parser("grep", help="print the lines matching a regex (ripgrep syntax)"))
     grep.add_argument("pattern")

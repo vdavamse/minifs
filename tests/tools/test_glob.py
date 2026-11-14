@@ -203,11 +203,12 @@ def test_bad_settings_fail_at_construction() -> None:
     with pytest.raises(GlobError, match="error parsing glob 'a\\['"):
         GlobSettings(excludes=("a[",))
     assert (GlobSettings().max_nodes, GlobSettings().timeout) == (200_000, 2.0)
-    for max_nodes in (-1, MAX_GLOB_LIMIT + 1):
+    assert GlobSettings(max_nodes=None).max_nodes is None
+    for max_nodes in (-1, 2**31):
         with pytest.raises(ValueError, match="glob max_nodes"):
             GlobSettings(max_nodes=max_nodes)
-    for bad in (1.5, True, None):
-        with pytest.raises(TypeError, match="glob max_nodes must be an int"):
+    for bad in (1.5, True, "1"):
+        with pytest.raises(TypeError, match="glob max_nodes must be an int or None"):
             GlobSettings(max_nodes=bad)  # pyright: ignore[reportArgumentType]
     for timeout in (0, -1, MAX_TIMEOUT * 2, True):
         with pytest.raises(ValueError, match="glob timeout"):
