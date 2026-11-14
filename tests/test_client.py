@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import logging
 import pickle
 import re
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
@@ -28,7 +29,7 @@ from minifs.vfs.client import (
     VFSClient,
     _gated,  # pyright: ignore[reportPrivateUsage]
 )
-from minifs.vfs.core import FileVersion, Kind, ReadResult, VFSError
+from minifs.vfs.core import CONTROL_CHARACTERS, MAX_COMPONENTS, FileVersion, Kind, ReadResult, VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.search import SearchRefused
 from tests.test_tree import holding_the_lock, wait_until_blocked
@@ -797,6 +798,20 @@ async def test_rename_errors_name_the_path_they_concern(vfs: VFSClient) -> None:
     await raises("ENOTDIR", vfs.rename("/a.txt", "/n.md/b"), "/n.md/b")
     await raises("ENOENT", vfs.rename("/nope", "/b"), "/nope")
     await raises("ENOTDIR", vfs.rename("/n.md/x", "/b"), "/n.md/x")
+
+
+async def test_over_deep_paths_are_refused(vfs: VFSClient) -> None:
+    """#89: an over-long path is refused by ``split``, before any query (no database error, no server detail),
+    and the server refuses a rename that would push a subtree over the depth cap."""
+    too_long = "/" + "/".join(["d"] * (MAX_COMPONENTS + 1))
+    error = await raises("ENAMETOOLONG", vfs.mkdir_p(too_long), too_long)
+    assert error.db_error is None and not error.detail  # split raised it: no round trip happened
+    assert "over the 1024-component limit" in error.message and "1025" not in error.message
+    # The same cap on the server: a chain of 1000, and /b holding a chain of 30; 1000 + 1 + 30 is over 1024.
+    await vfs.mkdir_p("/" + "/".join(["d"] * 1000))
+    await vfs.mkdir_p("/b/" + "/".join(["d"] * 30))
+    error = await raises("ENAMETOOLONG", vfs.rename("/b", "/" + "/".join(["d"] * 1000) + "/b"), "/b")
+    assert isinstance(error.db_error, psycopg.Error) and "subtree" in error.detail
 
 
 # Every errno the SQL layer reports comes back as a VFSError with that errno and the normalised path: the outcomes
@@ -1605,6 +1620,30 @@ async def test_a_write_waits_for_a_lock_no_longer_than_lock_timeout(pool: Pool, 
         # A read takes no lock.
         assert (await vfs.pread("/f")).content == b"v1\n"
     await write(vfs, version)  # the lock is free again
+
+
+async def test_a_timeout_logs_the_path_as_its_repr(pool: Pool, db: str, caplog: pytest.LogCaptureFixture) -> None:
+    vfs = VFSClient(pool, lock_timeout=0.1)
+    path = "/a\u200bb"  # a zero-width space: legal in a name, invisible in a log
+    await vfs.create(path, b"v1\n")
+    async with holding_the_lock(db, path):
+        with caplog.at_level(logging.WARNING, logger="minifs.vfs.client"):
+            await raises("EAGAIN", asyncio.wait_for(vfs.append(path, b"more\n"), 10), path)
+    (record,) = caplog.records
+    assert record.getMessage().startswith("EAGAIN on '/a\\u200bb': ")  # the repr (#98)
+
+
+async def test_a_returned_detail_is_escaped(vfs: VFSClient, db: str) -> None:
+    """A returned outcome's DETAIL can quote a name (a compare-and-swap's ESTALE names the node's name now, with
+    %L, which leaves a newline raw); a legacy name from before migration 016 holds one, and the CLI prints
+    ``detail``, so VFSError escapes it (#98)."""
+    version = await vfs.create("/a", b"x")
+    async with await AsyncConnection.connect(db, autocommit=True) as conn:
+        await conn.execute("ALTER TABLE vfs_nodes DROP CONSTRAINT vfs_nodes_name_check")
+        await conn.execute("UPDATE vfs_nodes SET name = %s WHERE name = 'a'", ("a\nb",))
+    error = await raises("ESTALE", vfs.write("/a", b"y", expect=version), "/a")
+    assert "\\u000a" in error.detail
+    assert not CONTROL_CHARACTERS.search(error.detail)
 
 
 async def test_a_long_write_is_cancelled_after_write_timeout(pool: Pool) -> None:

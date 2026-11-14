@@ -18,7 +18,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.migrate import load_migrations, migrate
-from minifs.vfs.core import VFSError
+from minifs.vfs.core import MAX_COMPONENTS, VFSError
 from minifs.vfs.watch import RESCAN, ConnectionFactory, Event, Op, PathWatch, Subscription, Watcher
 from tests.test_tree import create, mkdir_p, rename, unlink
 
@@ -1232,3 +1232,21 @@ async def test_an_indexed_watch_still_sees_its_events_end_to_end(conn: AsyncConn
         assert await rename(conn, p, None, "p2")  # the watched path changes; the watches follow their nodes
         moved = Event("move", id=p, parent=None, name="p2", kind="dir", old_parent=None, old_name="p")
         assert await next_event(heir_events) == moved
+
+
+async def test_watch_refuses_a_control_character_escaped(watcher: Watcher) -> None:
+    """Like core.split for a caller's path (#92): EINVAL before any lookup, the path escaped in the error (#98)."""
+    with pytest.raises(VFSError) as info:
+        async with watcher.watch("/a\nINFO forged"):
+            pass
+    assert info.value.errno == "EINVAL"
+    assert "\n" not in str(info.value)
+    assert info.value.path == "/a\\u000aINFO forged"
+
+
+async def test_watch_refuses_an_over_long_path(watcher: Watcher) -> None:
+    """#89: ENAMETOOLONG before any lookup, as core.split does, not vfs_lookup's raise as a database error."""
+    with pytest.raises(VFSError) as info:
+        async with watcher.watch("/" + "/".join(["d"] * (MAX_COMPONENTS + 1))):
+            pass
+    assert info.value.errno == "ENAMETOOLONG" and info.value.db_error is None

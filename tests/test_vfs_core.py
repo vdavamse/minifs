@@ -5,6 +5,7 @@ import pytest
 
 from minifs.vfs.core import (
     CONTROL_CHARACTERS,
+    MAX_COMPONENTS,
     Entry,
     VFSError,
     basename,
@@ -46,6 +47,21 @@ def test_split() -> None:
     assert split("/") == ()
     assert split("/a//b/../c/") == ("a", "c")
     assert join(*split("/x/./y")) == "/x/y"
+
+
+def test_split_caps_the_components() -> None:
+    """#89: a path is at most ``MAX_COMPONENTS`` components, counted after normalisation."""
+    assert len(split("/" + "/".join(["a"] * MAX_COMPONENTS))) == MAX_COMPONENTS
+    # The count is what normalisation leaves: 1030 'a', ten '..' back and 'b' is 1021 components.
+    assert len(split("/" + "a/" * 1030 + "../" * 10 + "b")) == MAX_COMPONENTS - 3
+    with pytest.raises(VFSError) as info:
+        split("/" + "/".join(["a"] * (MAX_COMPONENTS + 1)))
+    assert info.value.errno == "ENAMETOOLONG"
+    assert "over the 1024-component limit" in info.value.message
+    with pytest.raises(VFSError) as info:
+        normalize("/" + "/".join(["a"] * (MAX_COMPONENTS + 1)))
+    assert info.value.errno == "ENAMETOOLONG"
+    assert "over the 1024-component limit" in info.value.message
 
 
 @pytest.mark.parametrize("path", ["", "a", "a/b", "./a", "../a", "~/a"])
