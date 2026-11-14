@@ -5,11 +5,11 @@ candidates in the same order, checked by ``tests/tools/test_edit_replacers.py`` 
 O(n·m) in the content's and ``oldString``'s sizes, in lines and in characters (a file can be one line), where
 ladderframe's block scans were O(n²) in lines and its searches within a line O(n·m) per call that nothing could
 interrupt. ``replace`` departs from ladderframe on purpose where it edited the wrong text and reported success (#110,
-#122, #117, marked in the oracle): a whitespace-only ``oldString`` matches only exactly, an ambiguous exact
-``oldString`` is reported, block anchors alone don't take the line between them, a block-anchored match longer
-than ``oldString``, whose extra non-blank lines would be deleted unseen, is refused with a retry unless a
-stricter replacer finds the text, and with ``replaceAll`` a whitespace candidate of a non-blank ``oldString``
-is refused.
+#122, #117, #127, marked in the oracle): a whitespace-only ``oldString`` matches only exactly, an ambiguous
+exact ``oldString`` is reported, block anchors alone don't take the line between them, a block-anchored match
+longer than ``oldString``, whose extra non-blank lines would be deleted unseen, is refused with a retry unless
+a stricter replacer finds the text, with ``replaceAll`` a whitespace candidate of a non-blank ``oldString``
+is refused, and a fuzzy candidate's trailing ``\r`` (the file's line ending) is kept.
 ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker thread that
 can't be cancelled and holds the GIL while it works (#80).
 
@@ -736,8 +736,21 @@ def replace(
                             "Refusing replacement because the matched span is much larger than oldString. "
                             "Re-read the file and provide the full exact oldString for the intended replacement."
                         )
+                    # A candidate's trailing `\r` with the file's `\n` right after this occurrence is a CRLF
+                    # line ending, not text the model wrote: dropping it would leave a bare LF, whatever
+                    # oldString ends with (a fuzzy replacer may have matched an oldString whose trailing `\r`
+                    # was whitespace it ignored), so the replacement keeps it (#127). Deleting a block with
+                    # newString "" then leaves "\r\n", as an LF file leaves "\n". With replaceAll the first
+                    # occurrence (index) decides, for every occurrence it substitutes.
+                    replacement = (
+                        new_string + "\r"
+                        if search.endswith("\r")
+                        and content.startswith("\n", index + len(search))
+                        and not new_string.endswith("\r")
+                        else new_string
+                    )
                     if replace_all:
-                        return content.replace(search, new_string)
+                        return content.replace(search, replacement)
                     # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one
                     # call on a repetitive file ran for seconds that no deadline could interrupt.
                     if content.find(search, index + 1) != -1:
@@ -746,7 +759,7 @@ def replace(
                             # (#110)
                             raise ValueError(MULTIPLE_MATCHES)
                         continue
-                    return content[:index] + new_string + content[index + len(search) :]
+                    return content[:index] + replacement + content[index + len(search) :]
             except _LongerBlock as e:  # pending, not final (#117): a later replacer may still find the text
                 refusal = e
     except ReplaceTimeout:
