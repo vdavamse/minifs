@@ -30,7 +30,7 @@ jobs:
         include:
           - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64, manylinux: auto }
           - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
-          - { name: macos-arm64, runner: macos-14, target: aarch64-apple-darwin }
+          - { name: macos-arm64, runner: macos-15, target: aarch64-apple-darwin }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
