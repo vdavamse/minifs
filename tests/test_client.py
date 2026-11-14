@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import logging
 import pickle
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
@@ -26,7 +27,7 @@ from minifs.vfs.client import (
     VFSClient,
     _gated,  # pyright: ignore[reportPrivateUsage]
 )
-from minifs.vfs.core import FileVersion, Kind, ReadResult, VFSError
+from minifs.vfs.core import CONTROL_CHARACTERS, FileVersion, Kind, ReadResult, VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.search import SearchRefused
 from tests.test_tree import holding_the_lock, wait_until_blocked
@@ -1275,6 +1276,30 @@ async def test_a_write_waits_for_a_lock_no_longer_than_lock_timeout(pool: Pool, 
         # A read takes no lock.
         assert (await vfs.pread("/f")).content == b"v1\n"
     await write(vfs, version)  # the lock is free again
+
+
+async def test_a_timeout_logs_the_path_as_its_repr(pool: Pool, db: str, caplog: pytest.LogCaptureFixture) -> None:
+    vfs = VFSClient(pool, lock_timeout=0.1)
+    path = "/a\u200bb"  # a zero-width space: legal in a name, invisible in a log
+    await vfs.create(path, b"v1\n")
+    async with holding_the_lock(db, path):
+        with caplog.at_level(logging.WARNING, logger="minifs.vfs.client"):
+            await raises("EAGAIN", asyncio.wait_for(vfs.append(path, b"more\n"), 10), path)
+    (record,) = caplog.records
+    assert record.getMessage().startswith("EAGAIN on '/a\\u200bb': ")  # the repr (#98)
+
+
+async def test_a_returned_detail_is_escaped(vfs: VFSClient, db: str) -> None:
+    """A returned outcome's DETAIL can quote a name (a compare-and-swap's ESTALE names the node's name now, with
+    %L, which leaves a newline raw); a legacy name from before migration 016 holds one, and the CLI prints
+    ``detail``, so VFSError escapes it (#98)."""
+    version = await vfs.create("/a", b"x")
+    async with await AsyncConnection.connect(db, autocommit=True) as conn:
+        await conn.execute("ALTER TABLE vfs_nodes DROP CONSTRAINT vfs_nodes_name_check")
+        await conn.execute("UPDATE vfs_nodes SET name = %s WHERE name = 'a'", ("a\nb",))
+    error = await raises("ESTALE", vfs.write("/a", b"y", expect=version), "/a")
+    assert "\\u000a" in error.detail
+    assert not CONTROL_CHARACTERS.search(error.detail)
 
 
 async def test_a_long_write_is_cancelled_after_write_timeout(pool: Pool) -> None:
