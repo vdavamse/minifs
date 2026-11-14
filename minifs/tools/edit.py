@@ -9,7 +9,7 @@ interrupt. ``replace`` departs from ladderframe on purpose where it edited the w
 exact ``oldString`` is reported, block anchors alone don't take the line between them, a block-anchored match
 longer than ``oldString``, whose extra non-blank lines would be deleted unseen, is refused with a retry unless
 a stricter replacer finds the text, with ``replaceAll`` a whitespace candidate of a non-blank ``oldString``
-is refused, and a fuzzy candidate's trailing ``\r`` (the file's line ending) is kept.
+is refused, and a fuzzy match never splits a CRLF line ending, where opencode left a bare LF or a lone CR (#127).
 ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker thread that
 can't be cancelled and holds the GIL while it works (#80).
 
@@ -736,21 +736,15 @@ def replace(
                             "Refusing replacement because the matched span is much larger than oldString. "
                             "Re-read the file and provide the full exact oldString for the intended replacement."
                         )
-                    # A candidate's trailing `\r` with the file's `\n` right after this occurrence is a CRLF
-                    # line ending, not text the model wrote: dropping it would leave a bare LF, whatever
-                    # oldString ends with (a fuzzy replacer may have matched an oldString whose trailing `\r`
-                    # was whitespace it ignored), so the replacement keeps it (#127). Deleting a block with
-                    # newString "" then leaves "\r\n", as an LF file leaves "\n". With replaceAll the first
-                    # occurrence (index) decides, for every occurrence it substitutes.
-                    replacement = (
-                        new_string + "\r"
-                        if search.endswith("\r")
-                        and content.startswith("\n", index + len(search))
-                        and not new_string.endswith("\r")
-                        else new_string
-                    )
+                    # A fuzzy candidate's span never splits a CRLF pair (#127): `_substitute` keeps the pair
+                    # with the side that holds its `\n`, per occurrence (deleting a block with newString ""
+                    # then leaves "\r\n", as an LF file leaves "\n"). The model's literal text is never
+                    # adjusted: the exact match substitutes as before #127, so a deliberate CR removal (an
+                    # exact "\r" the model asked to delete) deletes it.
                     if replace_all:
-                        return content.replace(search, replacement)
+                        if search == old_string:
+                            return content.replace(search, new_string)
+                        return _substitute(content, search, index, new_string, True)
                     # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one
                     # call on a repetitive file ran for seconds that no deadline could interrupt.
                     if content.find(search, index + 1) != -1:
@@ -759,7 +753,9 @@ def replace(
                             # (#110)
                             raise ValueError(MULTIPLE_MATCHES)
                         continue
-                    return content[:index] + replacement + content[index + len(search) :]
+                    if search == old_string:
+                        return content[:index] + new_string + content[index + len(search) :]
+                    return _substitute(content, search, index, new_string, False)
             except _LongerBlock as e:  # pending, not final (#117): a later replacer may still find the text
                 refusal = e
     except ReplaceTimeout:
@@ -781,6 +777,54 @@ def replace(
             "and line endings."
         )
     raise ValueError(MULTIPLE_MATCHES)
+
+
+def _substitute(content: str, search: str, index: int, new_string: str, replace_all: bool) -> str:
+    """Substitute ``search`` (first occurrence at ``index``) by ``new_string`` (#127). A fuzzy candidate's span
+    never splits a CRLF pair; the pair goes with the side that holds its ``\\n``, per occurrence:
+
+    - END: where the candidate ends in ``\\r`` and a ``\\n`` follows the occurrence (or the file ends there: a
+      CR with no LF after it is kept too, as the model never saw it), and ``new_string`` doesn't already end in
+      ``\\r``, that ``\\r`` is the file's line ending, not the model's text: it stays in the file (the span
+      shrinks a character) — unless the next occurrence being replaced starts right there, whose span then
+      covers the pair's ``\\n`` too.
+    - START: where the candidate starts with ``\\n`` and a ``\\r`` precedes the occurrence that no previous
+      replaced span has claimed, that ``\\r`` is the pair's other half: it joins the span, since the ``\\n`` is
+      in it.
+
+    The model's literal text (an exact match) is never adjusted, so ``replace`` calls this only for fuzzy
+    candidates. Without ``replace_all`` the only occurrence is the one at ``index``; with it, the occurrences
+    are the ones ``str.replace`` would substitute: non-overlapping, left to right."""
+    if not search.endswith("\r") and not search.startswith("\n"):  # neither rule can fire
+        if replace_all:
+            return content.replace(search, new_string)
+        return content[:index] + new_string + content[index + len(search) :]
+
+    size = len(search)
+    starts: list[int] = []
+    at: int = index
+    while at != -1:
+        starts.append(at)
+        at = content.find(search, at + size) if replace_all else -1
+
+    pieces: list[str] = []
+    cursor = previous_end = 0  # previous_end: the end of the previous replaced span, for the START rule
+    for k, s in enumerate(starts):
+        e = s + size
+        if search.startswith("\n") and s > 0 and content[s - 1] == "\r" and s - 1 >= previous_end:
+            s -= 1  # START: the pair's "\r" joins the span, since its "\n" is in the span
+        if (
+            search.endswith("\r")
+            and (e == len(content) or content[e] == "\n")
+            and not new_string.endswith("\r")
+            and not (k + 1 < len(starts) and starts[k + 1] == e)
+        ):
+            e -= 1  # END: the trailing "\r" is the file's line ending; it stays in the file
+        pieces.append(content[cursor:s])
+        pieces.append(new_string)
+        cursor = previous_end = e
+    pieces.append(content[cursor:])
+    return "".join(pieces)
 
 
 def _is_disproportionate_match(search: str, old_string: str) -> bool:

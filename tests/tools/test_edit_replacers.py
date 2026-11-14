@@ -296,6 +296,46 @@ REPLACERS: tuple[Replacer, ...] = (
 )
 
 
+def _substitute(content: str, search: str, index: int, new_string: str, replace_all: bool) -> str:
+    """The oracle's own copy of minifs's ``_substitute`` (the oracle mirrors the code; it must not import the
+    private helper). Substitute ``search`` (first occurrence at ``index``) by ``new_string``: a candidate span
+    never splits a CRLF pair; the pair goes with the side that holds its ``\n`` (#127). END: a candidate ending
+    in ``\r`` whose occurrence is followed by ``\n`` (or by the end of the file) keeps that ``\r`` in the file
+    unless ``new_string`` already ends in ``\r`` or the next occurrence being replaced starts right there.
+    START: a candidate starting with ``\n`` preceded by a ``\r`` no previous replaced span claimed takes that
+    ``\r`` into the span."""
+    if not search.endswith("\r") and not search.startswith("\n"):  # neither rule can fire
+        if replace_all:
+            return content.replace(search, new_string)
+        return content[:index] + new_string + content[index + len(search) :]
+
+    size = len(search)
+    starts: list[int] = []
+    at: int = index
+    while at != -1:
+        starts.append(at)
+        at = content.find(search, at + size) if replace_all else -1
+
+    pieces: list[str] = []
+    cursor = previous_end = 0  # previous_end: the end of the previous replaced span, for the START rule
+    for k, s in enumerate(starts):
+        e = s + size
+        if search.startswith("\n") and s > 0 and content[s - 1] == "\r" and s - 1 >= previous_end:
+            s -= 1  # START: the pair's "\r" joins the span, since its "\n" is in the span
+        if (
+            search.endswith("\r")
+            and (e == len(content) or content[e] == "\n")
+            and not new_string.endswith("\r")
+            and not (k + 1 < len(starts) and starts[k + 1] == e)
+        ):
+            e -= 1  # END: the trailing "\r" is the file's line ending; it stays in the file
+        pieces.append(content[cursor:s])
+        pieces.append(new_string)
+        cursor = previous_end = e
+    pieces.append(content[cursor:])
+    return "".join(pieces)
+
+
 def replace(content: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
     """Replace `old_string`, trying each replacer in turn until one finds a unique match (or any, with
     `replace_all`). Raises `ValueError` with the message for the model when nothing fits."""
@@ -334,21 +374,17 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
                         "Refusing replacement because the matched span is much larger than oldString. "
                         "Re-read the file and provide the full exact oldString for the intended replacement."
                     )
-                # departs from ladderframe (#127): a candidate's trailing `\r` with the file's `\n` right after
-                # this occurrence is a CRLF line ending, not text the model wrote: dropping it would leave a
-                # bare LF, whatever oldString ends with (a fuzzy replacer may have matched an oldString whose
-                # trailing `\r` was whitespace it ignored), so the replacement keeps it; deleting a block with
-                # newString "" then leaves "\r\n", as an LF file leaves "\n". With replace_all the first
-                # occurrence (index) decides, for every occurrence it substitutes.
-                replacement = (
-                    new_string + "\r"
-                    if search.endswith("\r")
-                    and content.startswith("\n", index + len(search))
-                    and not new_string.endswith("\r")
-                    else new_string
-                )
+                # departs from ladderframe (#127): a fuzzy candidate's span never splits a CRLF pair; the pair
+                # goes with the side that holds its "\n", per occurrence (see _substitute): a candidate's
+                # trailing "\r" with the file's "\n" right after is the line ending and stays (deleting a block
+                # with newString "" then leaves "\r\n", as an LF file leaves "\n"), and a candidate starting
+                # with "\n" takes the "\r" right before it, rather than leaving a lone CR. The model's literal
+                # text is never adjusted: the exact match substitutes as ladderframe did, so a deliberate CR
+                # removal (an exact "\r" the model asked to delete) deletes it.
                 if replace_all:
-                    return content.replace(search, replacement)
+                    if search == old_string:
+                        return content.replace(search, new_string)
+                    return _substitute(content, search, index, new_string, True)
                 if index != content.rfind(search):
                     if search == old_string:
                         # departs from ladderframe (#110): an ambiguous exact oldString is reported, not skipped
@@ -357,7 +393,9 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
                         # error is safer.
                         raise ValueError(MULTIPLE_MATCHES)
                     continue
-                return content[:index] + replacement + content[index + len(search) :]
+                if search == old_string:
+                    return content[:index] + new_string + content[index + len(search) :]
+                return _substitute(content, search, index, new_string, False)
         except _LongerBlock as e:
             # departs from ladderframe (#117): pending, not final: a later replacer may still find the text.
             refusal = e
@@ -735,10 +773,13 @@ def test_a_fuzzy_match_in_a_crlf_file_keeps_the_line_ending() -> None:
 def test_each_line_based_replacers_candidate_keeps_its_trailing_cr() -> None:
     """Each line-based replacer's candidate in a CRLF file ends with its last line's ``\\r``, and the
     replacement keeps it, so the output has no bare LF (#127). Each find routes to the named replacer (the
-    earlier ones find nothing). The context-aware find departs from the issue's example (a ``zzz = 9`` middle
-    between two exact middles still scores 0.78 at the block anchors, which win): with one exact and one
-    wholly different middle the block score is 0.5 (< 0.65) and the context match is 1/2 (>= 0.5), so the
-    context-aware matcher is the one that yields."""
+    earlier ones find nothing), except the indentation-flexible one: a window whose lines are lstrip-equal to
+    the find's (its gate) is necessarily strip-equal (the line-trimmed gate), so the line-trimmed matcher
+    always finds what the indentation-flexible one finds and its identical candidate wins in ``replace``; that
+    case checks the indentation-flexible candidate directly. The context-aware find departs from the issue's
+    example (a ``zzz = 9`` middle between two exact middles still scores 0.78 at the block anchors, which win):
+    with one exact and one wholly different middle the block score is 0.5 (< 0.65) and the context match is
+    1/2 (>= 0.5), so the context-aware matcher is the one that yields."""
     cases: list[tuple[Replacer, str, str, str]] = [
         (
             new.line_trimmed_replacer,
@@ -757,6 +798,12 @@ def test_each_line_based_replacers_candidate_keeps_its_trailing_cr() -> None:
             "    alpha = 1\r\n    beta = 2",
             "    alpha = ONE\r\n    beta = 2",
             "def f():\r\n    alpha = ONE\r\n    beta = 2\r\n    gamma = 3\r\nend\r\n",
+        ),
+        (
+            new.indentation_flexible_replacer,
+            "    def f():\r\n        alpha = 1\r",
+            "def f():\r\nalpha = ONE",
+            "def f():\r\nalpha = ONE\r\n    beta  = 2\r\n    gamma = 3\r\nend\r\n",
         ),
         (
             new.context_aware_replacer,
@@ -804,12 +851,71 @@ def test_the_crlf_guard_looks_at_the_file_not_at_oldstring() -> None:
         assert re.search(r"(?<!\r)\n", out) is None
 
 
+def test_an_exact_cr_removal_is_the_models_to_make() -> None:
+    """The CRLF rules adjust fuzzy candidates only: the model's literal text (the exact match) is substituted
+    as it was before #127, so a deliberate CR removal removes it. The old guard also fired on the exact match,
+    which silently changed nothing and still reported success (#127)."""
+    for search in (new.replace, replace):
+        assert search("a\r\nb\r\n", "\r", "", True) == "a\nb\n"
+        assert search("x\r\nfoo\r\ny\r\n", "foo\r", "foo") == "x\r\nfoo\ny\r\n"
+
+
+def test_replace_all_decides_the_crlf_rules_per_occurrence() -> None:
+    """With ``replaceAll`` every occurrence gets its own END-rule decision (#127); the old guard let the first
+    occurrence decide for all. The line-trimmed candidate for ``"  foo"`` is ``"foo\\r"``: its first occurrence
+    is followed by ``"b"`` (no CRLF pair, the ``\\r`` is the model's match and goes), its second by ``"\\n"``
+    (the pair's ``\\r`` stays in the file)."""
+    content = "foo\rbar\r\nfoo\r\n"
+    assert next(islice(new.line_trimmed_replacer(content, "  foo"), 1)) == "foo\r"
+    for search in (new.replace, replace):
+        assert search(content, "  foo", "NEW", True) == "NEWbar\r\nNEW\r\n"
+
+
+def test_a_candidate_starting_with_lf_takes_the_cr_of_its_pair() -> None:
+    """A candidate that starts with ``\\n`` right after a ``\\r`` holds the pair's ``\\n``, so the pair's
+    ``\\r`` joins the span (START rule, #127). The old code split the pair and left a lone CR: the escape
+    matcher unescapes the literal ``\\n`` of oldString to a real one, and the replacement of the candidate
+    ``"\\nfoo"`` gave ``"x\\r\\r\\nFOO\\r\\ny\\r\\n"``."""
+    content = "x\r\nfoo\r\ny\r\n"
+    assert next(islice(new.escape_normalized_replacer(content, "\\nfoo"), 1)) == "\nfoo"
+    for search in (new.replace, replace):
+        assert search(content, "\\nfoo", "\r\nFOO") == "x\r\nFOO\r\ny\r\n"
+        assert search(content, "\\nfoo", "FOO") == "xFOO\r\ny\r\n"
+
+
+def test_the_crlf_rules_interleave_across_replace_all_occurrences() -> None:
+    """The two rules per occurrence with ``replaceAll`` (#127): in ``"a\\r\\nfoo\\r\\nfoo\\r\\n"`` the
+    candidate ``"\\nfoo\\r"`` (the escape matcher unescapes the literal ``\\nfoo\\r``) is at 2 and 7. First
+    occurrence: the START rule extends the span to [1, 7); the END rule is off, as the next occurrence starts
+    at 7. Second: the START rule is off (6 < the previous span's end, 7); the END rule keeps the ``\\r`` at 11
+    (a ``\\n`` follows at 12, and there is no next occurrence): the span is [7, 11)."""
+    content = "a\r\nfoo\r\nfoo\r\n"
+    assert next(islice(new.escape_normalized_replacer(content, "\\nfoo\\r"), 1)) == "\nfoo\r"
+    for search in (new.replace, replace):
+        assert search(content, "\\nfoo\\r", "X", True) == "aXX\r\n"
+
+
+def test_a_file_ending_in_a_lone_cr_keeps_it() -> None:
+    """A candidate's trailing ``\\r`` at the very end of the file (no ``\\n`` after) is a line ending the model
+    never saw a pair of: the END rule counts the end of the file like a following ``\\n`` and keeps the CR
+    (#127); the old guard dropped it. The line-trimmed candidate for ``"  a\\n  b"`` in ``"a\\r\\nb\\r"`` is
+    ``"a\\r\\nb\\r"``. The newString is the CRLF one ``_edit`` passes for this file; with a bare-LF one (a
+    caller's own doing) the file's final CR is still kept."""
+    assert next(islice(new.line_trimmed_replacer("a\r\nb\r", "  a\n  b"), 1)) == "a\r\nb\r"
+    for search in (new.replace, replace):
+        assert search("a\r\nb\r", "  a\n  b", "A\r\nB") == "A\r\nB\r"
+        assert search("a\r\nb\r", "  a\n  b", "A\nB") == "A\nB\r"
+
+
 @pytest.mark.parametrize("seed", range(4))
 def test_crlf_replacements_never_leave_a_bare_lf(seed: int) -> None:
     """On CRLF content (every ``\\n`` of the random text converted) with CRLF finds, whenever ``replace``
-    returns, the output has no bare LF: the input has none, the newString has none, and a candidate's
-    trailing ``\\r`` that is a CRLF line ending in the file is kept by the replacement (#127). The oracle
-    must give the same outcome."""
+    returns for a find that is not in the content exactly, the output has no bare LF: the input has none, the
+    newString has none, and a fuzzy candidate's span never splits a CRLF pair (#127) — a candidate's trailing
+    ``\\r`` with the file's ``\\n`` right after stays, and a candidate starting with ``\\n`` takes the ``\\r``
+    before it. An exact find is the model's literal text and is never adjusted: one ending in ``\\r`` removes
+    that CR on purpose and may leave the file's ``\\n`` bare. The oracle must give the same outcome in every
+    case."""
     rng = random.Random(seed)
     for _ in range(500):
         content_lf = random_text(rng, 10)
@@ -818,7 +924,7 @@ def test_crlf_replacements_never_leave_a_bare_lf(seed: int) -> None:
         replace_all = rng.random() < 0.2
         result = outcome(new.replace, content, find, "R\r\nS", replace_all)
         assert result == outcome(replace, content, find, "R\r\nS", replace_all), (content, find, replace_all)
-        if isinstance(result, str):
+        if isinstance(result, str) and find not in content:
             assert re.search(r"(?<!\r)\n", result) is None, (content, find, replace_all, result)
 
 
