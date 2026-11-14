@@ -13,8 +13,9 @@ from minifs.vfs.view import VFSView
 
 BOM = "\ufeff"
 
-PAGE = 1024 * 1024
-"""Bytes per ``pread`` when reading a whole file."""
+PAGE = 16 * 1024 * 1024
+"""The most bytes ``read_file`` asks one ``pread`` for, whatever its cap: big enough that Edit's default 10 MB cap
+is one statement, small enough to bound what one statement holds and how long it runs when the cap is raised."""
 
 
 class TooLarge(Exception):
@@ -26,17 +27,27 @@ class TooLarge(Exception):
 
 
 async def read_file(vfs: VFSView, path: str, max_size: int | None = None) -> tuple[bytes, FileVersion]:
-    """The whole content of file ``path`` and the version it is, read in pages: what a compare-and-swap write
-    expects. ESTALE if the file changed between pages (the content would mix two versions). ``TooLarge``, after
-    the first page, for a file over ``max_size`` bytes."""
-    first = await vfs.pread(path, 0, PAGE)
+    """The whole content of file ``path`` and the version it is: what a compare-and-swap write expects. ``TooLarge``,
+    after the first page, for a file over ``max_size`` bytes.
+
+    Each ``pread`` asks for up to ``max_size`` bytes and at most ``PAGE``, so a file within both (as Edit's default
+    cap is) is one statement, read from one snapshot, and a file that grew past the cap is refused having read at
+    most ``max_size`` bytes. A larger file is read in pages, and ESTALE is raised if it changed between them (the
+    content would mix two versions).
+
+    A page costs about three times its size in client memory while it arrives (bytea comes as hex text, then is
+    decoded), and the server holds it whole before sending it (spilling to disk past ``work_mem``). Reads set no
+    ``statement_timeout`` of their own, so a server one applies to each page: ``PAGE`` bounds both, whatever
+    ``EditSettings.max_bytes`` or ``WriteSettings.max_diff_bytes`` allow."""
+    page_size = PAGE if max_size is None else min(max_size, PAGE)
+    first = await vfs.pread(path, 0, page_size)
     if max_size is not None and first.size > max_size:
         raise TooLarge(first.size)
     version = FileVersion(first.id, first.generation, first.size)
     chunks = [first.content]
     page = first
     while not page.eof:
-        page = await vfs.pread(path, page.next_offset, PAGE)
+        page = await vfs.pread(path, page.next_offset, page_size)
         if (page.id, page.generation, page.size) != (version.id, version.generation, version.size):
             raise VFSError("ESTALE", path, "changed while it was read")
         chunks.append(page.content)
