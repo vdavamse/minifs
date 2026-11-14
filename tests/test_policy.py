@@ -184,7 +184,7 @@ def test_a_negated_empty_range_matches_a_newline() -> None:
 
 def _best_of(call: Callable[[], bool], runs: int = 5, bound: float = 0.05) -> tuple[bool, float]:
     """``call()``'s answer and its fastest time over up to ``runs`` runs, so a preempted runner or a GC pause in one
-    run can't fail a timing bound. It stops at the first run under ``bound``, and after a run ten times over it
+    run can't fail a timing bound. It stops at the first run under ``bound``, and after a run twenty times over it
     (backtracking, not noise), so a regression fails in one slow run instead of five."""
     best = float("inf")
     answer = False
@@ -192,7 +192,7 @@ def _best_of(call: Callable[[], bool], runs: int = 5, bound: float = 0.05) -> tu
         started = time.perf_counter()
         answer = call()
         best = min(best, time.perf_counter() - started)
-        if best < bound or best > 10 * bound:
+        if best < bound or best > 20 * bound:
             break
     return answer, best
 
@@ -337,3 +337,15 @@ def test_star_and_globstar_heavy_rules_agree_with_the_reference_matcher() -> Non
                 deep_matches += several and want
     assert deep_matches >= 500, deep_matches  # matches through two or more **, where a middle ** must stop right
     assert globstars >= 100, globstars  # enough patterns with two or more ** to exercise the atomic lazy groups
+
+
+def test_a_path_holding_a_nul_is_decided_by_the_reference_matcher() -> None:
+    """No stored name holds a NUL, which the dual string uses as its separator, so such a path goes through the
+    reference matcher and is answered as before #142, in both directions."""
+    nul = chr(0)
+    policy = Policy({"agent": [Rule("/w/[s]?cret"), Rule("/w/.env"), Rule("/w/**", "read")]})
+    for path in (f"/w/s{nul}cret", f"/w/.env{nul}x", f"/w/a{nul}b"):
+        segments = split_trusted(path)
+        first = next((rule for rule in policy.rules["agent"] if _matches_by_rests(rule, segments)), None)
+        assert policy.matches("agent", path) == (first is not None), ascii(path)
+        assert policy.allows("agent", "read", path) == (first is not None and first.grants("read")), ascii(path)

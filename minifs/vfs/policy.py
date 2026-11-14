@@ -106,8 +106,9 @@ class Rule:
 
     def matches(self, path: str) -> bool:
         """Whether the pattern matches ``path`` (normalised first)."""
-        joined = "".join("/" + s for s in split(path))
-        return bool(self.regex.fullmatch(_dual_string(joined) if self.hides else joined))
+        split(path)  # EINVAL for a path with a control character, as before
+        plain = _path_string(path)
+        return bool(self.regex.fullmatch(_dual_string(plain) if self.hides else plain))
 
     def grants(self, action: Action) -> bool:
         return action in self.actions or (action == "append" and "write" in self.actions)
@@ -142,17 +143,28 @@ class Policy:
     def matches(self, actor: str, path: str) -> bool:
         """Whether some rule of ``actor`` matches ``path`` itself, so that the first such rule decides it. KeyError
         for an actor without rules; ``path`` as ``allows`` takes it."""
+        return self._first_match(actor, path) is not None
+
+    def _first_match(self, actor: str, path: str) -> Rule | None:
+        """The first rule of ``actor`` whose regex fullmatches ``path`` (the path string for a grant rule, the dual
+        string for a hide rule, built once and only when a hide rule is reached), or None. A path holding a NUL,
+        which no stored name can, would break the dual string's separator, so it goes through the reference
+        matcher (``_rests``) instead, which answers it as before."""
+        rules = self.rules[actor]
+        if "\x00" in path:
+            segments = split_trusted(path)
+            return next((rule for rule in rules if _matches_by_rests(rule, segments)), None)
         plain = _path_string(path)
         dual: str | None = None
-        for rule in self.rules[actor]:
+        for rule in rules:
             if rule.hides:
                 if dual is None:
                     dual = _dual_string(plain)
                 if rule.regex.fullmatch(dual):
-                    return True
+                    return rule
             elif rule.regex.fullmatch(plain):
-                return True
-        return False
+                return rule
+        return None
 
     def allows(self, actor: str, action: Action, path: str, *, subtree: bool = False) -> bool:
         """Whether ``actor`` may ``action`` at ``path`` and, with ``subtree``, at every path below it too (what
@@ -170,17 +182,9 @@ class Policy:
                     if any(rest and _only_globstars(rest) for rest in rests):  # ends in **: covers the subtree
                         return True
         else:
-            plain = _path_string(path)
-            dual: str | None = None
-            for rule in self.rules[actor]:
-                if rule.hides:
-                    if dual is None:  # the dual string is only needed once a hide rule is reached
-                        dual = _dual_string(plain)
-                    matched = rule.regex.fullmatch(dual) is not None
-                else:
-                    matched = rule.regex.fullmatch(plain) is not None
-                if matched:
-                    return rule.grants(action)
+            rule = self._first_match(actor, path)
+            if rule is not None:
+                return rule.grants(action)
         return action == "read" and self.read_unmatched
 
     def allows_any(self, actor: str, action: Action, path: str) -> bool:
@@ -445,9 +449,10 @@ def _only_globstars(rest: tuple[tuple[str, ...], ...]) -> bool:
     return all(segment[0] == "**" for segment in rest)
 
 
-def _matches_by_rests(rule: Rule, segments: tuple[str, ...]) -> bool:  # pyright: ignore[reportUnusedFunction]
+def _matches_by_rests(rule: Rule, segments: tuple[str, ...]) -> bool:
     """Whether ``rule`` matches ``segments`` by the reference matcher (``_rests`` over the rule's alternatives),
-    what the lookups did before ``Rule.regex``: for the differential test (tests/test_policy.py) alone."""
+    what the lookups did before ``Rule.regex``: for a path holding a NUL (``Policy._first_match``) and the
+    differential test (tests/test_policy.py)."""
     return any(_only_globstars(rest) for rest in _rule_rests(rule, segments))
 
 
