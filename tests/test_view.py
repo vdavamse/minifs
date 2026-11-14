@@ -1049,7 +1049,7 @@ async def test_a_result_path_that_is_not_a_path_is_eio(
     rather than being reported, and policy-checked, as the directory itself; the string is shown nowhere."""
     fake = str(uuid4())
 
-    async def broken_readdir(path: str) -> list[Entry]:
+    async def broken_readdir(path: str, *, after: str | None = None, limit: int | None = None) -> list[Entry]:
         return [Entry(fake, uuid4(), "file", 0, None)]
 
     monkeypatch.setattr(vfs, "readdir", broken_readdir)
