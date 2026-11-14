@@ -23,7 +23,7 @@ from fnmatch import fnmatchcase
 from functools import lru_cache
 from typing import Literal, get_args
 
-from minifs.vfs.core import VFSError, split
+from minifs.vfs.core import VFSError, split, split_trusted
 
 Action = Literal["read", "write", "append"]
 _ACTIONS: frozenset[str] = frozenset(get_args(Action))
@@ -102,8 +102,9 @@ class Policy:
         """Whether ``actor`` may ``action`` at ``path`` and, with ``subtree``, at every path below it too (what
         moving a directory needs). The subtree answer is conservative: a rule that could match below ``path``
         and doesn't grant ``action`` refuses, unless an earlier rule covers the whole subtree. KeyError for an
-        actor without rules."""
-        segments = split(path)
+        actor without rules. ``path`` isn't checked for control characters (``split_trusted``): it is as often a
+        path the server listed as one from a caller, which ``check`` and the operation itself refuse."""
+        segments = split_trusted(path)
         for rule in self.rules[actor]:
             rests = _rests(rule.segments, segments)
             if not subtree:
@@ -119,7 +120,7 @@ class Policy:
     def allows_any(self, actor: str, action: Action, path: str) -> bool:
         """Whether ``actor`` may ``action`` at ``path`` or at some path below it. Conservative the other way: True
         unless a rule that doesn't grant ``action`` covers the whole subtree before any rule that could grant it."""
-        segments = split(path)
+        segments = split_trusted(path)
         for rule in self.rules[actor]:
             rests = _rests(rule.segments, segments)
             if not rests:
@@ -135,6 +136,7 @@ class Policy:
     ) -> None:
         """Raises EACCES (``PolicyDenied``) for ``path`` unless ``actor`` may ``action`` there (``allows``), and
         counts the denial unless ``count_denials`` is False (a speculative lookup)."""
+        split(path)  # EINVAL before EACCES for a path with a control character: ``allows`` doesn't look
         if not self.allows(actor, action, path, subtree=subtree):
             if count_denials:
                 self.denials[actor, action] += 1

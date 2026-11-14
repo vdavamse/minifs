@@ -5,11 +5,16 @@ else looks at a path, as ladderframe's ``_path_subject`` does, so ``/workspace/.
 ``/docs/a.md`` name the same file everywhere (resolution, the chroot view, the write policy). ``..`` at the root
 stays at the root, as in POSIX. Unlike POSIX, a trailing slash is dropped too, so ``/notes.md/`` names the file
 ``/notes.md`` rather than failing with ENOTDIR: paths are names here, not walks through the kernel.
+
+A path with a control character is EINVAL (``CONTROL_CHARACTERS``): names can't contain one (migration 016), and
+refusing the path here keeps a newline or an escape sequence from reaching a round trip or a listing. The error
+reports the path with those characters escaped (``escape_controls``), so they don't reach a log line either.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -20,6 +25,11 @@ import psycopg
 from minifs.db.errors import errno_name
 
 Kind = Literal["file", "dir"]
+
+CONTROL_CHARACTERS = re.compile("[\x00-\x1f\x7f-\x9f\u2028-\u202e\u2066-\u2069]")
+"""What a name can't contain, as ``vfs_check_name`` tests it (migration 016): the C0 controls, DEL, the C1
+controls, the Unicode line and paragraph separators, and the bidi embeddings, overrides and isolates. NUL is a
+C0 control the server never sees: refused here, it can't surface as an encoding error (EIO) from psycopg."""
 
 
 class VFSError(Exception):
@@ -57,7 +67,8 @@ class VFSError(Exception):
         errno = errno_name(error)
         if errno is None:
             return None
-        return cls(errno, path, detail=error.diag.message_detail or "")
+        # Escaped: a constraint's DETAIL is PostgreSQL's "Failing row contains (...)", with the name as it is.
+        return cls(errno, path, detail=escape_controls(error.diag.message_detail or ""))
 
 
 @dataclass(frozen=True)
@@ -161,17 +172,26 @@ def millis(seconds: float) -> str:
 def normalize(path: str) -> str:
     """The canonical form of absolute ``path``: no ``.``, ``..``, repeated or trailing slashes.
 
-    EINVAL for a relative path, an empty one, or one containing a NUL character.
+    EINVAL for a relative path, an empty one, or one containing a control character (``CONTROL_CHARACTERS``).
     """
     return "/" + "/".join(split(path))
 
 
 def split(path: str) -> tuple[str, ...]:
-    """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``."""
+    """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``.
+
+    For a path from a caller. The control characters are checked first, so no refusal echoes one."""
+    if found := CONTROL_CHARACTERS.search(path):
+        raise VFSError("EINVAL", escape_controls(path), f"path contains a control character U+{ord(found[0]):04X}")
+    return split_trusted(path)
+
+
+def split_trusted(path: str) -> tuple[str, ...]:
+    """``split`` without the control-character check, for a path the server reported or one ``split`` has been
+    through: a listing or a search with a name from before migration 016 is filtered and mapped rather than
+    failed (the view then reports the name escaped)."""
     if not path.startswith("/"):
-        raise VFSError("EINVAL", path, "path must be absolute")
-    if "\0" in path:
-        raise VFSError("EINVAL", path, "path contains a NUL character")
+        raise VFSError("EINVAL", escape_controls(path), "path must be absolute")
     parts: list[str] = []
     for part in path.split("/"):
         if part in ("", "."):
@@ -182,6 +202,15 @@ def split(path: str) -> tuple[str, ...]:
             continue
         parts.append(part)
     return tuple(parts)
+
+
+def escape_controls(path: str) -> str:
+    """``path`` with each control character (``CONTROL_CHARACTERS``) spelled as ``\\uXXXX``, for an error message: a
+    refused path is reported without the newline or escape sequence it was refused for. Unchanged without one;
+    with one, a backslash is doubled, so the result reads back one way only."""
+    if not CONTROL_CHARACTERS.search(path):
+        return path
+    return CONTROL_CHARACTERS.sub(lambda c: f"\\u{ord(c[0]):04x}", path.replace("\\", "\\\\"))
 
 
 def join(*segments: str) -> str:

@@ -56,7 +56,18 @@ import psycopg
 from minifs.vfs import glob as globbing
 from minifs.vfs import search as searching
 from minifs.vfs.client import DEFAULT_LINE_BYTES, DEFAULT_LINE_LIMIT, DEFAULT_READ_LIMIT, MAX_TIMEOUT, VFSClient
-from minifs.vfs.core import Entry, FileVersion, GlobResult, LineReadResult, ReadResult, VFSError, join, split
+from minifs.vfs.core import (
+    Entry,
+    FileVersion,
+    GlobResult,
+    LineReadResult,
+    ReadResult,
+    VFSError,
+    escape_controls,
+    join,
+    split,
+    split_trusted,
+)
 from minifs.vfs.policy import Action, Policy
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
@@ -137,7 +148,7 @@ class VFSView:
         else:
             listing = await self._mapped(self._client.readdir(_real(target)), target)
             entries = [self._entry(e, target) for e in listing]
-        return [e for e in entries if self.policy.allows(self.actor, "read", e.path)]
+        return self._readable(entries)
 
     async def pread(self, path: str, offset: int = 0, limit: int = DEFAULT_READ_LIMIT) -> ReadResult:
         """``VFSClient.pread`` of ``path``."""
@@ -246,7 +257,9 @@ class VFSView:
         return GlobResult(readable[:limit], len(readable) > limit)
 
     def _readable(self, entries: list[Entry]) -> list[Entry]:
-        return [e for e in entries if self.policy.allows(self.actor, "read", e.path)]
+        """The ``entries`` the actor may read, as reported: a name from before migration 016 is matched by the
+        policy as stored, then spelled without its control characters (``_reported``)."""
+        return [_reported(e) for e in entries if self.policy.allows(self.actor, "read", e.path)]
 
     async def _glob(
         self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
@@ -397,7 +410,7 @@ class VFSView:
         assert mount is not None
 
         def keep(real: str) -> bool:
-            segments = split(real)
+            segments = split_trusted(real)
             if segments[: len(mount.real)] != mount.real:
                 return False
             visible = join(*mount.visible, *segments[len(mount.real) :])
@@ -535,12 +548,12 @@ class VFSView:
         return Entry(self._visible(entry.path, target), entry.id, entry.kind, entry.size, entry.mtime, entry.generation)
 
     def _hit(self, hit: searching.GrepHit, target: _Target) -> searching.GrepHit:
-        return dataclasses.replace(hit, path=self._visible(hit.path, target))
+        return dataclasses.replace(hit, path=escape_controls(self._visible(hit.path, target)))
 
     def _visible(self, real: str, *targets: _Target) -> str:
         """The visible path of ``real``, a path the operation on ``targets`` reported: one of their real paths, or
         a path below or above one in its mount. A path above a mount point is reported as the mount point."""
-        segments = split(real)
+        segments = split_trusted(real)
         for target in targets:
             if real == target.real:
                 return target.visible
@@ -643,6 +656,14 @@ def _mtime(entry: Entry) -> datetime:
 def _real(target: _Target) -> str:
     assert target.real is not None
     return target.real
+
+
+def _reported(entry: Entry) -> Entry:
+    """``entry`` as a listing or a glob reports it: a name from before migration 016 with its control characters
+    escaped (``escape_controls``), so it can't forge a line of a tool result. Nothing is lost by it: ``split``
+    refuses the raw path when it comes back, so the node is reached by id or renamed in SQL (the header of 016)."""
+    path = escape_controls(entry.path)
+    return entry if path == entry.path else dataclasses.replace(entry, path=path)
 
 
 def _below(pattern: str, prefix: tuple[str, ...], *, dirs: bool, path: str) -> str | Literal[True] | None:
