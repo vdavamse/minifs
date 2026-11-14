@@ -555,7 +555,10 @@ class VFSView:
         a path below or above one in its mount. A path above a mount point is reported as the mount point, and a
         string that isn't an absolute path as the first target."""
         if not real.startswith("/"):
-            return targets[0].visible  # not a path (a node id, say): never shown, and no error from in here
+            # Not a path (a node id, say): a client bug, in an error or a result. Never shown, so the real string
+            # stays out of the log too, and nothing raises from in here (``_mapped`` calls this in its handler).
+            _log.warning("the client reported a path that isn't absolute; reported at %s", targets[0].visible)
+            return targets[0].visible
         segments = split_trusted(real)
         for target in targets:
             if real == target.real:

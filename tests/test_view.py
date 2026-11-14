@@ -940,8 +940,9 @@ async def test_glob_from_a_virtual_directory_matches_globbing_the_tree(vfs: VFSC
 async def test_glob_reports_a_bad_root_at_its_path(
     vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A vfs_glob that reports ENOENT for its root (here faked; elsewhere a race with the client's lookup) is
-    reported at the path the root was resolved from, not at the root's id, and the view strips id and detail."""
+    """A vfs_glob that reports ENOENT for its root (unreachable today: the client resolves the root in the same
+    snapshot, so faked here) is reported at the path the root was resolved from, not at the root's id, and the view
+    strips id and detail."""
     real_glob = globbing.glob
     fake_root = uuid4()  # vfs_glob returns ENOENT for a root that isn't there
 
@@ -956,18 +957,39 @@ async def test_glob_reports_a_bad_root_at_its_path(
 
 
 async def test_an_error_path_that_is_not_a_path_is_reported_at_the_target(
-    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A client error whose path isn't an absolute path (a node id, say) is reported at the target: the view
-    neither shows the string nor fails on it."""
+    neither shows the string nor fails on it. One warning is logged each time, without the string."""
     agent = view(vfs, policy)
-    for bad in [str(uuid4()), "None", ""]:
+    with caplog.at_level(logging.WARNING, logger="minifs.vfs.view"):
+        fake = uuid4()
 
-        async def broken_stat(path: str, bad: str = bad) -> Entry:
-            raise VFSError("ENOENT", bad, detail="real detail")
+        async def broken_rename(src: str, dst: str, *, expect: UUID | None = None) -> None:
+            raise VFSError("ENOENT", str(fake), detail="real detail")
 
-        monkeypatch.setattr(vfs, "stat", broken_stat)
-        error = await raises("ENOENT", agent.stat("/workspace/notes.md"), "/workspace/notes.md")
-        assert "real detail" not in str(error)
-        if bad:
-            assert bad not in str(error)
+        # Two targets: the error is reported at the first (the source). Only rename is patched, so the stat
+        # `_pin` does on the source is the real one: this case must come before the loop below.
+        monkeypatch.setattr(vfs, "rename", broken_rename)
+        error = await raises(
+            "ENOENT", agent.rename("/workspace/notes.md", "/workspace/moved.md"), "/workspace/notes.md"
+        )
+        assert error.detail == ""
+        assert str(fake) not in str(error)
+        bads = [str(uuid4()), "None", ""]
+        for bad in bads:
+
+            async def broken_stat(path: str, bad: str = bad) -> Entry:
+                raise VFSError("ENOENT", bad, detail="real detail")
+
+            monkeypatch.setattr(vfs, "stat", broken_stat)
+            error = await raises("ENOENT", agent.stat("/workspace/notes.md"), "/workspace/notes.md")
+            assert error.detail == ""
+            if bad:
+                assert bad not in str(error)
+        messages = [r.getMessage() for r in caplog.records if r.name == "minifs.vfs.view"]
+        assert len(messages) == 4  # the rename case, then one per bad path
+        for message in messages:
+            assert "isn't absolute" in message
+            assert str(fake) not in message
+            assert not any(bad and bad in message for bad in bads)
