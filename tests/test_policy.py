@@ -1,13 +1,15 @@
 """The compiled rule regex (``Rule.regex``, #77) without a database: unit tests of the pieces a lookup is built
 from, and a differential test of every regex lookup against the reference matcher (``_rests``) over random
-patterns and paths, built from the characters folding makes tricky (#93)."""
+patterns and paths, built from the characters folding makes tricky (#93) and from the control characters a name
+from before migration 016 can hold (#142)."""
 
 from __future__ import annotations
 
 import contextlib
 import random
+import time
 
-from minifs.vfs.core import split
+from minifs.vfs.core import CONTROL_CHARACTERS, split, split_trusted
 from minifs.vfs.policy import (
     Action,
     Policy,
@@ -16,7 +18,10 @@ from minifs.vfs.policy import (
     _path_string,  # pyright: ignore[reportPrivateUsage]
 )
 
+ACTIONS: tuple[Action, ...] = ("read", "write", "append")
 ZWSP = chr(0x200B)  # zero-width space: a format character, dropped when a name folds
+NEWLINE = chr(10)  # a control character: split refuses a path with one, split_trusted and the policy don't
+SOH = chr(1)  # another control character, so a class fnmatch reads as "any character" is tried against one
 FW_LOWER_A = chr(0xFF41)  # fullwidth "a": folds to "a"
 FW_ASTERISK = chr(0xFF0A)  # fullwidth asterisk: folds to "*", so such a pattern segment isn't foldable
 FW_SOLIDUS = chr(0xFF0F)  # fullwidth solidus: folds to "/", a NUL in the dual string
@@ -55,7 +60,7 @@ LITERALS = [
     "e" + COMBINING_ACUTE,
     E_ACUTE,
 ]
-CLASSES = ["[a-c]", "[!a]", "[A-Z]", "[]a]", "[!]x]", "[z-a]"]
+CLASSES = ["[a-c]", "[!a]", "[A-Z]", "[]a]", "[!]x]", "[z-a]", "[!z-a]", "[!b-a]"]
 TOKENS = LITERALS + ["*", "?"] + CLASSES
 NAMES = LITERALS + [
     "B",
@@ -72,6 +77,8 @@ NAMES = LITERALS + [
     FW_UPPER_F + FW_UPPER_I,
     FW_FULL_STOP + FW_UPPER_E + FW_LOWER_N + FW_LOWER_V,
     FW_LOWER_X + ZWSP,
+    NEWLINE,
+    SOH,
 ]
 
 
@@ -85,18 +92,29 @@ def _random_pattern(rng: random.Random) -> str:
 
 
 def _random_path(rng: random.Random) -> str:
-    """A random normalised path of 0-4 segments, each name 1-2 tokens of the names' pool."""
+    """A random normalised path of 0-4 segments, each name 1-2 tokens of the names' pool, which holds control
+    characters too: a name from before migration 016 can hold one (#142)."""
     return "/" + "/".join(
         "".join(rng.choice(NAMES) for _ in range(rng.randint(1, 2))) for _ in range(rng.randint(0, 4))
     )
 
 
+def _unnormalised(rng: random.Random, path: str) -> str:
+    """``path`` spelled another way that names the same file: a random one of its slashes as ``//``, ``/./`` or a
+    ``/x/../`` round trip, or a trailing slash. What ``split_trusted`` gives is unchanged, so the lookups, which
+    normalise a path first (``_path_string``), must answer as they do for ``path`` itself."""
+    if rng.random() < 0.25:
+        return path + "/"
+    slash = rng.choice([i for i, c in enumerate(path) if c == "/"])
+    return path[:slash] + rng.choice(("//", "/./", "/x/../")) + path[slash + 1 :]
+
+
 def _rules_for(pattern: str) -> list[Rule]:
-    """The hide and the grant rule for ``pattern``, skipping what ``Rule`` refuses as main does: ValueError for
+    """The hide and the grant rules for ``pattern``, skipping what ``Rule`` refuses as main does: ValueError for
     glob syntax fnmatch would read literally. Compiling the regex must never raise (a rule main loads must still
     load), so ``re.error`` isn't suppressed."""
     rules: list[Rule] = []
-    variants: tuple[tuple[Action, ...], ...] = ((), ("read",))
+    variants: tuple[tuple[Action, ...], ...] = ((), ("read",), ("write",), ("read", "append"))
     for actions in variants:
         with contextlib.suppress(ValueError):
             rules.append(Rule(pattern, *actions))
@@ -144,19 +162,69 @@ def test_an_impossible_class_compiles_and_matches_nothing() -> None:
             assert not _matches_by_rests(rule, split(path)), ascii(path)
 
 
+def test_a_negated_empty_range_matches_a_newline() -> None:
+    """``[!z-a]``: fnmatch translates a negated empty range to "any character", which its ``(?s:...)`` group makes
+    a newline too. A name from before migration 016 can hold one, and the policy's lookups take a path unchecked
+    (``split_trusted``), so the hide rule must hide that name (#142). ``Rule.matches`` isn't tried here: it checks
+    the path first (``split``) and refuses a control character."""
+    hide = Rule("/w/[!z-a]env")
+    rules = [hide, Rule("/w/**", "read")]
+    policy = Policy({"agent": rules})
+    for hidden in (f"/w/{NEWLINE}env", f"/w/{SOH}env"):
+        segments = split_trusted(hidden)
+        assert _matches_by_rests(hide, segments), ascii(hidden)  # the reference hides it
+        first = next((rule for rule in rules if _matches_by_rests(rule, segments)), None)
+        assert first is hide, ascii(hidden)
+        assert policy.matches("agent", hidden) == (first is not None), ascii(hidden)
+        assert not policy.allows("agent", "read", hidden), ascii(hidden)  # the hide rule grants nothing
+        assert not policy.allows("agent", "write", hidden), ascii(hidden)
+
+
+def test_many_stars_dont_backtrack() -> None:
+    """Several stars and a long name that nearly matches: each star but the last goes in an atomic group with a
+    lazy wildcard (``_segment_regex``, as ``fnmatch.translate`` spells it), so the matcher takes the leftmost
+    match of each piece instead of trying every way of sharing the name between the stars. Plain greedy stars
+    took seconds on these; the reference matcher is fast because fnmatch compiles the same way (#142)."""
+    path = "/w/" + "a" * 250
+    for rule in (Rule("/w/*a*a*a*a*b"), Rule("/w/*a*a*a*a*b", "read"), Rule("/w/*_*_*.env")):
+        name = ascii(rule.pattern)
+        segments = split_trusted(path)
+        want = _matches_by_rests(rule, segments)
+        assert not want, name  # the name holds neither a "b" nor a "_", so no rule matches it
+
+        started = time.perf_counter()
+        got = rule.matches(path)
+        took = time.perf_counter() - started
+        assert got == want, name
+        assert took < 0.05, f"{name} took {took * 1000:.1f} ms"
+
+        rules = (rule, Rule("/w/**", "read"))  # a rule that does match, so allows answers as the first rule
+        policy = Policy({"agent": list(rules)})
+        first = next((other for other in rules if _matches_by_rests(other, segments)), None)
+        for action in ACTIONS:
+            want_allows = first.grants(action) if first is not None else False
+            started = time.perf_counter()
+            got_allows = policy.allows("agent", action, path)
+            took = time.perf_counter() - started
+            assert got_allows == want_allows, f"{name} {action}"
+            assert took < 0.05, f"{name} {action} took {took * 1000:.1f} ms"
+
+
 def test_rule_regexes_agree_with_the_reference_matcher() -> None:
     """Over 20,000 (rule, path) pairs: ``Rule.matches``, answered by one ``fullmatch`` of the compiled regex,
-    decides exactly as the reference matcher ``_matches_by_rests``, for hide and grant rules alike (#77, #93)."""
+    decides exactly as the reference matcher ``_matches_by_rests``, for hide and grant rules alike (#77, #93).
+    The paths hold no control character: ``Rule.matches`` checks the path it is given (``split``) and refuses one,
+    so the names with a control character are the policy differential's business, which doesn't check (#142)."""
     rng = random.Random(77)
     rules: list[Rule] = []
     while len(rules) < 80:
         rules.extend(_rules_for(_random_pattern(rng)))
-    paths = [_random_path(rng) for _ in range(300)]
+    paths = [p for p in (_random_path(rng) for _ in range(350)) if not CONTROL_CHARACTERS.search(p)]
     checks = 0
     for rule in rules:
         for path in paths:
             by_regex = rule.matches(path)
-            by_rests = _matches_by_rests(rule, split(path))
+            by_rests = _matches_by_rests(rule, split_trusted(path))
             assert by_regex == by_rests, (
                 f"pattern {ascii(rule.pattern)} on path {ascii(path)}: regex {by_regex}, rests {by_rests}"
             )
@@ -166,7 +234,9 @@ def test_rule_regexes_agree_with_the_reference_matcher() -> None:
 
 def test_policy_lookups_agree_with_the_reference_matcher() -> None:
     """``Policy.allows`` (without ``subtree``) and ``Policy.matches``, answered by the compiled regexes, decide
-    exactly as the same first-match-wins loop over the reference matcher, for random 1-3-rule policies."""
+    exactly as the same first-match-wins loop over the reference matcher, for random 1-3-rule policies and the
+    three actions. The lookups take a path unchecked (``split_trusted``), so a path may hold a control character,
+    and a fraction of them is looked up in a spelling ``_path_string`` has to normalise first (#142)."""
     rng = random.Random(77)
     pool: list[Rule] = []
     while len(pool) < 30:
@@ -177,19 +247,22 @@ def test_policy_lookups_agree_with_the_reference_matcher() -> None:
         rules = tuple(rng.sample(pool, rng.randint(1, 3)))
         read_unmatched = rng.random() < 0.5
         policy = Policy({"agent": rules}, read_unmatched=read_unmatched)
+        names = [ascii(rule.pattern) for rule in rules]
         for path in paths:
-            segments = split(path)
-            first = next((rule for rule in rules if _matches_by_rests(rule, segments)), None)
-            want_allows = first.grants("read") if first is not None else read_unmatched
-            want_matches = first is not None
-            got_allows = policy.allows("agent", "read", path)
-            got_matches = policy.matches("agent", path)
-            names = [ascii(rule.pattern) for rule in rules]
-            assert got_allows == want_allows, (
-                f"rules {names} on path {ascii(path)}: allows {got_allows}, reference {want_allows}"
-            )
-            assert got_matches == want_matches, (
-                f"rules {names} on path {ascii(path)}: matches {got_matches}, reference {want_matches}"
-            )
-            checks += 1
+            looked_up = (path, _unnormalised(rng, path)) if rng.random() < 0.5 else (path,)
+            for looked in looked_up:
+                segments = split_trusted(looked)
+                first = next((rule for rule in rules if _matches_by_rests(rule, segments)), None)
+                want_matches = first is not None
+                got_matches = policy.matches("agent", looked)
+                assert got_matches == want_matches, (
+                    f"rules {names} on path {ascii(looked)}: matches {got_matches}, reference {want_matches}"
+                )
+                for action in ACTIONS:
+                    want_allows = first.grants(action) if first is not None else (action == "read" and read_unmatched)
+                    got_allows = policy.allows("agent", action, looked)
+                    assert got_allows == want_allows, (
+                        f"rules {names} on path {ascii(looked)}: allows {action} {got_allows}, reference {want_allows}"
+                    )
+                checks += 1
     assert checks >= 10_000, checks

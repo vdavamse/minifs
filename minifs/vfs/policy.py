@@ -283,19 +283,34 @@ def _fold_pattern(segment: str) -> str:
 
 def _segment_regex(segment: str, exclude: str) -> str:
     """The regex for one raw pattern ``segment`` (never ``**``), matching one name of the string a rule regex is
-    fullmatched against: ``*`` and ``?`` become classes matching anything but the characters of ``exclude`` (the
-    separators a name never contains), a ``[...]`` class becomes the regex ``fnmatch.translate`` gives that class
-    token alone, behind a lookahead that keeps ``exclude`` out of it too, and any other character is literal
-    (``re.escape``). Classes are scanned exactly as ``_bad_class`` scans them, which ``_no_literal_globs`` has
-    been through, so every ``[`` closes within the segment."""
-    out: list[str] = []
+    fullmatched against: ``?`` becomes a class matching anything but the characters of ``exclude`` (the separators
+    a name never contains), a ``[...]`` class becomes the regex ``fnmatch.translate`` gives that class token alone,
+    its ``(?s:...)`` group kept so a class fnmatch reads as "any character" (``[!z-a]``, an empty range negated)
+    also matches a newline, which a name from before migration 016 can hold, behind a lookahead that keeps
+    ``exclude`` out of it too, and any other character is literal (``re.escape``).
+
+    A run of ``*`` is one star, and the stars are then spelled as ``fnmatch.translate`` spells them: the pieces
+    between two stars go in atomic groups with a lazy wildcard, ``(?>[^{exclude}]*?piece)``, and only the last
+    star stays a plain greedy ``[^{exclude}]*``, followed by the piece after it (``*a*a*b`` is
+    ``(?>[^{exclude}]*?a)(?>[^{exclude}]*?a)[^{exclude}]*b``). Without the atomic groups a name that nearly
+    matches makes the matcher try every way of sharing it between the stars (``/w/*a*a*a*a*b`` against 250 ``a``
+    takes seconds); taking the leftmost match of a piece loses nothing, because the star after it absorbs whatever
+    follows, and a segment's regex is followed only by ``/``, a NUL or the end of the string, so no piece has to
+    reach past a separator. Classes are scanned exactly as ``_bad_class`` scans them, which ``_no_literal_globs``
+    has been through, so every ``[`` closes within the segment."""
+    chunks: list[list[str]] = [[]]  # the pieces the stars divide the segment into: one more than the stars
+    after_star = False
     i, n = 0, len(segment)
     while i < n:
         c, i = segment[i], i + 1
         if c == "*":
-            out.append(f"[^{exclude}]*")
-        elif c == "?":
-            out.append(f"[^{exclude}]")
+            if not after_star:  # a run of consecutive "*" is one star, as in fnmatch.translate
+                chunks.append([])
+            after_star = True
+            continue
+        after_star = False
+        if c == "?":
+            chunks[-1].append(f"[^{exclude}]")
         elif c == "[":
             j = i
             if j < n and segment[j] == "!":
@@ -310,10 +325,16 @@ def _segment_regex(segment: str, exclude: str) -> str:
             shape = re.fullmatch(r"\(\?s:(.*)\)\\[Zz]", translated, re.DOTALL)
             if shape is None:
                 raise AssertionError(f"fnmatch.translate has an unexpected shape: {translated!r}")
-            out.append(f"(?![{exclude}]){shape[1]}")
+            chunks[-1].append(f"(?![{exclude}])(?s:{shape[1]})")
             i = j + 1
         else:
-            out.append(re.escape(c))
+            chunks[-1].append(re.escape(c))
+    pieces = ["".join(chunk) for chunk in chunks]
+    if len(pieces) == 1:  # no star at all
+        return pieces[0]
+    out = [pieces[0]]  # the piece before the first star, as it is
+    out += [f"(?>[^{exclude}]*?{piece})" for piece in pieces[1:-1]]  # each star but the last, atomic
+    out.append(f"[^{exclude}]*{pieces[-1]}")  # the last star stays greedy, so the piece after it can backtrack
     return "".join(out)
 
 
