@@ -14,7 +14,7 @@ resolution, never the wrong node; this cache only has to keep stale entries rare
 
 - Only positive entries are cached (the dcache also keeps negative ones). A missing name is never cached, so a
   name another client creates is visible at once.
-- ``follow(watcher)`` keeps it fresh from the ``vfs`` NOTIFY channel: a ``delete`` evicts the node by id (through
+- ``follow(watcher)`` keeps it fresh from the schema's NOTIFY channel: a ``delete`` evicts the node by id (through
   the reverse map ``id -> (parent, name)``), and so does a ``move``, unless the node is already cached under its new
   name (the client stored it after the move, and the event arrived late). A ``rescan`` (after the LISTEN connection
   reconnects, when the subscription overflows, or on a TRUNCATE) clears everything.
