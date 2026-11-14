@@ -134,7 +134,7 @@ async def glob(
     returns them. ``.git`` directories are never walked. Without ``hints`` it walks the whole tree (for tests).
 
     ``max_nodes`` (None: no cap) bounds the walk: the directories it descends into and the files whose name can
-    match, see ``vfs_glob`` (migration 017). A wider one raises ``WalkTooWide`` and returns nothing, since a
+    match, see ``vfs_glob`` (migration 019). A wider one raises ``WalkTooWide`` and returns nothing, since a
     partial walk can't say which files are the newest.
 
     Raises GlobError for a bad pattern, and ``VFSError`` ENOENT / ENOTDIR for a bad ``root`` (with the root's id

@@ -74,6 +74,8 @@ _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
 MAX_GLOB_LIMIT = _MAX_LIMIT - 1
 """The largest ``limit`` ``VFSView.glob`` takes (it asks for ``limit + 1``)."""
 _REFETCH_FACTOR = 8
+_READDIR_BATCH = 256  # the fewest entries a paged readdir asks for after its first round
+_READDIR_MAX_BATCH = 8192  # and what that grows to, doubling each round, while it reads past hidden entries
 
 
 class _Bounds(NamedTuple):
@@ -148,16 +150,34 @@ class VFSView:
         entry = await self._mapped(self._client.stat(_real(target)), target)
         return self._entry(entry, target)
 
-    async def readdir(self, path: str, *, count_denials: bool = True) -> list[Entry]:
-        """The entries of directory ``path`` the actor may read, in byte order of name. With
+    async def readdir(
+        self, path: str, *, after: str | None = None, limit: int | None = None, count_denials: bool = True
+    ) -> list[Entry]:
+        """The entries of directory ``path`` the actor may read, in byte order of name: those whose name sorts
+        after ``after`` (None: from the first), at most ``limit`` of them (None: all), as ``VFSClient.readdir``.
+        ``limit`` counts readable entries: the view reads on past the ones the policy hides until it has that many
+        or the listing ends, so a page is a slice of the readable listing and tells nothing about the rest (and the
+        hidden entries it passes are still read from the server, in batches). With
         ``count_denials=False`` a refusal isn't counted in ``policy.denials``: for a speculative lookup."""
         target = self._target(path, "read", count_denials=count_denials)
+        if limit is not None and not 0 <= limit <= _MAX_LIMIT:
+            raise VFSError("EINVAL", target.visible, f"invalid limit {limit}")
         if target.real is None:
-            entries = await self._virtual_entries(target.path)
-        else:
-            listing = await self._mapped(self._client.readdir(_real(target)), target)
-            entries = [self._entry(e, target) for e in listing]
-        return self._readable(entries)
+            # Python orders str by code point, which is UTF-8 byte order.
+            virtual = [e for e in await self._virtual_entries(target.path) if after is None or e.name > after]
+            return self._readable(virtual)[:limit]
+        entries: list[Entry] = []
+        batch = 0  # the first round asks for just what is wanted
+        while True:
+            # After a round that met hidden entries: at least a batch, twice as large each round, so a long run
+            # of them is few statements.
+            asked = None if limit is None else min(max(limit - len(entries), batch), _MAX_LIMIT)
+            batch = min(max(2 * batch, _READDIR_BATCH), _READDIR_MAX_BATCH)
+            listing = await self._mapped(self._client.readdir(_real(target), after=after, limit=asked), target)
+            entries.extend(self._readable([self._entry(e, target) for e in listing]))
+            if limit is None or asked is None or len(listing) < asked or len(entries) >= limit:
+                return entries[:limit]
+            after = listing[-1].name
 
     async def pread(self, path: str, offset: int = 0, limit: int = DEFAULT_READ_LIMIT) -> ReadResult:
         """``VFSClient.pread`` of ``path``."""
