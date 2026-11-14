@@ -14,18 +14,18 @@ tool's globs give a meaning (``{a,b}``, ``[^...]``, ``[[:alpha:]]`` and backslas
 is a ``[`` not closed within its segment (``[!/]``), so a rule can't silently match nothing.
 
 Grant rules match names byte for byte, case-sensitively. A rule with no actions (a hide rule) matches what its
-pattern matches byte for byte and, in addition, the case and Unicode variants of the names it spells: the folded
-pattern against the folded name, where folding drops the format characters (Unicode category Cf, such as
-zero-width spaces), then applies NFKC normalisation, case folding and NFKC again, and a ``?`` or ``[...]`` of
-the pattern matches one character of the folded name. The byte-exact and the folded match are tried per
-segment, not per character, so one segment that needs both (``[!a-z]*.env`` against ``Config.ENV``) isn't
-hidden; spell such rules as two rules or with ``*``. A hide rule that missed a variant would leak it, while a
-loosened grant would grant more than written, so a rule with some actions is a grant and stays exact. A hide
-rule may not contain a character that folds to glob syntax, such as the fullwidth asterisk U+FF0A, which folds
-to ``*``, nor a ``[...]`` class that folding would change into another class: a member that folds to more or
-fewer than one character, a range whose endpoints fold (ASCII capital ranges such as ``[A-Z]`` excepted), a
-negated class that folding changes, or members NFKC composes. Suffixes and trailing spaces are other names: use
-``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/workspace/Makefile")`` also hides ``MAKEFILE``.
+pattern matches byte for byte and, in addition, the case and Unicode variants of the names it spells: each
+segment of the folded pattern against the folded name, where folding a name drops the format characters
+(Unicode category Cf, such as zero-width spaces), then applies NFKC normalisation, case folding and NFKC again.
+The byte-exact and the folded match are tried per segment, not per character, so one segment that needs both
+(``[!a-z]*.env`` against ``Config.ENV``) isn't hidden; spell such rules as two rules or with ``*``. A hide rule
+that missed a variant would leak it, while a loosened grant would grant more than written, so a rule with some
+actions is a grant and stays exact. A segment folds only where folding keeps its glob syntax: a segment with a
+``[...]`` class, or one with a character that folds to glob syntax (the fullwidth asterisk U+FF0A folds to
+``*``), matches byte for byte only, so spell such a class with both cases (``[Ee]``). A ``?`` matches one
+character of the folded name (the sharp s folds to ``ss``). Suffixes and trailing spaces are other names: use
+``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/workspace/Makefile")`` also hides ``MAKEFILE``, and a
+hide rule naming ``/Docs/**`` hides the ``/docs`` mount.
 """
 
 from __future__ import annotations
@@ -62,16 +62,15 @@ class PolicyDenied(VFSError):
 @dataclass(frozen=True, init=False)
 class Rule:
     """``actions`` granted on the paths ``pattern`` matches: ``Rule("/docs/**", "read")``. A rule with no actions
-    hides those paths instead: it matches what ``pattern`` matches byte for byte (``segments``) and, in addition,
-    the case and Unicode variants of the names it spells (``match_segments``, the folded pattern, against the
-    folded path), the two tried per segment (``alternatives``), so it may not contain a character that folds to
-    glob syntax. A rule that grants matches ``segments`` byte for byte."""
+    hides those paths instead: it matches what ``pattern`` matches byte for byte and, in addition, the case and
+    Unicode variants of the names it spells, each segment of the folded pattern against the folded name, the two
+    tried per segment (``alternatives``). A segment folds only where folding keeps its glob syntax: one with a
+    ``[...]`` class, or with a character that folds to glob syntax, matches byte for byte only. A rule that
+    grants matches byte for byte."""
 
     pattern: str
     actions: frozenset[Action]
     segments: tuple[str, ...] = field(repr=False, compare=False)
-    hides: bool = field(repr=False, compare=False)
-    match_segments: tuple[str, ...] = field(repr=False, compare=False)
     alternatives: tuple[tuple[str, ...], ...] = field(repr=False, compare=False)
 
     def __init__(self, pattern: str, *actions: Action) -> None:
@@ -82,19 +81,18 @@ class Rule:
         if not pattern.startswith("/") or any(s in ("", ".", "..") for s in segments):
             raise ValueError(f"rule pattern must be a normalised absolute path: {pattern!r}")
         _no_literal_globs(pattern, segments)
-        hides = not actions
-        match_segments = _folded(segments) if hides else segments
-        if hides:
-            _no_folded_glob_syntax(pattern)
-            _no_literal_globs(pattern, match_segments)  # the folded pattern is what matching uses
-            _no_folded_class_splits(pattern, segments)
-        alternatives = tuple(zip(segments, match_segments, strict=False)) if hides else tuple((s,) for s in segments)
+        alternatives = (
+            tuple(_pattern_alts(segment) for segment in segments) if not actions else tuple((s,) for s in segments)
+        )
         object.__setattr__(self, "pattern", pattern)
         object.__setattr__(self, "actions", frozenset(actions))
         object.__setattr__(self, "segments", segments)
-        object.__setattr__(self, "hides", hides)
-        object.__setattr__(self, "match_segments", match_segments)
         object.__setattr__(self, "alternatives", alternatives)
+
+    @property
+    def hides(self) -> bool:
+        """Whether the rule hides the paths it matches instead of granting on them: a rule with no actions."""
+        return not self.actions
 
     def matches(self, path: str) -> bool:
         """Whether the pattern matches ``path`` (normalised first)."""
@@ -207,10 +205,9 @@ def _bad_class(segment: str) -> bool:
 
 
 def _no_literal_globs(pattern: str, segments: tuple[str, ...]) -> None:
-    """Raises ValueError if ``segments`` has glob syntax that fnmatch reads literally; the message names
-    ``pattern`` as written. Called on a rule's own segments and, when the rule hides, on the folded ones too, so
-    e.g. a fullwidth left curly bracket U+FF5B (which folds to ``{``, past ``_no_folded_glob_syntax``) is
-    refused in a hide rule."""
+    """Raises ValueError if a rule's own ``segments`` have glob syntax that fnmatch reads literally, so the rule
+    can't silently match nothing: braces, a ``[^`` class or a backslash, a ``[`` not closed within its segment
+    (``[!/]``), or ``[:`` in a class (a POSIX class). The message names ``pattern`` as written."""
     joined = "/".join(segments)
     if any(c in joined for c in "{}\\") or "[^" in joined:
         raise ValueError(
@@ -223,94 +220,50 @@ def _no_literal_globs(pattern: str, segments: tuple[str, ...]) -> None:
         )
 
 
-_GLOB_SYNTAX = "*?[]!-"
+def _pattern_alts(segment: str) -> tuple[str, ...]:
+    """The alternatives a hide rule's pattern ``segment`` matches by: the raw and the folded segment, ``(s, f)``,
+    where folding keeps its glob structure, so the segment also matches the folded name; the raw segment alone,
+    ``(s,)``, otherwise, so it matches byte for byte only (what ``_rests`` does with a 1-tuple). Folding doesn't
+    keep the structure where the segment has a ``[`` (a class, whose members, ranges or negation folding could
+    change), where the folded form has glob syntax the raw one doesn't spell as such (a fullwidth asterisk folds
+    to ``*``, a fullwidth bracket to ``[``), where folding changes the count of ``*`` or ``?``, or where the
+    segment is ``**``, which stays ``("**",)``: a whole segment, not two wildcards."""
+    folded = _fold_pattern(segment)
+    foldable = (
+        "[" not in segment
+        and not any(c in folded for c in "[]{}\\")
+        and segment.count("*") == folded.count("*")
+        and segment.count("?") == folded.count("?")
+        and segment != "**"
+    )
+    return (segment, folded) if foldable else (segment,)
 
 
-def _no_folded_glob_syntax(pattern: str) -> None:
-    """Raises ValueError if a hide rule's ``pattern`` has a character, not itself one of ``*?[]!-``, that folds
-    to one of them: the folded pattern would read it as glob syntax, so the rule would hide more than it spells.
-    E.g. the fullwidth asterisk U+FF0A folds to ``*``, and the fullwidth hyphen-minus U+FF0D to ``-``, which
-    would turn a class of literal characters into a range. Grant rules aren't folded, so they aren't checked."""
-    for c in pattern:
-        if c not in _GLOB_SYNTAX and any(g in _fold(c) for g in _GLOB_SYNTAX):
-            raise ValueError(
-                f"rule pattern has {c!r} (U+{ord(c):04X}), which folds to glob syntax fnmatch would read: {pattern!r}"
-            )
+def _fold_pattern(segment: str) -> str:
+    """The form of a hide rule's pattern ``segment`` that matching folds a name to: NFKC normalisation, case
+    folding and NFKC again, without dropping the format characters, so a zero-width space in a pattern stays and
+    can't join two ``*`` into ``**``. ASCII takes the fast path (``lower``), exact because NFKC is the identity on
+    ASCII and case folding equals ``lower`` there, and ASCII has no format characters to drop."""
+    if segment.isascii():
+        return segment.lower()
+    return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", segment).casefold())
 
 
-def _no_folded_class_splits(pattern: str, segments: tuple[str, ...]) -> None:
-    """Raises ValueError if a hide rule's ``pattern`` has a character inside a ``[...]`` class that folds to more
-    or fewer than one character: the folded class would gain or lose members, so fnmatch would read it as a
-    different class than the one spelled. E.g. the sharp s U+00DF folds to ``ss`` and the zero-width space U+200B
-    to nothing. Scans as ``_bad_class`` does: a ``]`` first in a class, after any ``!``, is literal. Grant rules
-    aren't folded, so they aren't checked.
-
-    Folding a whole segment must also leave each class meaning the folds of what it lists, so these are refused
-    too: a segment whose fold differs from folding its classes member by member (NFKC composing a member with
-    its neighbour: ``[e<U+0301>]``); a range whose endpoints folding changes, unless both are ASCII capitals
-    (``[A-Z]`` folds to ``[a-z]``, but ``[Z-z]`` would fold to ``[z-z]`` and ``[A-z]`` lose ``_``); and a
-    negated class that folding changes at all (``[!A-Z]*`` would fold to ``[!a-z]*`` and miss ``README``, the
-    variant of the ``readme`` it hides)."""
-    for segment in segments:
-        i, n = 0, len(segment)
-        start, pieces = 0, list[str]()
-        while i < n:
-            c, i = segment[i], i + 1
-            if c != "[":
-                continue
-            j = i
-            negated = j < n and segment[j] == "!"
-            if negated:
-                j += 1
-            body_start = j
-            if j < n and segment[j] == "]":
-                j += 1
-            while j < n and segment[j] != "]":
-                member = segment[j]
-                if len(_fold(member)) != 1:
-                    raise ValueError(
-                        f"rule pattern has {member!r} (U+{ord(member):04X}) in a class, which folds to"
-                        f" {len(_fold(member))} characters, splitting the class fnmatch would match: {pattern!r}"
-                    )
-                j += 1
-            body = segment[body_start:j]
-            folded_body = "".join(_fold(m) for m in body)
-            if negated and folded_body != body:
-                raise ValueError(
-                    f"rule pattern has a negated class [!{body}] that folding changes, so its folded form would"
-                    f" exclude other characters than fnmatch reads byte for byte: {pattern!r}"
-                )
-            for k in range(1, len(body) - 1):
-                lo, hi = body[k - 1], body[k + 1]
-                if body[k] != "-" or (_fold(lo), _fold(hi)) == (lo, hi):
-                    continue
-                if not ("A" <= lo <= "Z" and "A" <= hi <= "Z"):
-                    raise ValueError(
-                        f"rule pattern has a range {lo}-{hi} in a class whose endpoints folding changes, so the"
-                        f" folded range would cover other characters than fnmatch reads byte for byte: {pattern!r}"
-                    )
-            pieces += [_fold(segment[start : i - 1]), "[!" if negated else "[", folded_body, "]"]
-            start = i = j + 1
-        pieces.append(_fold(segment[start:]))
-        if pieces[1:] and "".join(pieces) != _fold(segment):
-            raise ValueError(
-                f"rule pattern has a class whose folded form differs from its members folded one by one (NFKC"
-                f" composes a member with its neighbour), which fnmatch would read as another class: {pattern!r}"
-            )
-
-
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=65536)
 def _fold(name: str) -> str:
     """The form of ``name`` a hide rule matches by: the format characters (Unicode category Cf, such as the
     zero-width space U+200B) dropped first, so a combining mark they separate can still compose, then NFKC
     normalisation, case folding and NFKC again (folding can denormalise), then the format characters dropped
-    once more (folding can produce them)."""
+    once more (folding can produce them). ASCII takes the fast path (``lower``), exact because ASCII has no
+    format characters, NFKC is the identity on it, and case folding equals ``lower`` there."""
+    if name.isascii():
+        return name.lower()
     dropped = "".join(c for c in name if unicodedata.category(c) != "Cf")
     folded = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", dropped).casefold())
     return "".join(c for c in folded if unicodedata.category(c) != "Cf")
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=16384)
 def _folded(segments: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(_fold(segment) for segment in segments)
 
@@ -318,25 +271,27 @@ def _folded(segments: tuple[str, ...]) -> tuple[str, ...]:
 def _rule_rests(rule: Rule, segments: tuple[str, ...]) -> frozenset[tuple[tuple[str, ...], ...]]:
     """What can remain of ``rule``'s pattern once ``segments`` is matched against its start. Each of the rule's
     pattern segments carries the alternatives it matches by (``rule.alternatives``): the raw segment alone for a
-    grant rule, the raw and the folded segment for a hide rule, and the path segments are built in the same
-    shape, so ``_rests`` tries the byte-exact and the folded match per segment."""
+    grant rule or for a hide rule's segment that folding would change the glob syntax of, the raw and the folded
+    segment for a foldable one. A hide rule's path segments are built as ``(raw, folded)`` pairs (``_folded_alts``)
+    and a grant rule's as 1-tuples (``_exact_alts``), so ``_rests`` tries the byte-exact and the folded match per
+    segment, and a 1-tuple pattern segment compares the raw path segment alone."""
     path = _folded_alts(segments) if rule.hides else _exact_alts(segments)
     return _rests(rule.alternatives, path)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=16384)
 def _exact_alts(segments: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
     """The path form of a grant rule's match: every segment matches byte for byte alone."""
     return tuple((segment,) for segment in segments)
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=16384)
 def _folded_alts(segments: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
     """The path form of a hide rule's match: every segment matches raw or folded."""
-    return tuple(zip(segments, _folded(segments), strict=False))
+    return tuple(zip(segments, _folded(segments), strict=True))
 
 
-@lru_cache(maxsize=4096)
+@lru_cache(maxsize=16384)
 def _rests(
     pattern: tuple[tuple[str, ...], ...], path: tuple[tuple[str, ...], ...]
 ) -> frozenset[tuple[tuple[str, ...], ...]]:
