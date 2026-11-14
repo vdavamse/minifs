@@ -121,7 +121,7 @@ async def test_a_block_that_leaves_out_lines_is_a_retry(deps: Deps, client: VFSC
         deps, "win.py", "def f():\n    keep_me()\n    return 1\n", "def f():\n    keep_me()\n    return 2\n"
     )
     assert "lines 1-4" in message
-    assert "1 more non-blank line(s)" in message
+    assert "1 non-blank line(s) of that block have no counterpart" in message
     assert await content(client, "win.py") == text.encode()
 
 

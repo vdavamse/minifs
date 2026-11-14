@@ -117,19 +117,15 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
         return
     first, last = search[0].strip(), search[-1].strip()
     max_delta = max(1, len(search) // 4)
-    search_code = sum(1 for s in search if s.strip())
 
     def leaves_out_lines(start: int, end: int) -> int | None:
-        # departs from ladderframe (#117): how many more non-blank lines the block start..end has than the find,
-        # or None when it has no more. A block longer than the find has lines the find doesn't include: the
-        # middle is scored by position over the shorter of the two, so the block's lines past the find's length
-        # were never compared and the replacement deleted lines the model never wrote. Extra lines that are all
-        # *blank* are fine and the block is yielded as ladderframe did: a model often leaves out a blank line,
-        # and losing one is harmless.
-        if end - start + 1 <= len(search):
-            return None
-        extra = sum(1 for k in range(start, end + 1) if original[k].strip()) - search_code
-        return extra if extra > 0 else None
+        # departs from ladderframe (#117): how many non-blank lines of the block start..end pair with no line of
+        # the find (the middle is scored by position over the shorter of the two, so in a longer block the lines
+        # from the find's length up to the last anchor were never compared and the replacement deleted them), or
+        # None. Blank ones are fine: the block is yielded as ladderframe did. Not a net count: a find line missing
+        # from the file must not cancel out a block line nobody compared.
+        extra = sum(1 for k in range(start + len(search) - 1, end) if original[k].strip())
+        return extra or None
 
     blocks: list[tuple[int, int]] = []
     for i, line in enumerate(original):
@@ -353,10 +349,11 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
             # departs from ladderframe (#117): pending, not final: a later replacer may still find the text.
             refusal = e
 
-    # departs from ladderframe (#117): nothing stricter found the text, so the refusal is the answer.
-    if refusal is not None:
-        raise refusal
     if not_found:
+        # departs from ladderframe (#117): nothing found the text, so the refusal is the answer; when a replacer
+        # found it more than once, the ambiguity is (the refused block is not what was meant).
+        if refusal is not None:
+            raise refusal
         raise ValueError(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
             "and line endings."
@@ -597,7 +594,7 @@ def test_block_anchors_alone_dont_take_the_line_between() -> None:
 
 
 def test_block_anchors_refuse_a_longer_block() -> None:
-    """A block-anchored match with more non-blank lines than the find has lines the find doesn't include: the
+    """A block-anchored match longer than the find has lines the find doesn't include: the
     middle is scored by position over the shorter of the two, so the block's lines past the find's length were
     never compared and the replacement deleted lines the model never wrote (#117). Such a block is refused with
     a retry rather than dropped: dropping it let another block elsewhere win the scoring. The refusal is pending
@@ -682,6 +679,29 @@ def test_a_left_out_blank_line_is_accepted() -> None:
             )
             == "def f():\n    a()\n    return 2\n"
         )
+
+
+def test_lines_missing_from_the_file_dont_cancel_out_a_left_out_line() -> None:
+    """Only the block's lines that pair with no find line count (#117), not the block's non-blank lines against the
+    find's: here the find's ``e()`` and ``g()`` aren't in the file, the block has blank lines in their place, and
+    ``x()`` past the find's length was never compared. A net count (7 non-blank lines against 8) deleted it."""
+    content = "def f():\n    a()\n    b()\n    c()\n    d()\n\n\n    x()\n    return 1\n"
+    find = "def f():\n    a()\n    b()\n    c()\n    d()\n    e()\n    g()\n    return 1"
+    message = re.escape(BLOCK_LEAVES_OUT_LINES.format(first=1, last=9, extra=1))
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match=message):
+            search(content, find, "NEW")
+
+
+def test_an_ambiguous_match_outranks_a_refusal() -> None:
+    """When a stricter replacer finds the text twice after the block anchors refused a block, the answer is the
+    ambiguity: the refused block (lines 1-5 here) is not what was meant, and a retry naming it would send the model
+    to edit it (#117)."""
+    same = "if x:\n  a  = 1\n  b = 2\nreturn\n"
+    content = "if x:\n  a = 1\n  b = 2\n  c = 3\nreturn\n" + same + same
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match="Found multiple matches"):
+            search(content, "if x:\n  a = 1\n  b = 2\nreturn", "NEW")
 
 
 def test_multi_occurrence_replacer_is_not_tried() -> None:

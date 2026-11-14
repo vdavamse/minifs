@@ -6,8 +6,8 @@ O(n·m) in the content's and ``oldString``'s sizes, in lines and in characters (
 ladderframe's block scans were O(n²) in lines and its searches within a line O(n·m) per call that nothing could
 interrupt. ``replace`` departs from ladderframe on purpose where it edited the wrong text and reported success (#110,
 #122, #117, marked in the oracle): a whitespace-only ``oldString`` matches only exactly, an ambiguous exact
-``oldString`` is reported, block anchors alone don't take the line between them, a block-anchored match with more
-non-blank lines than ``oldString``, whose extra lines would be deleted unseen, is refused with a retry unless a
+``oldString`` is reported, block anchors alone don't take the line between them, a block-anchored match longer
+than ``oldString``, whose extra non-blank lines would be deleted unseen, is refused with a retry unless a
 stricter replacer finds the text, and with ``replaceAll`` a whitespace candidate of a non-blank ``oldString``
 is refused.
 ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker thread that
@@ -74,8 +74,9 @@ EMPTY_OLD_STRING = (
     "or use write for an intentional full-file replacement."
 )
 BLOCK_LEAVES_OUT_LINES = (
-    "oldString looks like lines {first}-{last} of the file, but that block has {extra} more non-blank line(s) than "
-    "oldString, which the replacement would delete. Read those lines again and include every one of them in oldString."
+    "oldString looks like lines {first}-{last} of the file, but {extra} non-blank line(s) of that block have no "
+    "counterpart in oldString, and the replacement would delete them. Read those lines again and include every one "
+    "of them in oldString."
 )
 
 
@@ -90,7 +91,7 @@ class _LongerBlock(ValueError):
 
     def __init__(self, start: int, end: int, extra: int) -> None:
         """``start`` and ``end``: the 0-based indices of the block's first and last line; ``extra``: how many
-        more non-blank lines than the find it has."""
+        non-blank lines of the block pair with no line of the find."""
         super().__init__(BLOCK_LEAVES_OUT_LINES.format(first=start + 1, last=end + 1, extra=extra))
 
 
@@ -381,19 +382,18 @@ def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
         return
     first, last = search[0].strip(), search[-1].strip()
     max_delta = max(1, len(search) // 4)
-    search_code = sum(1 for s in search if s.strip())
 
     def leaves_out_lines(start: int, end: int) -> int | None:
-        """How many more non-blank lines the block ``start..end`` has than the find, or None when it doesn't
-        leave out lines (#117). A block longer than the find has lines the find doesn't include: the middle is
-        scored by position over the shorter of the two, so the block's lines past the find's length are never
-        compared and the replacement would delete lines the model never wrote. Extra lines that are all *blank*
-        are fine, and the block is yielded as ladderframe did: a model often leaves out a blank line, and losing
-        one is harmless."""
-        if end - start + 1 <= len(search):
-            return None
-        extra = sum(1 for k in range(start, end + 1) if original[k].strip()) - search_code
-        return extra if extra > 0 else None
+        """How many non-blank lines of the block ``start..end`` pair with no line of the find, or None when there
+        are none (#117). The middle is scored by position over the shorter of the two, so in a block longer than the
+        find the lines from the find's length up to the last anchor are never compared, and the replacement would
+        delete lines the model never wrote. Those lines may be blank: the block is then yielded as ladderframe did
+        (a model often leaves out a blank line, and losing one is harmless). The count is of these lines only, not
+        a net count of the block against the find: a find line missing from the file must not cancel out a block
+        line nobody compared."""
+        unpaired = range(start + len(search) - 1, end)  # empty unless the block is longer than the find
+        extra = sum(1 for k in unpaired if original[k].strip())
+        return extra or None
 
     last_at = _lines_equal_to(original, last)
     n = len(original)
@@ -750,8 +750,9 @@ def replace(
             except _LongerBlock as e:  # pending, not final (#117): a later replacer may still find the text
                 refusal = e
     except ReplaceTimeout:
-        # A concrete refusal says more than a timeout (#117): it names the block that leaves out lines.
-        if refusal is not None:
+        # A refusal is the answer when no replacer found the text anywhere (#117): it names the block, where a
+        # timeout says nothing. Once the text was found, ambiguously, the ambiguous timeout below says more.
+        if refusal is not None and not_found:
             raise refusal from None
         if not_found or timeout is None:
             raise
@@ -759,9 +760,9 @@ def replace(
     finally:
         _deadline.reset(token)
 
-    if refusal is not None:
-        raise refusal
     if not_found:
+        if refusal is not None:  # nothing found the text: the refused block is what oldString looked like (#117)
+            raise refusal
         raise ValueError(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
             "and line endings."
