@@ -1086,13 +1086,13 @@ async def test_a_write_waits_for_a_lock_no_longer_than_lock_timeout(pool: Pool, 
 
 async def test_a_timeout_logs_the_path_as_its_repr(pool: Pool, db: str, caplog: pytest.LogCaptureFixture) -> None:
     vfs = VFSClient(pool, lock_timeout=0.1)
-    await vfs.create("/f", b"v1\n")
-    async with holding_the_lock(db, "/f"):
+    path = "/a\u200bb"  # a zero-width space: legal in a name, invisible in a log
+    await vfs.create(path, b"v1\n")
+    async with holding_the_lock(db, path):
         with caplog.at_level(logging.WARNING, logger="minifs.vfs.client"):
-            await raises("EAGAIN", asyncio.wait_for(vfs.append("/f", b"more\n"), 10), "/f")
+            await raises("EAGAIN", asyncio.wait_for(vfs.append(path, b"more\n"), 10), path)
     (record,) = caplog.records
-    # The quotes are the repr's, which escapes a newline in a name (#98).
-    assert record.getMessage().startswith("EAGAIN on '/f': ")
+    assert record.getMessage().startswith("EAGAIN on '/a\\u200bb': ")  # the repr (#98)
 
 
 async def test_a_long_write_is_cancelled_after_write_timeout(pool: Pool) -> None:

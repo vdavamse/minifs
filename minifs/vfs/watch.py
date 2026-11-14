@@ -45,7 +45,7 @@ from psycopg import AsyncConnection, errors, sql
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import ConnectionFactory
-from minifs.vfs.core import VFSError
+from minifs.vfs.core import CONTROL_CHARACTERS, VFSError, escape_controls
 
 logger = logging.getLogger(__name__)
 
@@ -577,6 +577,8 @@ class Watcher:
     @contextlib.asynccontextmanager
     async def _watch(self, path: str, *, ancestors: bool = False, fence: bool = False) -> AsyncGenerator[PathWatch]:
         """``watch``, with ``PathWatch``'s ``ancestors`` and ``fence`` options."""
+        if found := CONTROL_CHARACTERS.search(path):  # as core.split refuses a caller's path (#92), escaped
+            raise VFSError("EINVAL", escape_controls(path), f"path contains a control character U+{ord(found[0]):04X}")
         segments = [s for s in path.split("/") if s]
         watch = PathWatch(self, segments, self._maxsize, self._rescan_interval, ancestors=ancestors, fence=fence)
         watch = self._add(watch)

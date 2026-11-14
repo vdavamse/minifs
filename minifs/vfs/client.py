@@ -51,6 +51,7 @@ from minifs.vfs.core import (
     LineReadResult,
     ReadResult,
     VFSError,
+    escape_controls,
     join,
     millis,
     normalize,
@@ -333,7 +334,9 @@ class VFSClient:
             node, lookup_err, lookup_detail, size, generation, start, _, err, detail = by_read[n][0][1:10]
             if lookup_err is not None or err is not None:
                 failed = lookup_err or err
-                results[i] = VFSError(failed, paths[i], detail=(lookup_detail if lookup_err else detail) or "")
+                results[i] = VFSError(
+                    failed, paths[i], detail=escape_controls((lookup_detail if lookup_err else detail) or "")
+                )
                 continue
             content = b"".join(row[7] for row in by_read[n] if row[7] is not None)
             end = start + len(content)
@@ -898,7 +901,7 @@ class VFSClient:
             if err is not None:
                 if err in ("ENOENT", "ENOTDIR"):
                     await self._await_eviction([ref for ref in refs if ref.cached is not None])
-                raise VFSError(err, normalize(path), detail=detail or "")
+                raise VFSError(err, normalize(path), detail=escape_controls(detail or ""))
 
     async def _run(
         self,

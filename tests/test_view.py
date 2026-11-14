@@ -337,11 +337,36 @@ async def test_a_database_error_logs_the_path_as_its_repr(
         raise psycopg.OperationalError("the connection is lost")
 
     monkeypatch.setattr(vfs, "stat", lost)
+    path = "/workspace/a\u200bb.md"  # a zero-width space: legal in a name, invisible in a log
     with caplog.at_level(logging.WARNING, logger="minifs.vfs.view"):
-        await raises("EIO", view(vfs, policy).stat("/workspace/notes.md"), "/workspace/notes.md")
+        await raises("EIO", view(vfs, policy).stat(path), path)
     (record,) = caplog.records
-    # The quotes are the repr's, which escapes a newline in a name (#98).
-    assert record.getMessage() == "database error in an operation on '/workspace/notes.md'"
+    assert record.getMessage() == "database error in an operation on '/workspace/a\\u200bb.md'"  # the repr (#98)
+
+
+async def test_a_client_bug_logs_the_path_as_its_repr(
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The two client-bug lines (a path from the client that isn't absolute) log the caller's path as its repr."""
+    path = "/workspace/a\u200bb.md"
+    shown = "'/workspace/a\\u200bb.md'"
+
+    async def failed(*args: object, **kwargs: object) -> Entry:
+        raise VFSError("ENOENT", "node-id")
+
+    async def found(*args: object, **kwargs: object) -> Entry:
+        return Entry("node-id", None, "file", 0, None)
+
+    agent = view(vfs, policy)
+    with caplog.at_level(logging.WARNING, logger="minifs.vfs.view"):
+        monkeypatch.setattr(vfs, "stat", failed)
+        await raises("ENOENT", agent.stat(path), path)
+        monkeypatch.setattr(vfs, "stat", found)
+        await raises("EIO", agent.stat(path), path)
+    assert [record.getMessage() for record in caplog.records] == [
+        f"ENOENT from the client at a path that isn't absolute, in an operation on {shown}",
+        f"the client reported a path that isn't absolute, in an operation on {shown}",
+    ]
 
 
 async def test_uncounted_reads_are_refused_but_not_counted(vfs: VFSClient, caplog: pytest.LogCaptureFixture) -> None:

@@ -1232,3 +1232,13 @@ async def test_an_indexed_watch_still_sees_its_events_end_to_end(conn: AsyncConn
         assert await rename(conn, p, None, "p2")  # the watched path changes; the watches follow their nodes
         moved = Event("move", id=p, parent=None, name="p2", kind="dir", old_parent=None, old_name="p")
         assert await next_event(heir_events) == moved
+
+
+async def test_watch_refuses_a_control_character_escaped(watcher: Watcher) -> None:
+    """Like core.split for a caller's path (#92): EINVAL before any lookup, the path escaped in the error (#98)."""
+    with pytest.raises(VFSError) as info:
+        async with watcher.watch("/a\nINFO forged"):
+            pass
+    assert info.value.errno == "EINVAL"
+    assert "\n" not in str(info.value)
+    assert info.value.path == "/a\\u000aINFO forged"
