@@ -647,6 +647,42 @@ async def test_node_cap(conn: AsyncConnection) -> None:
     assert errno_name(raised.value) == "EINVAL"
 
 
+async def test_the_walk_stops_at_the_node_cap(db: str) -> None:
+    """The cap ends the walk itself, not just its result: over a tree of ~5,050 rows a capped glob reads a few
+    dozen of them (11 here, against 5,051 uncapped). ``pg_stat_xact_user_tables`` counts the current transaction
+    only, so the tree, the counter reads and both globs all run in one transaction."""
+
+    async def walked(c: AsyncConnection) -> int:
+        """Rows of vfs_nodes this transaction has read: index fetches plus sequential reads."""
+        await c.execute("SELECT pg_stat_clear_snapshot()")  # the transaction's stats snapshot would be stale
+        cur = await c.execute(
+            "SELECT idx_tup_fetch + coalesce(seq_tup_read, 0) FROM pg_stat_xact_user_tables WHERE relname = 'vfs_nodes'"
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        return int(row[0])
+
+    async with await AsyncConnection.connect(db) as c, c.transaction():
+        # 50 directories of 100 files each below one directory, in one statement.
+        await c.execute(
+            "WITH root AS (INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (NULL, 'root', 'dir') RETURNING id),"
+            " d AS (INSERT INTO vfs_nodes (parent_id, name, kind) SELECT root.id, 'd' || g, 'dir'"
+            "       FROM root, generate_series(1, 50) AS g RETURNING id)"
+            " INSERT INTO vfs_nodes (parent_id, name, kind) SELECT d.id, 'f' || g, 'file'"
+            " FROM d, generate_series(1, 100) AS g"
+        )
+        await c.execute("ANALYZE vfs_nodes")  # so the walk plans nested loops over the (parent_id, name) index
+        before = await walked(c)
+        with pytest.raises(WalkTooWide):  # EOVERFLOW is returned in a row, not raised: no savepoint needed
+            await glob(c, None, "**", max_nodes=10)
+        capped = await walked(c) - before
+        assert capped < 500, capped
+        before = await walked(c)
+        assert len(await glob(c, None, "**", max_nodes=None)) == 5000  # the control: the counter does work
+        uncapped = await walked(c) - before
+        assert uncapped > 5000, uncapped
+
+
 async def test_a_bad_root_comes_before_the_node_cap(conn: AsyncConnection) -> None:
     with pytest.raises(VFSError) as info:
         await glob(conn, uuid.uuid4(), "*", max_nodes=0)

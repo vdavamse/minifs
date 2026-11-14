@@ -231,6 +231,8 @@ minifs grep -i 'todo|fixme' /workspaces/<id> -g '*.py'
 minifs mv /docs/a.md /docs/b.md && minifs rm /docs/b.md
 ```
 
+`minifs glob` stops past 200,000 files and directories walked or 2 s per statement; `--max-nodes none` and `--timeout` lift them.
+
 ## Limits
 
 - Text first: files from kilobytes to a few megabytes. Images and PDFs can be read as attachments, other binaries are refused by `Read`, and non-UTF-8 files are skipped by `Grep`.

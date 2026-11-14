@@ -112,7 +112,9 @@ BEGIN
     ),
     -- The cap: the walk is read one row past it and no further. A recursive query is evaluated only as far as
     -- its rows are fetched, level by level, so the LIMIT ends the walk there (LIMIT NULL: no cap). MATERIALIZED,
-    -- so the count and the result read the same rows and the walk runs once.
+    -- so the count and the result read the same rows and the walk runs once. The materialisation costs every
+    -- glob a second pass over the walked rows (about 10% on a 250,000-node tree, measured), and grep's scope
+    -- query, which passes no cap, pays it too.
     walked AS MATERIALIZED (SELECT * FROM t LIMIT p_max_nodes::bigint + 1),
     capped AS (SELECT coalesce(count(*) > p_max_nodes, false) AS over FROM walked)
     (SELECT w.id, w.path, w.size, w.mtime, NULL::text, NULL::text
