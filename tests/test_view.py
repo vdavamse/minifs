@@ -987,9 +987,30 @@ async def test_an_error_path_that_is_not_a_path_is_reported_at_the_target(
             assert error.detail == ""
             if bad:
                 assert bad not in str(error)
-        messages = [r.getMessage() for r in caplog.records if r.name == "minifs.vfs.view"]
+        messages = [r.getMessage() for r in caplog.records if "isn't absolute" in r.getMessage()]
         assert len(messages) == 4  # the rename case, then one per bad path
         for message in messages:
             assert "isn't absolute" in message
+            assert "ENOENT" in message
             assert str(fake) not in message
             assert not any(bad and bad in message for bad in bads)
+
+
+async def test_a_result_path_that_is_not_a_path_is_eio(
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A listing entry whose path isn't an absolute path (a client bug) fails the call as EIO at the directory,
+    rather than being reported, and policy-checked, as the directory itself; the string is shown nowhere."""
+    fake = str(uuid4())
+
+    async def broken_readdir(path: str) -> list[Entry]:
+        return [Entry(fake, uuid4(), "file", 0, None)]
+
+    monkeypatch.setattr(vfs, "readdir", broken_readdir)
+    with caplog.at_level(logging.ERROR, logger="minifs.vfs.view"):
+        error = await raises("EIO", view(vfs, policy).readdir("/workspace"), "/workspace")
+    assert fake not in str(error)
+    assert error.detail == ""
+    messages = [r.getMessage() for r in caplog.records if "isn't absolute" in r.getMessage()]
+    assert len(messages) == 1
+    assert fake not in messages[0]
