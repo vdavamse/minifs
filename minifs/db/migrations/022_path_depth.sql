@@ -42,14 +42,14 @@ CREATE FUNCTION vfs_max_components() RETURNS int LANGUAGE sql IMMUTABLE PARALLEL
 -- The number of nodes from p_node up to the root, p_node included; 0 for the root. Walks parent_id without
 -- locks and stops past p_limit, clamped to the cap, so a cycle or an over-deep chain returns that limit + 1:
 -- callers pass the cap and read that as "over the cap, exact depth unknown". Never more than cap + 1 probes,
--- whatever the caller passes; a NULL p_limit is the cap.
+-- whatever the caller passes; a NULL p_limit is the cap, a negative one 0.
 CREATE FUNCTION vfs_depth(p_node uuid, p_limit int) RETURNS int
 LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $$
 DECLARE
     v_id uuid := p_node;
     v_up uuid;
     v_depth int := 0;
-    v_limit int := least(coalesce(p_limit, vfs_max_components()), vfs_max_components());
+    v_limit int := greatest(least(coalesce(p_limit, vfs_max_components()), vfs_max_components()), 0);
 BEGIN
     WHILE v_id IS NOT NULL LOOP
         v_depth := v_depth + 1;
@@ -241,7 +241,9 @@ END $$;
 -- file's move walks the ancestors too since 022, without locks, only to count the destination's depth (one
 -- probe per level). A walk that goes over the cap stops there: a real cycle (vfs_ancestors_cycle) is still
 -- EINVAL, and a chain merely deeper than the cap is ENAMETOOLONG, not the false cycle the old 10,000-step
--- guess reported; a rename that keeps the parent doesn't change any depth, so it isn't refused for one.
+-- guess reported; a rename that keeps the parent doesn't change any depth, so it isn't refused for one. (A
+-- directory moved into its own subtree more than the cap below it, possible only in a legacy over-deep tree,
+-- is refused as ENAMETOOLONG rather than EINVAL: the walk stops before it reaches the directory.)
 --
 -- The subtree check of a directory that moves deeper reads the descendants without locking them, so it is
 -- best effort: a concurrent mkdir inside the moved subtree can slip one over the cap; so is a file's depth
