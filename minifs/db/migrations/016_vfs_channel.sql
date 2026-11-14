@@ -9,17 +9,27 @@
 -- below with the same bodies but for the channel) send on it, and minifs.vfs.watch runs SELECT vfs_channel() on its
 -- LISTEN connection, so they agree without configuration.
 --
--- Who can learn the name: a role that can call vfs_channel(), which takes USAGE on this schema (EXECUTE is PUBLIC's
--- by default, as for every function). The table itself is its owner's alone, and vfs_channel() is SECURITY DEFINER
--- so that a role with USAGE and its table grants keeps working without a grant on the new table. The name is in a
--- table and not a literal in the function's body because pg_proc.prosrc is readable by every role. So USAGE on the
--- schema is now the trust boundary for notifications, not CONNECT on the database: a role without it can neither
--- read this schema's events nor forge them. A role with it still can, so events stay hints (a watcher reads the
--- database before acting on one), and the watcher rate-limits rescans and truncates the payloads it logs.
+-- Who can learn the name: a role that can call vfs_channel(). EXECUTE on it is revoked from PUBLIC below, so that
+-- is the schema's owner and whoever the owner grants it to. (USAGE on the schema would not do as the boundary:
+-- every role has it on "public", where minifs is installed by default.) The table itself is its owner's alone, and
+-- the name is in a table and not a literal in the function's body because pg_proc.prosrc is readable by every
+-- role. vfs_channel() and the two trigger functions are SECURITY DEFINER, so a role that writes through its table
+-- grants notifies without being able to read the name. So EXECUTE on vfs_channel() is now the trust boundary for
+-- notifications, not CONNECT on the database: a role without it can neither read this schema's events nor forge
+-- them. A watcher that doesn't connect as the owner needs
+--     GRANT EXECUTE ON FUNCTION vfs_channel() TO <role>;
+-- A role with it can still forge events, so they stay hints (a watcher reads the database before acting on one),
+-- and the watcher rate-limits rescans and truncates the payloads it logs. The LISTEN statement carries the name,
+-- so members of pg_read_all_stats (pg_stat_activity) and readers of the server's statement log can see it too.
 --
--- A client older than this migration listens on 'vfs' and receives nothing: upgrade the schema and the clients
--- together. A copy of this schema (dump and restore) in the same database shares the channel with the original
--- until the row is given a new name; a restore into another database doesn't matter.
+-- Migrate with writers and watchers stopped, or restart the watchers afterwards: a transaction that fired the old
+-- trigger before this migration commits notifies on 'vfs', which no new watcher hears, and a client older than
+-- this migration keeps listening on 'vfs' and receives nothing, without an error.
+--
+-- To change the name later: UPDATE vfs_channel_name SET channel = 'vfs_' || replace(gen_random_uuid()::text, '-', '')
+-- (one UPDATE, never a DELETE: with no row, every write fails in the trigger). Running watchers follow within
+-- their keepalive interval. A copy of this schema (dump and restore) in the same database shares the channel with
+-- the original until that is done; a restore into another database doesn't matter.
 
 CREATE TABLE vfs_channel_name (
     one     boolean PRIMARY KEY DEFAULT true CHECK (one),  -- a single row
@@ -40,6 +50,7 @@ BEGIN
         'SET search_path = %I, pg_temp AS %L',
         current_schema(), format('SELECT channel FROM %I.vfs_channel_name', current_schema()));
 END $$;
+REVOKE EXECUTE ON FUNCTION vfs_channel() FROM PUBLIC;
 COMMENT ON FUNCTION vfs_channel() IS
     'The NOTIFY channel of this schema (migration 016): what vfs_notify sends on and a watcher listens to.';
 
@@ -69,4 +80,14 @@ CREATE OR REPLACE FUNCTION vfs_notify_truncate() RETURNS trigger LANGUAGE plpgsq
 BEGIN
     PERFORM pg_notify(vfs_channel(), '{"op": "rescan"}');
     RETURN NULL;
+END $$;
+
+
+-- The triggers run as the owner, who may call vfs_channel(), whoever writes. Like vfs_channel(), they get the
+-- schema itself as their search_path (with pg_temp last) in place of the caller's, as SECURITY DEFINER wants.
+DO $$
+BEGIN
+    EXECUTE format('ALTER FUNCTION vfs_notify() SECURITY DEFINER SET search_path = %I, pg_temp', current_schema());
+    EXECUTE format('ALTER FUNCTION vfs_notify_truncate() SECURITY DEFINER SET search_path = %I, pg_temp',
+                   current_schema());
 END $$;

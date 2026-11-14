@@ -15,7 +15,7 @@ from psycopg import AsyncConnection, errors, sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool
 
-from minifs.db.migrate import migrate
+from minifs.db.migrate import load_migrations, migrate
 from minifs.vfs.core import VFSError
 from minifs.vfs.watch import RESCAN, ConnectionFactory, Event, Subscription, Watcher
 from tests.test_tree import create, mkdir_p, rename, unlink
@@ -480,8 +480,53 @@ async def test_a_schema_without_the_channel_function_fails_at_start(conn: AsyncC
     async def connect_old() -> AsyncConnection[Any]:
         return await AsyncConnection.connect(db, autocommit=True, options="-c search_path=old,public")
 
+    async with await connect_old() as c:
+        await migrate(c, [m for m in load_migrations() if m.version < 16])
     with pytest.raises(RuntimeError, match="no vfs_channel.. in schema 'old'.*migration 016"):
         await Watcher(connect_old).start()
+
+
+async def test_the_schema_is_where_vfs_nodes_resolves(conn: AsyncConnection, db: str) -> None:
+    """The minifs schema need not be first on the search_path: the watcher takes the one its statements use."""
+    await conn.execute("CREATE SCHEMA app")
+
+    async def connect_app() -> AsyncConnection[Any]:
+        return await AsyncConnection.connect(db, autocommit=True, options="-c search_path=app,public")
+
+    async with Watcher(connect_app) as watcher:
+        assert watcher.channel == await channel(conn)
+    await conn.execute("CREATE SCHEMA empty")
+
+    async def connect_empty() -> AsyncConnection[Any]:
+        return await AsyncConnection.connect(db, autocommit=True, options="-c search_path=empty")
+
+    with pytest.raises(RuntimeError, match="no vfs_nodes table"):
+        await Watcher(connect_empty).start()
+
+
+async def test_a_watcher_follows_a_changed_channel(conn: AsyncConnection, db: str) -> None:
+    """The name can change under a running watcher. A reconnect reads it again, and so does the keepalive probe,
+    which reconnects: either way the subscriber gets a rescan and then the events on the new channel."""
+    async with Watcher(factory(db), keepalive=0.2, retry_min=0.01) as watcher:
+        events = watcher.subscribe(lambda e: e.op == "create")  # and rescans; not the catch-up markers
+        await catch_up(watcher, conn)
+        for how in ("probe", "reconnect"):
+            if how == "reconnect":
+                watcher._keepalive = 3600  # pyright: ignore[reportPrivateUsage]
+                await catch_up(watcher, conn)  # the next wait for notifications has the long keepalive
+            await conn.execute("UPDATE vfs_channel_name SET channel = %s", (name := f"vfs_{uuid4().hex}",))
+            if how == "reconnect":
+                await terminate(conn, watcher.backend_pid)
+            assert await next_event(events) == RESCAN
+            assert watcher.channel == name
+            f = await create(conn, None, how)
+            assert (await next_event(events)).id == f
+
+
+async def test_an_empty_channel_table_fails_at_start(conn: AsyncConnection, db: str) -> None:
+    await conn.execute("DELETE FROM vfs_channel_name")
+    with pytest.raises(RuntimeError, match="no channel in public.vfs_channel_name"):
+        await Watcher(factory(db)).start()
 
 
 async def test_each_schema_has_its_own_channel(conn: AsyncConnection, db: str) -> None:
@@ -508,11 +553,19 @@ async def test_each_schema_has_its_own_channel(conn: AsyncConnection, db: str) -
         assert await collect(events, 0.3) == []
 
 
-async def test_only_a_role_with_usage_on_the_schema_learns_the_channel(db: str) -> None:
+async def test_only_a_role_granted_the_function_learns_the_channel(db: str) -> None:
     """The channel's name is what keeps other roles out, so it must not leak: the table is the owner's, the name
-    isn't in vfs_channel()'s source, and the function takes USAGE on the schema. A role with USAGE and table grants,
-    but none on vfs_channel_name, still gets the name and still writes (the trigger calls vfs_channel() as it)."""
-    role = sql.Identifier(f"minifs_watch_{uuid4().hex[:8]}")
+    isn't in vfs_channel()'s source, and EXECUTE on the function is not PUBLIC's (USAGE on "public" is). A role with
+    table grants alone still writes, and its writes notify (the trigger runs as the owner), but it can't learn the
+    name and a watcher run as it says what to grant. With the grant, it gets the name."""
+    name_ = f"minifs_watch_{uuid4().hex[:8]}"
+    role = sql.Identifier(name_)
+
+    async def connect_as_role() -> AsyncConnection[Any]:
+        c = await AsyncConnection.connect(db, autocommit=True)
+        await c.execute(sql.SQL("SET ROLE {}").format(role))
+        return c
+
     async with await AsyncConnection.connect(db, autocommit=True) as admin:
         name = await channel(admin)
         await admin.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(role))
@@ -521,11 +574,13 @@ async def test_only_a_role_with_usage_on_the_schema_learns_the_channel(db: str) 
                 sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON vfs_nodes, vfs_extents TO {}").format(role)
             )
             await admin.execute(sql.SQL("SET ROLE {}").format(role))
-            assert await channel(admin) == name
-            with pytest.raises(errors.InsufficientPrivilege):
-                await admin.execute("SELECT channel FROM vfs_channel_name")
+            for statement in ("SELECT vfs_channel()", "SELECT channel FROM vfs_channel_name"):
+                with pytest.raises(errors.InsufficientPrivilege):
+                    await admin.execute(statement)
             cur = await admin.execute("SELECT count(*) FROM pg_proc WHERE prosrc LIKE '%%' || %s || '%%'", (name,))
             assert await cur.fetchone() == (0,)
+            with pytest.raises(RuntimeError, match=r"GRANT EXECUTE ON FUNCTION \"public\".vfs_channel\(\)"):
+                await Watcher(connect_as_role).start()
             async with await AsyncConnection.connect(db, autocommit=True) as listener:
                 await listener.execute(sql.SQL("LISTEN {}").format(sql.Identifier(name)))
                 f = await create(admin, None, "f")
@@ -533,10 +588,9 @@ async def test_only_a_role_with_usage_on_the_schema_learns_the_channel(db: str) 
                 assert json.loads(notify.payload)["id"] == str(f)
 
             await admin.execute("RESET ROLE")
-            await admin.execute("REVOKE USAGE ON SCHEMA public FROM PUBLIC")
-            await admin.execute(sql.SQL("SET ROLE {}").format(role))
-            with pytest.raises(errors.InsufficientPrivilege):
-                await admin.execute("SELECT public.vfs_channel()")
+            await admin.execute(sql.SQL("GRANT EXECUTE ON FUNCTION vfs_channel() TO {}").format(role))
+            async with Watcher(connect_as_role) as watcher:
+                assert watcher.channel == name
         finally:
             await admin.execute("RESET ROLE")
             await admin.execute(sql.SQL("DROP OWNED BY {}").format(role))
@@ -589,7 +643,7 @@ async def test_a_path_watch_checks_once_per_interval(conn: AsyncConnection, db: 
 
         events._still_there = counted  # pyright: ignore[reportPrivateUsage]
         watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]
-        assert [e for _, e in await collect(events, 0.1)] == [RESCAN]
+        assert await next_event(events) == RESCAN  # its check opens a connection: no short window around it
         assert checks == 1
         for _ in range(20):  # all inside the interval: one deferred rescan, one more check
             watcher._broadcast(RESCAN)  # pyright: ignore[reportPrivateUsage]

@@ -17,7 +17,7 @@ connection.
 The channel is the schema's own (``vfs_channel()``, migration 016): a random name, read from the database when the
 watcher connects, so two minifs schemas in one database don't see each other's events. Channels are database-wide,
 and anyone who knows a channel's name can LISTEN and NOTIFY on it, so the trust boundary is who can learn the name:
-a role with USAGE on the schema. PostgreSQL also folds identical payloads within one transaction. So events are
+a role with EXECUTE on ``vfs_channel()``, which is the schema's owner until it grants it. PostgreSQL also folds identical payloads within one transaction. So events are
 hints, not facts: react to one by reading the database, never by trusting its fields alone. What forged events can
 cost is bounded where it is cheap to: each subscription delivers at most one ``rescan`` per ``rescan_interval``
 (the rest collapse into it; none is lost, only delayed), and a malformed payload is logged cut short and at most
@@ -39,7 +39,7 @@ from types import TracebackType
 from typing import Any, Literal, Self, cast
 from uuid import UUID
 
-from psycopg import AsyncConnection, sql
+from psycopg import AsyncConnection, errors, sql
 from psycopg_pool import AsyncConnectionPool
 
 from minifs.db.pool import ConnectionFactory
@@ -359,9 +359,11 @@ class Watcher:
     ``pool`` if given, else on a short-lived one from ``connect``. Each is bounded by ``connect_timeout``. With many
     watches per process, pass a pool, so a reconnect doesn't open one connection per watch at once.
 
-    The channel is read from the database (``vfs_channel()`` of the connection's ``current_schema()``) when the
-    first connection opens, unless ``channel`` names one; RuntimeError from ``start()`` if the schema has no such
-    function (it predates migration 016). ``rescan_interval`` is the least time between two ``rescan`` deliveries to
+    The channel is read from the database (``vfs_channel()`` of the schema ``vfs_nodes`` resolves to) whenever a
+    connection opens, unless ``channel`` names one, and each keepalive probe checks it, so a watcher follows a
+    changed name within ``keepalive`` seconds, with a ``rescan``. RuntimeError from ``start()`` if the schema has no
+    such function (it predates migration 016), or the role may not call it: EXECUTE on ``vfs_channel()`` is the
+    owner's alone until granted, and it is what lets a role read the schema's events. ``rescan_interval`` is the least time between two ``rescan`` deliveries to
     one subscription (see ``Subscription``); 0 delivers every one.
     """
 
@@ -385,7 +387,9 @@ class Watcher:
             raise ValueError("rescan_interval must be a finite number of seconds, at least 0")
         self._connect = connect
         self._pool = pool
+        self._fixed_channel = channel
         self._channel = channel
+        self._schema: str | None = None  # the minifs schema, when the channel is read from it
         self._keepalive = keepalive
         self._probe_timeout = probe_timeout
         self._connect_timeout = connect_timeout
@@ -409,7 +413,8 @@ class Watcher:
 
     @property
     def channel(self) -> str | None:
-        """The NOTIFY channel the watcher listens on: None until the first connection read it from the database."""
+        """The NOTIFY channel the watcher listens on: None until the first connection read it from the database,
+        and read again on every reconnect."""
         return self._channel
 
     @property
@@ -500,8 +505,10 @@ class Watcher:
             try:
                 if not conn.autocommit:
                     await conn.set_autocommit(True)
-                if self._channel is None:
-                    self._channel = await self._read_channel(conn)
+                if self._fixed_channel is None:
+                    # Read on every connection, not once: the name can change (a rotation, a schema migrated anew).
+                    self._schema, self._channel = await self._read_channel(conn)
+                assert self._channel is not None
                 await conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self._channel)))
             except BaseException:
                 await conn.close()
@@ -510,25 +517,38 @@ class Watcher:
         return conn
 
     @staticmethod
-    async def _read_channel(conn: AsyncConnection[Any]) -> str:
-        """The channel of the connection's ``current_schema()``. The function is looked up in that schema alone:
-        through the search_path, a schema that predates migration 016 would get the channel of a later schema on
-        the path that has one, and listen to that schema's events instead of its own."""
+    async def _read_channel(conn: AsyncConnection[Any]) -> tuple[str, str]:
+        """The minifs schema of the connection and its channel. The schema is the one ``vfs_nodes`` resolves to,
+        which is where the client's statements go, and the function is looked up in that schema alone: through the
+        search_path, a schema that predates migration 016 would get the channel of a later schema on the path that
+        has one, and listen to that schema's events instead of its own."""
         cur = await conn.execute(
-            "SELECT current_schema(), to_regprocedure(quote_ident(current_schema()) || '.vfs_channel()') IS NOT NULL"
+            "SELECT n.nspname, to_regprocedure(quote_ident(n.nspname) || '.vfs_channel()') IS NOT NULL"
+            " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass('vfs_nodes')"
         )
         row = await cur.fetchone()
-        assert row is not None
+        if row is None:
+            raise RuntimeError("no vfs_nodes table on the connection's search_path: is the schema migrated?")
         schema, found = row
         if not found:
             raise RuntimeError(
-                f"no vfs_channel() in schema {schema!r}: it predates migration 016 (run `minifs db migrate`), "
-                "or the connection's search_path doesn't start with the minifs schema"
+                f"no vfs_channel() in schema {schema!r}: it predates migration 016 (run `minifs db migrate`)"
             )
-        cur = await conn.execute(sql.SQL("SELECT {}.vfs_channel()").format(sql.Identifier(schema)))
+        function = sql.SQL("{}.vfs_channel()").format(sql.Identifier(schema))
+        try:
+            cur = await conn.execute(sql.SQL("SELECT {}").format(function))
+        except errors.InsufficientPrivilege as error:
+            raise RuntimeError(
+                f"the watcher's role may not call {function.as_string(conn)}: the schema's owner must "
+                f"GRANT EXECUTE ON FUNCTION {function.as_string(conn)} to it (and USAGE on the schema)"
+            ) from error
         row = await cur.fetchone()
-        assert row is not None and isinstance(row[0], str)
-        return row[0]
+        if row is None or not isinstance(row[0], str) or not row[0]:
+            raise RuntimeError(
+                f"no channel in {schema}.vfs_channel_name: the table must hold one row "
+                "(change the name with an UPDATE, never a DELETE)"
+            )
+        return schema, row[0]
 
     async def _discard(self) -> None:
         conn, self._conn = self._conn, None
@@ -587,13 +607,24 @@ class Watcher:
         self._malformed_logged_at = now
         self._malformed_suppressed = 0
 
+    async def _probe_query(self, conn: AsyncConnection[Any]) -> str | None:
+        """The channel as the database has it now; the one listened on if it was given, after a SELECT 1."""
+        if self._schema is None:
+            await conn.execute("SELECT 1")
+            return self._channel
+        cur = await conn.execute(sql.SQL("SELECT {}.vfs_channel()").format(sql.Identifier(self._schema)))
+        row = await cur.fetchone()
+        return None if row is None else row[0]
+
     async def _probe(self, conn: AsyncConnection[Any]) -> None:
-        """SELECT 1, or TimeoutError after probe_timeout.
+        """A trivial query, or TimeoutError after probe_timeout. Unless the channel was given, the query is the
+        schema's ``vfs_channel()``, and ConnectionError if the name is no longer the one this connection listens on:
+        the caller then reconnects, which reads the new name, and every subscriber gets a ``rescan``.
 
         On a timeout the connection is closed here rather than by cancelling the query: psycopg's cancel waits for
         the server, and how long depends on the psycopg and libpq versions.
         """
-        probe = asyncio.ensure_future(conn.execute("SELECT 1"))
+        probe = asyncio.ensure_future(self._probe_query(conn))
         probe.add_done_callback(lambda task: task.cancelled() or task.exception())  # may be abandoned: retrieve it
         try:
             done, _ = await asyncio.wait({probe}, timeout=self._probe_timeout)
@@ -602,7 +633,9 @@ class Watcher:
             probe.cancel()
             raise
         if probe in done:
-            probe.result()
+            channel = probe.result()
+            if channel != self._channel:
+                raise ConnectionError(f"the schema's NOTIFY channel changed (it was {self._channel!r})")
             return
         await self._discard()
         probe.cancel()
