@@ -27,7 +27,7 @@ from minifs.vfs.client import (
     VFSClient,
     _gated,  # pyright: ignore[reportPrivateUsage]
 )
-from minifs.vfs.core import CONTROL_CHARACTERS, FileVersion, Kind, ReadResult, VFSError
+from minifs.vfs.core import CONTROL_CHARACTERS, MAX_COMPONENTS, FileVersion, Kind, ReadResult, VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.search import SearchRefused
 from tests.test_tree import holding_the_lock, wait_until_blocked
@@ -468,6 +468,20 @@ async def test_rename_errors_name_the_path_they_concern(vfs: VFSClient) -> None:
     await raises("ENOTDIR", vfs.rename("/a.txt", "/n.md/b"), "/n.md/b")
     await raises("ENOENT", vfs.rename("/nope", "/b"), "/nope")
     await raises("ENOTDIR", vfs.rename("/n.md/x", "/b"), "/n.md/x")
+
+
+async def test_over_deep_paths_are_refused(vfs: VFSClient) -> None:
+    """#89: an over-long path is refused by ``split``, before any query (no database error, no server detail),
+    and the server refuses a rename that would push a subtree over the depth cap."""
+    too_long = "/" + "/".join(["d"] * (MAX_COMPONENTS + 1))
+    error = await raises("ENAMETOOLONG", vfs.mkdir_p(too_long), too_long)
+    assert error.db_error is None and not error.detail  # split raised it: no round trip happened
+    assert "1025 components" in error.message
+    # The same cap on the server: a chain of 1000, and /b holding a chain of 30; 1000 + 1 + 30 is over 1024.
+    await vfs.mkdir_p("/" + "/".join(["d"] * 1000))
+    await vfs.mkdir_p("/b/" + "/".join(["d"] * 30))
+    error = await raises("ENAMETOOLONG", vfs.rename("/b", "/" + "/".join(["d"] * 1000) + "/b"), "/b")
+    assert isinstance(error.db_error, psycopg.Error) and "subtree" in error.detail
 
 
 # Every errno the SQL layer reports comes back as a VFSError with that errno and the normalised path: the outcomes

@@ -50,7 +50,8 @@ Two tables. `vfs_nodes` holds inodes and directory entries; `vfs_extents` holds 
 CREATE TABLE vfs_nodes (                         -- inode + directory entry (no hard links)
     id          uuid PRIMARY KEY DEFAULT uuidv7(),
     parent_id   uuid,                            -- NULL for root entries
-    name        text NOT NULL,                   -- no '/', no control or bidi-override characters, <= 255 bytes (016)
+    name        text NOT NULL,                   -- no '/', no control or bidi-override characters, <= 255 bytes (016);
+                                                 -- a whole path: <= 1024 components, and a node at most that deep (022)
     kind        text NOT NULL CHECK (kind IN ('file','dir')),   -- never changes after create
     size        bigint NOT NULL DEFAULT 0,       -- exact, maintained under the inode lock; 0 for dirs
     lines       bigint NOT NULL DEFAULT 0,       -- line count, updated with size
@@ -98,7 +99,7 @@ CREATE INDEX vfs_extents_not_utf8_idx ON vfs_extents (node_id, generation) WHERE
 
 **Compaction.** An extent is as big as the write that made it, so a log appended one line at a time gains one extent per append. `vfs_compact(node, target)` merges neighbouring extents into pieces of about 64 KB under the inode lock. It merges whole extents, so pieces stay line-aligned, and it changes no bytes, `size`, `lines`, `generation` or `mtime`. Readers and caches never notice, and it emits no NOTIFY. No scheduled job runs it yet.
 
-**Moves never create cycles.** Moving a directory locks the destination's ancestors while it checks that the source isn't among them, so `mv /a /a/b/c` is `EINVAL`, even under concurrent moves.
+**Moves never create cycles.** Moving a node locks the destination's ancestors while it checks them: that a directory's source isn't among them, so `mv /a /a/b/c` is `EINVAL`, even under concurrent moves, and how deep the destination is. Paths and nodes are capped at 1024 levels (`vfs_max_components()`, migration 022; the client's `MAX_COMPONENTS` refuses an over-long path before any round trip): `vfs_lookup` and `vfs_mkdir_p` refuse more components as `ENAMETOOLONG`, and `vfs_rename` refuses a destination deeper than the cap, a node that would land past it, and a subtree that a deeper move would push over it. An ancestor walk that doesn't end within the cap is a real cycle (still `EINVAL`, now told apart from the too-deep case by `vfs_ancestors_cycle`'s lock-free walk, where the old 10,000-step guess called both a cycle) or a too-deep destination (`ENAMETOOLONG`). The subtree check takes no locks on descendants, so it is best effort under a concurrent mkdir inside the moved subtree; a move that doesn't go deeper never scans it, so an over-deep legacy subtree can always be moved up by id.
 
 ## Operations and errors
 
@@ -111,7 +112,7 @@ CREATE INDEX vfs_extents_not_utf8_idx ON vfs_extents (node_id, generation) WHERE
 | Append | `vfs_append(node, data)` | `write` with `O_APPEND` | Inode `FOR UPDATE` |
 | Overwrite | `vfs_write(node, data, [expected generation, size, parent, name])` | `open(O_TRUNC)` + `write` | Inode `FOR UPDATE`; optional compare-and-swap |
 | Create, mkdir | `vfs_create(parent, name, kind, data)`, `vfs_mkdir_p(segments)` | `open(O_CREAT\|O_EXCL)`, `mkdir -p` | Unique constraint |
-| Rename | `vfs_rename(node, new_parent, new_name, expect_parent)` | `rename` with `RENAME_NOREPLACE` | Row locks; cycle check |
+| Rename | `vfs_rename(node, new_parent, new_name, expect_parent)` | `rename` with `RENAME_NOREPLACE` | Row locks; cycle and depth checks |
 | Unlink, rmdir | `vfs_unlink(node)` | `unlink`, `rmdir` | Foreign key |
 | Glob, search | `vfs_glob(...)`, `vfs_search(...)` | `find`, `rg` | None |
 | Compact | `vfs_compact(node, target)` | — | Inode `FOR UPDATE` |
