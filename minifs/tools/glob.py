@@ -31,7 +31,14 @@ async def glob(ctx: RunContext[HasVFS], pattern: str, path: str | None = None) -
     search = resolve(ctx, path or ".")
     excludes = (*ALWAYS_EXCLUDED, *config.excludes)
     try:
-        result = await ctx.deps.vfs.glob(pattern, search, excludes=excludes, limit=config.limit)
+        result = await ctx.deps.vfs.glob(
+            pattern,
+            search,
+            excludes=excludes,
+            limit=config.limit,
+            max_nodes=config.max_nodes,
+            timeout=config.timeout,
+        )
     except GlobError as e:
         raise ModelRetry(str(e)) from None
     except (VFSError, SearchRefused) as e:

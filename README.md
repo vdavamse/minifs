@@ -195,6 +195,7 @@ class Deps:
 | --- | --- |
 | `Read` | 2,000 lines, lines cut at 2,000 characters, output capped at 50 KB; `AGENTS.md`/`CLAUDE.md` attachments cut at 64 KB; directories sorted up to 10,000 entries (larger ones are paged in byte order of name) |
 | `Glob`, `Grep` | 100 results; excludes `node_modules`, `.venv`, `__pycache__`, `.mypy_cache` (and always `.git`) |
+| `Glob` | 2 s per statement, and a walk of at most 200,000 files and directories; past either, the call is a retry that asks for a narrower glob |
 | `Grep` | 2 s per statement; hit lines cut at 2,000 characters |
 | `Edit` | files up to 10 MB; 10 s to find `oldString` (the exact match, then the fuzzy matchers), after which the call is a retry (`EditSettings(timeout=None)`: no limit) |
 | `Write` | diffs old files up to 1 MB (larger ones are replaced without a diff) |
@@ -229,6 +230,8 @@ minifs glob '**/*.py' /workspaces/<id>
 minifs grep -i 'todo|fixme' /workspaces/<id> -g '*.py'
 minifs mv /docs/a.md /docs/b.md && minifs rm /docs/b.md
 ```
+
+`minifs glob` stops past 200,000 files and directories walked or 2 s per statement; `--max-nodes N` (or `none`, no cap) and `--timeout S` change them.
 
 ## Limits
 
