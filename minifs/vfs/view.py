@@ -43,10 +43,11 @@ virtual directory is EBUSY. A mount point is a directory: a file can't be create
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Literal, NamedTuple
 from uuid import UUID
@@ -69,6 +70,8 @@ from minifs.vfs.core import (
     split_trusted,
 )
 from minifs.vfs.policy import Action, Policy
+from minifs.vfs.view_watch import ViewWatch
+from minifs.vfs.watch import Watcher
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
 MAX_GLOB_LIMIT = _MAX_LIMIT - 1
@@ -167,9 +170,17 @@ class VFSView:
     rules for, for mounts that nest, visibly or in the real tree (two visible names for one node would let
     the policy on one name be bypassed through the other), and for a mount with a prefix that isn't in normal
     form, a real prefix of ``/``, or one in ``/workspaces`` that isn't one whole workspace. Build an agent's
-    mounts with ``workspace_mounts``."""
+    mounts with ``workspace_mounts``. ``watcher`` (the process's, ``VFS.watcher``) serves ``watch``."""
 
-    def __init__(self, client: VFSClient, mounts: Mapping[str, str], policy: Policy, actor: str) -> None:
+    def __init__(
+        self,
+        client: VFSClient,
+        mounts: Mapping[str, str],
+        policy: Policy,
+        actor: str,
+        *,
+        watcher: Watcher | None = None,
+    ) -> None:
         if actor not in policy.actors:
             raise ValueError(f"the policy has no rules for actor {actor!r}")
         self._client = client
@@ -184,6 +195,7 @@ class VFSView:
                     raise ValueError(f"mount {join(*b.visible)} reaches into mount {join(*a.visible)}'s tree")
         self.policy = policy
         self.actor = actor
+        self._watcher = watcher
 
     # Reads
 
@@ -518,6 +530,36 @@ class VFSView:
             return self.policy.allows(self.actor, "read", visible)
 
         return keep
+
+    # Watch
+
+    @contextlib.asynccontextmanager
+    async def watch(self, path: str) -> AsyncGenerator[ViewWatch]:
+        """Events for the node at ``path`` that the actor may see, in visible paths, until the block exits (see
+        ``ViewWatch``). Needs ``read`` on ``path``; ENOENT outside the mounts, or where nothing is; EINVAL for a
+        virtual directory (watch a mount point instead). RuntimeError if the view was built without a watcher.
+        This is the watch for code acting for an actor: ``Watcher.watch`` takes real paths and applies no policy.
+        """
+        if self._watcher is None:
+            raise RuntimeError("this VFSView has no watcher: pass watcher= (open_vfs(..., watch=True) opens one)")
+        target = self._target(path, "read")
+        if target.real is None:
+            raise VFSError("EINVAL", target.visible, "a virtual directory can't be watched")
+        async with contextlib.AsyncExitStack() as stack:
+            watch = self._watcher._watch(target.real, ancestors=True, fence=True)  # pyright: ignore[reportPrivateUsage]
+            inner = await self._mapped(stack.enter_async_context(watch), target)
+            view_watch = ViewWatch(
+                inner,
+                target.path,
+                split_trusted(target.real),
+                mount_point=target.is_mount_point,
+                policy=self.policy,
+                actor=self.actor,
+            )
+            try:
+                yield view_watch
+            finally:
+                view_watch.close()  # and a check still pending
 
     # Writes
 
