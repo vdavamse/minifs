@@ -163,6 +163,17 @@ class LineReadResult:
     cut: frozenset[int] = frozenset()
 
 
+@dataclass(frozen=True)
+class PageRead:
+    """What ``pread_page`` read in one statement: ``sample``, the first bytes of the file; ``lines``, its page's
+    first batch, from the same snapshot (so the same ``id`` and ``generation``); and ``also``, the other reads, each
+    a result or its outcome in place, as ``pread_many`` gives them."""
+
+    sample: ReadResult
+    lines: LineReadResult
+    also: list[ReadResult | VFSError]
+
+
 def millis(seconds: float) -> str:
     """``seconds`` as the value of a timeout setting (``statement_timeout``, ``lock_timeout``): whole
     milliseconds, rounded up, at least one."""

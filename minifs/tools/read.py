@@ -3,9 +3,8 @@ tool), over the view. Lines come from ``VFSView.pread_lines``, so a page is read
 
 from __future__ import annotations
 
-import asyncio
 import mimetypes
-from collections.abc import Awaitable
+from collections.abc import Sequence
 from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
@@ -45,8 +44,8 @@ INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
 MAX_ATTACHMENT_BYTES = 3_750_000
 """Largest image or PDF attached to a result: about 5 MB once base64-encoded, the providers' usual limit."""
 _PAGE_ATTEMPTS = 3
-"""Reads of a file that changes under the tool (between the sample and the page or attachment, or between a page's
-batches) before it settles for what the last attempt read."""
+"""Reads of a file that changes under the tool (between the sample and an attachment's whole read, or between a
+page's batches) before it settles for what the last attempt read."""
 _RACES = frozenset({"ENOENT", "ENOTDIR", "EISDIR"})
 """Errors of a later call that mean the path changed since the sample: the read starts again."""
 _MAX_LINES = 2**31 - 1  # pread_lines' max_lines and max_bytes, and pread's limit, are int
@@ -70,37 +69,34 @@ async def read(
     vfs = ctx.deps.vfs
     start = offset or 1
     count = limit if limit is not None else config.default_limit
-    instructions: list[str] | BaseException | None = None  # looked up with the first attempt's sample
+    instructions: list[str] | None = None  # looked up with the first attempt's sample
     try:
         for attempt in range(_PAGE_ATTEMPTS):
             settle = attempt + 1 == _PAGE_ATTEMPTS
-            # The sample, the page's first batch and, once, the instruction files at once: one round trip for most
-            # reads, on at most three connections. The sample decides, so only its denial counts in
+            # The sample, the page's first batch and, on the first attempt, the instruction files are one
+            # statement: one connection, one snapshot. The sample decides, so only the file's denial counts in
             # ``policy.denials``: one per denied Read, none for the instruction files a Read looks up on its own.
-            calls: list[Awaitable[Any]] = [
-                vfs.pread(path, 0, SAMPLE_BYTES),
-                vfs.pread_lines(
+            reads, groups = _instruction_reads(ctx, path) if instructions is None else ([], [])
+            try:
+                found = await vfs.pread_page(
                     path,
+                    SAMPLE_BYTES,
                     min(start, _MAX_LINE),
                     min(count, _MAX_LINES),
                     _fetch(config),
                     max_line_bytes=_line_cap(config),
-                    count_denials=False,
-                ),
-            ]
-            if instructions is None:
-                calls.append(_nearby_instructions(ctx, path))
-            sample, first, *looked_up = await asyncio.gather(*calls, return_exceptions=True)
-            if looked_up:
-                instructions = looked_up[0]
-            if isinstance(sample, VFSError):
-                if sample.errno == "EISDIR" and sample.path == path:
+                    also=reads,
+                    groups=groups,
+                )
+            except VFSError as e:
+                if e.errno == "EISDIR" and e.path == path:
                     return await _directory(ctx, path, start, count, config)
-                if sample.errno in ("ENOENT", "ENOTDIR"):
-                    raise ModelRetry(await _not_found(ctx, path))
-                raise sample
-            if isinstance(sample, BaseException):
-                raise sample
+                if e.errno in ("ENOENT", "ENOTDIR"):
+                    raise ModelRetry(await _not_found(ctx, path)) from None
+                raise
+            if instructions is None:
+                instructions = _instruction_texts(reads, found.also, settings(ctx).read.instruction_bytes)
+            sample, first = found.sample, found.lines
             version = (sample.id, sample.generation)
 
             mime = _sniff_mime(sample.content, path)
@@ -124,12 +120,6 @@ async def read(
             if _is_binary(path, sample.content):
                 raise ModelRetry(f"Cannot read binary file: {path}")
 
-            if isinstance(first, VFSError) and first.errno in _RACES and not settle:
-                continue  # gone, or replaced by a directory, since the sample
-            if isinstance(first, BaseException):
-                raise first
-            if (first.id, first.generation) != version and not settle:
-                continue  # the page isn't the sampled file's
             if first.lines < start and not (first.lines == 0 and start == 1):
                 raise ModelRetry(f"Offset {start} is out of range for this file ({first.lines} lines)")
             page = await _read_lines(ctx, path, start, count, config, first, None if settle else version)
@@ -138,14 +128,12 @@ async def read(
             lines, total, more, capped = page
             if total < start and not (total == 0 and start == 1):
                 raise ModelRetry(f"Offset {start} is out of range for this file ({total} lines)")
-            if isinstance(instructions, BaseException):
-                raise instructions
             break
         else:  # pragma: no cover - the last attempt never continues
             raise AssertionError("not reached")
     except VFSError as e:
         return tool_error(e, "read")
-    assert instructions is not None and not isinstance(instructions, BaseException)
+    assert instructions is not None
 
     output = f"<path>{path}</path>\n<type>file</type>\n<content>\n"
     output += "\n".join(f"{start + i}: {line}" for i, line in enumerate(lines))
@@ -361,29 +349,35 @@ def _batch_lines(batch: LineReadResult) -> list[bytes]:
     return rows
 
 
-async def _nearby_instructions(ctx: RunContext[HasVFS], path: str) -> list[str]:
-    """AGENTS.md / CLAUDE.md files between the file and the working directory, once per conversation: in each
-    directory from the file's up to, not including, the working directory, the first of the two that is a file
-    the view lets the actor read. Every candidate is looked up, and the wanted ones read, in one ``pread_many``,
-    so the cost doesn't grow with the depth; the file itself and those already shown are looked up, not read."""
+def _instruction_reads(ctx: RunContext[HasVFS], path: str) -> tuple[list[tuple[str, int, int]], list[int]]:
+    """The ``pread_page`` reads and groups that look up ``path``'s instruction files: the AGENTS.md / CLAUDE.md
+    files between the file and the working directory, once per conversation — in each directory from the file's up
+    to, not including, the working directory, the first of the two that is a file the view lets the actor read.
+    Every candidate is looked up, and the wanted ones read, in the file's own statement, so the cost doesn't grow
+    with the depth; the file itself and those already shown are looked up, not read. ``([], [])`` when the file
+    isn't below the working directory."""
     root = split(workdir(ctx))
     current = split(path)[:-1]
     if len(current) <= len(root) or current[: len(root)] != root:
-        return []
+        return [], []
     seen = _loaded_instructions(ctx)
     cap = settings(ctx).read.instruction_bytes
     candidates = [
         join(*current[:end], name) for end in range(len(current), len(root), -1) for name in INSTRUCTION_FILES
     ]
     reads = [(c, 0, 0 if c == path or c in seen else cap) for c in candidates]
-    try:
-        # One group per directory: a CLAUDE.md behind an AGENTS.md file is looked up, not read.
-        groups = [i // len(INSTRUCTION_FILES) for i in range(len(reads))]
-        found = await ctx.deps.vfs.pread_many(reads, groups=groups, count_denials=False)
-    except VFSError:
-        return []  # a failed lookup (EIO): picking another name then could attach a file ladderframe never would
+    # One group per directory: a CLAUDE.md behind an AGENTS.md file is looked up, not read.
+    groups = [i // len(INSTRUCTION_FILES) for i in range(len(reads))]
+    return reads, groups
+
+
+def _instruction_texts(
+    reads: Sequence[tuple[str, int, int]], found: Sequence[ReadResult | VFSError], cap: int
+) -> list[str]:
+    """The reminder blocks of the results ``found`` of the reads ``_instruction_reads`` built: each directory's
+    wanted file, read with ``cap`` bytes (``_instruction_text``)."""
     texts: list[str] = []
-    for i in range(0, len(candidates), len(INSTRUCTION_FILES)):
+    for i in range(0, len(reads), len(INSTRUCTION_FILES)):
         group = slice(i, i + len(INSTRUCTION_FILES))
         for (candidate, _, limit), result in zip(reads[group], found[group], strict=True):
             if isinstance(result, VFSError):
@@ -425,7 +419,7 @@ _ABSENT = frozenset({"ENOENT", "ENOTDIR", "EISDIR", "EACCES"})
 """What a lookup of an instruction file says when it's missing, a directory or the actor may not read it."""
 
 _FROM = "Instructions from: "
-"""The marker that opens the first line of every block of a reminder: ``_nearby_instructions`` writes it and
+"""The marker that opens the first line of every block of a reminder: ``_instruction_texts`` writes it and
 ``already_loaded`` reads it back."""
 
 _REMINDER = "\n</content>\n\n<system-reminder>\n"

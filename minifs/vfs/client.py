@@ -49,6 +49,7 @@ from minifs.vfs.core import (
     FileVersion,
     Kind,
     LineReadResult,
+    PageRead,
     ReadResult,
     VFSError,
     join,
@@ -93,6 +94,31 @@ _NULL = (
 )
 # The parent of a create with parents, and mkdir_p: the directories vfs_mkdir_p found or made, every one in chain.
 _MKDIR_P = "(SELECT id, 'dir'::text AS kind, chain, err, err_detail FROM vfs_mkdir_p(%s))"
+# pread_page's lines join: the vfs_pread_lines of read 1 (its file), placed before the p join and, like it, a
+# one-time filter, so the function runs at most once. It returns exactly one row, so the row count doesn't change.
+# Its 4 parameters come after the 4 unnest arrays, which is their order in the SQL text.
+_LINES_JOIN = (
+    " LEFT JOIN LATERAL (SELECT * FROM vfs_pread_lines(vfs_gate(w.id, w.err), %s::bigint, %s::int, %s::int, %s::int)"
+    "                    WHERE w.err IS NULL AND w.i = 1 OFFSET 0) l ON true"
+)
+# l's columns, appended to the SELECT list and sent only on read 1's first row (as the walk column is): the file's
+# extents give it as many rows as p has, and l is the same one row of them all.
+_FIRST_OF_READ = "row_number() OVER (PARTITION BY w.i ORDER BY p.byte_offset) = 1"
+_LINES_COLUMNS = "".join(
+    f", CASE WHEN {_FIRST_OF_READ} THEN l.{name} END"
+    for name in (
+        "size",
+        "generation",
+        "lines",
+        "first_line",
+        "byte_offset",
+        "data",
+        "next_offset",
+        "cut",
+        "err",
+        "err_detail",
+    )
+)
 
 
 class DirCache(Protocol):
@@ -303,9 +329,93 @@ class VFSClient:
         if not asked:
             return results
         group_ids = [groups[i] if groups is not None else i for i in asked]
+        found, _ = await self._pread_rows(
+            [paths[i] for i in asked], [reads[i][1] for i in asked], [reads[i][2] for i in asked], group_ids
+        )
+        for i, result in zip(asked, found, strict=True):
+            results[i] = result
+        return results
+
+    async def pread_page(
+        self,
+        path: str,
+        sample: int,
+        first_line: int,
+        max_lines: int,
+        max_bytes: int,
+        *,
+        max_line_bytes: int | None = None,
+        also: Sequence[tuple[str, int, int]] = (),
+        groups: Sequence[int] | None = None,
+    ) -> PageRead:
+        """``pread(path, 0, sample)`` and ``pread_lines(path, first_line, max_lines, max_bytes,
+        max_line_bytes=...)`` of the same file, and ``pread_many(also, groups=groups)``, in one statement: one
+        round trip, one connection, one snapshot. The file's outcome (ENOENT, ENOTDIR, EISDIR) raises, as ``pread``
+        does; the other reads' stay in place. EINVAL for bad limits, as the three calls check them."""
+        segments = split(path)
+        if not segments:
+            raise VFSError("EISDIR", "/")
+        normalized = join(*segments)
+        if not 0 <= sample <= _MAX_INT:
+            raise VFSError("EINVAL", normalized, f"invalid limit {sample}")
+        if not 1 <= first_line <= _MAX_BIGINT:
+            raise VFSError("EINVAL", normalized, f"invalid first line {first_line}")
+        if not (0 <= max_lines <= _MAX_INT and 0 <= max_bytes <= _MAX_INT) or not (
+            max_line_bytes is None or 0 <= max_line_bytes <= _MAX_INT
+        ):
+            raise VFSError(
+                "EINVAL",
+                normalized,
+                f"invalid limits {max_lines} lines, {max_bytes} bytes, {max_line_bytes} bytes a line",
+            )
+        also_paths = [join(*split(also_path)) for also_path, _, _ in also]
+        for also_path, offset, limit in zip(also_paths, (r[1] for r in also), (r[2] for r in also), strict=True):
+            if not 0 <= limit <= _MAX_INT:
+                raise VFSError("EINVAL", also_path, f"invalid limit {limit}")
+            if not -_MAX_BIGINT - 1 <= offset <= _MAX_BIGINT:
+                raise VFSError("EINVAL", also_path, f"invalid offset {offset}")
+        if groups is not None and len(groups) != len(also):
+            raise ValueError(f"{len(groups)} groups for {len(also)} reads")
+        # The file is read 1, in a group of its own (the others shifted by one), so it never shadows and is never
+        # shadowed. An also read that is "/" isn't sent, as in pread_many, and never stands in for its group's file.
+        sent = [j for j, also_path in enumerate(also_paths) if also_path != "/"]
+        found, l_row = await self._pread_rows(
+            [normalized, *(also_paths[j] for j in sent)],
+            [0, *(also[j][1] for j in sent)],
+            [sample, *(also[j][2] for j in sent)],
+            [0, *((groups[j] if groups is not None else j) + 1 for j in sent)],
+            (first_line, max_lines, max_bytes, max_line_bytes),
+        )
+        first = found[0]
+        if isinstance(first, VFSError):
+            raise first  # the file's outcome raises, at its normalized path; the walks were stored (_pread_rows)
+        assert l_row is not None
+        size, generation, lines, _, start, content, end, cut, err, detail = l_row
+        if err is not None:
+            raise VFSError(err, normalized, detail=detail or "")
+        results: list[ReadResult | VFSError] = [VFSError("EISDIR", "/") for _ in also]
+        for j, result in zip(sent, found[1:], strict=True):
+            results[j] = result
+        page = LineReadResult(
+            first.id, content, first_line, start, end, size, generation, lines, end >= size, frozenset(cut)
+        )
+        return PageRead(first, page, results)
+
+    async def _pread_rows(
+        self,
+        paths: Sequence[str],
+        offsets: Sequence[int],
+        limits: Sequence[int],
+        group_ids: Sequence[int],
+        lines: tuple[int, int, int, int | None] | None = None,
+    ) -> tuple[list[ReadResult | VFSError], tuple[Any, ...] | None]:
+        """The pread_many statement over the sent reads (``paths`` normalized, none of them "/", one group id per
+        read), and, with ``lines`` (``first_line``, ``max_lines``, ``max_bytes``, ``max_line_bytes``), the
+        ``vfs_pread_lines`` of the first read in the same statement, on the same snapshot. Returns each read's
+        result or outcome, in order, and that row's columns (None without ``lines``). Paths are resolved on the
+        server, without the cache, which then stores each walk."""
         # A path is "/" and names joined by "/", which no name contains, so the server splits it back.
-        rows = await self._run(
-            paths[asked[0]],
+        query = (
             "WITH q AS (SELECT q.i, q.off, q.lim, q.grp, l.id, l.kind, l.chain, l.err, l.err_detail"
             "             FROM unnest(%s::text[], %s::bigint[], %s::int[], %s::bigint[])"
             "                  WITH ORDINALITY AS q(path, off, lim, grp, i)"
@@ -313,32 +423,39 @@ class VFSClient:
             " w AS (SELECT q.*, coalesce(bool_or(q.kind = 'file') OVER (PARTITION BY q.grp ORDER BY q.i"
             "                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), false) AS shadowed FROM q)"
             " SELECT w.i, w.id, w.err, w.err_detail, p.size, p.generation, p.byte_offset, p.data, p.err, p.err_detail,"
-            "        CASE WHEN row_number() OVER (PARTITION BY w.i ORDER BY p.byte_offset) = 1 THEN w.chain END, w.kind"
-            " FROM w LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(w.id, w.err), w.off,"
+            f"        CASE WHEN {_FIRST_OF_READ} THEN w.chain END, w.kind"
+            + (_LINES_COLUMNS if lines is not None else "")
+            + " FROM w"
+            + (_LINES_JOIN if lines is not None else "")
+            + " LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(w.id, w.err), w.off,"
             "                                                   CASE WHEN w.shadowed THEN 0 ELSE w.lim END)"
             "                           WHERE w.err IS NULL OFFSET 0) p ON true"
-            " ORDER BY w.i, p.byte_offset",
-            [[paths[i] for i in asked], [reads[i][1] for i in asked], [reads[i][2] for i in asked], group_ids],
+            " ORDER BY w.i, p.byte_offset"
         )
+        params: list[object] = [list(paths), list(offsets), list(limits), list(group_ids)]
+        if lines is not None:
+            params.extend(lines)
+        rows = await self._run(paths[0], query, params)
         by_read: dict[int, list[tuple[Any, ...]]] = {}
         for row in rows:
             by_read.setdefault(row[0], []).append(row)
         walked: list[_Ref] = []
-        for n, i in enumerate(asked, 1):
-            ref = _Ref(_LOOKUP, [], segments=split(paths[i]))
+        for n, path in enumerate(paths, 1):
+            ref = _Ref(_LOOKUP, [], segments=split(path))
             ref.walk = (by_read[n][0][10], by_read[n][0][11], by_read[n][0][2])
             walked.append(ref)
         self._learn(walked)
-        for n, i in enumerate(asked, 1):
+        results: list[ReadResult | VFSError] = []
+        for n, path in enumerate(paths, 1):
             node, lookup_err, lookup_detail, size, generation, start, _, err, detail = by_read[n][0][1:10]
             if lookup_err is not None or err is not None:
                 failed = lookup_err or err
-                results[i] = VFSError(failed, paths[i], detail=(lookup_detail if lookup_err else detail) or "")
+                results.append(VFSError(failed, path, detail=(lookup_detail if lookup_err else detail) or ""))
                 continue
             content = b"".join(row[7] for row in by_read[n] if row[7] is not None)
             end = start + len(content)
-            results[i] = ReadResult(node, content, start, end, size, generation, end >= size)
-        return results
+            results.append(ReadResult(node, content, start, end, size, generation, end >= size))
+        return results, by_read[1][0][12:22] if lines is not None else None
 
     async def glob(
         self,

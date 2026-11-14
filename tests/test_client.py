@@ -185,6 +185,74 @@ async def test_pread_many(vfs: VFSClient) -> None:
     await raises("EINVAL", vfs.pread_many([("/a/f", 2**63, 1)]))
 
 
+async def test_pread_page(vfs: VFSClient) -> None:
+    await vfs.create("/a/f", b"one\ntwo\nthree\n", parents=True)
+    await vfs.create("/a/AGENTS.md", b"agents")
+    await vfs.create("/a/CLAUDE.md", b"claude")
+    page = await vfs.pread_page(
+        "/a//f/",
+        4096,
+        2,
+        2,
+        1000,
+        also=[("/a/AGENTS.md", 0, 100), ("/a/CLAUDE.md", 0, 100), ("/a/x", 0, 100)],
+        groups=[0, 0, 1],
+    )
+    assert page.sample == await vfs.pread("/a/f", 0, 4096)
+    assert page.lines == await vfs.pread_lines("/a/f", 2, 2, 1000)
+    assert (page.lines.id, page.lines.generation) == (page.sample.id, page.sample.generation)
+    agents, claude, missing = page.also
+    assert isinstance(agents, ReadResult) and agents.content == b"agents"
+    assert isinstance(claude, ReadResult) and claude.content == b""  # behind AGENTS.md: read with limit 0
+    assert isinstance(missing, VFSError) and (missing.errno, missing.path) == ("ENOENT", "/a/x")
+    # No also reads: the file's sample and page alone.
+    page = await vfs.pread_page("/a/f", 3, 1, 1, 1000)
+    assert (page.sample.content, page.lines.content, page.also) == (b"one", b"one\n", [])
+
+
+async def test_pread_page_outcomes_raise(vfs: VFSClient) -> None:
+    """The file's outcome raises, as pread's would; the other reads' stay in place (``test_pread_page``)."""
+    await vfs.create("/a/f", b"one\ntwo\n", parents=True)
+    await vfs.mkdir("/a/d")
+    await raises("ENOENT", vfs.pread_page("/a/x", 4096, 1, 10, 1000), "/a/x")
+    await raises("EISDIR", vfs.pread_page("/a/d", 4096, 1, 10, 1000), "/a/d")
+    await raises("EISDIR", vfs.pread_page("/", 4096, 1, 10, 1000), "/")
+    await raises("ENOTDIR", vfs.pread_page("/a/f/x", 4096, 1, 10, 1000), "/a/f/x")
+    await raises("EINVAL", vfs.pread_page("/a/f", -1, 1, 10, 1000), "/a/f")
+    await raises("EINVAL", vfs.pread_page("/a/f", 4096, 0, 10, 1000), "/a/f")
+    await raises("EINVAL", vfs.pread_page("/a/f", 4096, 1, -1, 1000), "/a/f")
+    await raises("EINVAL", vfs.pread_page("/a/f", 4096, 1, 10, 1000, also=[("/a/f", 0, -1)]), "/a/f")
+    with pytest.raises(ValueError):
+        await vfs.pread_page("/a/f", 4096, 1, 10, 1000, also=[("/a/f", 0, 1), ("/a/d", 0, 1)], groups=[0])
+
+
+async def test_pread_page_of_a_file_of_several_extents(vfs: VFSClient) -> None:
+    """The page isn't repeated or cut per extent row: the sample and the batch equal the separate calls'."""
+    await vfs.create("/f", b"one\ntwo\n")
+    for i in range(8):
+        await vfs.append("/f", b"line %d\n" % i)
+    page = await vfs.pread_page("/f", 4096, 1, 20, 1000)
+    assert page.sample == await vfs.pread("/f", 0, 4096)
+    assert page.lines == await vfs.pread_lines("/f", 1, 20, 1000)
+    assert (page.sample.eof, page.lines.eof) == (True, True)
+
+
+async def test_pread_page_is_one_statement(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    await vfs.create("/a/f", b"one\n", parents=True)
+    await vfs.create("/a/AGENTS.md", b"rules")
+    statements: list[str] = []
+    execute = AsyncConnection.execute
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        if "vfs_" in str(query):
+            statements.append(str(query))
+        return await execute(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    await vfs.pread_page("/a/f", 4096, 1, 10, 1000, also=[("/a/AGENTS.md", 0, 100), ("/a/x", 0, 1)])
+    assert len(statements) == 1, statements
+
+
 async def test_write_and_compare_and_swap(vfs: VFSClient) -> None:
     created = await vfs.create("/n.md", b"v0")
     written = await vfs.write("/n.md", b"v1!")
