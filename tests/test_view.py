@@ -358,6 +358,42 @@ async def test_a_virtual_directory_is_readable_where_something_below_is(vfs: VFS
     assert nothing.policy.denials == {("x", "read"): 2}
 
 
+async def test_a_nested_mount_is_listed_under_a_deny_default(vfs: VFSClient) -> None:
+    """A virtual directory below a nested mount point is listed where something below it may be read. A rule with no
+    actions leaves nothing readable below it, so the virtual directories above the mount are refused."""
+    mounts = {"/a/b/ws": f"/workspaces/{W1}"}
+    nested = VFSView(vfs, mounts, Policy({"x": [Rule("/a/b/ws/**", "read", "write")]}), "x")
+    assert [e.path for e in await nested.readdir("/")] == ["/a"]
+    assert [e.path for e in await nested.readdir("/a")] == ["/a/b"]
+    assert [e.path for e in await nested.readdir("/a/b")] == ["/a/b/ws"]
+    assert nested.policy.denials == {}
+    hidden = VFSView(vfs, mounts, Policy({"x": [Rule("/a/b/ws/**")]}), "x")
+    await raises("EACCES", hidden.readdir("/"), "/")
+    await raises("EACCES", hidden.readdir("/a"), "/a")
+
+
+async def test_glob_and_grep_from_the_root_skip_a_mount_no_rule_covers(vfs: VFSClient, policy: Policy) -> None:
+    """A glob and a grep from the virtual root search only the mounts something in them may be read, and skipping a
+    mount counts no denial."""
+    agent = VFSView(vfs, {"/workspace": f"/workspaces/{W1}", "/shared": "/docs"}, policy, "agent")
+    paths = [e.path for e in (await agent.glob("**", "/")).entries]
+    assert "/workspace/notes.md" in paths
+    assert not any(p.startswith("/shared") for p in paths)
+    assert (await agent.grep("guide", "/")).hits == []
+    assert policy.denials == {}
+
+
+async def test_a_rule_narrower_than_its_mount_leaves_the_mount_point_unreadable(vfs: VFSClient) -> None:
+    """A rule that matches only below a mount point leaves the mount point itself unreadable: it is refused, left out
+    of the root's listing, and a glob from the root still reaches what the rule covers."""
+    await vfs.create(f"/workspaces/{W1}/src/a.md", b"x", parents=True)
+    narrow = VFSView(vfs, workspace_mounts(W1), Policy({"x": [Rule("/workspace/src/**", "read", "write")]}), "x")
+    await raises("EACCES", narrow.stat("/workspace"), "/workspace")
+    assert [e.path for e in await narrow.readdir("/")] == []
+    assert [e.path for e in await narrow.readdir("/workspace/src")] == ["/workspace/src/a.md"]
+    assert [e.path for e in (await narrow.glob("**", "/")).entries] == ["/workspace/src/a.md"]
+
+
 async def test_the_default_policy_still_reads_the_root(vfs: VFSClient, policy: Policy) -> None:
     """Each actor of ``DEFAULT_POLICY`` may read the root, and nothing is counted as denied."""
     for actor in ("agent", "ingestion", "operator"):

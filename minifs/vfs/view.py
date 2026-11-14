@@ -9,13 +9,15 @@ points (``/`` for the mounts above) are virtual: they list the mount points belo
 moved or removed. There are no symlinks in the tree (``vfs_nodes.kind`` is ``file`` or ``dir``), so a mapped path
 never leads elsewhere.
 
-Every operation checks the ``Policy`` for the view's actor on the visible path before it runs (EACCES, counted
-in ``policy.denials`` unless a read passes ``count_denials=False``), then runs as the ``VFSClient`` operation on
-the real path. The check needs no transaction of its own: it depends on the path alone, and the operation
-resolves that same path in its one statement. Results and errors come back in visible paths: a ``VFSError``
-keeps its errno and message, gets the visible path, and drops ``detail`` and ``db_error``, which name real paths
-and node ids. Entries the actor may not read are left out of listings, glob results and the files a grep
-searches.
+Every operation checks the ``Policy`` for the view's actor on the visible path before it runs (EACCES, counted in
+``policy.denials`` unless a read passes ``count_denials=False``), then runs as the ``VFSClient`` operation on the
+real path. The check needs no transaction of its own: it depends on the path alone, and the operation resolves that
+same path in its one statement. Results and errors come back in visible paths: a ``VFSError`` keeps its errno and
+message, gets the visible path, and drops ``detail`` and ``db_error``, which name real paths and node ids. Entries
+the actor may not read are left out of listings, glob results and the files a grep searches. A virtual directory,
+which no rule names, may be read where the actor may read something below it (``Policy.allows_any``), and is refused
+(and counted) only where nothing below it is readable; its listing shows a virtual directory below it on the same
+terms and a mount point where the mount point itself may be read.
 
 What each operation needs:
 
@@ -201,7 +203,7 @@ class VFSView:
         if target.real is None:
             # Python orders str by code point, which is UTF-8 byte order.
             virtual = [e for e in await self._virtual_entries(target.path) if after is None or e.name > after]
-            return self._readable(virtual)[:limit]
+            return [_reported(e) for e in virtual if self._listable(e)][:limit]
         entries: list[Entry] = []
         batch = 0  # the first round asks for just what is wanted
         while True:
@@ -325,6 +327,13 @@ class VFSView:
         """The ``entries`` the actor may read, as reported: a name from before migration 016 is matched by the
         policy as stored, then spelled without its control characters (``_reported``)."""
         return [_reported(e) for e in entries if self.policy.allows(self.actor, "read", e.path)]
+
+    def _listable(self, entry: Entry) -> bool:
+        """Whether a virtual directory's listing shows ``entry``: a virtual directory below it (id None) where the
+        actor may read something below that one, as ``_target`` decides it, and a mount point where it may read the
+        mount point itself."""
+        check = self.policy.allows_any if entry.id is None else self.policy.allows
+        return check(self.actor, "read", entry.path)
 
     async def _glob(
         self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
@@ -539,9 +548,11 @@ class VFSView:
         await self._mapped(self._client.unlink(_real(target)), target)
 
     def allows(self, action: Action, path: str) -> bool:
-        """Whether the actor may ``action`` at ``path`` as the view's operations decide it: ENOENT outside every
-        mount (raised, as the operations report it), a virtual directory readable where something below it is.
-        A refusal isn't counted in ``policy.denials``: for a tool deciding which check to make first."""
+        """Whether the actor may ``action`` at ``path``, by the policy check the view's operations make first (a
+        virtual directory may be read where something below it may, as in ``_target``). Raises the mapping errors the
+        operations would: ENOENT outside every mount, EINVAL for a bad path. Exact for ``read``; for another action
+        the operation may still refuse on its own (a mount point can't be removed, say). A refusal isn't counted in
+        ``policy.denials``: for a tool deciding which check to make first."""
         try:
             self._target(path, action, count_denials=False)
         except PolicyDenied:
