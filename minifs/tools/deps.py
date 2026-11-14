@@ -38,6 +38,24 @@ class ReadSettings:
     """Characters kept of each line; longer lines are cut."""
     max_bytes: int = 50 * 1024
     """Output cap per call."""
+    instruction_bytes: int = 64 * 1024
+    """Bytes read of each ``AGENTS.md`` / ``CLAUDE.md`` attached to a result; a longer one is cut there, with a
+    note (ladderframe reads them whole). 0 attaches none."""
+    max_entries: int = 10_000
+    """Entries of a directory ``Read`` fetches to sort and page as ladderframe does. A directory with more is paged
+    in byte order of name, at most this many entries a page, and no names are suggested for a missing path in
+    it. At least 1."""
+
+    def __post_init__(self) -> None:
+        for name in ("default_limit", "max_line_length", "max_bytes", "instruction_bytes", "max_entries"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"read {name} must be an int, not {value!r}")
+            low = int(name == "max_entries")
+            # The SQL functions take an int; a directory Read asks for max_entries + 1 entries.
+            high = 2**31 - 1 - low
+            if not low <= value <= high:
+                raise ValueError(f"read {name} must be from {low} to {high}, not {value}")
 
 
 ALWAYS_EXCLUDED: tuple[str, ...] = ("**/.git/**",)

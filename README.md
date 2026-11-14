@@ -193,7 +193,7 @@ class Deps:
 
 | Setting | Default |
 | --- | --- |
-| `Read` | 2,000 lines, lines cut at 2,000 characters, output capped at 50 KB |
+| `Read` | 2,000 lines, lines cut at 2,000 characters, output capped at 50 KB; `AGENTS.md`/`CLAUDE.md` attachments cut at 64 KB; directories sorted up to 10,000 entries (larger ones are paged in byte order of name) |
 | `Glob`, `Grep` | 100 results; excludes `node_modules`, `.venv`, `__pycache__`, `.mypy_cache` (and always `.git`) |
 | `Grep` | 2 s per statement; hit lines cut at 2,000 characters |
 | `Edit` | files up to 10 MB |

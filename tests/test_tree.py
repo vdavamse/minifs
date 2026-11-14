@@ -10,7 +10,7 @@ from uuid import UUID
 
 import psycopg
 import pytest
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 
 from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO, errno_name
 
@@ -405,6 +405,93 @@ async def test_readdir_errors(conn: AsyncConnection) -> None:
         await readdir(conn, file)
     with raises_errno("ENOENT"):
         await readdir(conn, uuid.uuid4())
+
+
+async def test_readdir_pages_by_name(conn: AsyncConnection) -> None:
+    """p_after and p_limit page the listing in byte order; an empty page is no rows (migration 016)."""
+    directory = await create(conn, None, "d", "dir")
+    await create(conn, None, "e", "dir")
+    for name in ["B", "a", "b", "c", "é"]:
+        await create(conn, directory, name)
+
+    async def page(parent: UUID | None, after: str | None, limit: int | None) -> list[str]:
+        cur = await conn.execute("SELECT name, err FROM vfs_readdir(%s, %s, %s)", (parent, after, limit))
+        rows = await cur.fetchall()
+        assert all(err is None for _, err in rows)
+        return [name for name, _ in rows]
+
+    assert await page(directory, None, 2) == ["B", "a"]
+    assert await page(directory, "a", 2) == ["b", "c"]
+    assert await page(directory, "a", None) == ["b", "c", "é"]
+    assert await page(directory, "aa", 1) == ["b"]  # after a name that isn't there
+    assert await page(directory, "C", 1) == ["a"]  # byte order: "C" sorts before "a"
+    assert await page(directory, "é", 2) == []
+    assert await page(directory, None, 0) == []
+    assert await page(None, None, 1) == ["d"]
+    assert await page(None, "d", None) == ["e"]
+    assert await readdir(conn, directory) == [(name, "file") for name in ["B", "a", "b", "c", "é"]]  # one argument
+    with raises_errno("EINVAL"):
+        await page(directory, None, -1)
+    with raises_errno("ENOENT"):
+        await readdir(conn, uuid.uuid4())
+
+
+async def test_a_readdir_page_reads_only_its_rows(conn: AsyncConnection) -> None:
+    """A page is a bounded range scan of the (parent_id, name) index, under a generic plan too: no sort of the
+    directory, and no walk over the entries before the page."""
+    directory = await create(conn, None, "d", "dir")
+    await conn.execute(
+        "INSERT INTO vfs_nodes (parent_id, name, kind) SELECT %s, 'f' || lpad(i::text, 5, '0'), 'file'"
+        " FROM generate_series(1, 3000) i",
+        (directory,),
+    )
+    await conn.execute("ANALYZE vfs_nodes")
+    await conn.execute("SET plan_cache_mode = force_generic_plan")
+    await conn.execute(
+        "PREPARE page(uuid, text, int) AS SELECT n.name FROM vfs_nodes n"
+        ' WHERE n.parent_id = $1 AND n.name > $2 COLLATE "C" ORDER BY n.name LIMIT $3'
+    )
+    # EXPLAIN takes no parameters, so the id goes in as a literal.
+    explain = sql.SQL("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) EXECUTE page({}, 'f02000', 10)")
+    cur = await conn.execute(explain.format(sql.Literal(directory)))
+    plan = "\n".join(line for (line,) in await cur.fetchall())
+    assert "Sort" not in plan and "Bitmap" not in plan, plan
+    assert "rows=10" in plan and "Rows Removed" not in plan, plan
+    cur = await conn.execute("SELECT name FROM vfs_readdir(%s, 'f02000', 2)", (directory,))
+    assert [name for (name,) in await cur.fetchall()] == ["f02001", "f02002"]
+
+
+@pytest.mark.parametrize("root", [False, True])
+async def test_vfs_readdir_reads_only_its_page(conn: AsyncConnection, root: bool) -> None:
+    """The function itself, under a generic plan, in a directory and in the root: the rows it reads from
+    vfs_nodes are its page's (and the directory's own row), not the directory's 3,000 entries."""
+    directory = None if root else await create(conn, None, "d", "dir")
+    await conn.execute(
+        "INSERT INTO vfs_nodes (parent_id, name, kind) SELECT %s, 'f' || lpad(i::text, 5, '0'), 'file'"
+        " FROM generate_series(1, 3000) i",
+        (directory,),
+    )
+    # The listed directory is a small part of the tree, as in a real one (were it the whole table, reading the
+    # table in full would be the right plan).
+    other = await create(conn, None, "other", "dir")
+    await conn.execute(
+        "INSERT INTO vfs_nodes (parent_id, name, kind) SELECT %s, 'g' || i, 'file' FROM generate_series(1, 30000) i",
+        (other,),
+    )
+    await conn.execute("ANALYZE vfs_nodes")
+    await conn.execute("SET plan_cache_mode = force_generic_plan")
+    counters = (
+        "SELECT coalesce(seq_tup_read, 0), coalesce(idx_tup_fetch, 0) FROM pg_stat_xact_user_tables"
+        " WHERE relname = 'vfs_nodes' AND schemaname = current_schema()"
+    )
+    async with conn.transaction():
+        before: tuple[int, int] | None = await (await conn.execute(counters)).fetchone()
+        cur = await conn.execute("SELECT name FROM vfs_readdir(%s, 'f02000', 10)", (directory,))
+        assert [name for (name,) in await cur.fetchall()] == [f"f{i:05}" for i in range(2001, 2011)]
+        after: tuple[int, int] | None = await (await conn.execute(counters)).fetchone()
+    assert before is not None and after is not None
+    scanned, fetched = after[0] - before[0], after[1] - before[1]
+    assert scanned == 0 and 10 <= fetched <= 12, (scanned, fetched)
 
 
 # vfs_create

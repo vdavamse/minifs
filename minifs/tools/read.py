@@ -17,7 +17,7 @@ from pydantic_ai.messages import BinaryContent, ToolReturn, ToolReturnPart
 from minifs.tools.base import vfs_tool
 from minifs.tools.deps import HasVFS, ReadSettings, resolve, settings, workdir
 from minifs.tools.errors import tool_error
-from minifs.vfs.core import Entry, LineReadResult, VFSError, basename, join, split
+from minifs.vfs.core import Entry, LineReadResult, ReadResult, VFSError, basename, join, split
 
 DESCRIPTION = """Read a file or directory from the filesystem. If the path does not exist, an error is returned.
 
@@ -95,7 +95,7 @@ async def read(
                 instructions = looked_up[0]
             if isinstance(sample, VFSError):
                 if sample.errno == "EISDIR" and sample.path == path:
-                    return _directory(path, await vfs.readdir(path), start, count)
+                    return await _directory(ctx, path, start, count, config)
                 if sample.errno in ("ENOENT", "ENOTDIR"):
                     raise ModelRetry(await _not_found(ctx, path))
                 raise sample
@@ -175,31 +175,77 @@ async def _not_found(ctx: RunContext[HasVFS], path: str) -> str:
     segments = split(path)
     parent = join(*segments[:-1])
     base = basename(path).lower()
-    try:
-        listing = await ctx.deps.vfs.readdir(parent, count_denials=False) if segments else []
-        entries = sorted(e.name for e in listing)
-    except VFSError:
-        entries = []
+    cap = settings(ctx).read.max_entries
+    entries: list[str] = []
+    if segments:
+        try:
+            # A parent over the cap gets no suggestions: its listing isn't fetched whole (``_directory``).
+            listing = await ctx.deps.vfs.readdir(parent, limit=cap + 1, count_denials=False)
+            if len(listing) <= cap:
+                entries = sorted(e.name for e in listing)
+        except VFSError:
+            pass
     similar = [join(*segments[:-1], e) for e in entries if base in e.lower() or e.lower() in base][:3]
     if similar:
         return f"File not found: {path}\n\nDid you mean one of these?\n" + "\n".join(similar)
     return f"File not found: {path}"
 
 
-def _directory(path: str, entries: list[Entry], offset: int, limit: int) -> str:
-    names = sorted((f"{e.name}/" if e.is_dir else e.name for e in entries), key=lambda n: (n.lower(), n.swapcase()))
+async def _directory(ctx: RunContext[HasVFS], path: str, offset: int, limit: int, config: ReadSettings) -> str:
+    """ladderframe's listing: every entry, sorted case-insensitively with ``/`` after subdirectories, paged in
+    Python, for a directory of up to ``config.max_entries`` readable entries. A larger directory isn't fetched
+    whole: its page is in byte order of name, the order the server pages in, at most ``max_entries`` long; the
+    footer says so, and every entry stays reachable by ``offset``."""
+    cap = config.max_entries
+    first = await ctx.deps.vfs.readdir(path, limit=cap + 1)
     start = offset - 1
-    shown = names[start : start + limit]
-    truncated = start + len(shown) < len(names)
-    footer = (
-        f"\n(Showing {len(shown)} of {len(names)} entries. "
-        f"Use 'offset' parameter to read beyond entry {offset + len(shown)})"
-        if truncated
-        else f"\n({len(names)} entries)"
-    )
+    if len(first) <= cap:
+        names = sorted((_listed(e) for e in first), key=lambda n: (n.lower(), n.swapcase()))
+        shown = names[start : start + limit]
+        truncated = start + len(shown) < len(names)
+        footer = (
+            f"\n(Showing {len(shown)} of {len(names)} entries. "
+            f"Use 'offset' parameter to read beyond entry {offset + len(shown)})"
+            if truncated
+            else f"\n({len(names)} entries)"
+        )
+    else:
+        page, total = await _byte_order_page(ctx, path, first, start, min(limit, cap), cap)
+        shown = [_listed(e) for e in page]
+        order = f"in byte order of name: the directory is over the {cap} entries Read sorts"
+        footer = (
+            f"\n(Showing {len(shown)} of more than {cap} entries, {order}. "
+            f"Use 'offset' parameter to read beyond entry {offset + len(shown)})"
+            if total is None
+            else f"\n(Showing {len(shown)} of {total} entries, {order})"
+        )
     return "\n".join(
         [f"<path>{path}</path>", "<type>directory</type>", "<entries>", "\n".join(shown), footer, "</entries>"]
     )
+
+
+def _listed(entry: Entry) -> str:
+    return f"{entry.name}/" if entry.is_dir else entry.name
+
+
+async def _byte_order_page(
+    ctx: RunContext[HasVFS], path: str, first: list[Entry], start: int, limit: int, batch: int
+) -> tuple[list[Entry], int | None]:
+    """Entries ``start`` to ``start + limit`` (0-based) of ``path``'s listing in byte order of name, of which
+    ``first`` is the beginning (not empty), and the directory's entry count if the page reaches its end, else None.
+    Entries past ``first`` are read ``batch`` at a time, each batch continuing after the last name of the one
+    before, and only the page is kept: a page deep in the directory costs the entries before it in transfer, not
+    in memory."""
+    end = start + limit
+    page = first[start:end]
+    seen, last = len(first), first[-1].name
+    while seen <= end:  # until the entry after the page is seen: there's more
+        entries = await ctx.deps.vfs.readdir(path, after=last, limit=min(end + 1 - seen, batch))
+        if not entries:
+            return page, seen
+        page += entries[max(start - seen, 0) : end - seen]
+        seen, last = seen + len(entries), entries[-1].name
+    return page, None
 
 
 def _sniff_mime(sample: bytes, path: str) -> str:
@@ -319,10 +365,11 @@ async def _nearby_instructions(ctx: RunContext[HasVFS], path: str) -> list[str]:
     if len(current) <= len(root) or current[: len(root)] != root:
         return []
     seen = _loaded_instructions(ctx)
+    cap = settings(ctx).read.instruction_bytes
     candidates = [
         join(*current[:end], name) for end in range(len(current), len(root), -1) for name in INSTRUCTION_FILES
     ]
-    reads = [(c, 0, 0 if c == path or c in seen else _MAX_LINES) for c in candidates]
+    reads = [(c, 0, 0 if c == path or c in seen else cap) for c in candidates]
     try:
         # One group per directory: a CLAUDE.md behind an AGENTS.md file is looked up, not read.
         groups = [i // len(INSTRUCTION_FILES) for i in range(len(reads))]
@@ -337,11 +384,35 @@ async def _nearby_instructions(ctx: RunContext[HasVFS], path: str) -> list[str]:
                 if result.errno in _ABSENT:
                     continue
                 break  # any other outcome: skip the directory, as for EIO
-            text = result.content.decode("utf-8", errors="replace").strip()
+            text = _instruction_text(result, cap)
             if limit and text:
                 texts.append(f"Instructions from: {candidate}\n{text}")
             break
     return texts
+
+
+def _instruction_text(result: ReadResult, cap: int) -> str:
+    """The text of an instruction file read with ``cap`` bytes: whole when the read reached its end, else the first
+    ``cap`` bytes cut back to a character boundary, with a note saying how much there is ("" when that leaves no
+    text: a note alone isn't worth attaching)."""
+    if result.eof:
+        return result.content.decode("utf-8", errors="replace").strip()
+    text = _whole_characters(result.content).decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    return f"{text}\n\n(Instructions truncated at {cap} bytes of {result.size})"
+
+
+def _whole_characters(data: bytes) -> bytes:
+    """``data`` without a multi-byte UTF-8 sequence cut off at its end, which would decode as replacement
+    characters. Only a lead byte in the last three positions can start a sequence that doesn't fit."""
+    for back in range(1, min(3, len(data)) + 1):
+        byte = data[-back]
+        if byte & 0xC0 != 0x80:  # not a continuation byte: ASCII, a lead byte, or an invalid byte
+            if 0xC0 <= byte < 0xF8 and (2 if byte < 0xE0 else 3 if byte < 0xF0 else 4) > back:
+                return data[:-back]
+            return data
+    return data
 
 
 _ABSENT = frozenset({"ENOENT", "ENOTDIR", "EISDIR", "EACCES"})

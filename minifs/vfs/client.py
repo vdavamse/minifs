@@ -196,16 +196,23 @@ class VFSClient:
         self._checked(ref, node)
         return Entry(join(*segments), node, kind, size, mtime, generation)
 
-    async def readdir(self, path: str) -> list[Entry]:
-        """The entries of directory ``path``, in byte order of name. ENOENT, ENOTDIR."""
+    async def readdir(self, path: str, *, after: str | None = None, limit: int | None = None) -> list[Entry]:
+        """The entries of directory ``path``, in byte order of name: those whose name sorts after ``after`` (None:
+        from the first), at most ``limit`` of them (None: all). To page a large directory, pass the last name of
+        one page as the next one's ``after``: a page costs its own rows, and pages neither skip nor repeat an
+        entry when the directory changes between them. ENOENT, ENOTDIR; EINVAL for a negative limit."""
         segments = split(path)
+        if limit is not None and not 0 <= limit <= _MAX_INT:
+            raise VFSError("EINVAL", join(*segments), f"invalid limit {limit}")
+        if after is not None and "\0" in after:
+            raise VFSError("EINVAL", join(*segments), "invalid name to continue after")
         ref = self._dir_ref(segments)
-        rows = await self._call(path, [ref], "vfs_readdir({0})", [])
+        rows = await self._call(path, [ref], "vfs_readdir({0}, %s::text, %s::int)", [after, limit])
         parent = rows[0][0]
         self._checked(ref, parent)
         entries: list[Entry] = []
         for node, name, kind, size, mtime in (row[3:8] for row in rows):
-            if name is None:  # an empty directory
+            if name is None:  # an empty page
                 continue
             if self.cache is not None:
                 self.cache.store(parent, name, node, kind)

@@ -158,6 +158,52 @@ async def test_virtual_directories(vfs: VFSClient, policy: Policy) -> None:
     assert await nested.mkdir_p("/a") is None
 
 
+async def test_readdir_pages_are_slices_of_the_readable_listing(vfs: VFSClient) -> None:
+    """``limit`` counts readable entries and ``after`` is a name, so a page says nothing about the entries the
+    policy hides: the view reads on past them. A virtual directory pages its mount points the same way."""
+    for name in ("a", "b", "c", "d", "e"):
+        await vfs.create(f"/workspaces/{W1}/many/{name}", b"", parents=True)
+    hidden = Policy({"agent": [Rule("/workspace/many/b"), Rule("/workspace/many/c"), Rule("/**", "read", "write")]})
+    agent = view(vfs, hidden)
+
+    async def names(after: str | None = None, limit: int | None = None) -> list[str]:
+        return [e.name for e in await agent.readdir("/workspace/many", after=after, limit=limit)]
+
+    assert await names() == ["a", "d", "e"]
+    assert await names(limit=2) == ["a", "d"]  # not ["a"]: b and c don't use up the limit
+    assert await names("a", 1) == ["d"]  # not []: nothing tells that b follows a
+    assert await names("b", 5) == ["d", "e"]
+    assert await names("e") == [] and await names(limit=0) == []
+    assert [e.path for e in await agent.readdir("/", limit=1)] == ["/docs"]
+    assert [e.path for e in await agent.readdir("/", after="docs")] == ["/workspace"]
+    assert await agent.readdir("/", after="workspace", limit=3) == []
+    await raises("EINVAL", agent.readdir("/", limit=-1), "/")
+    await raises("EINVAL", agent.readdir("/workspace", limit=-1), "/workspace")
+
+
+async def test_a_readdir_page_reads_past_a_long_hidden_run(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The view asks for a batch at a time until it has ``limit`` readable entries or the listing ends."""
+    monkeypatch.setattr("minifs.vfs.view._READDIR_BATCH", 2)
+    for i in range(7):
+        await vfs.create(f"/workspaces/{W1}/run/h{i}", b"", parents=True)
+    await vfs.create(f"/workspaces/{W1}/run/z", b"")
+    agent = view(vfs, Policy({"agent": [Rule("/workspace/run/h*"), Rule("/**", "read", "write")]}))
+    asked: list[int | None] = []
+    readdir = VFSClient.readdir
+
+    async def spy(self: VFSClient, path: str, *, after: str | None = None, limit: int | None = None) -> list[Entry]:
+        asked.append(limit)
+        return await readdir(self, path, after=after, limit=limit)
+
+    monkeypatch.setattr(VFSClient, "readdir", spy)
+    assert [e.name for e in await agent.readdir("/workspace/run", limit=1)] == ["z"]
+    assert asked == [2, 4, 8]  # the batch doubles: 2 + 4 hidden entries, then the last hidden one and z
+    monkeypatch.setattr("minifs.vfs.view._READDIR_MAX_BATCH", 2)
+    asked.clear()
+    assert [e.name for e in await agent.readdir("/workspace/run", limit=3)] == ["z"]
+    assert asked == [3, 3, 3]  # never below what is still wanted, and no larger than the cap otherwise
+
+
 async def test_a_missing_mount_root(vfs: VFSClient, policy: Policy) -> None:
     fresh = VFSView(vfs, workspace_mounts("33333333-3333-3333-3333-333333333333"), policy, "agent")
     assert [e.path for e in await fresh.readdir("/")] == ["/docs"]
