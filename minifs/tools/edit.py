@@ -124,7 +124,7 @@ async def _edit(
 ) -> tuple[str, str]:
     """Edits ``path``: ``(its old text, the new text)``, without BOMs. ``_Lost`` where another writer got in
     between: a create beaten to the file, a file changed, removed or replaced by a directory after its stat."""
-    if not vfs.policy.allows(vfs.actor, "read", path):
+    if not vfs.allows("read", path):
         # As in ``Write``: ladderframe checks its one permission first, here the write. Allowed to write but not
         # read, an empty ``oldString`` may still create the file; anything else needs the old text.
         vfs.policy.check(vfs.actor, "write", path)

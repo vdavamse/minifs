@@ -9,13 +9,16 @@ points (``/`` for the mounts above) are virtual: they list the mount points belo
 moved or removed. There are no symlinks in the tree (``vfs_nodes.kind`` is ``file`` or ``dir``), so a mapped path
 never leads elsewhere.
 
-Every operation checks the ``Policy`` for the view's actor on the visible path before it runs (EACCES, counted
-in ``policy.denials`` unless a read passes ``count_denials=False``), then runs as the ``VFSClient`` operation on
-the real path. The check needs no transaction of its own: it depends on the path alone, and the operation
-resolves that same path in its one statement. Results and errors come back in visible paths: a ``VFSError``
-keeps its errno and message, gets the visible path, and drops ``detail`` and ``db_error``, which name real paths
-and node ids. Entries the actor may not read are left out of listings, glob results and the files a grep
-searches.
+Every operation checks the ``Policy`` for the view's actor on the visible path before it runs (EACCES, counted in
+``policy.denials`` unless a read passes ``count_denials=False``), then runs as the ``VFSClient`` operation on the
+real path. The check needs no transaction of its own: it depends on the path alone, and the operation resolves that
+same path in its one statement. Results and errors come back in visible paths: a ``VFSError`` keeps its errno and
+message, gets the visible path, and drops ``detail`` and ``db_error``, which name real paths and node ids. Entries
+the actor may not read are left out of listings, glob results and the files a grep searches. A virtual directory is
+decided by a rule that matches it, like any path; one no rule matches may be read where the actor may read something
+in a mount below it (``Policy.allows_any`` on the mount point, which errs toward allowing) or where the policy has
+``read_unmatched``, and is refused (and counted) otherwise. Its listing shows a virtual directory below it on the
+same terms and a mount point where the mount point itself may be read.
 
 What each operation needs:
 
@@ -69,7 +72,7 @@ from minifs.vfs.core import (
     split,
     split_trusted,
 )
-from minifs.vfs.policy import Action, Policy
+from minifs.vfs.policy import Action, Policy, PolicyDenied
 from minifs.vfs.view_watch import ViewWatch
 from minifs.vfs.watch import Watcher
 
@@ -222,7 +225,7 @@ class VFSView:
         if target.real is None:
             # Python orders str by code point, which is UTF-8 byte order.
             virtual = [e for e in await self._virtual_entries(target.path) if after is None or e.name > after]
-            return self._readable(virtual)[:limit]
+            return [_reported(e) for e in virtual if self._listable(e)][:limit]
         entries: list[Entry] = []
         batch = 0  # the first round asks for just what is wanted
         while True:
@@ -358,6 +361,25 @@ class VFSView:
         """The ``entries`` the actor may read, as reported: a name from before migration 016 is matched by the
         policy as stored, then spelled without its control characters (``_reported``)."""
         return [_reported(e) for e in entries if self.policy.allows(self.actor, "read", e.path)]
+
+    def _virtual_readable(self, path: tuple[str, ...]) -> bool:
+        """Whether the actor may read virtual directory ``path``. A rule that matches it decides, as for any path;
+        with none, where it may read something in a mount below it (``allows_any`` on the mount point, as a glob or
+        grep from ``path`` picks the mounts it searches), or where the policy has ``read_unmatched``."""
+        visible = join(*path)
+        if self.policy.matches(self.actor, visible):
+            return self.policy.allows(self.actor, "read", visible)
+        return self.policy.read_unmatched or any(
+            mount.visible[: len(path)] == path and self.policy.allows_any(self.actor, "read", join(*mount.visible))
+            for mount in self._mounts
+        )
+
+    def _listable(self, entry: Entry) -> bool:
+        """Whether a virtual directory's listing shows ``entry``: a virtual directory below it (id None) on the terms
+        ``_target`` reads one (``_virtual_readable``), and a mount point where the mount point itself may be read."""
+        if entry.id is None:
+            return self._virtual_readable(split_trusted(entry.path))
+        return self.policy.allows(self.actor, "read", entry.path)
 
     async def _glob(
         self,
@@ -616,11 +638,24 @@ class VFSView:
         target = self._movable(path)
         await self._mapped(self._client.unlink(_real(target)), target)
 
+    def allows(self, action: Action, path: str) -> bool:
+        """Whether the actor may ``action`` at ``path``, by the policy check the view's operations make first (a virtual
+        directory may be read where something in a mount below it may, as in ``_target``). Raises the mapping errors the
+        operations would: ENOENT outside every mount, EINVAL for a bad path. Exact for ``read``; for another action the
+        operation may still refuse on its own (a mount point can't be removed, say). A refusal isn't counted in
+        ``policy.denials``: for a tool deciding which check to make first."""
+        try:
+            self._target(path, action, count_denials=False)
+        except PolicyDenied:
+            return False
+        return True
+
     # Mapping
 
     def _target(self, path: str, action: Action | None = None, *, count_denials: bool = True) -> _Target:
-        """``path`` mapped to the real tree, after checking ``action`` on it (``Policy.check``). ENOENT outside
-        every mount."""
+        """``path`` mapped to the real tree, after checking ``action`` on it (``Policy.check``), except a read of a
+        virtual directory, which ``_virtual_readable`` decides (refused through ``Policy.check``, so counted). ENOENT
+        outside every mount."""
         segments = split(path)
         target: _Target | None = None
         for mount in self._mounts:
@@ -631,7 +666,11 @@ class VFSView:
         if target is None:
             raise VFSError("ENOENT", join(*segments))
         if action is not None:
-            self.policy.check(self.actor, action, target.visible, count_denials=count_denials)
+            # A virtual directory (the root, or one above a mount point) shows only the mount points below it, each
+            # filtered by the policy: it may be read where something in a mount below it may be. No rule names it.
+            virtual_read = target.real is None and action == "read"
+            if not (virtual_read and self._virtual_readable(target.path)):
+                self.policy.check(self.actor, action, target.visible, count_denials=count_denials)
         return target
 
     def _creatable(self, path: str, parents: bool) -> _Target:
@@ -748,8 +787,11 @@ class VFSView:
                 continue
             name = mount.visible[len(path)]
             if len(mount.visible) > len(path) + 1:
+                # id None: a virtual directory, which _listable tells from a mount point by it
                 children.setdefault(name, Entry(join(*path, name), None, "dir", 0, None))
                 continue
+            if not self.policy.allows(self.actor, "read", join(*mount.visible)):
+                continue  # a mount point the actor may not read isn't listed: no need to stat it
             target = _Target(mount.visible, mount)
             try:
                 entry = await self._mapped(self._client.stat(_real(target)), target)

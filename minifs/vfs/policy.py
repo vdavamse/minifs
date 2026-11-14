@@ -3,8 +3,9 @@
 Each actor has an ordered list of path rules, like mount options; the first rule whose pattern matches a path
 decides, so specific rules go before general ones. A rule grants any of ``read``, ``write`` and ``append``, and
 ``write`` implies ``append`` (replacing a file is the stronger right). A rule granting nothing denies everything.
-A path no rule matches may be read but not written. Rules match the paths of the agent's view (the chroot,
-``minifs.vfs.view``), normalised, so ``/workspace/../docs/a.md`` meets the ``/docs/**`` rule.
+A path no rule matches is refused, unless the policy is built with ``read_unmatched=True``, which lets it be read
+(not written). Rules match the paths of the agent's view (the chroot, ``minifs.vfs.view``), normalised, so
+``/workspace/../docs/a.md`` meets the ``/docs/**`` rule.
 
 Patterns are absolute paths whose segments may use ``*``, ``?`` and ``[...]`` (``[!...]`` negates) within one
 segment (``fnmatch``), and ``**`` as a whole segment for zero or more segments: ``/workspace/**`` matches
@@ -84,19 +85,32 @@ class Policy:
     the caller asked for (``check``), for the write-policy denials metric: one per refused tool call or view
     operation.
 
-    Lookups a caller makes on its own account, where a refusal only means "skip it", pass
-    ``count_denials=False`` and aren't counted (logged at DEBUG instead): Read's instruction files, its
-    suggestions for a missing path, and its page read alongside the sample that decides. Nor are entries a view
-    leaves out of a listing, which aren't refusals. The counter belongs to the policy object, so
-    ``DEFAULT_POLICY``'s is process-wide: build a ``Policy`` of its ``rules`` for a counter of your own."""
+    Lookups a caller makes on its own account, where a refusal only means "skip it", pass ``count_denials=False``
+    and aren't counted (logged at DEBUG instead): Read's instruction files, its suggestions for a missing path, and
+    its page read alongside the sample that decides. Nor are entries a view leaves out of a listing, which aren't
+    refusals. The counter belongs to the policy object, so ``DEFAULT_POLICY``'s is process-wide: build
+    ``Policy(p.rules, read_unmatched=p.read_unmatched)`` for a counter of your own (``Policy(p.rules)`` alone would
+    drop ``read_unmatched``).
 
-    def __init__(self, rules: Mapping[str, Sequence[Rule]]) -> None:
+    ``read_unmatched=True`` lets a path no rule matches be read, as before 0.1.0: a mount the rules don't cover is then
+    readable by every actor of the policy. Without it, a real directory, the mount point included, is readable only
+    where a rule matches it: ``/workspace/**`` matches ``/workspace`` itself, while ``/workspace/src/**`` alone leaves
+    ``/workspace`` unreadable."""
+
+    def __init__(self, rules: Mapping[str, Sequence[Rule]], *, read_unmatched: bool = False) -> None:
         self.rules: dict[str, tuple[Rule, ...]] = {actor: tuple(r) for actor, r in rules.items()}
         self.denials: Counter[tuple[str, Action]] = Counter()
+        self.read_unmatched = read_unmatched
 
     @property
     def actors(self) -> Iterable[str]:
         return self.rules.keys()
+
+    def matches(self, actor: str, path: str) -> bool:
+        """Whether some rule of ``actor`` matches ``path`` itself, so that the first such rule decides it. KeyError
+        for an actor without rules; ``path`` as ``allows`` takes it."""
+        segments = split_trusted(path)
+        return any(_match(rule.segments, segments) for rule in self.rules[actor])
 
     def allows(self, actor: str, action: Action, path: str, *, subtree: bool = False) -> bool:
         """Whether ``actor`` may ``action`` at ``path`` and, with ``subtree``, at every path below it too (what
@@ -115,7 +129,7 @@ class Policy:
                     return False
                 if any(rest and _only_globstars(rest) for rest in rests):  # ends in **: covers the subtree
                     return True
-        return action == "read"
+        return action == "read" and self.read_unmatched
 
     def allows_any(self, actor: str, action: Action, path: str) -> bool:
         """Whether ``actor`` may ``action`` at ``path`` or at some path below it. Conservative the other way: True
@@ -129,7 +143,7 @@ class Policy:
                 return True
             if any(rest and _only_globstars(rest) for rest in rests):
                 return False
-        return action == "read"
+        return action == "read" and self.read_unmatched
 
     def check(
         self, actor: str, action: Action, path: str, *, subtree: bool = False, count_denials: bool = True
