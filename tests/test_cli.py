@@ -287,18 +287,26 @@ def test_errors_that_quote_the_password_are_masked(
 
 
 # URIs libpq misreads: it ends the userinfo at the first @ before the first /, so an unescaped @ or / in the
-# password leaves part of it in a field (host, port, dbname) error messages quote without masking.
+# password leaves part of it in a field (host, port, host list, dbname) error messages quote without masking.
 _MISREAD_URIS = (
     "postgresql://u:PH@ss7f3a@127.0.0.1:1/x",
     "postgresql://u:PH/ss7f3a@127.0.0.1:1/x",
     "postgres://u:PH@ss7f3a@127.0.0.1:1/x",
     "postgres://u:PH/ss7f3a@127.0.0.1:1/x",
+    "postgresql://u:PH-1@127.0.0.1:7f3a@h/x",  # the rest lands in the port
+    "postgresql://u:PH-1@ss:7f3a@127.0.0.1/x",  # in the host and port
+    "postgresql://u:PH-1@127.0.0.1,7f3a:5@h/x",  # in the host list
+    "postgresql://u:PH-1@localhost/7f3a@h/x",  # in the database name
+    "postgresql://u:P?7f3a@b:c@h/x",  # libpq doesn't end the userinfo at ?
+    "postgresql://127.0.0.1:1/db@7f3a",  # a database name with @: refused, %40 writes it
 )
 # The same passwords written so libpq reads them right: these must reach the connection, not the refusal.
 _MISREAD_SAFE_URIS = (
     "postgresql://u:PH%40ss7f3a@127.0.0.1:1/x",
     "postgresql://u:PH?ss7f3a@127.0.0.1:1/x",
     "postgresql://127.0.0.1:1/db?user=me@corp",
+    "postgresql://u:PH-7f3a@127.0.0.1:1/db?user=me@corp",
+    "postgresql://127.0.0.1:1/db%407f3a",
 )
 
 
@@ -308,7 +316,7 @@ def test_misread_uri_is_refused(monkeypatch: pytest.MonkeyPatch, capsysbinary: C
     assert main(["ls", "--dsn", dsn]) == 1
     err = capsysbinary.readouterr().err.decode()
     assert "write @ as %40" in err
-    assert "ss7f3a" not in err
+    assert "7f3a" not in err
 
 
 @pytest.mark.parametrize("dsn", _MISREAD_SAFE_URIS)
@@ -325,11 +333,11 @@ def test_misread_uri_counter_cases_reach_the_connection(
 def test_misread_uri() -> None:
     misread = cli._misread_uri  # pyright: ignore[reportPrivateUsage]
     for dsn in _MISREAD_URIS:
-        assert misread(dsn, conninfo_to_dict(dsn))
+        assert misread(dsn)
     for dsn in _MISREAD_SAFE_URIS:
-        assert not misread(dsn, conninfo_to_dict(dsn))
+        assert not misread(dsn)
     keyword = "host=127.0.0.1 port=1 password=PH-7f3a"
-    assert not misread(keyword, conninfo_to_dict(keyword))  # not a URI: nothing libpq could misread
+    assert not misread(keyword)  # not a URI: nothing libpq could misread
 
 
 @pytest.mark.parametrize("password", ["a", "1", "%25"])
@@ -415,3 +423,11 @@ def test_mask() -> None:
 
     # A secret shorter than _MIN_MASKED characters is left alone (see test_short_password_hides_the_error).
     assert mask("failed", ["a"]) == "failed"
+
+
+def test_unreadable_dsn_file_is_not_named(capsysbinary: Capture) -> None:
+    """A connection string given to --dsn-file by mistake isn't echoed back in the "no such file" error."""
+    assert main(["ls", "--dsn-file", "host=h password=PH-7f3a"]) == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert "can't read --dsn-file: No such file or directory" in err
+    assert "PH-7f3a" not in err

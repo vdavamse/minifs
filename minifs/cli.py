@@ -9,7 +9,7 @@ import getpass
 import os
 import re
 import sys
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import quote, unquote
@@ -186,14 +186,18 @@ def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
             dsn = args.dsn_file.read_bytes().decode("utf-8-sig").strip()
         except UnicodeDecodeError:
             raise _Refused(f"{_INVALID}: --dsn-file is not UTF-8 text") from None
+        except OSError as e:  # not its text: the name, which may be a mistyped connection string
+            raise _Refused(f"can't read --dsn-file: {e.strerror or type(e).__name__}") from None
     else:
         dsn = os.environ.get("MINIFS_DSN", "")
     try:
         params = conninfo_to_dict(dsn)
     except (psycopg.Error, UnicodeError):  # UnicodeError: undecodable argv bytes, kept as surrogates
         raise _Refused(_INVALID) from None
-    if _misread_uri(dsn, params):
-        raise _Refused(f"{_INVALID}: in a postgresql:// URI, write @ as %40 and / as %2F in the user and password")
+    if _misread_uri(dsn):
+        raise _Refused(
+            f"{_INVALID}: in a postgresql:// URI, write @ as %40 and / as %2F in the user, password and database name"
+        )
     password = params.get("password")
     secrets = _forms(str(password), dsn) if password else []
     if password and args.dsn is not None:
@@ -212,19 +216,20 @@ def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
     return dsn, secrets
 
 
-def _misread_uri(dsn: str, params: Mapping[str, object]) -> bool:
-    """Whether libpq split a URI's unescaped ``@`` or ``/`` elsewhere than its writer meant, so that part of the
-    password lands in a field an error message quotes (``failed to resolve host "rest-of-password@host"``)
-    without being parsed as the password, hence unmasked. libpq ends the userinfo at the first ``@`` before the
-    first ``/``: a second ``@`` ends up in the host; a ``/`` before the ``@`` leaves no userinfo, the user and the
-    start of the password become host and port, and the ``@`` lands in the database name."""
+def _misread_uri(dsn: str) -> bool:
+    """Whether a URI holds an unescaped ``@`` that libpq doesn't read as the end of the userinfo, so that part of
+    a password may land in a field an error message quotes (``invalid integer value "rest-of-password@host" for
+    connection option "port"``) without being parsed as the password, hence unmasked. libpq ends the userinfo
+    at the first ``@`` before the first ``/``; past it, an ``@`` before the query string can only be a misread
+    password (a second ``@`` lands in the host, port or host list; a ``/`` in the password leaves no userinfo
+    and puts the ``@`` in the database name), or an ``@`` in a database name, which ``%40`` writes as well."""
     scheme = next((s for s in _URI_SCHEMES if dsn.startswith(s)), None)
     if scheme is None:
         return False
-    if "@" in str(params.get("host", "")):
-        return True
-    authority, _, path = dsn[len(scheme) :].partition("?")[0].partition("/")
-    return "@" not in authority and "@" in path
+    rest = dsn[len(scheme) :]
+    if "@" in rest.partition("/")[0]:
+        rest = rest.partition("@")[2]
+    return "@" in rest.partition("?")[0]
 
 
 def _ask_password() -> str:
