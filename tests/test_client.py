@@ -5,7 +5,7 @@ import asyncio
 import contextlib
 import json
 import pickle
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -257,7 +257,9 @@ async def test_pread_page_is_one_statement(vfs: VFSClient, monkeypatch: pytest.M
 async def test_pread_page_plan_stays_cheap(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """The plan's estimate stays under ``jit_above_cost``: with OFFSET 0 the planner put ``vfs_pread_lines`` (no
     ROWS) at 1000 rows, and every Read JIT-compiled. LIMIT 1 keeps the one-time filter, so the function still
-    runs once per statement, not once per extent row of the file."""
+    runs once per statement, not once per extent row of the file. The cost grows by about 350 per instruction
+    candidate (``vfs_pread``'s own 1000-row estimate), so it passes ``jit_above_cost`` only at about 140
+    directories deep."""
     await vfs.create("/a/b/f", b"one\ntwo\n", parents=True)
     for i in range(8):
         await vfs.append("/a/b/f", b"line %d\n" % i)  # several extents: read 1 has several rows
@@ -306,6 +308,50 @@ async def test_pread_page_plan_stays_cheap(vfs: VFSClient, monkeypatch: pytest.M
             row = await cur.fetchone()
         assert row is not None, "vfs_pread_lines was not tracked: SET track_functions must have been refused"
         assert row[0] == 1, f"vfs_pread_lines ran {row[0]} times, not once"
+
+
+async def test_pread_page_sorts_the_page_once(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The page rides the window's sort once, not once per extent row of the file: ``l`` is attached after the
+    window that numbers read 1's rows, so a file built by many small appends doesn't spill the ~208 KB page to
+    temp-disk sort once per extent. Under ``work_mem = '4MB'`` the old plan (``l`` below the window) spilled."""
+    f = await vfs.create("/a/f", b"", parents=True)
+    for i in range(400):
+        await vfs.append("/a/f", b"line %04d\n" % i)  # an extent per append: 400 of them in the 4 KB sample
+    await vfs.append("/a/f", b"".join(b"x" * 99 + b"\n" for _ in range(2000)))  # and a 200 KB tail
+    async with vfs.pool.connection() as conn:
+        cur = await conn.execute("SELECT count(*) FROM vfs_extents WHERE node_id = %s AND byte_offset < 4096", [f.id])
+        row = await cur.fetchone()
+    assert row is not None and row[0] > 300, row  # the layout the test needs: appends don't coalesce
+    calls: list[tuple[str, Any]] = []
+    execute = AsyncConnection.execute
+
+    async def capturing(self: AsyncConnection[Any], query: Any, params: Any = None, *args: Any, **kwargs: Any) -> Any:
+        if "vfs_pread_lines" in str(query):
+            calls.append((str(query), params))
+        return await execute(self, query, params, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", capturing)
+    page = await vfs.pread_page("/a/f", 4096, 1, 2400, 400000)
+    monkeypatch.undo()
+    assert page.lines.lines == 2400 and len(page.lines.content) == page.lines.size  # the whole file came back
+    assert len(calls) == 1, calls
+    query, params = calls[0]
+
+    def walk(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        yield node
+        for child in node.get("Plans", []):
+            yield from walk(child)
+
+    async with vfs.pool.connection() as conn, conn.transaction():
+        await conn.execute("SET LOCAL work_mem = '4MB'")
+        cur = await conn.execute(cast(Any, "EXPLAIN (ANALYZE, FORMAT JSON) " + query), params)
+        row = await cur.fetchone()
+        assert row is not None
+        plan = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        for node in walk(plan[0]["Plan"]):
+            assert node.get("Sort Space Type") != "Disk", (
+                f"{node.get('Node Type')} spilled {node.get('Sort Space Used')} kB of sort to temp disk"
+            )
 
 
 async def test_pread_page_group_ids_never_reach_the_files_group(vfs: VFSClient) -> None:

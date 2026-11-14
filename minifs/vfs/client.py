@@ -94,33 +94,48 @@ _NULL = (
 )
 # The parent of a create with parents, and mkdir_p: the directories vfs_mkdir_p found or made, every one in chain.
 _MKDIR_P = "(SELECT id, 'dir'::text AS kind, chain, err, err_detail FROM vfs_mkdir_p(%s))"
-# pread_page's lines join: the vfs_pread_lines of read 1 (its file), placed before the p join and, like it, a
-# one-time filter, so the function runs at most once. LIMIT 1 (the function returns exactly one row, so the row
-# count doesn't change) keeps the subquery from being flattened, as OFFSET 0 does, and caps the planner's
-# estimate, which for a function without ROWS is 1000 rows: without it the statement's estimated cost passes
-# ``jit_above_cost``, and every Read would JIT-compile. Its 4 parameters come after the 4 unnest arrays, which is
-# their order in the SQL text.
-_LINES_JOIN = (
-    " LEFT JOIN LATERAL (SELECT * FROM vfs_pread_lines(vfs_gate(w.id, w.err), %s::bigint, %s::int, %s::int, %s::int)"
-    "                    WHERE w.err IS NULL AND w.i = 1 LIMIT 1) l ON true"
-)
-# l's columns, appended to the SELECT list and sent only on read 1's first row (as the walk column is): the file's
-# extents give it as many rows as p has, and l is the same one row of them all.
+# pread_many's columns, one row per extent read (a read without extents has one row of NULL p columns): the read,
+# its lookup's outcome, the extent, and, on a read's first row only, its walk (chain, kind).
 _FIRST_OF_READ = "row_number() OVER (PARTITION BY w.i ORDER BY p.byte_offset) = 1"
-_LINES_COLUMNS = "".join(
-    f", CASE WHEN {_FIRST_OF_READ} THEN l.{name} END"
-    for name in (
-        "size",
-        "generation",
-        "lines",
-        "first_line",
-        "byte_offset",
-        "data",
-        "next_offset",
-        "cut",
-        "err",
-        "err_detail",
-    )
+_READ_COLUMNS = (
+    "w.i",
+    "w.id",
+    "w.err",
+    "w.err_detail",
+    "p.size",
+    "p.generation",
+    "p.byte_offset",
+    "p.data",
+    "p.err",
+    "p.err_detail",
+    f"CASE WHEN {_FIRST_OF_READ} THEN w.chain END",
+    "w.kind",
+)
+# vfs_pread_lines' columns (migration 012), appended to pread_page's rows after _READ_COLUMNS.
+_LINES_NAMES = (
+    "size",
+    "generation",
+    "lines",
+    "first_line",
+    "byte_offset",
+    "data",
+    "next_offset",
+    "cut",
+    "err",
+    "err_detail",
+)
+_LINES = slice(len(_READ_COLUMNS), len(_READ_COLUMNS) + len(_LINES_NAMES))
+# pread_page's lines join: the vfs_pread_lines of read 1 (its file), joined to pread_many's rows r after the window
+# that numbers each read's rows, and only to read 1's first row: joined below the window, the page (up to a few
+# hundred KB) would go through the window's sort once per extent row, and a file of many small appends spilled
+# tens of MB to disk per Read. The quals name only r's columns, so they're a one-time filter and the function runs
+# once. LIMIT 1 (the function returns exactly one row) keeps the subquery from being flattened and caps the
+# planner's estimate, which for a function without ROWS is 1000 rows: without it the statement's estimated cost
+# passes ``jit_above_cost``, and every Read would JIT-compile. Its 4 parameters come after the 4 unnest arrays,
+# which is their order in the SQL text.
+_LINES_JOIN = (
+    " LEFT JOIN LATERAL (SELECT * FROM vfs_pread_lines(vfs_gate(r.c1, r.c2), %s::bigint, %s::int, %s::int, %s::int)"
+    "                    WHERE r.c2 IS NULL AND r.c0 = 1 AND r.first LIMIT 1) l ON true"
 )
 
 
@@ -433,23 +448,32 @@ class VFSClient:
         result or outcome, in order, and that row's columns (None without ``lines``). Paths are resolved on the
         server, without the cache, which then stores each walk."""
         # A path is "/" and names joined by "/", which no name contains, so the server splits it back.
-        query = (
+        reads = (
             "WITH q AS (SELECT q.i, q.off, q.lim, q.grp, l.id, l.kind, l.chain, l.err, l.err_detail"
             "             FROM unnest(%s::text[], %s::bigint[], %s::int[], %s::bigint[])"
             "                  WITH ORDINALITY AS q(path, off, lim, grp, i)"
             "            CROSS JOIN LATERAL vfs_lookup(string_to_array(substr(q.path, 2), '/')) l),"
             " w AS (SELECT q.*, coalesce(bool_or(q.kind = 'file') OVER (PARTITION BY q.grp ORDER BY q.i"
             "                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), false) AS shadowed FROM q)"
-            " SELECT w.i, w.id, w.err, w.err_detail, p.size, p.generation, p.byte_offset, p.data, p.err, p.err_detail,"
-            f"        CASE WHEN {_FIRST_OF_READ} THEN w.chain END, w.kind"
-            + (_LINES_COLUMNS if lines is not None else "")
+            " SELECT "
+            + ", ".join(f"{column} AS c{k}" for k, column in enumerate(_READ_COLUMNS))
+            + (f", {_FIRST_OF_READ} AS first" if lines is not None else "")
             + " FROM w"
-            + (_LINES_JOIN if lines is not None else "")
-            + " LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(w.id, w.err), w.off,"
+            " LEFT JOIN LATERAL (SELECT * FROM vfs_pread(vfs_gate(w.id, w.err), w.off,"
             "                                                   CASE WHEN w.shadowed THEN 0 ELSE w.lim END)"
             "                           WHERE w.err IS NULL OFFSET 0) p ON true"
-            " ORDER BY w.i, p.byte_offset"
         )
+        if lines is None:
+            query = reads + " ORDER BY c0, c6"
+        else:  # r keeps the window below it (a subquery with a window isn't flattened); l joins its rows
+            query = (
+                "SELECT "
+                + ", ".join(f"r.c{k}" for k in range(len(_READ_COLUMNS)))
+                + "".join(f", l.{name}" for name in _LINES_NAMES)
+                + f" FROM ({reads}) r"
+                + _LINES_JOIN
+                + " ORDER BY r.c0, r.c6"
+            )
         params: list[object] = [list(paths), list(offsets), list(limits), list(group_ids)]
         if lines is not None:
             params.extend(lines)
@@ -473,7 +497,7 @@ class VFSClient:
             content = b"".join(row[7] for row in by_read[n] if row[7] is not None)
             end = start + len(content)
             results.append(ReadResult(node, content, start, end, size, generation, end >= size))
-        return results, by_read[1][0][12:22] if lines is not None else None
+        return results, by_read[1][0][_LINES] if lines is not None else None
 
     async def glob(
         self,

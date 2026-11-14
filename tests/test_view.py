@@ -841,6 +841,19 @@ async def test_pread_page(vfs: VFSClient, policy: Policy) -> None:
         assert isinstance(error, VFSError) and (error.errno, error.path, error.detail) == (errno, path, "")
     assert isinstance(guide, ReadResult) and guide.content == b"ne\n"
     assert policy.denials == {}  # the also reads are speculative: their refusals aren't counted
+    page = await ingestion.pread_page(
+        "/docs/guide.md",
+        4096,
+        1,
+        10,
+        1000,
+        also=[("/workspace/notes.md", 0, 100), ("/docs/guide.md", 0, 100)],
+        groups=[0, 0],
+    )
+    denied, guide = page.also  # a read the policy refused isn't sent, so it shadows nothing in its group
+    assert isinstance(denied, VFSError) and denied.errno == "EACCES"
+    assert isinstance(guide, ReadResult) and guide.content == b"one\ntwo\n"
+    assert policy.denials == {}
     await raises("EACCES", ingestion.pread_page("/workspace/notes.md", 4096, 1, 10, 1000), "/workspace/notes.md")
     assert policy.denials == {("ingestion", "read"): 1}  # the file's refusal is
     agent = view(vfs, policy)

@@ -1,5 +1,7 @@
 """``Read``: files (with line numbers), directories, images and PDFs, as ladderframe's ``Read`` (opencode's read
-tool), over the view. Lines come from ``VFSView.pread_lines``, so a page is read without the rest of the file."""
+tool), over the view. A page's first batch of lines comes from ``VFSView.pread_page``, in one statement with
+the sample and the instruction files, and later batches from ``VFSView.pread_lines``, so a page is read without
+the rest of the file."""
 
 from __future__ import annotations
 
@@ -93,9 +95,15 @@ async def read(
                     return await _directory(ctx, path, start, count, config)
                 if e.errno in ("ENOENT", "ENOTDIR"):
                     raise ModelRetry(await _not_found(ctx, path)) from None
+                if reads and e.errno in ("EIO", "ETIMEDOUT"):
+                    # A corrupt or slow instruction file fails the statement it shares with the page: go on without
+                    # instructions, as when the lookups were a statement of their own (one more statement, on this
+                    # error path only). A failure of the file itself raises on the next attempt.
+                    instructions = []
+                    continue
                 raise
             if instructions is None:
-                instructions = _instruction_texts(reads, found.also, settings(ctx).read.instruction_bytes)
+                instructions = _instruction_texts(reads, found.also, config.instruction_bytes)
             sample, first = found.sample, found.lines
             version = (sample.id, sample.generation)
 
