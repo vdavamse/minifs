@@ -393,10 +393,15 @@ async def test_no_suggestions_from_a_directory_over_the_cap(client: VFSClient, d
 
 def test_read_settings_are_checked() -> None:
     assert (ReadSettings().instruction_bytes, ReadSettings().max_entries) == (64 * 1024, 10_000)
-    with pytest.raises(ValueError, match="read max_entries must be at least 1"):
+    with pytest.raises(ValueError, match="read max_entries must be from 1 to 2147483646"):
         ReadSettings(max_entries=0)
-    with pytest.raises(ValueError, match="read max_bytes must be at least 0"):
+    with pytest.raises(ValueError, match="read max_entries must be from 1"):
+        ReadSettings(max_entries=2**31 - 1)  # a directory Read asks for one more, and the limit is an int
+    with pytest.raises(ValueError, match="read max_bytes must be from 0 to 2147483647"):
         ReadSettings(max_bytes=-1)
+    with pytest.raises(ValueError, match="read instruction_bytes"):
+        ReadSettings(instruction_bytes=2**31)
+    ReadSettings(max_entries=2**31 - 2, instruction_bytes=2**31 - 1)
     with pytest.raises(TypeError, match="read instruction_bytes"):
         ReadSettings(instruction_bytes=True)
 

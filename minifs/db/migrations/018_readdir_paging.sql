@@ -25,9 +25,12 @@ BEGIN
     END IF;
     -- Two branches, not IS NOT DISTINCT FROM, so each uses the (parent_id, name) index (as vfs_glob's seeds).
     IF p_dir IS NULL THEN
+        -- ORDER BY parent_id too (all NULL here, so the order is by name): "parent_id IS NULL", unlike
+        -- "parent_id = p_dir", doesn't tell the planner that the index returns these rows in name order, and
+        -- with ORDER BY name alone it sorts every entry after p_after to return a page.
         RETURN QUERY SELECT n.id, n.name::text, n.kind, n.size, n.mtime, NULL::text, NULL::text
                        FROM vfs_nodes n WHERE n.parent_id IS NULL AND n.name > v_after COLLATE "C"
-                      ORDER BY n.name LIMIT p_limit;
+                      ORDER BY n.parent_id, n.name LIMIT p_limit;
         RETURN;
     END IF;
     SELECT n.kind INTO v_kind FROM vfs_nodes n WHERE n.id = p_dir;

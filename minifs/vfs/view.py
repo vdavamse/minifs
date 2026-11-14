@@ -63,7 +63,8 @@ _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
 MAX_GLOB_LIMIT = _MAX_LIMIT - 1
 """The largest ``limit`` ``VFSView.glob`` takes (it asks for ``limit + 1``)."""
 _REFETCH_FACTOR = 8
-_READDIR_BATCH = 256  # the fewest entries a paged readdir asks the server for
+_READDIR_BATCH = 256  # the fewest entries a paged readdir asks the server for at first
+_READDIR_MAX_BATCH = 8192  # and what that grows to, doubling each round, while it reads past hidden entries
 _NO_NODE = UUID(int=0)  # never a node id: a pin that nothing matches
 _log = logging.getLogger(__name__)
 
@@ -135,7 +136,8 @@ class VFSView:
         """The entries of directory ``path`` the actor may read, in byte order of name: those whose name sorts
         after ``after`` (None: from the first), at most ``limit`` of them (None: all), as ``VFSClient.readdir``.
         ``limit`` counts readable entries: the view reads on past the ones the policy hides until it has that many
-        or the listing ends, so a page is a slice of the readable listing and tells nothing about the rest. With
+        or the listing ends, so a page is a slice of the readable listing and tells nothing about the rest (and the
+        hidden entries it passes are still read from the server, in batches). With
         ``count_denials=False`` a refusal isn't counted in ``policy.denials``: for a speculative lookup."""
         target = self._target(path, "read", count_denials=count_denials)
         if limit is not None and not 0 <= limit <= _MAX_LIMIT:
@@ -145,9 +147,11 @@ class VFSView:
             virtual = [e for e in await self._virtual_entries(target.path) if after is None or e.name > after]
             return [e for e in virtual if self.policy.allows(self.actor, "read", e.path)][:limit]
         entries: list[Entry] = []
+        batch = _READDIR_BATCH
         while True:
-            # At least a batch, so a long run of hidden entries isn't a statement each.
-            asked = None if limit is None else min(max(limit - len(entries), _READDIR_BATCH), _MAX_LIMIT)
+            # At least a batch, twice as large each round, so a long run of hidden entries is few statements.
+            asked = None if limit is None else min(max(limit - len(entries), batch), _MAX_LIMIT)
+            batch = min(2 * batch, _READDIR_MAX_BATCH)
             listing = await self._mapped(self._client.readdir(_real(target), after=after, limit=asked), target)
             mapped = (self._entry(e, target) for e in listing)
             entries.extend(e for e in mapped if self.policy.allows(self.actor, "read", e.path))

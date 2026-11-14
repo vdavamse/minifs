@@ -461,6 +461,39 @@ async def test_a_readdir_page_reads_only_its_rows(conn: AsyncConnection) -> None
     assert [name for (name,) in await cur.fetchall()] == ["f02001", "f02002"]
 
 
+@pytest.mark.parametrize("root", [False, True])
+async def test_vfs_readdir_reads_only_its_page(conn: AsyncConnection, root: bool) -> None:
+    """The function itself, under a generic plan, in a directory and in the root: the rows it reads from
+    vfs_nodes are its page's (and the directory's own row), not the directory's 3,000 entries."""
+    directory = None if root else await create(conn, None, "d", "dir")
+    await conn.execute(
+        "INSERT INTO vfs_nodes (parent_id, name, kind) SELECT %s, 'f' || lpad(i::text, 5, '0'), 'file'"
+        " FROM generate_series(1, 3000) i",
+        (directory,),
+    )
+    # The listed directory is a small part of the tree, as in a real one (were it the whole table, reading the
+    # table in full would be the right plan).
+    other = await create(conn, None, "other", "dir")
+    await conn.execute(
+        "INSERT INTO vfs_nodes (parent_id, name, kind) SELECT %s, 'g' || i, 'file' FROM generate_series(1, 30000) i",
+        (other,),
+    )
+    await conn.execute("ANALYZE vfs_nodes")
+    await conn.execute("SET plan_cache_mode = force_generic_plan")
+    counters = (
+        "SELECT coalesce(seq_tup_read, 0), coalesce(idx_tup_fetch, 0) FROM pg_stat_xact_user_tables"
+        " WHERE relname = 'vfs_nodes' AND schemaname = current_schema()"
+    )
+    async with conn.transaction():
+        before: tuple[int, int] | None = await (await conn.execute(counters)).fetchone()
+        cur = await conn.execute("SELECT name FROM vfs_readdir(%s, 'f02000', 10)", (directory,))
+        assert [name for (name,) in await cur.fetchall()] == [f"f{i:05}" for i in range(2001, 2011)]
+        after: tuple[int, int] | None = await (await conn.execute(counters)).fetchone()
+    assert before is not None and after is not None
+    scanned, fetched = after[0] - before[0], after[1] - before[1]
+    assert scanned == 0 and 10 <= fetched <= 12, (scanned, fetched)
+
+
 # vfs_create
 
 

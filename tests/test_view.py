@@ -188,8 +188,20 @@ async def test_a_readdir_page_reads_past_a_long_hidden_run(vfs: VFSClient, monke
         await vfs.create(f"/workspaces/{W1}/run/h{i}", b"", parents=True)
     await vfs.create(f"/workspaces/{W1}/run/z", b"")
     agent = view(vfs, Policy({"agent": [Rule("/workspace/run/h*"), Rule("/**", "read", "write")]}))
+    asked: list[int | None] = []
+    readdir = VFSClient.readdir
+
+    async def spy(self: VFSClient, path: str, *, after: str | None = None, limit: int | None = None) -> list[Entry]:
+        asked.append(limit)
+        return await readdir(self, path, after=after, limit=limit)
+
+    monkeypatch.setattr(VFSClient, "readdir", spy)
     assert [e.name for e in await agent.readdir("/workspace/run", limit=1)] == ["z"]
+    assert asked == [2, 4, 8]  # the batch doubles: 2 + 4 hidden entries, then the last hidden one and z
+    monkeypatch.setattr("minifs.vfs.view._READDIR_MAX_BATCH", 2)
+    asked.clear()
     assert [e.name for e in await agent.readdir("/workspace/run", limit=3)] == ["z"]
+    assert asked == [3, 3, 3]  # never below what is still wanted, and no larger than the cap otherwise
 
 
 async def test_a_missing_mount_root(vfs: VFSClient, policy: Policy) -> None:

@@ -51,8 +51,11 @@ class ReadSettings:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"read {name} must be an int, not {value!r}")
-            if value < (name == "max_entries"):
-                raise ValueError(f"read {name} must be at least {int(name == 'max_entries')}, not {value}")
+            low = int(name == "max_entries")
+            # The SQL functions take an int; a directory Read asks for max_entries + 1 entries.
+            high = 2**31 - 1 - low
+            if not low <= value <= high:
+                raise ValueError(f"read {name} must be from {low} to {high}, not {value}")
 
 
 ALWAYS_EXCLUDED: tuple[str, ...] = ("**/.git/**",)
