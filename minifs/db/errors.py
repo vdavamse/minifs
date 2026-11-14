@@ -11,11 +11,14 @@ functions don't pre-check; their violations map to errnos too, on a best-effort 
 tell a missing parent from a parent that is a file, so both map to ENOTDIR, and an extent on a missing node maps
 to EISDIR like one on a directory. The functions report each case precisely.
 
-Two errors the server raises on its own map to errnos as well, so a caller can tell them from a fault and try
+The errors the server raises on its own map to errnos as well, so a caller can tell them from a fault and try
 again later: a lock wait that ran out (``lock_not_available``, 55P03: the ``lock_timeout`` ``VFSClient`` sets on
 writes, or a ``NOWAIT``) is EAGAIN, and a cancelled statement (``query_canceled``, 57014: a ``statement_timeout``,
-or an administrator's ``pg_cancel_backend``, which the server reports alike) is ETIMEDOUT. Neither is in
-``SQLSTATE_BY_ERRNO``: the SQL functions never raise them.
+or an administrator's ``pg_cancel_backend``, which the server reports alike) and a transaction the server ends for
+running long (``idle_in_transaction_session_timeout``, 25P03: the gaps between its statements, and
+``transaction_timeout``, 25P04, PostgreSQL 17+: the whole transaction) are ETIMEDOUT. A multi-statement read
+(``VFSClient.pread_file``) can hit the last two: the server closes the connection, the pool discards it, and a
+later retry can succeed. None is in ``SQLSTATE_BY_ERRNO``: the SQL functions never raise them.
 """
 
 from __future__ import annotations
@@ -45,6 +48,8 @@ _CHECK_VIOLATION = "23514"
 
 # The server's own timeouts (see the module docstring); retrying later may succeed.
 _ERRNO_BY_SERVER_SQLSTATE: dict[str, str] = {
+    "25P03": "ETIMEDOUT",  # idle_in_transaction_session_timeout
+    "25P04": "ETIMEDOUT",  # transaction_timeout (PostgreSQL 17+)
     "55P03": "EAGAIN",  # lock_not_available
     "57014": "ETIMEDOUT",  # query_canceled
 }

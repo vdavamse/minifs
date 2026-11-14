@@ -32,6 +32,12 @@ controls, the Unicode line and paragraph separators, and the bidi embeddings, ov
 C0 control the server never sees: refused here, it can't surface as an encoding error (EIO) from psycopg."""
 
 
+MAX_COMPONENTS = 1024
+"""The most components a path may have, and the deepest a node may be (migration 022's ``vfs_max_components()``,
+which ``vfs_lookup``, ``vfs_mkdir_p`` and ``vfs_rename`` enforce). Each component is one index probe, and
+``mkdir_p`` creates a row per missing one. Linux's PATH_MAX (4096 bytes) allows at most 2048."""
+
+
 class VFSError(Exception):
     """A filesystem error: ``errno`` is the errno name (``"ENOENT"``, ...), ``path`` the path it concerns.
 
@@ -184,17 +190,24 @@ def millis(seconds: float) -> str:
 def normalize(path: str) -> str:
     """The canonical form of absolute ``path``: no ``.``, ``..``, repeated or trailing slashes.
 
-    EINVAL for a relative path, an empty one, or one containing a control character (``CONTROL_CHARACTERS``).
+    EINVAL for a relative path, an empty one, or one containing a control character (``CONTROL_CHARACTERS``);
+    ENAMETOOLONG for more than ``MAX_COMPONENTS`` components.
     """
     return "/" + "/".join(split(path))
 
 
 def split(path: str) -> tuple[str, ...]:
-    """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``.
+    """The components of absolute ``path`` after normalisation; ``()`` for the root. EINVAL as ``normalize``;
+    ENAMETOOLONG for more than ``MAX_COMPONENTS`` of them.
 
     For a path from a caller. The control characters are checked first, so no refusal echoes one."""
     refuse_controls(path)
-    return split_trusted(path)
+    parts = split_trusted(path)
+    if len(parts) > MAX_COMPONENTS:
+        # No count in the message: under a view, ``path`` is the real path, longer than the visible one by the mount
+        # prefix, and a view keeps the message while it maps the path back.
+        raise VFSError("ENAMETOOLONG", path, f"over the {MAX_COMPONENTS}-component limit")
+    return parts
 
 
 def refuse_controls(path: str) -> None:

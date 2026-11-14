@@ -14,7 +14,7 @@ import pytest
 from psycopg import AsyncConnection, sql
 
 from minifs.db.errors import OUTCOMES, SQLSTATE_BY_ERRNO, errno_name
-from minifs.vfs.core import CONTROL_CHARACTERS, VFSError
+from minifs.vfs.core import CONTROL_CHARACTERS, MAX_COMPONENTS, VFSError
 
 Kind = str
 
@@ -1030,3 +1030,185 @@ async def test_control_character_class_matches_the_client(conn: AsyncConnection)
     error = VFSError.from_db(raw.value, "/x")
     assert error is not None and error.errno == "EINVAL"
     assert "u001b[31m" in error.detail and not CONTROL_CHARACTERS.search(error.detail)
+
+
+# The path and depth cap (migration 022)
+
+
+async def test_max_components_matches_the_client(conn: AsyncConnection) -> None:
+    """vfs_max_components() is the SQL source of the cap; the client's MAX_COMPONENTS must be the same number."""
+    assert await _one(conn, "SELECT vfs_max_components()") == (MAX_COMPONENTS,)
+
+
+async def test_lookup_caps_the_components(conn: AsyncConnection) -> None:
+    with raises_db_errno("ENAMETOOLONG"):
+        await conn.execute("SELECT * FROM vfs_lookup(%s)", (["d"] * (MAX_COMPONENTS + 1),))
+    # The detail counts the segments; it never lists them.
+    with pytest.raises(psycopg.Error) as info:
+        await conn.execute("SELECT * FROM vfs_lookup(%s)", (["missing"] * (MAX_COMPONENTS + 1),))
+    assert errno_name(info.value) == "ENAMETOOLONG"
+    detail = info.value.diag.message_detail or ""
+    assert "1025 components" in detail and "missing" not in detail
+    # The longest legal path is walked as usual: an outcome, not a raise.
+    with raises_errno("ENOENT"):
+        await resolve(conn, *(["d"] * MAX_COMPONENTS))
+
+
+async def test_mkdir_p_caps_the_components(conn: AsyncConnection) -> None:
+    before = await _one(conn, "SELECT count(*) FROM vfs_nodes")
+    with raises_db_errno("ENAMETOOLONG"):
+        await mkdir_p(conn, *(["d"] * (MAX_COMPONENTS + 1)))
+    assert await _one(conn, "SELECT count(*) FROM vfs_nodes") == before  # nothing created
+    deepest = await mkdir_p(conn, *(["d"] * MAX_COMPONENTS))  # the longest legal path is made in one call
+    assert await _one(conn, "SELECT vfs_depth(%s, vfs_max_components())", (deepest,)) == (MAX_COMPONENTS,)
+
+
+async def test_rename_a_file_caps_the_destination_depth(conn: AsyncConnection) -> None:
+    file = await create(conn, None, "f")
+    await mkdir_p(conn, *(["d"] * MAX_COMPONENTS))  # one call: the deepest directory is at depth 1024
+    deepest = (await resolve(conn, *(["d"] * MAX_COMPONENTS)))[0]
+    with raises_db_errno("ENAMETOOLONG"):
+        await rename(conn, file, deepest, "f")  # the file would land at depth 1025
+    assert await resolve(conn, "f") == (file, "file")  # it didn't move
+    one_up = (await resolve(conn, *(["d"] * (MAX_COMPONENTS - 1))))[0]
+    assert await rename(conn, file, one_up, "f")  # depth 1024: the deepest a node may be
+    assert await resolve(conn, *(["d"] * (MAX_COMPONENTS - 1)), "f") == (file, "file")
+
+
+async def test_rename_a_moved_directory_caps_its_subtree(conn: AsyncConnection) -> None:
+    await mkdir_p(conn, *(["d"] * 1000))  # chain A: depth 1000
+    leaf = await mkdir_p(conn, "b", *(["d"] * 30))  # B at the root, a chain of 30 below it
+    b = (await resolve(conn, "b"))[0]
+    assert b is not None
+    deepest = (await resolve(conn, *(["d"] * 1000)))[0]
+    # 1000 + 1 + 30 would be 1031: the subtree check refuses it, and nothing moves.
+    with pytest.raises(psycopg.Error) as info:
+        await rename(conn, b, deepest, "b")
+    assert errno_name(info.value) == "ENAMETOOLONG"
+    assert "subtree" in (info.value.diag.message_detail or "")
+    assert await resolve(conn, "b") == (b, "dir")
+    # 994 + 1 + 30 = 1025: one level over, refused too (the boundary from the refusing side).
+    with raises_db_errno("ENAMETOOLONG"):
+        await rename(conn, b, (await resolve(conn, *(["d"] * 994)))[0], "b")
+    # A file is the deepest node: B's subtree is 31 levels below it now. 993 + 1 + 31 = 1025 is refused, 992 fits.
+    room, one_up = (await resolve(conn, *(["d"] * 993)))[0], (await resolve(conn, *(["d"] * 992)))[0]
+    file = await create(conn, leaf, "f")
+    with raises_db_errno("ENAMETOOLONG"):
+        await rename(conn, b, room, "b")
+    assert await rename(conn, b, one_up, "b")
+    # Without the file, 993 + 1 + 30 = 1024: the deepest B and its subtree may go (a deeper move, scanned).
+    await unlink(conn, file)
+    assert await rename(conn, b, room, "b")
+    assert await resolve(conn, *(["d"] * 993), "b") == (b, "dir")
+    assert await resolve(conn, *(["d"] * 993), "b", *(["d"] * 30)) == (leaf, "dir")
+
+
+async def test_rename_still_reports_a_real_cycle_as_einval(conn: AsyncConnection) -> None:
+    x = await create(conn, None, "x", "dir")
+    y = await create(conn, None, "y", "dir")
+    z = await create(conn, None, "z", "dir")
+    # The schema doesn't forbid a cycle: raw SQL can make one, as a bug could.
+    await conn.execute("UPDATE vfs_nodes SET parent_id = %s WHERE id = %s", (x, y))
+    await conn.execute("UPDATE vfs_nodes SET parent_id = %s WHERE id = %s", (y, x))
+    with pytest.raises(psycopg.Error) as info:
+        await rename(conn, z, x, "z")
+    assert errno_name(info.value) == "EINVAL"  # not ENAMETOOLONG: the walk that never ends is a cycle
+    assert "cycle" in (info.value.diag.message_detail or "")
+    # A file's walk (lock-free) tells the cycle apart too.
+    with pytest.raises(psycopg.Error) as info:
+        await rename(conn, await create(conn, None, "f"), x, "f")
+    assert errno_name(info.value) == "EINVAL" and "cycle" in (info.value.diag.message_detail or "")
+
+
+async def test_a_file_rename_does_not_lock_the_ancestors(db: str) -> None:
+    """A file's move walks the destination's ancestors only to count its depth (022), without locks: a Maildir
+    claim doesn't queue behind another session holding an ancestor FOR UPDATE (a move of it, in progress)."""
+    async with (
+        await AsyncConnection.connect(db, autocommit=True) as setup,
+        await AsyncConnection.connect(db, autocommit=True) as mover,
+    ):
+        c = await mkdir_p(setup, "a", "b", "c")
+        f = await create(setup, None, "f")
+        assert c is not None
+        async with holding_the_lock(db, "/a"):
+            await mover.execute("SET statement_timeout = '3s'")
+            assert await rename(mover, f, c, "f")
+
+
+async def test_a_legacy_tree_deeper_than_the_cap(conn: AsyncConnection) -> None:
+    """A tree raw SQL grew past the cap (as one from before 022 could): too deep is ENAMETOOLONG, not the old
+    false cycle, and moving up (the repair) never scans the subtree."""
+    await conn.execute(
+        """
+        DO $$
+        DECLARE v_parent uuid := NULL; v_id uuid;
+        BEGIN
+            FOR i IN 1..1100 LOOP
+                INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (v_parent, 'd', 'dir') RETURNING id INTO v_id;
+                v_parent := v_id;
+            END LOOP;
+        END $$"""
+    )
+
+    async def dir_at(depth: int) -> UUID:
+        row = await _one(
+            conn,
+            "WITH RECURSIVE t(id, depth) AS ("
+            " SELECT n.id, 1 FROM vfs_nodes n WHERE n.parent_id IS NULL AND n.name = 'd'"
+            " UNION ALL"
+            " SELECT n.id, t.depth + 1 FROM vfs_nodes n JOIN t ON n.parent_id = t.id)"
+            " SELECT id FROM t WHERE depth = %s",
+            (depth,),
+        )
+        assert isinstance(row[0], UUID)
+        return row[0]
+
+    deepest, z = await dir_at(1100), await create(conn, None, "z", "dir")
+    with pytest.raises(psycopg.Error) as info:
+        await rename(conn, z, deepest, "z")  # the destination is too deep, not a cycle
+    assert errno_name(info.value) == "ENAMETOOLONG"
+    assert "deeper than" in (info.value.diag.message_detail or "")
+    # A file's walk (lock-free) is refused the same way, not reported as a cycle.
+    f = await create(conn, None, "f")
+    with pytest.raises(psycopg.Error) as info:
+        await rename(conn, f, deepest, "f")
+    assert errno_name(info.value) == "ENAMETOOLONG" and "deeper than" in (info.value.diag.message_detail or "")
+    # A rename that keeps the parent changes no depth: allowed in an over-deep directory, a no-op too, for a file
+    # (created by id, which isn't depth-checked) and for the directory itself.
+    g = await create(conn, deepest, "g")
+    assert await rename(conn, g, deepest, "h")
+    assert await rename(conn, g, deepest, "h")
+    assert await rename(conn, deepest, await dir_at(1099), "d")
+    # A partial repair, out of the over-deep region: the directory at depth 1050 moves under the one at 1000.
+    # Its old parent is past the cap, so the move is up and isn't scanned, though its subtree is still too deep.
+    assert await rename(conn, await dir_at(1050), await dir_at(1000), "up")  # the deepest is now at 1051
+    # Moving up from depth 2 to the root: the subtree still reaches 1050 levels, and a scan would refuse it.
+    assert await rename(conn, await dir_at(2), None, "top")
+    # Now top (1), the original 3..1000 as d (2..999), up (1000) and its 50 levels (1001..1050). The full repair:
+    # the directory at depth 600 moves to the root, and the deepest path is 451 components that resolve.
+    at_600 = (await resolve(conn, "top", *(["d"] * 599)))[0]
+    assert at_600 is not None
+    assert await rename(conn, at_600, None, "moved")
+    assert await resolve(conn, "moved", *(["d"] * 399), "up", *(["d"] * 50)) == (deepest, "dir")
+
+
+async def test_a_sideways_move_never_scans_the_subtree(conn: AsyncConnection) -> None:
+    """A directory whose legacy subtree is over the cap can still move sideways, to the same depth: the move
+    doesn't go deeper, so its subtree is never looked at."""
+    a = await mkdir_p(conn, "a")
+    b = await mkdir_p(conn, "b")
+    x = await create(conn, a, "x", "dir")
+    # A legacy chain under x, raw SQL past vfs_mkdir_p: x sits at depth 2 and its subtree reaches depth 1102.
+    await conn.execute(
+        sql.SQL("""
+        DO $$
+        DECLARE v_parent uuid := {}; v_id uuid;
+        BEGIN
+            FOR i IN 1..1100 LOOP
+                INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (v_parent, 'd', 'dir') RETURNING id INTO v_id;
+                v_parent := v_id;
+            END LOOP;
+        END $$""").format(sql.Literal(str(x)))
+    )
+    assert await rename(conn, x, b, "x")  # depth 2 either way
+    assert await resolve(conn, "b", "x") == (x, "dir")

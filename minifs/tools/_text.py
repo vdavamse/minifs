@@ -14,8 +14,11 @@ from minifs.vfs.view import VFSView
 BOM = "\ufeff"
 
 PAGE = 16 * 1024 * 1024
-"""The most bytes ``read_file`` asks one ``pread`` for, whatever its cap: big enough that Edit's default 10 MB cap
-is one statement, small enough to bound what one statement holds and how long it runs when the cap is raised."""
+"""The most bytes one page statement of ``read_file`` asks for: big enough that Edit's default 10 MB cap is one
+statement. Not small, because a line longer than ~64 KB is one pglz extent, and a page that starts inside it
+makes the server decompress the extent from its start (migration 013): small pages would make a long-line file
+cost about size²/page. A page costs about 3x its size in client memory while it arrives (hex text). Every page
+of a read is on one snapshot (``VFSView.pread_file``)."""
 
 
 class TooLarge(Exception):
@@ -26,32 +29,39 @@ class TooLarge(Exception):
         self.size = size
 
 
-async def read_file(vfs: VFSView, path: str, max_size: int | None = None) -> tuple[bytes, FileVersion]:
-    """The whole content of file ``path`` and the version it is: what a compare-and-swap write expects. ``TooLarge``,
-    after the first page, for a file over ``max_size`` bytes.
+class ReadTimedOut(VFSError):
+    """A read of ``path`` was cancelled by a server timeout: the file was too slow to read, not the write. An
+    ETIMEDOUT ``VFSError``, so a caller that catches only those still handles it; Edit and Write catch it first, for
+    their own message."""
 
-    Each ``pread`` asks for up to ``max_size`` bytes and at most ``PAGE``, so a file within both (as Edit's default
-    cap is) is one statement, read from one snapshot, and a file that grew past the cap is refused having read at
-    most ``max_size`` bytes. A larger file is read in pages, and ESTALE is raised if it changed between them (the
-    content would mix two versions).
+    def __init__(self, path: str) -> None:
+        super().__init__("ETIMEDOUT", path, "read timed out")
+
+
+async def read_file(vfs: VFSView, path: str, max_size: int | None = None) -> tuple[bytes, FileVersion]:
+    """The whole content of file ``path`` and the version it is: what a compare-and-swap write expects.
+    ``TooLarge``, having read at most one page, for a file over ``max_size`` bytes; ``ReadTimedOut`` where a
+    server timeout cancelled the read.
+
+    The file is read on one snapshot (``VFSView.pread_file``), in pages of at most ``PAGE`` bytes, so it never
+    mixes two versions, whatever its size or the caps that apply: a file within ``max_size`` comes back whole,
+    and one that grew past it is refused having read at most a page of it. Pages are large (``PAGE``), since a
+    page into a long line's pglz extent decompresses it from its start.
 
     A page costs about three times its size in client memory while it arrives (bytea comes as hex text, then is
     decoded), and the server holds it whole before sending it (spilling to disk past ``work_mem``). Reads set no
-    ``statement_timeout`` of their own, so a server one applies to each page: ``PAGE`` bounds both, whatever
-    ``EditSettings.max_bytes`` or ``WriteSettings.max_diff_bytes`` allow."""
-    page_size = PAGE if max_size is None else min(max_size, PAGE)
-    first = await vfs.pread(path, 0, page_size)
-    if max_size is not None and first.size > max_size:
-        raise TooLarge(first.size)
-    version = FileVersion(first.id, first.generation, first.size)
-    chunks = [first.content]
-    page = first
-    while not page.eof:
-        page = await vfs.pread(path, page.next_offset, page_size)
-        if (page.id, page.generation, page.size) != (version.id, version.generation, version.size):
-            raise VFSError("ESTALE", path, "changed while it was read")
-        chunks.append(page.content)
-    return b"".join(chunks), version
+    ``statement_timeout`` of their own, so a server one applies to each page statement, and is a slow read to
+    report (``ReadTimedOut``), not a slow write."""
+    page = PAGE if max_size is None else max(1, min(max_size, PAGE))
+    try:
+        result = await vfs.pread_file(path, page, max_size)
+    except VFSError as e:
+        if e.errno == "ETIMEDOUT":
+            raise ReadTimedOut(path) from None
+        raise
+    if max_size is not None and result.size > max_size:
+        raise TooLarge(result.size)
+    return result.content, FileVersion(result.id, result.generation, result.size)
 
 
 async def create_file(vfs: VFSView, path: str, data: bytes) -> None:

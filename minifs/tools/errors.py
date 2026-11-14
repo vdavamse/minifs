@@ -28,7 +28,7 @@ MESSAGES: dict[str, str] = {
     "ENOTEMPTY": "Directory not empty: {path}",
     "EBUSY": "Path is a mount point and can't be moved or removed: {path}",
     "ESTALE": "{path} was modified since it was read. Read it again before writing.",
-    "ENAMETOOLONG": "File name too long: {path}",
+    "ENAMETOOLONG": "File name or path too long (names up to 255 bytes, paths up to 1024 components): {path}",
     "EAGAIN": "{path} is locked by another write in progress. Try again.",
     "ETIMEDOUT": "Timed out on {path}. Try again.",  # Write and Edit add what to change
     "EIO": "Internal error reading {path}",
@@ -40,6 +40,15 @@ ran too long): a retry later may succeed, so the model gets one, unlike the EIO 
 
 TIMED_OUT_WRITE = "Timed out on {path}. Try again; if it keeps timing out, write less at once."
 """The ETIMEDOUT message of ``Write`` and ``Edit``: a payload too big for ``write_timeout`` times out every time."""
+
+TIMED_OUT_READ = "Timed out reading {path}: the server was too slow to read it. Try again."
+"""What ``Write`` says when reading the old file timed out (``ReadTimedOut``), not the write."""
+
+TIMED_OUT_EDIT_READ = (
+    "Timed out reading {path}: the server was too slow to read it. Try again; if it keeps timing out, use the Write "
+    "tool to replace the whole file instead."
+)
+"""What ``Edit`` says when reading the file timed out: Write needs no read of the old text past its diff cap."""
 
 _OVERRIDABLE = frozenset(MESSAGES) | {"EINVAL"}
 
