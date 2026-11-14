@@ -251,7 +251,7 @@ So the translator never relies on ARE's classes, word boundaries or case folding
 | `*`, `+`, `?`, `{n,m}`, lazy forms | The same quantifier (counts up to 255, ARE's limit) |
 | Groups, alternation | `(?:...)`, `|` |
 
-**Rejected, with an rg-style message:** lookaround and backreferences (as rg without `-P`), a literal `\n` (as rg without `-U`), byte classes outside ASCII, counts above 255, and a translation over the size cap. Rejecting is always better than a silent zero-match. Each translation is also compiled once in Postgres (`SELECT '' ~ $1`); a failure there is reported as a translator bug, never as the model's mistake.
+**Rejected, with an rg-style message:** lookaround and backreferences (as rg without `-P`), a literal `\n` (as rg without `-U`), byte classes outside ASCII, counts above 255, and a translation over the size cap. Rejecting is always better than a silent zero-match. Each translation is also compiled once in Postgres (`SELECT '' ~ $1`); a failure there is reported as a translator bug, never as the model's mistake. The log line carries the pattern and the translation cut to 200 characters, with the full length and the start of the pattern's SHA-256, since a pattern can quote file contents, and `Grep` asks the model for a simpler pattern instead of ending the run.
 
 **Cost of explicit classes**, on PG 18 over 200,000 lines:
 
@@ -285,7 +285,7 @@ The tools follow opencode's file-tool contracts (which Claude Code's resemble): 
 
 **Glob and Grep** are described above. Output: one absolute path per line for `Glob`, newest first; `Found N matches`, then hits grouped by file as `  Line N: text`, for `Grep`. Both return `No files found` when nothing matches, and a truncation footer past 100 results.
 
-**Errors.** A mistake the model can fix by calling again raises `ModelRetry` with a message that says what to change: `File not found` (with up to three similar names from inside the view), an offset past the end, a bad pattern (rg's message), a scope over the cap, a timeout. A path outside the view gets each tool's not-found error, so errors never reveal what exists beyond the chroot. A policy denial is returned as the result, `Permission denied: <action> <path>`, since retrying won't help. `minifs.tools.errors.tool_error` does the mapping at each tool's boundary.
+**Errors.** A mistake the model can fix by calling again raises `ModelRetry` with a message that says what to change: `File not found` (with up to three similar names from inside the view), an offset past the end, a bad pattern (rg's message), a scope over the cap, a timeout. A path outside the view gets each tool's not-found error, so errors never reveal what exists beyond the chroot. A policy denial is returned as the result, `Permission denied: <action> <path>`, since retrying won't help. An internal error in `Grep` never ends the run: a translator bug is a retry that asks for a simpler pattern, and anything else (a database that isn't UTF8, an unforeseen `RuntimeError`) is a result, `Grep failed: internal error...`, with the cause in the log. `minifs.tools.errors.tool_error` does the mapping at each tool's boundary.
 
 **Where the tools differ from disk-based implementations of the same contracts:**
 - The view's policy is the only permission gate.
