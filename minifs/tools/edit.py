@@ -351,10 +351,12 @@ def _next_line(positions: array[int], at: int, n: int) -> int:
 def block_anchor_replacer(content: str, find: str) -> Iterator[str]:
     original = content.split("\n")
     search = find.split("\n")
-    if len(search) < 3:
-        return
     if search[-1] == "":
         search.pop()
+    # Check the length after the pop (#110): a two-line find with a trailing newline has no middle line to
+    # score, and its anchors alone matched a block and replaced the unrelated line between them.
+    if len(search) < 3:
+        return
     first, last = search[0].strip(), search[-1].strip()
     max_delta = max(1, len(search) // 4)
 
@@ -641,13 +643,18 @@ def replace(
     deadline = _Deadline(timeout)
     token = _deadline.set(deadline)
     not_found = True
+    ambiguous = False
     try:
         seen: set[str] = set()  # a candidate already tried gave its answer: the same find, the same ambiguity
         seen_size = 0
         for replacer in REPLACERS:
+            if ambiguous:
+                break
             deadline.check()
             for search in replacer(content, old_string):
                 deadline.check()  # each candidate costs two scans of the file
+                if not search:
+                    continue  # an empty candidate is "found" at 0 and would insert between every character (#110)
                 if search in seen:
                     continue
                 if seen_size + len(search) > _SEEN_BYTES:
@@ -669,6 +676,9 @@ def replace(
                 # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one call
                 # on a repetitive file ran for seconds that no deadline could interrupt.
                 if content.find(search, index + 1) != -1:
+                    if search == old_string:
+                        ambiguous = True  # the exact oldString is ambiguous: report it, don't fuzzy past it (#110)
+                        break
                     continue
                 return content[:index] + new_string + content[index + len(search) :]
     except ReplaceTimeout:
