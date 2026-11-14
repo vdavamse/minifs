@@ -1,4 +1,4 @@
-"""Watch: inotify-style change events from the schema's NOTIFY channel (migrations 005 and 017).
+"""Watch: inotify-style change events from the schema's NOTIFY channel (migrations 005 and 016).
 
 One ``Watcher`` per process holds one dedicated LISTEN connection and fans the events out to its subscriptions:
 ``watch(path)`` for callers, and ``subscribe()`` for the library's own consumers such as the directory cache.
@@ -14,7 +14,7 @@ and treats no answer within ``probe_timeout`` as a lost connection, which it clo
 server. The probe keeps a Lakebase compute awake while a watcher runs; that is the price of noticing a dead
 connection.
 
-The channel is the schema's own (``vfs_channel()``, migration 017): a random name, read from the database when the
+The channel is the schema's own (``vfs_channel()``, migration 016): a random name, read from the database when the
 watcher connects, so two minifs schemas in one database don't see each other's events. Channels are database-wide,
 and anyone who knows a channel's name can LISTEN and NOTIFY on it, so the trust boundary is who can learn the name:
 a role with USAGE on the schema. PostgreSQL also folds identical payloads within one transaction. So events are
@@ -361,7 +361,7 @@ class Watcher:
 
     The channel is read from the database (``vfs_channel()`` of the connection's ``current_schema()``) when the
     first connection opens, unless ``channel`` names one; RuntimeError from ``start()`` if the schema has no such
-    function (it predates migration 017). ``rescan_interval`` is the least time between two ``rescan`` deliveries to
+    function (it predates migration 016). ``rescan_interval`` is the least time between two ``rescan`` deliveries to
     one subscription (see ``Subscription``); 0 delivers every one.
     """
 
@@ -512,7 +512,7 @@ class Watcher:
     @staticmethod
     async def _read_channel(conn: AsyncConnection[Any]) -> str:
         """The channel of the connection's ``current_schema()``. The function is looked up in that schema alone:
-        through the search_path, a schema that predates migration 017 would get the channel of a later schema on
+        through the search_path, a schema that predates migration 016 would get the channel of a later schema on
         the path that has one, and listen to that schema's events instead of its own."""
         cur = await conn.execute(
             "SELECT current_schema(), to_regprocedure(quote_ident(current_schema()) || '.vfs_channel()') IS NOT NULL"
@@ -522,7 +522,7 @@ class Watcher:
         schema, found = row
         if not found:
             raise RuntimeError(
-                f"no vfs_channel() in schema {schema!r}: it predates migration 017 (run `minifs db migrate`), "
+                f"no vfs_channel() in schema {schema!r}: it predates migration 016 (run `minifs db migrate`), "
                 "or the connection's search_path doesn't start with the minifs schema"
             )
         cur = await conn.execute(sql.SQL("SELECT {}.vfs_channel()").format(sql.Identifier(schema)))

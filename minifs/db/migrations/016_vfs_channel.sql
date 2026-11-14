@@ -26,7 +26,7 @@ CREATE TABLE vfs_channel_name (
     channel text    NOT NULL
 );
 COMMENT ON TABLE vfs_channel_name IS
-    'The NOTIFY channel of this schema, one row (migration 017). Read it through vfs_channel().';
+    'The NOTIFY channel of this schema, one row (migration 016). Read it through vfs_channel().';
 REVOKE ALL ON vfs_channel_name FROM PUBLIC;
 INSERT INTO vfs_channel_name (channel) VALUES ('vfs_' || replace(gen_random_uuid()::text, '-', ''));
 
@@ -41,7 +41,7 @@ BEGIN
         current_schema(), format('SELECT channel FROM %I.vfs_channel_name', current_schema()));
 END $$;
 COMMENT ON FUNCTION vfs_channel() IS
-    'The NOTIFY channel of this schema (migration 017): what vfs_notify sends on and a watcher listens to.';
+    'The NOTIFY channel of this schema (migration 016): what vfs_notify sends on and a watcher listens to.';
 
 
 CREATE OR REPLACE FUNCTION vfs_notify() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$

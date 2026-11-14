@@ -46,12 +46,15 @@ async def catch_up(watcher: Watcher, conn: AsyncConnection) -> None:
 
     A watch can see a change committed just before it started, so tests call this after their setup. Each
     listener receives notifications in commit order, so once a marker sent now arrives, everything before it has.
+    A rescan still on its way when this subscribes (every subscription gets those) is skipped.
     """
     marker = uuid4()
     with watcher.subscribe(lambda e: e.id == marker) as events:
         payload = json.dumps({"op": "modify", "id": str(marker), "parent": str(uuid4())})
         await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (payload,))
-        assert (await next_event(events)).id == marker
+        while (event := await next_event(events)) is RESCAN:
+            pass
+        assert event.id == marker
 
 
 @pytest.fixture
@@ -470,14 +473,14 @@ async def test_channel_is_the_schemas(conn: AsyncConnection, watcher: Watcher) -
 
 
 async def test_a_schema_without_the_channel_function_fails_at_start(conn: AsyncConnection, db: str) -> None:
-    """A schema that predates migration 017 has no vfs_channel(): the watcher says so instead of listening on a
+    """A schema that predates migration 016 has no vfs_channel(): the watcher says so instead of listening on a
     channel nothing notifies, even when a later schema on the search_path has the function."""
     await conn.execute("CREATE SCHEMA old")
 
     async def connect_old() -> AsyncConnection[Any]:
         return await AsyncConnection.connect(db, autocommit=True, options="-c search_path=old,public")
 
-    with pytest.raises(RuntimeError, match="no vfs_channel.. in schema 'old'.*migration 017"):
+    with pytest.raises(RuntimeError, match="no vfs_channel.. in schema 'old'.*migration 016"):
         await Watcher(connect_old).start()
 
 
