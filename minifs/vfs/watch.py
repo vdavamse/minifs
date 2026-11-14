@@ -285,11 +285,7 @@ class PathWatch(Subscription):
         """With ``ancestors=True``, the ids of the directories above the node."""
         self.kind = "dir"
         self._resolved = False
-        self._id_keys: tuple[UUID, ...] = ()
-        """The keys ``Watcher._index`` filed this watch under in its id index; unsubscription removes by these."""
-        self._parent_key: UUID | None = None
-        """The key ``Watcher._index`` filed this watch under in the parent index (None is the root), if any."""
-        self._parent_key_set = False
+        self._indexed = False  # filed in the watcher's indexes, under keys derived from node, kind and ancestors
         self._gone = False
         self._check: asyncio.Task[bool] | None = None  # survives a cancelled get(), so the next one resumes it
         self._checks: set[asyncio.Task[bool]] = set()  # every check still running, so closing can cancel them
@@ -496,7 +492,10 @@ class Watcher:
         """Subscriptions every non-rescan event is offered to: every ``subscribe()`` one, and every ``PathWatch``
         until ``_index`` (an unresolved watch buffers every event, so it must be offered all of them)."""
         self._by_id: dict[UUID, set[PathWatch]] = {}
-        """Resolved watches by node id and ancestor ids."""
+        """Resolved watches by node id."""
+        self._by_ancestor: dict[UUID, set[PathWatch]] = {}
+        """Resolved watches with ``ancestors`` by the ids of the directories above their node (move and delete
+        only: the only events ``matches`` takes from an ancestor)."""
         self._by_parent: dict[UUID | None, set[PathWatch]] = {}
         """Resolved directory watches by the id of the node whose children they see; None is the root."""
         self._conn: AsyncConnection[Any] | None = None
@@ -542,6 +541,7 @@ class Watcher:
             self._subscriptions.clear()
             self._unindexed.clear()
             self._by_id.clear()
+            self._by_ancestor.clear()
             self._by_parent.clear()
 
     async def __aenter__(self) -> Self:
@@ -604,20 +604,20 @@ class Watcher:
         return subscription
 
     def _index(self, watch: PathWatch) -> None:
-        """Moves a just-resolved ``watch`` from ``_unindexed`` into the lookup indexes, storing the keys on it for
-        ``_unsubscribe``. The keys never change afterwards: a watch follows its node by id, and ``node``, ``kind``,
-        ``chain`` and ``ancestors`` are set once, in ``PathWatch._open``, so a rename needs no re-indexing."""
+        """Moves a just-resolved ``watch`` from ``_unindexed`` into the lookup indexes. Its keys never change
+        afterwards: a watch follows its node by id, and ``node``, ``kind`` and ``ancestors`` are set once, in
+        ``PathWatch._open``, so a rename needs no re-indexing and ``_unsubscribe`` derives the same keys. Nothing is
+        filed once the watcher is closed (a watch that resolves after ``aclose``)."""
         self._unindexed.discard(watch)
-        id_keys = set(watch.ancestors)
+        if self._closed:
+            return
         if watch.node is not None:
-            id_keys.add(watch.node)
-        watch._id_keys = tuple(id_keys)  # pyright: ignore[reportPrivateUsage]
-        for key in watch._id_keys:  # pyright: ignore[reportPrivateUsage]
-            self._by_id.setdefault(key, set()).add(watch)
+            self._by_id.setdefault(watch.node, set()).add(watch)
+        for ancestor in watch.ancestors:
+            self._by_ancestor.setdefault(ancestor, set()).add(watch)
         if watch.kind == "dir":
-            watch._parent_key = watch.node  # pyright: ignore[reportPrivateUsage]
-            watch._parent_key_set = True  # pyright: ignore[reportPrivateUsage]
             self._by_parent.setdefault(watch.node, set()).add(watch)
+        watch._indexed = True  # pyright: ignore[reportPrivateUsage]
 
     @staticmethod
     def _forget[K](index: dict[K, set[PathWatch]], key: K, watch: PathWatch) -> None:
@@ -635,25 +635,30 @@ class Watcher:
         indexed (a failed lookup): the stored keys name no bucket then, and discards miss."""
         self._subscriptions.discard(subscription)
         self._unindexed.discard(subscription)
-        if not isinstance(subscription, PathWatch):
+        if not isinstance(subscription, PathWatch) or not subscription._indexed:  # pyright: ignore[reportPrivateUsage]
             return
-        for key in subscription._id_keys:  # pyright: ignore[reportPrivateUsage]
-            self._forget(self._by_id, key, subscription)
-        if subscription._parent_key_set:  # pyright: ignore[reportPrivateUsage]
-            parent_key = subscription._parent_key  # pyright: ignore[reportPrivateUsage]
-            self._forget(self._by_parent, parent_key, subscription)
+        subscription._indexed = False  # pyright: ignore[reportPrivateUsage]
+        if subscription.node is not None:
+            self._forget(self._by_id, subscription.node, subscription)
+        for ancestor in subscription.ancestors:
+            self._forget(self._by_ancestor, ancestor, subscription)
+        if subscription.kind == "dir":
+            self._forget(self._by_parent, subscription.node, subscription)
 
     def _targets(self, event: Event) -> Iterable[Subscription]:
         """The subscriptions to offer ``event`` to: all of them for a ``rescan``, else the unindexed ones plus the
-        watches its id, parent and (for a move) old parent select. ``PathWatch.matches`` accepts an event only for
+        watches its id, parent and (for a move) old parent select, and for a move or delete those it is an ancestor
+        of. ``PathWatch.matches`` accepts an event only for
         a rescan, its node's id, a move or delete of an ancestor, or (a directory's) child events by parent or old
         parent, so this is a superset of the subscriptions that would accept it, and ``_offer`` still filters. A
         fresh collection, as subscriptions can close while the event is being offered."""
         if event.op == "rescan":
             return list(self._subscriptions)
         targets = set(self._unindexed)
-        if event.id is not None:  # the id index has no None key: only ids of nodes and ancestors are filed there
+        if event.id is not None:  # the id indexes have no None key: matches never takes an event by a None id
             targets.update(self._by_id.get(event.id, ()))
+            if event.op in ("move", "delete"):
+                targets.update(self._by_ancestor.get(event.id, ()))
         targets.update(self._by_parent.get(event.parent, ()))  # None is the root's key, as in matches
         if event.op == "move":
             targets.update(self._by_parent.get(event.old_parent, ()))
