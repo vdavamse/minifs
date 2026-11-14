@@ -195,6 +195,7 @@ class Deps:
 | --- | --- |
 | `Read` | 2,000 lines, lines cut at 2,000 characters, output capped at 50 KB; `AGENTS.md`/`CLAUDE.md` attachments cut at 64 KB; directories sorted up to 10,000 entries (larger ones are paged in byte order of name) |
 | `Glob`, `Grep` | 100 results; excludes `node_modules`, `.venv`, `__pycache__`, `.mypy_cache` (and always `.git`) |
+| `Glob` | 2 s per statement, and a walk of at most 200,000 files and directories; past either, the call is a retry that asks for a narrower glob |
 | `Grep` | 2 s per statement; hit lines cut at 2,000 characters |
 | `Edit` | files up to 10 MB; 10 s to find `oldString` (the exact match, then the fuzzy matchers), after which the call is a retry (`EditSettings(timeout=None)`: no limit) |
 | `Write` | diffs old files up to 1 MB (larger ones are replaced without a diff) |
@@ -214,9 +215,11 @@ await view.create("/workspace/notes/today.md", b"# Today\n", parents=True)
 await view.append("/workspace/notes/today.md", b"- started\n")     # returns the offset it landed at
 page = await view.pread_lines("/workspace/notes/today.md", first_line=1, max_lines=50)
 await vfs.client.claim("/workspaces/w/tasks/new/t1", "/workspaces/w/tasks/cur/t1")   # exactly one claimer wins
-async with vfs.watcher.watch("/workspaces/w/tasks/new") as events:              # needs open_vfs(..., watch=True)
-    async for event in events: ...                                              # create, modify, move, delete, rescan
+async with view.watch("/workspace/tasks/new") as events:                     # VFSView(..., watcher=vfs.watcher)
+    async for event in events: ...                     # visible paths, filtered by the policy; rescan: re-check
 ```
+
+`vfs.watcher.watch(real_path)` is the operator's version: real paths, no policy, node ids; don't hand it to code that acts for an agent or a tenant.
 
 The `minifs` command works on the same tree, using `$MINIFS_DSN` or the `PG*` variables:
 
@@ -229,6 +232,8 @@ minifs glob '**/*.py' /workspaces/<id>
 minifs grep -i 'todo|fixme' /workspaces/<id> -g '*.py'
 minifs mv /docs/a.md /docs/b.md && minifs rm /docs/b.md
 ```
+
+`minifs glob` stops past 200,000 files and directories walked or 2 s per statement; `--max-nodes N` (or `none`, no cap) and `--timeout S` change them.
 
 ## Limits
 

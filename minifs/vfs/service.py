@@ -6,8 +6,9 @@
     log.info("directory cache: %s", cache.stats())
 
 With a ``cache``, the process's ``Watcher`` (its one LISTEN connection) keeps it fresh from NOTIFY (docs/design.md),
-and the same watcher serves ``vfs.watcher.watch(path)``. Without a cache or ``watch``, as for a one-shot
-script, nothing but the pools is opened.
+and the same watcher serves ``vfs.watcher.watch(path)``, the operator's API (real paths, no policy, node ids); code
+acting for an agent or a tenant passes ``watcher=vfs.watcher`` to its ``VFSView`` and uses ``view.watch(path)``.
+Without a cache or ``watch``, as for a one-shot script, nothing but the pools is opened.
 """
 
 from __future__ import annotations

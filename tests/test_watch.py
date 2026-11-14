@@ -127,8 +127,8 @@ async def test_payload_of_each_op(conn: AsyncConnection, listener: AsyncConnecti
     ]
     assert got[2:] == [
         {"op": "create", "id": str(f), "parent": str(d), "name": "f", "kind": "file"},
-        {"op": "modify", "id": str(f), "parent": str(d), "size": 5, "gen": 0},
-        {"op": "modify", "id": str(f), "parent": str(d), "size": 2, "gen": 1},
+        {"op": "modify", "id": str(f), "parent": str(d), "name": "f", "size": 5, "gen": 0},
+        {"op": "modify", "id": str(f), "parent": str(d), "name": "f", "size": 2, "gen": 1},
         {
             "op": "move",
             "id": str(f),
@@ -215,7 +215,7 @@ async def test_watch_file_sees_appends_as_modify(conn: AsyncConnection, watcher:
         assert (events.node, events.kind) == (log, "file")
         await append(conn, other, 3)
         await append(conn, log, 10)
-        assert await next_event(events) == Event("modify", id=log, parent=logs, size=10, generation=0)
+        assert await next_event(events) == Event("modify", id=log, parent=logs, name="app.log", size=10, generation=0)
 
 
 async def test_watch_directory_sees_its_entries_only(conn: AsyncConnection, watcher: Watcher) -> None:
@@ -230,7 +230,7 @@ async def test_watch_directory_sees_its_entries_only(conn: AsyncConnection, watc
         await unlink(conn, x)
         assert [(e.op, e.id, e.name) for e in [await next_event(events) for _ in range(4)]] == [
             ("create", x, "x"),
-            ("modify", x, None),
+            ("modify", x, "x"),
             ("move", x, "z"),
             ("delete", x, "z"),
         ]
@@ -780,6 +780,26 @@ async def test_malformed_payloads_are_logged_cut_short_and_seldom(
     await catch_up(watcher, conn)
     warnings = [r.getMessage() for r in caplog.records if "malformed" in r.getMessage()]
     assert len(warnings) == 2 and len(warnings[1]) < 400 and "and 4 more since the last warning" in warnings[1]
+
+
+async def test_a_fence_reaches_only_its_watch(
+    conn: AsyncConnection, watcher: Watcher, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fenced watch's fence is no event: no other subscription gets it and it isn't logged as malformed; nor
+    is another process's fence (a payload with the prefix no watch here waits for). Once it arrives the watch
+    delivers what follows, and closing forgets it."""
+    caplog.set_level("WARNING", logger="minifs.vfs.watch")
+    await conn.execute("SELECT pg_notify(vfs_channel(), %s)", ("minifs-fence:not-ours",))
+    with watcher.subscribe() as everything:
+        async with watcher._watch("/", fence=True) as w:  # pyright: ignore[reportPrivateUsage]
+            await catch_up(watcher, conn)
+            assert w._fenced  # pyright: ignore[reportPrivateUsage]
+            assert watcher._fences == {}  # pyright: ignore[reportPrivateUsage]
+            await conn.execute("SELECT pg_notify(vfs_channel(), %s)", (json.dumps({"op": "rescan"}),))
+            assert await next_event(w) is RESCAN
+        everything.close()
+        assert {e.op for e in await drain(everything)} <= {"modify", "rescan"}  # catch_up's marker, the rescan
+    assert not [r for r in caplog.records if "malformed" in r.getMessage()]
 
 
 async def test_consecutive_rescans_are_folded(db: str) -> None:

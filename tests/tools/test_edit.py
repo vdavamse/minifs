@@ -12,7 +12,6 @@ from typing import Any
 
 import pytest
 
-import minifs.tools._text as text
 import minifs.tools.edit as edit_module
 from minifs.tools import TOOLS, Edit
 from minifs.tools.deps import EditSettings, ToolSettings
@@ -294,11 +293,9 @@ async def test_size_cap(deps: Deps, client: VFSClient) -> None:
         EditSettings(max_bytes=1.5)  # pyright: ignore[reportArgumentType]
 
 
-async def test_a_file_grown_past_the_cap_is_refused_after_one_page(
-    view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The cap protects memory, so a file that grew past it after the stat isn't read in full first."""
-    monkeypatch.setattr(text, "PAGE", 10)
+async def test_a_file_grown_past_the_cap_is_refused_after_one_page(view: VFSView, client: VFSClient) -> None:
+    """The cap protects memory, so a file that grew past it after the stat isn't read in full first: one pread, of at
+    most the cap."""
     reads = 0
 
     class Growing(VFSView):

@@ -46,12 +46,13 @@ virtual directory is EBUSY. A mount point is a directory: a file can't be create
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 from uuid import UUID
 
 import psycopg
@@ -72,6 +73,8 @@ from minifs.vfs.core import (
     split_trusted,
 )
 from minifs.vfs.policy import Action, Policy, PolicyDenied
+from minifs.vfs.view_watch import ViewWatch
+from minifs.vfs.watch import Watcher
 
 _MAX_LIMIT = 2**31 - 1  # vfs_glob's limit is an int
 MAX_GLOB_LIMIT = _MAX_LIMIT - 1
@@ -79,6 +82,15 @@ MAX_GLOB_LIMIT = _MAX_LIMIT - 1
 _REFETCH_FACTOR = 8
 _READDIR_BATCH = 256  # the fewest entries a paged readdir asks for after its first round
 _READDIR_MAX_BATCH = 8192  # and what that grows to, doubling each round, while it reads past hidden entries
+
+
+class _Bounds(NamedTuple):
+    """What bounds each walk of one ``VFSView.glob`` (``VFSClient.glob``'s ``max_nodes`` and ``timeout``)."""
+
+    max_nodes: int | None
+    timeout: float
+
+
 _NO_NODE = UUID(int=0)  # never a node id: a pin that nothing matches
 _log = logging.getLogger(__name__)
 
@@ -161,9 +173,17 @@ class VFSView:
     rules for, for mounts that nest, visibly or in the real tree (two visible names for one node would let
     the policy on one name be bypassed through the other), and for a mount with a prefix that isn't in normal
     form, a real prefix of ``/``, or one in ``/workspaces`` that isn't one whole workspace. Build an agent's
-    mounts with ``workspace_mounts``."""
+    mounts with ``workspace_mounts``. ``watcher`` (the process's, ``VFS.watcher``) serves ``watch``."""
 
-    def __init__(self, client: VFSClient, mounts: Mapping[str, str], policy: Policy, actor: str) -> None:
+    def __init__(
+        self,
+        client: VFSClient,
+        mounts: Mapping[str, str],
+        policy: Policy,
+        actor: str,
+        *,
+        watcher: Watcher | None = None,
+    ) -> None:
         if actor not in policy.actors:
             raise ValueError(f"the policy has no rules for actor {actor!r}")
         self._client = client
@@ -178,6 +198,7 @@ class VFSView:
                     raise ValueError(f"mount {join(*b.visible)} reaches into mount {join(*a.visible)}'s tree")
         self.policy = policy
         self.actor = actor
+        self._watcher = watcher
 
     # Reads
 
@@ -284,9 +305,15 @@ class VFSView:
         excludes: Sequence[str] = (),
         hidden: bool = False,
         limit: int | None = None,
+        max_nodes: int | None = searching.MAX_NODES,
+        timeout: float = searching.TIMEOUT,
     ) -> GlobResult:
         """``VFSClient.glob`` below directory ``path``: the first ``limit`` files the actor may read, and whether
         there is at least one more (``truncated``).
+
+        ``max_nodes`` and ``timeout`` bound each walk as in ``VFSClient.glob`` (``SearchRefused``): each mount's,
+        below a virtual directory, and the second look described below. Files the actor can't read count toward
+        the cap, as the walk meets them before the policy does.
 
         Mounts the actor can't read anything in are not searched. The glob asks for ``limit + 1`` matches, so
         exactly ``limit`` readable ones are not ``truncated``. When all ``limit + 1`` came back and the policy hid
@@ -309,19 +336,25 @@ class VFSView:
         - for an exclude, a trailing ``//`` (``**//``).
 
         Every mount's pattern and excludes are restated before any is searched, so whether a glob is EINVAL
-        doesn't depend on the order of the mounts. EINVAL too for a ``limit`` outside 0 to 2**31 - 2."""
+        doesn't depend on the order of the mounts. EINVAL too for a ``limit`` outside 0 to 2**31 - 2, and for a
+        bad ``max_nodes`` or ``timeout``."""
         target = self._target(path, "read")
         if limit is not None and not 0 <= limit < _MAX_LIMIT:  # limit + 1 is asked for
             raise VFSError("EINVAL", target.visible, f"invalid limit {limit}")
+        if max_nodes is not None and not 0 <= max_nodes <= _MAX_LIMIT:
+            raise VFSError("EINVAL", target.visible, f"invalid node cap {max_nodes}")
+        if not 0 < timeout <= MAX_TIMEOUT:
+            raise VFSError("EINVAL", target.visible, f"invalid timeout {timeout}")
+        bounds = _Bounds(max_nodes, timeout)
         if limit is None:
-            return GlobResult(self._readable(await self._glob(target, pattern, excludes, hidden, None)), False)
+            return GlobResult(self._readable(await self._glob(target, pattern, excludes, hidden, None, bounds)), False)
         fetch = limit + 1
-        entries = await self._glob(target, pattern, excludes, hidden, fetch)
+        entries = await self._glob(target, pattern, excludes, hidden, fetch, bounds)
         readable = self._readable(entries)
         wider = min(max(limit, 1) * _REFETCH_FACTOR + 1, _MAX_LIMIT)
         if len(entries) == fetch and len(readable) <= limit and wider > fetch:
             # The policy hid some of the first `limit + 1`: look past them, a bounded distance.
-            readable = self._readable(await self._glob(target, pattern, excludes, hidden, wider))
+            readable = self._readable(await self._glob(target, pattern, excludes, hidden, wider, bounds))
         return GlobResult(readable[:limit], len(readable) > limit)
 
     def _readable(self, entries: list[Entry]) -> list[Entry]:
@@ -349,18 +382,33 @@ class VFSView:
         return self.policy.allows(self.actor, "read", entry.path)
 
     async def _glob(
-        self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
+        self,
+        target: _Target,
+        pattern: str,
+        excludes: Sequence[str],
+        hidden: bool,
+        limit: int | None,
+        bounds: _Bounds,
     ) -> list[Entry]:
         if target.real is not None:
             if not self.policy.allows_any(self.actor, "read", target.visible):
                 return []
             matches = await self._mapped(
-                self._client.glob(pattern, target.real, excludes=excludes, hidden=hidden, limit=limit), target
+                self._client.glob(
+                    pattern,
+                    target.real,
+                    excludes=excludes,
+                    hidden=hidden,
+                    limit=limit,
+                    max_nodes=bounds.max_nodes,
+                    timeout=bounds.timeout,
+                ),
+                target,
             )
             return [self._entry(e, target) for e in matches]
         globbing.compile_glob(pattern)  # a bad pattern is reported as such, not restated
         globbing.compile_excludes(excludes)
-        return await self._virtual_glob(target, pattern, excludes, hidden, limit)
+        return await self._virtual_glob(target, pattern, excludes, hidden, limit, bounds)
 
     async def grep(
         self,
@@ -504,6 +552,36 @@ class VFSView:
             return self.policy.allows(self.actor, "read", visible)
 
         return keep
+
+    # Watch
+
+    @contextlib.asynccontextmanager
+    async def watch(self, path: str) -> AsyncGenerator[ViewWatch]:
+        """Events for the node at ``path`` that the actor may see, in visible paths, until the block exits (see
+        ``ViewWatch``). Needs ``read`` on ``path``; ENOENT outside the mounts, or where nothing is; EINVAL for a
+        virtual directory (watch a mount point instead). RuntimeError if the view was built without a watcher.
+        This is the watch for code acting for an actor: ``Watcher.watch`` takes real paths and applies no policy.
+        """
+        if self._watcher is None:
+            raise RuntimeError("this VFSView has no watcher: pass watcher= (open_vfs(..., watch=True) opens one)")
+        target = self._target(path, "read")
+        if target.real is None:
+            raise VFSError("EINVAL", target.visible, "a virtual directory can't be watched")
+        async with contextlib.AsyncExitStack() as stack:
+            watch = self._watcher._watch(target.real, ancestors=True, fence=True)  # pyright: ignore[reportPrivateUsage]
+            inner = await self._mapped(stack.enter_async_context(watch), target)
+            view_watch = ViewWatch(
+                inner,
+                target.path,
+                split_trusted(target.real),
+                mount_point=target.is_mount_point,
+                policy=self.policy,
+                actor=self.actor,
+            )
+            try:
+                yield view_watch
+            finally:
+                view_watch.close()  # and a check still pending
 
     # Writes
 
@@ -725,7 +803,13 @@ class VFSView:
         return [children[name] for name in sorted(children)]
 
     async def _virtual_glob(
-        self, target: _Target, pattern: str, excludes: Sequence[str], hidden: bool, limit: int | None
+        self,
+        target: _Target,
+        pattern: str,
+        excludes: Sequence[str],
+        hidden: bool,
+        limit: int | None,
+        bounds: _Bounds,
     ) -> list[Entry]:
         entries: list[Entry] = []
         for mount_target, mount_pattern, mount_excludes in self._restated(target, pattern, excludes, hidden):
@@ -733,7 +817,13 @@ class VFSView:
             try:
                 matches = await self._mapped(
                     self._client.glob(
-                        mount_pattern, _real(mount_target), excludes=mount_excludes, hidden=hidden, limit=limit
+                        mount_pattern,
+                        _real(mount_target),
+                        excludes=mount_excludes,
+                        hidden=hidden,
+                        limit=limit,
+                        max_nodes=bounds.max_nodes,
+                        timeout=bounds.timeout,
                     ),
                     mount_target,
                 )

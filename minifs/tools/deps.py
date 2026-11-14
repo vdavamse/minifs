@@ -19,6 +19,7 @@ from pydantic_ai import RunContext
 
 from minifs.vfs.client import MAX_TIMEOUT
 from minifs.vfs.glob import compile_excludes
+from minifs.vfs.search import MAX_NODES, TIMEOUT
 from minifs.vfs.view import MAX_GLOB_LIMIT, VFSView
 
 DEFAULT_WORKDIR = "/workspace"
@@ -86,6 +87,13 @@ class GlobSettings:
     ``**`` segment followed by one that can match a directory at or above a mount point (``**/w*/`` or
     ``**/workspace/**``, though not ``**/*.pyc``), a brace or class with ``/``, an escaped ``/``, a trailing
     ``//``. They make every such glob EINVAL, which the model sees as a retry naming a pattern it never wrote."""
+    timeout: float = TIMEOUT
+    """Seconds each of a glob's statements may run. Past it the call is a retry that asks for a narrower glob."""
+    max_nodes: int | None = MAX_NODES
+    """Files and directories one walk may keep before the call is that retry: every match is collected before
+    the newest ``limit`` are known, so a glob of a huge tree is refused instead of running to the timeout. Files
+    whose name the pattern rules out (the ``.md`` files, for ``**/*.py``) don't count. Below ``/`` each mount's
+    walk has its own cap. None: no cap (the timeout still applies)."""
 
     def __post_init__(self) -> None:
         """A bad limit or exclude is the caller's mistake, so it fails here, not as a retry the model can't fix."""
@@ -93,6 +101,13 @@ class GlobSettings:
             raise TypeError(f"glob limit must be an int, not {self.limit!r}")
         if not 0 <= self.limit <= MAX_GLOB_LIMIT:
             raise ValueError(f"glob limit must be 0 to {MAX_GLOB_LIMIT}, not {self.limit}")
+        if self.max_nodes is not None:
+            if isinstance(self.max_nodes, bool) or not isinstance(self.max_nodes, int):  # pyright: ignore[reportUnnecessaryIsInstance]
+                raise TypeError(f"glob max_nodes must be an int or None, not {self.max_nodes!r}")
+            if not 0 <= self.max_nodes < 2**31:  # vfs_glob's p_max_nodes is an int
+                raise ValueError(f"glob max_nodes must be 0 to {2**31 - 1}, not {self.max_nodes}")
+        if isinstance(self.timeout, bool) or not 0 < self.timeout <= MAX_TIMEOUT:
+            raise ValueError(f"glob timeout must be over 0 and at most {MAX_TIMEOUT} seconds, not {self.timeout!r}")
         compile_excludes(self.excludes)  # GlobError
 
 
