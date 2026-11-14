@@ -535,6 +535,20 @@ async def test_the_trigger_functions_refuse_another_table(conn: AsyncConnection,
     assert [p["id"] for p in await payloads(listener, 1)] == [str(f)]
 
 
+async def test_a_function_in_the_schema_cannot_stand_in_for_a_builtin(conn: AsyncConnection) -> None:
+    """The trigger functions run as the owner, so they call pg_catalog's functions by name: a closer-matching
+    json_build_object in the schema (which a role with CREATE on it could add) is not what they run. Nor does the
+    table take a name that pg_notify would refuse, which would fail every write."""
+    await conn.execute(
+        "CREATE FUNCTION json_build_object(text, text, text, uuid, text, uuid, text, text, text, text) RETURNS json"
+        " LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'hijacked as %', current_user; END $$"
+    )
+    await create(conn, None, "f")
+    for bad in ("", "x" * 64):
+        with pytest.raises(errors.CheckViolation):
+            await conn.execute("UPDATE vfs_channel_name SET channel = %s", (bad,))
+
+
 async def test_an_empty_channel_table_fails_at_start(conn: AsyncConnection, db: str) -> None:
     await conn.execute("DELETE FROM vfs_channel_name")
     with pytest.raises(RuntimeError, match="no channel in public.vfs_channel_name"):

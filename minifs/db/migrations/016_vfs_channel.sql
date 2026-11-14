@@ -31,10 +31,12 @@
 -- their keepalive interval. A copy of this schema (dump and restore) in the same database shares the channel with
 -- the original until that is done; a restore into another database doesn't matter. A restore without privileges
 -- (pg_dump --no-acl) loses the REVOKEs: every role can call vfs_channel() again until they are repeated.
+-- Blanket grants do the same: GRANT SELECT ON ALL TABLES IN SCHEMA (or default privileges that grant it) gives the
+-- name to a read-only role through vfs_channel_name, and GRANT EXECUTE ON ALL FUNCTIONS through vfs_channel().
 
 CREATE TABLE vfs_channel_name (
     one     boolean PRIMARY KEY DEFAULT true CHECK (one),  -- a single row
-    channel text    NOT NULL
+    channel text    NOT NULL CHECK (octet_length(channel) BETWEEN 1 AND 63)  -- what LISTEN and pg_notify take
 );
 COMMENT ON TABLE vfs_channel_name IS
     'The NOTIFY channel of this schema, one row (migration 016). Read it through vfs_channel().';
@@ -63,19 +65,19 @@ BEGIN
         RAISE EXCEPTION 'vfs_notify() is the trigger function of vfs_nodes alone';
     END IF;
     IF TG_OP = 'INSERT' THEN
-        v_payload := json_build_object('op', 'create', 'id', NEW.id, 'parent', NEW.parent_id,
+        v_payload := pg_catalog.json_build_object('op', 'create', 'id', NEW.id, 'parent', NEW.parent_id,
                                        'name', NEW.name, 'kind', NEW.kind);
     ELSIF TG_OP = 'DELETE' THEN
-        v_payload := json_build_object('op', 'delete', 'id', OLD.id, 'parent', OLD.parent_id,
+        v_payload := pg_catalog.json_build_object('op', 'delete', 'id', OLD.id, 'parent', OLD.parent_id,
                                        'name', OLD.name, 'kind', OLD.kind);
     ELSIF OLD.parent_id IS DISTINCT FROM NEW.parent_id OR OLD.name <> NEW.name THEN
-        v_payload := json_build_object('op', 'move', 'id', NEW.id, 'parent', NEW.parent_id, 'name', NEW.name,
+        v_payload := pg_catalog.json_build_object('op', 'move', 'id', NEW.id, 'parent', NEW.parent_id, 'name', NEW.name,
                                        'old_parent', OLD.parent_id, 'old_name', OLD.name, 'kind', NEW.kind);
     ELSE
-        v_payload := json_build_object('op', 'modify', 'id', NEW.id, 'parent', NEW.parent_id,
+        v_payload := pg_catalog.json_build_object('op', 'modify', 'id', NEW.id, 'parent', NEW.parent_id,
                                        'size', NEW.size, 'gen', NEW.generation);
     END IF;
-    PERFORM pg_notify(vfs_channel(), v_payload::text);
+    PERFORM pg_catalog.pg_notify((SELECT channel FROM vfs_channel_name), v_payload::text);
     RETURN NULL;
 END $$;
 
@@ -85,7 +87,7 @@ BEGIN
     IF TG_RELID <> 'vfs_nodes'::regclass THEN
         RAISE EXCEPTION 'vfs_notify_truncate() is the trigger function of vfs_nodes alone';
     END IF;
-    PERFORM pg_notify(vfs_channel(), '{"op": "rescan"}');
+    PERFORM pg_catalog.pg_notify((SELECT channel FROM vfs_channel_name), '{"op": "rescan"}');
     RETURN NULL;
 END $$;
 
@@ -99,6 +101,11 @@ END $$;
 -- json_build_object would then run as this schema's owner. Hence the REVOKE (firing a trigger doesn't check
 -- EXECUTE, so roles that write through table grants are unaffected) and the TG_RELID checks in the bodies, which
 -- hold even where the ACL is lost (see pg_dump --no-acl above) or EXECUTE is granted by mistake.
+--
+-- For the same reason the bodies name pg_catalog for the functions they call: called unqualified, a function of
+-- the same name with a closer signature in this schema would be chosen over pg_catalog's (json_build_object is
+-- VARIADIC "any"), and a role with CREATE on the schema could have its code run as the owner. They read the name
+-- from the table themselves, as the owner, which also spares a call of vfs_channel() per changed row.
 REVOKE EXECUTE ON FUNCTION vfs_notify(), vfs_notify_truncate() FROM PUBLIC;
 DO $$
 BEGIN
