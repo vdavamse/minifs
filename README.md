@@ -177,7 +177,7 @@ Every write is visible to the next search at once, with no index lag. The transl
 | `/workspace/**` | read, write | — | read, write |
 | `/docs/**` | read | read, write | read |
 
-Rules are ordered and the first match wins. A rule with no actions hides a path, so `Policy({"agent": [Rule("/workspace/**/.env"), Rule("/workspace/**", "read", "write"), ...]})` makes `.env` files invisible to `Read`, `Glob` and `Grep`. The policy is the tools' only permission gate.
+Rules are ordered and the first match wins. A rule with no actions hides a path, so `Policy({"agent": [Rule("/workspace/**/.env"), Rule("/workspace/**", "read", "write"), ...]})` makes `.env` files invisible to `Read`, `Glob` and `Grep`. A path no rule matches is refused (`Policy(rules, read_unmatched=True)` lets it be read, as before 0.1.0). So a real directory, the mount point included, is readable only where a rule matches it: `/workspace/**` covers `/workspace` itself, while `/workspace/src/**` alone leaves `/workspace` unreadable (`Glob` and `Grep` from `/` still reach `src`). The virtual directories above the mounts, such as `/`, may be read wherever something in a mount below them may, unless a rule names them. The policy is the tools' only permission gate.
 
 ## Configuration
 
@@ -215,9 +215,11 @@ await view.create("/workspace/notes/today.md", b"# Today\n", parents=True)
 await view.append("/workspace/notes/today.md", b"- started\n")     # returns the offset it landed at
 page = await view.pread_lines("/workspace/notes/today.md", first_line=1, max_lines=50)
 await vfs.client.claim("/workspaces/w/tasks/new/t1", "/workspaces/w/tasks/cur/t1")   # exactly one claimer wins
-async with vfs.watcher.watch("/workspaces/w/tasks/new") as events:              # needs open_vfs(..., watch=True)
-    async for event in events: ...                                              # create, modify, move, delete, rescan
+async with view.watch("/workspace/tasks/new") as events:                     # VFSView(..., watcher=vfs.watcher)
+    async for event in events: ...                     # visible paths, filtered by the policy; rescan: re-check
 ```
+
+`vfs.watcher.watch(real_path)` is the operator's version: real paths, no policy, node ids; don't hand it to code that acts for an agent or a tenant.
 
 The `minifs` command works on the same tree, using `$MINIFS_DSN` or the `PG*` variables:
 
