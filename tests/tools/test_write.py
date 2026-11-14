@@ -447,6 +447,9 @@ async def test_a_file_grown_past_the_cap_after_its_stat_is_not_diffed(view: VFSV
     assert await content(client, "big.txt") == b"new\n"
 
 
+# read_file, which Write and Edit share
+
+
 async def test_read_file_reads_a_file_within_the_cap_in_one_pread(view: VFSView, client: VFSClient) -> None:
     """A file within ``max_size`` is one statement: a 2.56 MB file, more than the old 1 MB page, is one pread
     asking for the cap."""
@@ -470,12 +473,16 @@ async def test_read_file_pages_past_page(view: VFSView, client: VFSClient, monke
 
 
 async def test_read_file_without_a_cap_asks_for_page(view: VFSView, client: VFSClient) -> None:
-    """With no ``max_size`` the first pread asks for ``PAGE``, the largest limit ``vfs_pread`` takes."""
+    """With no ``max_size``, or one over ``PAGE``, the first pread asks for ``PAGE``."""
     await client.create(f"/workspaces/{W1}/whole.txt", b"abc\n")
     spy = Preads(view, client)
     got, _ = await text.read_file(spy, "/workspace/whole.txt")
     assert got == b"abc\n"
     assert spy.preads == [(0, text.PAGE)]
+    spy = Preads(view, client)
+    got, _ = await text.read_file(spy, "/workspace/whole.txt", 10 * text.PAGE)
+    assert got == b"abc\n"
+    assert spy.preads == [(0, text.PAGE)]  # a cap over the page asks for the page
 
 
 async def test_read_file_with_a_zero_cap(view: VFSView, client: VFSClient) -> None:

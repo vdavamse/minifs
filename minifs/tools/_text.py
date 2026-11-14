@@ -13,8 +13,9 @@ from minifs.vfs.view import VFSView
 
 BOM = "\ufeff"
 
-PAGE = 2**31 - 1
-"""The most bytes ``read_file`` asks one ``pread`` for: the largest limit ``vfs_pread`` takes (an int)."""
+PAGE = 16 * 1024 * 1024
+"""The most bytes ``read_file`` asks one ``pread`` for, whatever its cap: big enough that Edit's default 10 MB cap
+is one statement, small enough to bound what one statement holds and how long it runs when the cap is raised."""
 
 
 class TooLarge(Exception):
@@ -29,12 +30,15 @@ async def read_file(vfs: VFSView, path: str, max_size: int | None = None) -> tup
     """The whole content of file ``path`` and the version it is: what a compare-and-swap write expects. ``TooLarge``,
     after the first page, for a file over ``max_size`` bytes.
 
-    Each ``pread`` asks for up to ``max_size`` bytes (at most ``PAGE``), so a file within the cap is one statement,
-    read from one snapshot, and a file that grew past the cap is refused having read at most ``max_size`` bytes.
-    Memory peaks at about twice the file (the rows, one per extent, and their join), as it did with smaller pages.
-    Reads set no ``statement_timeout`` of their own, so a server one applies to the whole read: with a tight one and a
-    slow link, keep ``max_size`` small. A larger file is read in pages, and ESTALE is raised if it changed between
-    them (the content would mix two versions)."""
+    Each ``pread`` asks for up to ``max_size`` bytes and at most ``PAGE``, so a file within both (as Edit's default
+    cap is) is one statement, read from one snapshot, and a file that grew past the cap is refused having read at
+    most ``max_size`` bytes. A larger file is read in pages, and ESTALE is raised if it changed between them (the
+    content would mix two versions).
+
+    A page costs about three times its size in client memory while it arrives (bytea comes as hex text, then is
+    decoded), and the server holds it whole before sending it (spilling to disk past ``work_mem``). Reads set no
+    ``statement_timeout`` of their own, so a server one applies to each page: ``PAGE`` bounds both, whatever
+    ``EditSettings.max_bytes`` or ``WriteSettings.max_diff_bytes`` allow."""
     page_size = PAGE if max_size is None else min(max_size, PAGE)
     first = await vfs.pread(path, 0, page_size)
     if max_size is not None and first.size > max_size:
