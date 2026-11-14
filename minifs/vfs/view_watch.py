@@ -17,15 +17,17 @@ as far as the actor may see it:
   or to a name the actor may not read, a move or removal of any directory above it (a mount point's included), or
   a path that no longer leads to the node when the watch checks after a ``rescan`` (a move may have been missed).
   Watch the new path again to follow it.
-- Events are hints: the node's own ``move``, its ancestors' ``move`` and ``delete``, and a ``rescan`` are checked
-  against the database (one path lookup) before the watch acts on them, so one that changed nothing (a forged or
-  repeated notification) is dropped. When that lookup fails, the watch delivers a ``rescan`` and ends.
-- A child's ``modify`` notification carries no name. The watch keeps the names of the children it has seen, and
-  looks a missing one up with one query (on the watcher's pool) the first time the child is modified. It forgets
-  them on a ``rescan``, since a rename may have been missed. A child that is not in the directory is skipped (and
-  remembered as such, a bounded number of them), and a failed lookup is reported as a ``rescan``.
-- A name that no node can have (empty, ``.``, ``..``, or with a ``/``) comes only from a forged payload, and its
-  event is dropped.
+- Events are hints: the node's own ``move`` and ``delete``, its ancestors' ``move`` and ``delete``, and a
+  ``rescan`` are checked against the database before the watch acts on them: the watched path must still lead to
+  the node through the same directories (the same ids) it resolved through when the watch started, so a directory
+  above it that was replaced by another of the same name counts as moved. One that changed nothing (a forged or
+  repeated notification) is dropped. Each check costs one or two queries on the watcher's pool; when one fails,
+  the watch delivers a ``rescan`` and ends.
+- Each child event is judged by the name in its own notification (the name the child had when it changed; the
+  ``modify`` payload carries it since migration 021), so no name is remembered or looked up. A child ``modify``
+  without a name (a schema before 021) is dropped.
+- A name that no node can have (empty, ``.``, ``..``, with a ``/``, or over 255 bytes) comes only from a forged
+  payload, and its event is dropped.
 - An event is never lost to a caller's timeout: if ``get()`` is cancelled while it checks the database, the event
   and the check are kept, and the next ``get()`` resumes them.
 
@@ -38,16 +40,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Self
+from typing import Any, Self
 from uuid import UUID
+
+from psycopg import AsyncConnection
 
 from minifs.vfs.core import VFSError, escape_controls, join
 from minifs.vfs.policy import Policy
 from minifs.vfs.watch import Event, Op, PathWatch
 
 logger = logging.getLogger(__name__)
-
-_MAX_MISSING = 1024  # children remembered as not in the watched directory, before the set is forgotten
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +91,6 @@ class ViewWatch:
         self._mount_point = mount_point
         self._policy = policy
         self._actor = actor
-        self._names: dict[UUID, str] = {}  # the watched directory's children seen so far, by id
-        self._missing: set[UUID] = set()  # ids a lookup found not to be children
         self._ended = False
         self._pending: tuple[Event, asyncio.Task[WatchEvent | None]] | None = None  # survives a cancelled get()
 
@@ -120,7 +120,7 @@ class ViewWatch:
     async def get(self) -> WatchEvent:
         """The next event the actor may see. StopAsyncIteration once the watch has ended."""
         while True:
-            if self._ended:
+            if self._ended and self._pending is None:  # a pending task may hold the last event
                 raise StopAsyncIteration
             if self._pending is None:
                 event = await self._inner.get()
@@ -142,8 +142,6 @@ class ViewWatch:
     async def _seen(self, event: Event) -> WatchEvent | None:
         node = self._inner.node
         if event.op == "rescan":
-            self._names.clear()
-            self._missing.clear()
             return await self._confirmed(WatchEvent("rescan", self.path))
         if event.id == node:
             return await self._own(event)
@@ -154,39 +152,54 @@ class ViewWatch:
     async def _own(self, event: Event) -> WatchEvent | None:
         """An event of the watched node itself."""
         if event.op == "move":
-            if not self._mount_point and event.old_parent == event.parent and _valid(event.name):
-                assert event.name is not None
-                real = (*self._real[:-1], event.name)
-                if real == self._real:
-                    return None  # it is where the watch has it: a repeated notification
-                try:
-                    there = await self._at(real)
-                except Exception as error:
-                    return self._failed(error)
-                path = (*self._path[:-1], event.name)
-                if there == self._inner.node and self._readable(path):
-                    old, self._path, self._real = self.path, path, real
-                    return WatchEvent("move", self.path, kind=self.kind, old_path=old)
+            return await self._moved()
+        if event.op == "delete":  # PathWatch checked the node exists; the path may still lead to it (forged)
             return await self._confirmed(None)
         if event.op == "create":  # not for a node that exists: a forged payload
             return None
-        return WatchEvent(event.op, self.path, kind=self.kind, size=event.size, generation=event.generation)
+        return WatchEvent("modify", self.path, kind=self.kind, size=event.size, generation=event.generation)
 
-    async def _confirmed(self, event: WatchEvent | None) -> WatchEvent | None:
-        """``event`` if the watched path still leads to the node; otherwise a ``delete`` at that path, and the
-        watch ends."""
+    async def _moved(self) -> WatchEvent | None:
+        """The node moved, by its notification: where is it now? Followed if renamed in place to a readable name,
+        through the same directories; nothing if it is still at the watched path; otherwise a ``delete`` and the
+        watch ends. Judged by where the node is now, not by the payload, so a forged move changes nothing and two
+        quick renames end at the second name."""
+        chain = self._inner.chain
         try:
-            there = await self._at(self._real)
+            async with self._inner._watcher._query() as conn:  # pyright: ignore[reportPrivateUsage]
+                cur = await conn.execute("SELECT parent_id, name FROM vfs_nodes WHERE id = %s", (self._inner.node,))
+                row = await cur.fetchone()
+                if row is None or self._mount_point or row[0] != (chain[-2] if len(chain) > 1 else None):
+                    return self._end(WatchEvent("delete", self.path, kind=self.kind))
+                real = (*self._real[:-1], row[1])
+                there = await self._at(real, conn)
         except Exception as error:
             return self._failed(error)
-        if there == self._inner.node:
+        if there != chain:
+            return self._end(WatchEvent("delete", self.path, kind=self.kind))
+        if real == self._real:
+            return None  # it is where the watch has it
+        path = (*self._path[:-1], row[1])
+        if not self._readable(path):
+            return self._end(WatchEvent("delete", self.path, kind=self.kind))
+        old, self._path, self._real = self.path, path, real
+        return WatchEvent("move", self.path, kind=self.kind, old_path=old)
+
+    async def _confirmed(self, event: WatchEvent | None) -> WatchEvent | None:
+        """``event`` if the watched path still leads to the node through the directories it resolved through;
+        otherwise a ``delete`` at that path, and the watch ends."""
+        try:
+            async with self._inner._watcher._query() as conn:  # pyright: ignore[reportPrivateUsage]
+                there = await self._at(self._real, conn)
+        except Exception as error:
+            return self._failed(error)
+        if there == self._inner.chain:
             return event
         return self._end(WatchEvent("delete", self.path, kind=self.kind))
 
     async def _child(self, event: Event) -> WatchEvent | None:
-        """An event of a child of the watched directory."""
+        """An event of a child of the watched directory, judged by the name in its notification."""
         node = self._inner.node
-        assert event.id is not None
         if event.op == "move":
             into = event.parent == node
             out_of = event.old_parent == node
@@ -194,12 +207,6 @@ class ViewWatch:
                 return None
             old = self._child_path(event.old_name) if out_of else None
             new = self._child_path(event.name) if into else None
-            if into:
-                assert event.name is not None
-                self._names[event.id] = event.name
-                self._missing.discard(event.id)
-            else:
-                self._names.pop(event.id, None)
             if old is not None and new is not None:
                 return WatchEvent("move", new, kind=event.kind, old_path=old)
             if new is not None:
@@ -207,39 +214,14 @@ class ViewWatch:
             if old is not None:
                 return WatchEvent("delete", old, kind=event.kind)
             return None
-        if event.parent != node:
+        if event.parent != node or not _valid(event.name):
             return None
-        if event.op in ("create", "delete"):
-            if not _valid(event.name):
-                return None
-            assert event.name is not None
-            if event.op == "create":
-                self._names[event.id] = event.name
-                self._missing.discard(event.id)
-            else:
-                self._names.pop(event.id, None)
-            path = self._child_path(event.name)
-            return None if path is None else WatchEvent(event.op, path, kind=event.kind)
-        # modify: the payload has no name
-        name = self._names.get(event.id)
-        if name is None:
-            if event.id in self._missing:
-                return None
-            try:
-                name = await self._lookup(event.id)
-            except Exception as error:
-                logger.warning("minifs watch: could not look up a child's name (%r), sending a rescan", error)
-                self._names.clear()
-                self._missing.clear()
-                return WatchEvent("rescan", self.path)
-            if name is None:
-                if len(self._missing) >= _MAX_MISSING:
-                    self._missing.clear()
-                self._missing.add(event.id)
-                return None  # not in the watched directory: a later event says where it went
-            self._names[event.id] = name
-        path = self._child_path(name)
-        return None if path is None else WatchEvent("modify", path, size=event.size, generation=event.generation)
+        path = self._child_path(event.name)
+        if path is None:
+            return None
+        if event.op == "modify":
+            return WatchEvent("modify", path, size=event.size, generation=event.generation)
+        return WatchEvent(event.op, path, kind=event.kind)
 
     def _child_path(self, name: str | None) -> str | None:
         """The visible path of the child ``name``, reported as listings do, or None if the actor may not read it."""
@@ -254,21 +236,12 @@ class ViewWatch:
         except VFSError:  # a name the path rules refuse: never reported
             return False
 
-    async def _at(self, real: tuple[str, ...]) -> UUID | None:
-        """The node at real path ``real`` now, None if there is none."""
-        async with self._inner._watcher._query() as conn:  # pyright: ignore[reportPrivateUsage]
-            cur = await conn.execute("SELECT id FROM vfs_lookup(%s)", (list(real),))
-            row = await cur.fetchone()
-        return None if row is None else row[0]
-
-    async def _lookup(self, child: UUID) -> str | None:
-        """The name of ``child`` if it is in the watched directory."""
-        async with self._inner._watcher._query() as conn:  # pyright: ignore[reportPrivateUsage]
-            cur = await conn.execute(
-                "SELECT name FROM vfs_nodes WHERE id = %s AND parent_id = %s", (child, self._inner.node)
-            )
-            row = await cur.fetchone()
-        return None if row is None else row[0]
+    @staticmethod
+    async def _at(real: tuple[str, ...], conn: AsyncConnection[Any]) -> tuple[UUID, ...] | None:
+        """The ids along real path ``real`` now (as ``PathWatch.chain``), None if nothing is there."""
+        cur = await conn.execute("SELECT id, chain FROM vfs_lookup(%s)", (list(real),))
+        row = await cur.fetchone()
+        return None if row is None or row[0] is None else tuple(row[1])
 
     def _failed(self, error: Exception) -> WatchEvent:
         """A ``rescan`` that ends the watch: the check of its path failed, so it can't vouch for it."""
@@ -283,5 +256,5 @@ class ViewWatch:
 
 
 def _valid(name: str | None) -> bool:
-    """Whether a node could have ``name``: none is empty, ``.`` or ``..``, or has a ``/``."""
-    return name is not None and name not in ("", ".", "..") and "/" not in name
+    """Whether a node could have ``name``: none is empty, ``.`` or ``..``, has a ``/`` or is over 255 bytes."""
+    return name is not None and name not in ("", ".", "..") and "/" not in name and len(name.encode()) <= 255

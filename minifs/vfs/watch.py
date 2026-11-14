@@ -62,8 +62,9 @@ class Event:
     """One change to a node, as the ``vfs_notify`` trigger reports it, or a ``rescan``.
 
     ``parent`` is the node's directory after the change, None for the root; ``old_parent`` and ``old_name`` are
-    set for ``move`` only. ``name`` and ``kind`` are set for create, move and delete; ``size`` and ``generation``
-    for modify. A ``rescan`` has no fields: events may have been lost, so re-check what you watch.
+    set for ``move`` only. ``kind`` is set for create, move and delete; ``name`` for those and for modify (since
+    migration 021); ``size`` and ``generation`` for modify. A ``rescan`` has no fields: events may have been lost, so
+    re-check what you watch.
     """
 
     op: Op

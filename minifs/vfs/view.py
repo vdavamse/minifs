@@ -548,7 +548,7 @@ class VFSView:
         async with contextlib.AsyncExitStack() as stack:
             watch = self._watcher._watch(target.real, ancestors=True)  # pyright: ignore[reportPrivateUsage]
             inner = await self._mapped(stack.enter_async_context(watch), target)
-            yield ViewWatch(
+            view_watch = ViewWatch(
                 inner,
                 target.path,
                 split_trusted(target.real),
@@ -556,6 +556,10 @@ class VFSView:
                 policy=self.policy,
                 actor=self.actor,
             )
+            try:
+                yield view_watch
+            finally:
+                view_watch.close()  # and a check still pending
 
     # Writes
 
