@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import os
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 import psycopg
 from psycopg import AsyncConnection
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from minifs._regex import RegexError
 from minifs.db.migrate import MigrationError, applied_versions, load_migrations, migrate
@@ -100,23 +103,78 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     label = f"db {args.db_command}" if args.command == "db" else args.command
+    secrets: list[str] = []
     try:
+        dsn, secrets = _connection(args, label)
         if args.command == "db":
-            return asyncio.run(_migrate(args.dsn) if args.db_command == "migrate" else _status(args.dsn))
-        return asyncio.run(_with_client(args.dsn, _VFS_COMMANDS[args.command], args))
+            return asyncio.run(_migrate(dsn) if args.db_command == "migrate" else _status(dsn))
+        return asyncio.run(_with_client(dsn, _VFS_COMMANDS[args.command], args))
     except (MigrationError, VFSError, GlobError, RegexError, SearchRefused, psycopg.Error, OSError) as e:
         detail = f" ({e.detail})" if isinstance(e, VFSError) and e.detail else ""
-        print(f"minifs {label}: {e}{detail}", file=sys.stderr)
+        print(_mask(f"minifs {label}: {e}{detail}", secrets), file=sys.stderr)
+        return 1
+    except _BadConninfo as e:
+        print(f"minifs {label}: {e}", file=sys.stderr)
         return 1
 
 
 def _add_dsn(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--dsn",
-        default=os.environ.get("MINIFS_DSN", ""),
-        help="libpq connection string (default: $MINIFS_DSN, then the PG* environment variables)",
+        help="libpq connection string (default: $MINIFS_DSN, then the PG* environment variables and ~/.pgpass). "
+        "Don't put a password here: other users see it in the process list, and it stays in your shell history",
     )
+    source.add_argument("--dsn-file", type=Path, metavar="PATH", help="read the connection string from this file")
+    parser.add_argument("-W", "--password", dest="ask_password", action="store_true", help="prompt for the password")
     return parser
+
+
+class _BadConninfo(Exception):
+    """A connection string libpq can't parse. Its own message may quote the string, password included, so the
+    CLI says only this."""
+
+
+def _connection(args: argparse.Namespace, label: str) -> tuple[str, list[str]]:
+    """The conninfo to connect with, from ``--dsn``, ``--dsn-file`` or ``$MINIFS_DSN`` (empty: libpq's ``PG*``
+    variables and ``~/.pgpass``), with the prompted password if ``-W``; and the strings no message may show
+    (see ``_mask``). Warns, without showing it, when ``--dsn`` carries a password."""
+    if args.dsn is not None:
+        dsn = args.dsn
+    elif args.dsn_file is not None:
+        dsn = args.dsn_file.read_text().strip()
+    else:
+        dsn = os.environ.get("MINIFS_DSN", "")
+    try:
+        password = conninfo_to_dict(dsn).get("password")
+    except psycopg.Error:
+        raise _BadConninfo("invalid connection string (not shown: it may hold a password)") from None
+    secrets = _forms(str(password), dsn) if password else []
+    if password and args.dsn is not None:
+        print(
+            f"minifs {label}: warning: --dsn holds a password, which other users can see in the process list and"
+            " which stays in your shell history; use $MINIFS_DSN, PGPASSWORD or ~/.pgpass, --dsn-file, or -W",
+            file=sys.stderr,
+        )
+    if args.ask_password:
+        typed = getpass.getpass("Password: ")
+        dsn = make_conninfo(dsn, password=typed)
+        secrets += _forms(typed, dsn)
+    return dsn, secrets
+
+
+def _forms(password: str, dsn: str) -> list[str]:
+    """``password`` as a message might show it (as typed, percent-encoded, percent-decoded), and the whole
+    conninfo that holds it."""
+    return [s for s in {password, quote(password, safe=""), unquote(password), dsn} if s]
+
+
+def _mask(text: str, secrets: list[str]) -> str:
+    """``text`` with each of ``secrets`` replaced by ``****``, longest first (the conninfo before the password
+    inside it)."""
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        text = text.replace(secret, "****")
+    return text
 
 
 async def _with_client(
