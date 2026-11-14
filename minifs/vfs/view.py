@@ -89,10 +89,53 @@ _NO_NODE = UUID(int=0)  # never a node id: a pin that nothing matches
 _log = logging.getLogger(__name__)
 
 
+WORKSPACES = "/workspaces"
+"""The real directory that holds every workspace, ``/workspaces/<workspace_id>``."""
+
+
 def workspace_mounts(workspace_id: UUID | str) -> dict[str, str]:
     """The agent's mounts: its workspace at ``/workspace``, and the shared ``/docs``. ValueError if
-    ``workspace_id`` isn't a UUID (``""`` or ``..`` would mount other workspaces)."""
-    return {"/workspace": f"/workspaces/{UUID(str(workspace_id))}", "/docs": "/docs"}
+    ``workspace_id`` isn't a UUID (``""`` or ``..`` would mount other workspaces).
+
+    The supported way to give an agent its workspace: build the mounts here rather than by hand.
+    ``VFSView`` refuses the hand-built mistakes it can see (see ``_check_mount``), not a wrong id."""
+    return {"/workspace": f"{WORKSPACES}/{UUID(str(workspace_id))}", "/docs": "/docs"}
+
+
+def _check_mount(visible: str, real: str) -> _Mount:
+    """The mount ``visible`` -> ``real``. ValueError unless both are absolute paths in normal form, ``real`` isn't
+    ``/``, and a ``real`` in ``WORKSPACES`` is one whole workspace, ``/workspaces/<workspace id>`` (a canonical
+    UUID, as ``workspace_mounts`` writes it). A prefix built by hand, such as ``f"/workspaces/{wid}"`` with a
+    malformed id, would otherwise mount other workspaces: ``/workspaces/`` and ``/workspaces/x/../../docs`` once
+    normalised, ``/workspaces`` itself, or a directory inside another workspace (an id containing ``/``)."""
+    parts: list[tuple[str, ...]] = []
+    for kind, path in (("visible", visible), ("real", real)):
+        try:
+            parts.append(split(path))
+        except VFSError as e:
+            raise ValueError(f"mount {kind} prefix '{escape_controls(path)}' isn't a valid absolute path") from e
+        if (normal := join(*parts[-1])) != path:
+            raise ValueError(f"mount {kind} prefix '{path}' isn't normalised (it would be '{normal}')")
+    shown, inner = parts
+    if not inner:
+        raise ValueError(f"mount '{visible}' -> '/' would show every workspace: use workspace_mounts()")
+    if inner[: len(_WORKSPACES)] == _WORKSPACES and not (len(inner) == len(_WORKSPACES) + 1 and _is_id(inner[-1])):
+        raise ValueError(
+            f"mount '{visible}' -> '{real}': a mount in {WORKSPACES} must be one whole workspace, "
+            f"{WORKSPACES}/<workspace id>: use workspace_mounts()"
+        )
+    return _Mount(shown, inner)
+
+
+_WORKSPACES = split(WORKSPACES)
+
+
+def _is_id(name: str) -> bool:
+    """Whether ``name`` is a workspace id as ``workspace_mounts`` writes it: a UUID in canonical form."""
+    try:
+        return str(UUID(name)) == name
+    except ValueError:
+        return False
 
 
 class _Mount:
@@ -121,14 +164,16 @@ class _Target:
 class VFSView:
     """``client``'s tree as ``actor`` sees it through ``mounts`` (visible prefix -> real prefix), under
     ``policy``. The operations are ``VFSClient``'s, in visible paths. ValueError for an actor the policy has no
-    rules for, or for mounts that nest, visibly or in the real tree (two visible names for one node would let
-    the policy on one name be bypassed through the other)."""
+    rules for, for mounts that nest, visibly or in the real tree (two visible names for one node would let
+    the policy on one name be bypassed through the other), and for a mount with a prefix that isn't in normal
+    form, a real prefix of ``/``, or one in ``/workspaces`` that isn't one whole workspace. Build an agent's
+    mounts with ``workspace_mounts``."""
 
     def __init__(self, client: VFSClient, mounts: Mapping[str, str], policy: Policy, actor: str) -> None:
         if actor not in policy.actors:
             raise ValueError(f"the policy has no rules for actor {actor!r}")
         self._client = client
-        self._mounts = [_Mount(split(v), split(r)) for v, r in mounts.items()]
+        self._mounts = [_check_mount(v, r) for v, r in mounts.items()]
         for a in self._mounts:
             for b in self._mounts:
                 if a is b:

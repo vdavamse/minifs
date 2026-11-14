@@ -169,7 +169,7 @@ Every write is visible to the next search at once, with no index lag. The transl
 
 ## Workspaces and permissions
 
-`workspace_mounts(workspace_id)` gives an agent `/workspace` (its own `/workspaces/<id>`) and the shared `/docs`. `..` stops at `/`, and another workspace isn't reachable. `DEFAULT_POLICY` has three actors:
+`workspace_mounts(workspace_id)` gives an agent `/workspace` (its own `/workspaces/<id>`) and the shared `/docs`. `..` stops at `/`, and another workspace isn't reachable. Build mounts with `workspace_mounts` rather than by hand: `VFSView` refuses a mount prefix that isn't in normal form (`/workspaces/`, `/workspaces/x/../y`) a mount whose real prefix is `/`, and one in `/workspaces` that isn't exactly `/workspaces/<workspace id>`, but it can't tell a wrong workspace id, or two workspaces mounted in one view. `DEFAULT_POLICY` has three actors:
 
 | Path | `agent` | `ingestion` | `operator` |
 | --- | --- | --- | --- |
