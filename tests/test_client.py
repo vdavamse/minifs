@@ -120,6 +120,7 @@ async def test_pread_file_reads_every_page_on_one_snapshot(pool: Pool, monkeypat
     data = b"0123456789" * 4  # 40 bytes: 10 pages of 4 bytes
     version = await vfs.create("/f", data)
     statements: list[tuple[str, int]] = []  # (the statement's text, the id of the connection that ran it)
+    connections: list[AsyncConnection[Any]] = []
     execute = AsyncConnection.execute
     overwritten = False
 
@@ -128,6 +129,12 @@ async def test_pread_file_reads_every_page_on_one_snapshot(pool: Pool, monkeypat
         text = str(query)
         if "vfs_pread" in text or "SET TRANSACTION" in text:
             statements.append((text, id(self)))
+            if "vfs_pread" in text and not connections:
+                connections.append(self)
+                cur = await execute(
+                    self, "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
+                )
+                assert await cur.fetchone() == ("repeatable read", "on")
         result = await execute(self, query, *args, **kwargs)
         if "vfs_pread" in text and not overwritten:
             overwritten = True
@@ -141,8 +148,10 @@ async def test_pread_file_reads_every_page_on_one_snapshot(pool: Pool, monkeypat
     assert (result.id, result.generation, result.size, result.eof) == (version.id, version.generation, 40, True)
     assert (await vfs.stat("/f")).generation == version.generation + 1  # the overwrite committed during the read
     assert len([s for s in statements if "vfs_pread" in s[0]]) == -(-len(data) // 4)  # ceil(size / page)
-    assert len([s for s in statements if "SET TRANSACTION" in s[0]]) == 1
+    assert not [s for s in statements if "SET TRANSACTION" in s[0]]  # the BEGIN says it: no extra round trip
     assert len({conn for _, conn in statements}) == 1  # every statement on the same connection
+    # Reset before the connection went back to the pool, so whoever takes it next gets the default.
+    assert (connections[0].isolation_level, connections[0].read_only) == (None, None)
 
 
 async def test_pread_file_stops_after_a_page_over_max_size(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:

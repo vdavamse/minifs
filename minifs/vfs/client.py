@@ -1,7 +1,10 @@
 """``VFSClient``: async path-based operations, each a thin wrapper over one call to a minifs SQL function.
 
 Every operation takes absolute paths, normalises them (``minifs.vfs.core.normalize``), and runs as one statement
-in its own transaction on a connection from the write pool, retried on a serialization failure or a deadlock.
+in its own transaction on a connection from the write pool, retried on a serialization failure or a deadlock. The
+exception is ``pread_file``: a whole file, one statement per page, in one read-only REPEATABLE READ transaction
+that holds its connection until the last page (so a server ``transaction_timeout`` or
+``idle_in_transaction_session_timeout`` can end it: ETIMEDOUT).
 Errors from the SQL layer come back as ``VFSError`` with the errno the function reported: an outcome (ENOENT,
 EEXIST, ESTALE, ...) that it returned in its ``err`` column, or a fault (EINVAL, ENAMETOOLONG) that it raised
 (migration 009). Any other database error propagates unchanged.
@@ -32,6 +35,7 @@ Without a cache, every path is resolved on the server.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Protocol, cast
@@ -67,7 +71,6 @@ MAX_TIMEOUT = _MAX_INT / 1000  # seconds: statement_timeout is an int of millise
 DEFAULT_LOCK_TIMEOUT = 5.0  # seconds a write waits for a lock another writer holds
 DEFAULT_WRITE_TIMEOUT = 30.0  # seconds a write statement may run (locally a write costs about 60-80 ms per MB)
 _SET_WRITE_TIMEOUTS = "SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)"
-_SET_SNAPSHOT = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 # The type of ``_run``'s ``more`` hook: extra rows to append to a statement's, fetched on the same connection.
 type _More = Callable[[AsyncConnection[Any], list[tuple[Any, ...]]], Awaitable[list[tuple[Any, ...]]]]
 _log = logging.getLogger(__name__)
@@ -1161,9 +1164,10 @@ class VFSClient:
         A ``write`` runs under the client's ``lock_timeout`` and ``write_timeout``, ``SET LOCAL`` in the same
         transaction first (one more round trip; EAGAIN and ETIMEDOUT when they run out).
 
-        With ``snapshot``, ``SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`` is the transaction's
-        first statement, so it and ``more`` read one snapshot (``pread_file``). A ``write`` is refused with a
-        TypeError: the transaction can't run one.
+        With ``snapshot``, the transaction begins ``ISOLATION LEVEL REPEATABLE READ READ ONLY`` (set on the
+        connection for its BEGIN, so no extra round trip, and reset before it goes back to the pool), so the query
+        and ``more`` read one snapshot (``pread_file``). A ``write`` is refused with a TypeError: the transaction
+        can't run one.
 
         ``more`` is called inside the same transaction and connection once the query's rows are fetched, with
         those rows after the walk columns are cut, so it sees the layout its own rows are appended in; the rows
@@ -1178,20 +1182,28 @@ class VFSClient:
         extra: list[tuple[Any, ...]] = []
 
         async def attempt() -> list[tuple[Any, ...]]:
-            async with self.pool.connection() as conn, conn.transaction():
-                if snapshot:
-                    await conn.execute(_SET_SNAPSHOT)
-                if write:
-                    await conn.execute(_SET_WRITE_TIMEOUTS, self._write_timeouts)
-                cur = await conn.execute(cast(Any, query), params)
-                if refs:  # a query that forgot the prefix would shift every column the caller reads
-                    names = [column.name for column in cur.description or ()]
-                    assert names[: 3 * len(refs)] == ["chain", "kind", "err"] * len(refs), names
-                rows = await cur.fetchall()
-                if more is not None:
-                    extra.clear()  # a retried attempt starts over
-                    extra.extend(await more(conn, [row[3 * len(refs) :] for row in rows]))
-                return rows
+            async with self.pool.connection() as conn:
+                if snapshot:  # client-side only: the next BEGIN says it, so it costs no round trip
+                    await conn.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
+                    await conn.set_read_only(True)
+                try:
+                    async with conn.transaction():
+                        if write:
+                            await conn.execute(_SET_WRITE_TIMEOUTS, self._write_timeouts)
+                        cur = await conn.execute(cast(Any, query), params)
+                        if refs:  # a query that forgot the prefix would shift every column the caller reads
+                            names = [column.name for column in cur.description or ()]
+                            assert names[: 3 * len(refs)] == ["chain", "kind", "err"] * len(refs), names
+                        rows = await cur.fetchall()
+                        if more is not None:
+                            extra.clear()  # a retried attempt starts over
+                            extra.extend(await more(conn, [row[3 * len(refs) :] for row in rows]))
+                        return rows
+                finally:
+                    if snapshot:  # before the connection goes back to the pool, for whoever takes it next
+                        with contextlib.suppress(psycopg.Error):  # a broken one is discarded by the pool anyway
+                            await conn.set_isolation_level(None)
+                            await conn.set_read_only(None)
 
         try:
             rows = await _mapped(path, attempt)

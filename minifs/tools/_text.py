@@ -29,13 +29,13 @@ class TooLarge(Exception):
         self.size = size
 
 
-class ReadTimedOut(Exception):
-    """A read of ``path`` was cancelled by a server timeout (ETIMEDOUT): the file was too slow to read, not the
-    write."""
+class ReadTimedOut(VFSError):
+    """A read of ``path`` was cancelled by a server timeout: the file was too slow to read, not the write. An
+    ETIMEDOUT ``VFSError``, so a caller that catches only those still handles it; Edit and Write catch it first, for
+    their own message."""
 
     def __init__(self, path: str) -> None:
-        super().__init__(path)
-        self.path = path
+        super().__init__("ETIMEDOUT", path, "read timed out")
 
 
 async def read_file(vfs: VFSView, path: str, max_size: int | None = None) -> tuple[bytes, FileVersion]:

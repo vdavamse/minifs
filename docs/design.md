@@ -34,7 +34,7 @@ How minifs works and why, for contributors and for anyone who wants to check its
 | --- | --- | --- |
 | Agent tools | `minifs/tools/` | `Read`, `Write`, `Edit`, `Glob`, `Grep` as pydantic-ai tools over a `VFSView` |
 | View | `minifs/vfs/view.py`, `policy.py` | The agent's chroot (mounts) and the per-actor path rules |
-| Client | `minifs/vfs/client.py` | One SQL statement per operation; path resolution, with the directory cache |
+| Client | `minifs/vfs/client.py` | One SQL statement per operation (a whole-file read: one per page, on one snapshot); path resolution, with the directory cache |
 | Cache, watch | `minifs/vfs/cache.py`, `watch.py` | The directory-entry cache; `LISTEN` on the schema's channel and per-path watches |
 | Glob, search, regex | `minifs/vfs/glob.py`, `search.py`, `regex.py`, `crates/minifs-regex/` | Pattern compilation (Rust, `minifs._regex`) and the search statements |
 | Service | `minifs/vfs/service.py`, `minifs/db/pool.py` | `open_vfs`: pools, watcher and cache, opened and closed in order; credentials per connection |
