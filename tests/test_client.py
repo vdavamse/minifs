@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import pickle
+import re
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from itertools import islice
 from pathlib import Path
@@ -13,7 +14,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 import pytest
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, AsyncTransaction
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
@@ -165,6 +166,27 @@ async def test_pread_file_stops_after_a_page_over_max_size(vfs: VFSClient, monke
     assert len(statements) == 10
 
 
+async def test_pread_file_reads_a_long_line_in_one_statement(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A line over ~64 KB is one extent of its own (migration 007) and extents are pglz-compressed (migration
+    013), so ``substring`` decompresses one from its start up to a page's end: a 16 MiB page reads a 3 MB
+    single-line file in one statement, decompressing its extent once, where 1 MiB pages would decompress 1 + 2
+    + 3 MiB in all."""
+    data = b"x" * (3 * 1024 * 1024)  # one line, no \n: one extent of its own
+    await vfs.create("/f", data)
+    statements: list[str] = []
+    execute = AsyncConnection.execute
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        if "vfs_pread" in str(query):
+            statements.append(str(query))
+        return await execute(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    result = await vfs.pread_file("/f", 16 * 1024 * 1024, max_size=10 * 1024 * 1024)
+    assert len(statements) == 1, statements  # the whole file in one statement, as Edit's 10 MB cap reads it
+    assert (result.content, result.eof, result.size) == (data, True, len(data))
+
+
 async def test_pread_file_outcomes_and_einval(pool: Pool) -> None:
     """The outcomes ``pread`` reports, and a fully cached stale path evicted, as ``pread_page`` checks it."""
     cache = DictCache()
@@ -233,6 +255,22 @@ async def test_pread_file_page_queries_use_the_index(vfs: VFSClient) -> None:
     for i in range(1, 8):
         await vfs.append("/f", f"line {i}\n".encode())  # every append is one more extent
     async with vfs.pool.connection() as conn:
+        # The two queries below are a copy of ``vfs_pread``'s body: were the function changed, the EXPLAINs
+        # would check something else, so fail early and loudly instead of drifting.
+        cur = await conn.execute("SELECT pg_get_functiondef('vfs_pread(uuid, bigint, int)'::regprocedure)")
+        defrow = await cur.fetchone()
+        assert defrow is not None
+        functiondef = re.sub(r"\s+", " ", defrow[0])
+        for fragment in (
+            "e.byte_offset <= v_off ORDER BY e.byte_offset DESC LIMIT 1",  # step 1: the backward descent
+            "AND e.byte_offset >= v_start",  # step 2: the forward range scan,
+            "AND e.byte_offset < v_off + p_limit",  # bounded,
+            "AND e.byte_offset + length(e.data) > v_off",  # skipping extents that end before the offset,
+            "AND p_limit > 0 ORDER BY e.byte_offset",  # in offset order
+        ):
+            assert re.sub(r"\s+", " ", fragment) in functiondef, (
+                f"vfs_pread changed: {fragment!r} is gone from it; update this test's copy of the body queries"
+            )
         cur = await conn.execute("SELECT generation, size FROM vfs_nodes WHERE id = %s", [version.id])
         node_row = await cur.fetchone()
         assert node_row is not None
@@ -337,30 +375,55 @@ async def test_pread_file_idle_between_pages_is_etimedout(vfs: VFSClient, monkey
     assert (await vfs.pread_file("/f", 4)).content == b"0123456789"  # the pool replaced the killed connection
 
 
+@pytest.mark.parametrize("sqlstate", ["25P03", "25P04"])
+def test_the_servers_transaction_timeouts_map_to_etimedout(sqlstate: str) -> None:
+    """Both server timeouts that can end a whole-file read are ETIMEDOUT (``minifs.db.errors``): 25P03, the
+    ``idle_in_transaction_session_timeout`` of a gap between pages, and 25P04, the ``transaction_timeout`` of the
+    whole read (PostgreSQL 17+)."""
+    error_class = psycopg.errors.lookup(sqlstate)
+    assert error_class is not None
+    error = VFSError.from_db(error_class("the server ended the transaction"), "/f")
+    assert error is not None and error.errno == "ETIMEDOUT"
+    assert error.path == "/f"
+
+
 async def test_pread_file_retries_a_serialization_failure_after_more_ran(
     vfs: VFSClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A serialization failure (40001) on a later page retries the whole read, from the first page
-    (``retry_serializable``): the pages ``more`` had fetched are dropped with the failed attempt, so the retried
-    read returns the file whole, with no duplicated bytes."""
+    """A serialization failure (40001) at the read's COMMIT, after ``more`` fetched every later page, retries
+    the whole read (``retry_serializable``): the pages ``more`` had fetched are dropped with the failed attempt
+    (``_run`` clears them), so the retried read returns the file whole, with no duplicated bytes."""
     data = b"0123456789" * 4  # 40 bytes: 10 pages of 4
     await vfs.create("/f", data)
-    preads = 0
+    preads = failed_commits = 0
     execute = AsyncConnection.execute
+    aexit = AsyncTransaction.__aexit__
 
-    async def failing(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
         nonlocal preads
         if "vfs_pread" in str(query):
             preads += 1
-            if preads == 3:
-                raise psycopg.errors.SerializationFailure("could not serialize access due to concurrent update")
         return await execute(self, query, *args, **kwargs)
 
-    monkeypatch.setattr(AsyncConnection, "execute", failing)
+    async def failing_commit(self: AsyncTransaction, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        """The first clean exit rolls back and reports 40001, as a COMMIT the server refused would."""
+        nonlocal failed_commits
+        if exc_val is None and failed_commits == 0:
+            failed_commits += 1
+            error = psycopg.errors.SerializationFailure("could not serialize access due to concurrent update")
+            tx = cast(Any, self)
+            async with tx._conn.lock:
+                await tx._conn.wait(tx._exit_gen(type(error), error, None))
+            raise error
+        return await aexit(self, exc_type, exc_val, exc_tb)
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    monkeypatch.setattr(AsyncTransaction, "__aexit__", failing_commit)
     result = await vfs.pread_file("/f", 4)
-    assert result.content == data  # the retried read's pages alone, not the failed attempt's first two again
+    monkeypatch.undo()
+    assert result.content == data  # the retried read's pages alone: none of the failed attempt's doubled
     assert (result.eof, result.size) == (True, 40)
-    assert preads == 3 + 10  # the failed attempt's 3 statements, then the retried read's 10
+    assert (preads, failed_commits) == (20, 1)  # both attempts read all 10 pages; only the retry committed
 
 
 async def test_a_snapshot_refuses_a_write(vfs: VFSClient) -> None:

@@ -15,7 +15,7 @@ from psycopg import AsyncConnection
 import minifs.tools._text as text
 import minifs.tools.write as write_module
 from minifs.tools import TOOLS, Write
-from minifs.tools.deps import ToolSettings, WriteSettings
+from minifs.tools.deps import EditSettings, ToolSettings, WriteSettings
 from minifs.tools.errors import TIMED_OUT_READ, TIMED_OUT_WRITE
 from minifs.tools.write import DESCRIPTION
 from minifs.vfs.client import VFSClient
@@ -477,16 +477,24 @@ async def test_a_file_grown_past_the_cap_after_its_stat_is_not_diffed(view: VFSV
 # read_file, which Write and Edit share
 
 
+def test_page_covers_edits_default_cap() -> None:
+    """``PAGE`` stays large: a line longer than ~64 KB is one pglz-compressed extent, and a page that starts
+    inside it makes the server decompress it from its start (migration 013), so small pages would make a
+    long-line file cost about size²/page. At 16 MiB, Edit's default 10 MB cap is one statement."""
+    assert text.PAGE == 16 * 1024 * 1024
+    assert EditSettings().max_bytes <= text.PAGE
+
+
 async def test_read_file_reads_a_file_within_the_cap_in_one_call(view: VFSView, client: VFSClient) -> None:
     """A file within ``max_size`` is one ``pread_file`` call, paged at ``min(max_size, PAGE)``: a 2.56 MB file
-    under a 4 MB cap is read whole, in pages of ``PAGE``."""
+    under a 4 MB cap is read whole, in pages of the cap (``PAGE`` is bigger)."""
     data = b"0123456789abcde\n" * 160_000
     await client.create(f"/workspaces/{W1}/big.txt", data)
     spy = Preads(view, client)
     got, version = await text.read_file(spy, "/workspace/big.txt", 4 * 1024 * 1024)
     assert got == data
     assert version.size == len(data)
-    assert spy.pread_files == [(text.PAGE, 4 * 1024 * 1024)]
+    assert spy.pread_files == [(4 * 1024 * 1024, 4 * 1024 * 1024)]
 
 
 async def test_read_file_pages_past_page(view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -600,13 +608,15 @@ async def test_a_read_that_times_out_writes_without_a_diff(
     view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The old text only feeds the diff, so a read of it that times out is treated like a file over the cap: the
-    write happens anyway, without a diff, and only the BOM head is read."""
+    write happens anyway, without a diff, and the only read left is the BOM head — which still keeps the BOM of
+    a file that has one."""
+    preads = Preads(view, client)
 
     async def timing_out(path: str, page: int, max_size: int | None = None) -> ReadResult:
         raise VFSError("ETIMEDOUT", path)
 
-    monkeypatch.setattr(view, "pread_file", timing_out)
-    result, meta = await write(Deps(view), "notes.md", "yours\n")
+    monkeypatch.setattr(preads, "pread_file", timing_out)
+    result, meta = await write(Deps(preads), "notes.md", "yours\n")
     assert result == "Wrote file successfully."
     assert meta == {
         "filepath": "/workspace/notes.md",
@@ -615,7 +625,14 @@ async def test_a_read_that_times_out_writes_without_a_diff(
         "additions": None,
         "deletions": None,
     }
+    assert preads.preads == [(0, 3)]  # the BOM head alone
     assert await content(client, "notes.md") == b"yours\n"
+    # The head decides the BOM (``_read_old``'s ``source_bom``): a file with one keeps it through the timeout.
+    await client.create(f"/workspaces/{W1}/bom.txt", text.BOM.encode() + b"old\n")
+    result, meta = await write(Deps(preads), "bom.txt", "new\n")
+    assert result == "Wrote file successfully." and meta["diff"] == "" and meta["exists"] is True
+    assert preads.preads == [(0, 3), (0, 3)]  # one BOM head per write
+    assert await content(client, "bom.txt") == text.BOM.encode() + b"new\n"
 
 
 async def test_a_bom_read_that_times_out_is_a_slow_read_not_a_big_write(

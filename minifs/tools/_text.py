@@ -13,10 +13,12 @@ from minifs.vfs.view import VFSView
 
 BOM = "\ufeff"
 
-PAGE = 1024 * 1024
-"""The most bytes one page statement of ``read_file`` asks for. Every page of a read is on one snapshot
-(``VFSView.pread_file``), so a small page costs only a round trip each; it bounds what one statement holds on
-the server and in client memory, about 3x the page while it arrives, since bytea comes as hex text."""
+PAGE = 16 * 1024 * 1024
+"""The most bytes one page statement of ``read_file`` asks for: big enough that Edit's default 10 MB cap is one
+statement. Not small, because a line longer than ~64 KB is one pglz extent, and a page that starts inside it
+makes the server decompress the extent from its start (migration 013): small pages would make a long-line file
+cost about size²/page. A page costs about 3x its size in client memory while it arrives (hex text). Every page
+of a read is on one snapshot (``VFSView.pread_file``)."""
 
 
 class TooLarge(Exception):
@@ -43,7 +45,8 @@ async def read_file(vfs: VFSView, path: str, max_size: int | None = None) -> tup
 
     The file is read on one snapshot (``VFSView.pread_file``), in pages of at most ``PAGE`` bytes, so it never
     mixes two versions, whatever its size or the caps that apply: a file within ``max_size`` comes back whole,
-    and one that grew past it is refused having read at most a page of it.
+    and one that grew past it is refused having read at most a page of it. Pages are large (``PAGE``), since a
+    page into a long line's pglz extent decompresses it from its start.
 
     A page costs about three times its size in client memory while it arrives (bytea comes as hex text, then is
     decoded), and the server holds it whole before sending it (spilling to disk past ``work_mem``). Reads set no

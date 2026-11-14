@@ -293,8 +293,8 @@ class VFSClient:
         reading the rest.
 
         No lock and no ``statement_timeout`` of its own; a server one applies to each page statement. The
-        connection and the snapshot are held for the whole read, so their hold time grows with the file: about
-        one round trip per page. A server ``transaction_timeout`` bounds the whole read, and
+        connection and the snapshot are held for the whole read, so their hold time grows with the file: one
+        statement per page of ``page`` bytes. A server ``transaction_timeout`` bounds the whole read, and
         ``idle_in_transaction_session_timeout`` the gaps between pages; both are ETIMEDOUT, as a
         ``statement_timeout`` on a page is. ``page`` bounds what one statement holds on the server and in client
         memory: about 3x the page while it arrives, since bytea comes as hex text.
@@ -332,10 +332,12 @@ class VFSClient:
                 )
                 read = 0
                 for row in await cur.fetchall():
-                    if (row[0], row[1]) != (size, generation):  # one snapshot: they can't change
-                        raise VFSError("EIO", normalized, "the file changed within one snapshot")
+                    # The error check comes first: vfs_pread's error row leaves size and generation NULL, which
+                    # the comparison below would report as "the file changed", hiding the real errno.
                     if row[4] is not None:  # impossible on one snapshot; never a page to drop silently
                         raise VFSError(row[4], normalized, detail=row[5] or "")
+                    if (row[0], row[1]) != (size, generation):  # one snapshot: they can't change
+                        raise VFSError("EIO", normalized, "the file changed within one snapshot")
                     if row[3] is not None:
                         read += len(row[3])
                         extra.append((node, None, None, size, generation, row[2], row[3], None, None))

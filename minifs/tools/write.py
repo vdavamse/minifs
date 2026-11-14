@@ -6,9 +6,9 @@ version read for the diff, so a concurrent writer anywhere is detected. A lost r
 the file created, a file gone or replaced by a directory before its overwrite) is tried once more from the start,
 which is safe since ``Write`` replaces the whole file; a second loss is the ``ModelRetry`` of ``tool_error``.
 
-The old text only feeds the diff in the metadata, so a file over ``WriteSettings.max_diff_bytes`` isn't read or
-diffed (ladderframe has no such limit): only its first bytes are read, for the BOM to keep, along with the version
-for the compare-and-swap. The result text is the same either way.
+The old text only feeds the diff in the metadata, so a file over ``WriteSettings.max_diff_bytes``, or when
+reading it times out, isn't read for a diff (ladderframe has no such limit): only its first bytes are read, for
+the BOM to keep, along with the version for the compare-and-swap. The result text is the same either way.
 """
 
 from __future__ import annotations
@@ -84,8 +84,9 @@ async def write(ctx: RunContext[HasVFS], content: str, filePath: str) -> str | T
 
 async def _write(vfs: VFSView, path: str, content: str, max_diff_bytes: int) -> tuple[bool, str | None, str]:
     """Writes ``content`` to ``path``: ``(the file existed, its old text, the new text)``, without BOMs; the old
-    text is None for a file over ``max_diff_bytes``, which isn't read. ``_Lost`` where another writer got in
-    between: a create beaten to the file, a file changed, removed or replaced by a directory after its stat."""
+    text is None for a file over ``max_diff_bytes``, which isn't read, or when reading it times out. ``_Lost``
+    where another writer got in between: a create beaten to the file, a file changed, removed or replaced by a
+    directory after its stat."""
     next_bom, content_new = split_bom(content)
     if not vfs.allows("read", path):
         # ladderframe checks the write permission first. Allowed to write but not read: a new file needs no old
