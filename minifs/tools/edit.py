@@ -1,8 +1,10 @@
 """``Edit``: exact string replacement with opencode's fallback matchers (trimmed lines, block anchors, whitespace,
 indentation, escapes, ...). Keeps the file's BOM and line endings. ladderframe's ``Edit`` (``ladderframe.tools.edit``,
 which follows opencode's edit tool), over a ``VFSView``; the replacers below give ladderframe's answers (the same
-candidates in the same order, checked by ``tests/tools/test_edit_replacers.py`` against its code), but each is at
-most O(n·m) in the content's and ``oldString``'s sizes, in lines and in characters (a file can be one line), where
+candidates in the same order, checked by ``tests/tools/test_edit_replacers.py`` against its code), except for the
+deliberate departures of #110 (a whitespace-only ``oldString`` matches only exactly, an ambiguous exact ``oldString`` is
+reported, and block anchors alone don't take the line between them), marked in the oracle; but each is at most
+O(n·m) in the content's and ``oldString``'s sizes, in lines and in characters (a file can be one line), where
 ladderframe's block scans were O(n²) in lines and its searches within a line O(n·m) per call that nothing could
 interrupt. ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker
 thread that can't be cancelled and holds the GIL while it works (#80).
@@ -653,8 +655,9 @@ def replace(
             deadline.check()
             for search in replacer(content, old_string):
                 deadline.check()  # each candidate costs two scans of the file
-                if not search:
-                    continue  # an empty candidate is "found" at 0 and would insert between every character (#110)
+                # empty, or a whitespace-only oldString matched loosely: only its exact text may match (#110)
+                if not search or (not old_string.strip() and search != old_string):
+                    continue
                 if search in seen:
                     continue
                 if seen_size + len(search) > _SEEN_BYTES:

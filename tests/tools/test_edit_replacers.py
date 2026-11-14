@@ -274,9 +274,10 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
         if ambiguous:
             break
         for search in replacer(content, old_string):
-            if not search:
-                # departs from ladderframe (#110): an empty candidate is "found" at 0 and, with replace_all,
-                # inserts new_string between every character of the file. It is not a match.
+            if not search or (not old_string.strip() and search != old_string):
+                # departs from ladderframe (#110): an empty candidate is found at 0 and with replace_all inserts
+                # new_string between every character; a whitespace-only oldString matched loosely (a blank line of
+                # spaces for a tab) rewrote every indentation run; only its exact text may match.
                 continue
             index = content.find(search)
             if index == -1:
@@ -457,14 +458,30 @@ def test_replace_rejects_what_it_always_rejected() -> None:
         new.replace("a", "", "b")
 
 
-def test_an_empty_candidate_is_never_a_match() -> None:
-    """A whitespace-only find makes the trimmed-boundary matcher yield the empty string, which ``content.find``
-    finds at 0; with ``replace_all``, ``content.replace("", new)`` inserted ``new`` between every character."""
-    content = "def f():\n    return 1\n\nx = 2\n"
-    for replace_all in (False, True):
+def test_a_blank_candidate_is_never_a_match() -> None:
+    """A whitespace-only find made the fallback matchers yield blank lines (empty or spaces): an empty one was
+    "found" at 0 and, with ``replace_all``, inserted the new string between every character, and a run of spaces
+    rewrote every indentation run. Only the exact text of a whitespace-only find may match then; a non-blank find
+    (an escaped tab) still matches whitespace through the escape matcher."""
+    blanks = [
+        ("def f():\n    return 1\n\nx = 2\n", "\t", "    ", False),
+        ("def f():\n    return 1\n\nx = 2\n", "\t", "    ", True),
+        ("def f():\n    return 1\n    \nx = 2\n", "\t", "  ", False),
+        ("def f():\n    return 1\n    \nx = 2\n", "\t", "  ", True),
+        ("a\n\n    \n    b\n", "\t", "  ", False),
+        ("a\n\n    \n    b\n", "\t", "  ", True),
+        ("def f():\n\treturn 1\n   \nx = 2\n", "\t\t", "#", False),
+    ]
+    for content, find, new_string, replace_all in blanks:
         for search in (new.replace, replace):
             with pytest.raises(ValueError, match="Could not find oldString"):
-                search(content, "\t", "    ", replace_all)
+                search(content, find, new_string, replace_all)
+    # A whitespace-only oldString that is in the file exactly still matches: it is the find itself.
+    for search in (new.replace, replace):
+        assert search("a\n    \nb\n", "    \n", "") == "a\nb\n"
+    # A non-blank find whose candidate is blank (an escaped tab) still matches through the escape matcher.
+    for search in (new.replace, replace):
+        assert search("a\tb\n", "\\t", " ") == "a b\n"
 
 
 def test_an_ambiguous_exact_match_is_reported() -> None:
@@ -680,6 +697,16 @@ def test_a_timeout_after_an_ambiguous_match_says_so(monkeypatch: pytest.MonkeyPa
     with pytest.raises(ReplaceTimeout, match=re.escape(timeout_message(0.01, ambiguous=True))) as caught:
         new.replace("a\na\n", "b", "c", timeout=0.01)
     assert "Found multiple matches" in str(caught.value)
+
+
+def test_an_ambiguous_exact_match_fails_before_a_slow_matcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ambiguous exact oldString is reported at once, without trying the later matchers until the deadline."""
+    monkeypatch.setattr(new, "REPLACERS", (new.simple_replacer, slow_replacer))
+    begin = time.monotonic()
+    with pytest.raises(ValueError, match="Found multiple matches") as caught:
+        new.replace("a\na\n", "a", "c", timeout=0.5)
+    assert not isinstance(caught.value, ReplaceTimeout)
+    assert time.monotonic() - begin < 0.4
 
 
 def test_replace_stops_between_block_scores() -> None:
