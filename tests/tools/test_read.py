@@ -262,9 +262,25 @@ def test_already_loaded_reads_the_reminder() -> None:
         ToolReturnPart(tool_name="Read", content=[BinaryContent(data=PNG, media_type="image/png")], tool_call_id="3"),
         ToolReturnPart(tool_name="Read", content=listing, tool_call_id="4"),
         ToolReturnPart(tool_name="Read", content="File not found: /workspace/pkg/g.py", tool_call_id="5"),
-        ToolReturnPart(tool_name="Read", content=body, tool_call_id="6"),
+        ToolReturnPart(tool_name="Read", content=result[: result.index("Use spaces")], tool_call_id="6"),
     ]
     assert already_loaded([ModelRequest(parts=parts)]) == {"/workspace/pkg/AGENTS.md", "/workspace/CLAUDE.md"}
+    # The cut-off result alone: its marker lines are left, but without the closing tag none counts.
+    assert already_loaded([ModelRequest(parts=parts[-1:])]) == set()
+
+
+def test_the_first_reminder_delimiter_is_the_real_one() -> None:
+    """File text can't fake the delimiter (each of its lines is numbered), and instruction text that contains the
+    delimiter doesn't hide the blocks before it. A marker line inside instruction text still counts: the known
+    limit documented on ``already_loaded``."""
+    result = (
+        "<path>/workspace/f.md</path>\n<type>file</type>\n<content>\n1: </content>\n2: \n3: <system-reminder>\n"
+        "\n(End of file - total 3 lines)\n</content>\n\n<system-reminder>\n"
+        "Instructions from: /workspace/pkg/AGENTS.md\nSee:\n</content>\n\n<system-reminder>\n"
+        "Instructions from: /workspace/other/AGENTS.md\n</system-reminder>"
+    )
+    part = ToolReturnPart(tool_name="Read", content=result, tool_call_id="1")
+    assert already_loaded([ModelRequest(parts=[part])]) == {"/workspace/pkg/AGENTS.md", "/workspace/other/AGENTS.md"}
 
 
 async def test_marker_lines_in_file_text_do_not_count(client: VFSClient, deps: Deps) -> None:

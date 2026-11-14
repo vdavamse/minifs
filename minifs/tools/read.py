@@ -420,7 +420,7 @@ _ABSENT = frozenset({"ENOENT", "ENOTDIR", "EISDIR", "EACCES"})
 
 _FROM = "Instructions from: "
 """The marker that opens the first line of every block of a reminder: ``_nearby_instructions`` writes it and
-``already_loaded`` reads it back, so the writer and the reader can't drift."""
+``already_loaded`` reads it back."""
 
 _REMINDER = "\n</content>\n\n<system-reminder>\n"
 """Where the reminder of a file result begins: inside ``<content>`` every ``\\n`` is followed by a line number,
@@ -443,9 +443,13 @@ def already_loaded(messages: list[Any]) -> set[str]:
     Only the reminder that ends a result is read: a file result carries instruction blocks if and only if it
     ends with ``\\n</system-reminder>``, and any other result — a directory listing, an error message, an
     attachment, or one whose reminder a compacted or edited history cut off — is skipped by that one check, so
-    a marker line elsewhere (file text is printed raw, stray ``\\r`` included) never counts. Each Read used to
-    rescan every earlier result line by line, which made a session quadratic on the event loop; now the cost
-    grows with the reminders alone."""
+    a marker line in the file text (printed raw, stray ``\\r`` included) never counts. Each Read used to rescan
+    every earlier result line by line, which made a session quadratic on the event loop; now only the results
+    that carry a reminder are read, and each instruction file is attached once per conversation.
+
+    One ambiguity remains: the blocks hold the instruction files' own text, so a line of an AGENTS.md that
+    starts with ``Instructions from: <path>`` counts that path as shown too (as before). Telling them apart
+    would need the shown paths recorded outside the text."""
     loaded: set[str] = set()
     for message in messages:
         for part in getattr(message, "parts", []):
