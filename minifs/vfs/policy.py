@@ -12,11 +12,20 @@ segment (``fnmatch``), and ``**`` as a whole segment for zero or more segments: 
 ``/workspace`` itself and everything below it. Glob syntax that ``fnmatch`` would read literally, which the Glob
 tool's globs give a meaning (``{a,b}``, ``[^...]``, ``[[:alpha:]]`` and backslash escapes), is refused, and so
 is a ``[`` not closed within its segment (``[!/]``), so a rule can't silently match nothing.
+
+Grant rules match names byte for byte, case-sensitively. A rule with no actions (a hide rule) also matches case
+and Unicode variants of the names it spells: names are compared after NFKC normalisation, case folding and with
+the format characters (Unicode category Cf, such as zero-width spaces) ignored, since a hide rule that missed a
+variant would leak it, while a loosened grant would grant more than written. A rule with some actions is a grant
+and stays exact. A hide rule's ``?`` and ``[...]`` match one character of the folded name. Suffixes and trailing
+spaces are other names: use ``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/workspace/Makefile")`` also
+hides ``MAKEFILE``.
 """
 
 from __future__ import annotations
 
 import logging
+import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -46,11 +55,16 @@ class PolicyDenied(VFSError):
 
 @dataclass(frozen=True, init=False)
 class Rule:
-    """``actions`` granted on the paths ``pattern`` matches: ``Rule("/docs/**", "read")``."""
+    """``actions`` granted on the paths ``pattern`` matches: ``Rule("/docs/**", "read")``. A rule with no actions
+    hides those paths instead, and matching then uses ``match_segments``: the folded segments, which also cover
+    case and Unicode variants of the names the pattern spells. A rule that grants matches ``segments`` byte for
+    byte."""
 
     pattern: str
     actions: frozenset[Action]
     segments: tuple[str, ...] = field(repr=False, compare=False)
+    hides: bool = field(repr=False, compare=False)
+    match_segments: tuple[str, ...] = field(repr=False, compare=False)
 
     def __init__(self, pattern: str, *actions: Action) -> None:
         unknown = set(actions) - _ACTIONS
@@ -59,22 +73,21 @@ class Rule:
         segments = tuple(pattern.split("/")[1:]) if pattern != "/" else ()
         if not pattern.startswith("/") or any(s in ("", ".", "..") for s in segments):
             raise ValueError(f"rule pattern must be a normalised absolute path: {pattern!r}")
-        if any(c in pattern for c in "{}\\") or "[^" in pattern:
-            raise ValueError(
-                f"rule pattern has braces, a [^ class or a backslash, which fnmatch reads literally: {pattern!r}"
-            )
-        if any(_bad_class(segment) for segment in segments):
-            raise ValueError(
-                f"rule pattern has a [ not closed in its segment, or a [: in a class, which fnmatch reads literally:"
-                f" {pattern!r}"
-            )
+        _no_literal_globs(pattern, segments)
+        hides = not actions
+        match_segments = _folded(segments) if hides else segments
+        if hides:
+            _no_literal_globs(pattern, match_segments)  # the folded pattern is what matching uses
         object.__setattr__(self, "pattern", pattern)
         object.__setattr__(self, "actions", frozenset(actions))
         object.__setattr__(self, "segments", segments)
+        object.__setattr__(self, "hides", hides)
+        object.__setattr__(self, "match_segments", match_segments)
 
     def matches(self, path: str) -> bool:
         """Whether the pattern matches ``path`` (normalised first)."""
-        return _match(self.segments, split(path))
+        segments = split(path)
+        return _match(self.match_segments, _folded(segments) if self.hides else segments)
 
     def grants(self, action: Action) -> bool:
         return action in self.actions or (action == "append" and "write" in self.actions)
@@ -110,7 +123,8 @@ class Policy:
         """Whether some rule of ``actor`` matches ``path`` itself, so that the first such rule decides it. KeyError
         for an actor without rules; ``path`` as ``allows`` takes it."""
         segments = split_trusted(path)
-        return any(_match(rule.segments, segments) for rule in self.rules[actor])
+        folded = _folded(segments)
+        return any(_match(rule.match_segments, folded if rule.hides else segments) for rule in self.rules[actor])
 
     def allows(self, actor: str, action: Action, path: str, *, subtree: bool = False) -> bool:
         """Whether ``actor`` may ``action`` at ``path`` and, with ``subtree``, at every path below it too (what
@@ -119,8 +133,9 @@ class Policy:
         actor without rules. ``path`` isn't checked for control characters (``split_trusted``): it is as often a
         path the server listed as one from a caller, which ``check`` and the operation itself refuse."""
         segments = split_trusted(path)
+        folded = _folded(segments)
         for rule in self.rules[actor]:
-            rests = _rests(rule.segments, segments)
+            rests = _rests(rule.match_segments, folded if rule.hides else segments)
             if not subtree:
                 if any(_only_globstars(rest) for rest in rests):
                     return rule.grants(action)
@@ -135,8 +150,9 @@ class Policy:
         """Whether ``actor`` may ``action`` at ``path`` or at some path below it. Conservative the other way: True
         unless a rule that doesn't grant ``action`` covers the whole subtree before any rule that could grant it."""
         segments = split_trusted(path)
+        folded = _folded(segments)
         for rule in self.rules[actor]:
-            rests = _rests(rule.segments, segments)
+            rests = _rests(rule.match_segments, folded if rule.hides else segments)
             if not rests:
                 continue
             if rule.grants(action):
@@ -180,6 +196,35 @@ def _bad_class(segment: str) -> bool:
             return True
         i = j + 1
     return False
+
+
+def _no_literal_globs(pattern: str, segments: tuple[str, ...]) -> None:
+    """Raises ValueError if ``segments`` has glob syntax that fnmatch reads literally; the message names
+    ``pattern`` as written. Called on a rule's own segments and, when the rule hides, on the folded ones too, so
+    e.g. a fullwidth left square bracket U+FF3B (which folds to ``[``) is refused in a hide rule."""
+    joined = "/".join(segments)
+    if any(c in joined for c in "{}\\") or "[^" in joined:
+        raise ValueError(
+            f"rule pattern has braces, a [^ class or a backslash, which fnmatch reads literally: {pattern!r}"
+        )
+    if any(_bad_class(segment) for segment in segments):
+        raise ValueError(
+            f"rule pattern has a [ not closed in its segment, or a [: in a class, which fnmatch reads literally:"
+            f" {pattern!r}"
+        )
+
+
+@lru_cache(maxsize=4096)
+def _fold(name: str) -> str:
+    """The form of ``name`` a hide rule matches by: NFKC normalisation, case folding and NFKC again (folding can
+    denormalise), then the format characters dropped (Unicode category Cf, such as the zero-width space U+200B)."""
+    name = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", name).casefold())
+    return "".join(c for c in name if unicodedata.category(c) != "Cf")
+
+
+@lru_cache(maxsize=4096)
+def _folded(segments: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(_fold(segment) for segment in segments)
 
 
 def _match(pattern: tuple[str, ...], path: tuple[str, ...]) -> bool:

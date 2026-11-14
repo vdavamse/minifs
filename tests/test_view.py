@@ -1009,6 +1009,54 @@ def test_rules() -> None:
         Rule("/w", "delete")  # pyright: ignore[reportArgumentType]
 
 
+def test_hide_rules_match_variants() -> None:
+    """A hide rule (no actions) also hides case and Unicode variants of the names it spells; a grant rule stays
+    byte-exact and case-sensitive, since a loosened grant would fail open."""
+    zwsp = chr(0x200B)  # a zero-width space: a format character, ignored when folding
+    fullwidth = "".join(chr(ord(c) + 0xFEE0) for c in ".env")
+    hiding = Policy({"a": [Rule("/w/**/.env"), Rule("/w/**", "read", "write")]})
+    for name in (".env", ".ENV", ".Env", fullwidth, ".e" + zwsp + "nv"):
+        assert not hiding.allows("a", "read", f"/w/{name}")
+        assert not hiding.allows("a", "write", f"/w/sub/{name}")
+    assert not hiding.allows("a", "read", "/w/sub/.ENV")
+    assert hiding.allows("a", "read", "/w/.env.local")  # a suffix is another name ...
+    assert hiding.allows("a", "read", "/w/.env ")  # ... and so is a trailing space
+    starred = Policy({"a": [Rule("/w/**/.env*"), Rule("/w/**", "read", "write")]})
+    for name in (".env.local", ".ENV.LOCAL", ".env "):  # the * hides the other names too, in every variant
+        assert not starred.allows("a", "read", f"/w/{name}")
+    exact = Policy({"a": [Rule("/w/PUBLIC/**", "read")]})  # a grant rule matches byte for byte
+    assert not exact.allows("a", "read", "/w/public/x")
+    assert not Rule("/w/log.md", "read").matches("/w/LOG.md")
+    assert Rule("/w/.env").matches("/w/.ENV")  # the same pattern, hiding, matches the variant
+    assert Rule("/w/.e?nv").matches("/w/.EXNV")  # ? matches one character of the folded name
+    assert not Rule("/w/.e?nv").matches("/w/.e" + zwsp + "nv")  # the zwsp is gone: the folded name is .env
+    assert Policy({"a": [Rule("/A")]}).matches("a", "/a")
+    assert not Policy({"a": [Rule("/A", "read")]}).matches("a", "/a")
+    subtree = Policy({"a": [Rule("/w/**/.ENV"), Rule("/w/**", "read", "write")]})
+    assert not subtree.allows("a", "write", "/w/x", subtree=True)  # the hide rule could match below
+    assert subtree.allows_any("a", "read", "/w")  # /w/x below it is readable
+    assert not subtree.allows_any("a", "read", "/W")  # the grant rule stays exact: nothing below /W is readable
+    secret = Policy({"a": [Rule("/w/secret/**"), Rule("/w/**", "read")]})
+    assert not secret.allows_any("a", "read", "/w/SECRET")  # the hide rule covers the whole subtree
+    bracket = "/w/" + chr(0xFF3B) + "x"  # a fullwidth left square bracket: it folds to [
+    with pytest.raises(ValueError, match="fnmatch"):
+        Rule(bracket)
+    Rule(bracket, "read")  # a grant rule isn't folded: the bracket is an ordinary character
+
+
+async def test_a_hide_rule_hides_case_and_unicode_variants(vfs: VFSClient) -> None:
+    operator = view(vfs, Policy({"operator": [Rule("/**", "read", "write")]}), "operator")
+    await operator.create("/workspace/.ENV", b"secret")
+    await operator.create("/workspace/a.txt", b"x")
+    agent = view(vfs, Policy({"agent": [Rule("/workspace/**/.env"), Rule("/**", "read", "write")]}))
+    assert [e.path for e in await agent.readdir("/workspace")] == [
+        "/workspace/a.txt",
+        "/workspace/log.md",
+        "/workspace/notes.md",
+    ]
+    await raises("EACCES", agent.pread("/workspace/.ENV"), "/workspace/.ENV")
+
+
 # Glob
 
 
