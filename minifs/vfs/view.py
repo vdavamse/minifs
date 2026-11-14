@@ -14,10 +14,11 @@ Every operation checks the ``Policy`` for the view's actor on the visible path b
 real path. The check needs no transaction of its own: it depends on the path alone, and the operation resolves that
 same path in its one statement. Results and errors come back in visible paths: a ``VFSError`` keeps its errno and
 message, gets the visible path, and drops ``detail`` and ``db_error``, which name real paths and node ids. Entries
-the actor may not read are left out of listings, glob results and the files a grep searches. A virtual directory,
-which no rule names, may be read where the actor may read something in a mount below it (``Policy.allows_any`` on
-the mount point), and is refused (and counted) only where nothing below it is readable; its listing shows a virtual
-directory below it on the same terms and a mount point where the mount point itself may be read.
+the actor may not read are left out of listings, glob results and the files a grep searches. A virtual directory is
+decided by a rule that matches it, like any path; one no rule matches may be read where the actor may read something
+in a mount below it (``Policy.allows_any`` on the mount point, which errs toward allowing) or where the policy has
+``read_unmatched``, and is refused (and counted) otherwise. Its listing shows a virtual directory below it on the
+same terms and a mount point where the mount point itself may be read.
 
 What each operation needs:
 
@@ -329,9 +330,13 @@ class VFSView:
         return [_reported(e) for e in entries if self.policy.allows(self.actor, "read", e.path)]
 
     def _virtual_readable(self, path: tuple[str, ...]) -> bool:
-        """Whether the actor may read virtual directory ``path``: where it may read something in a mount below it
-        (``allows_any`` on the mount point, as a glob or grep from ``path`` picks the mounts it searches)."""
-        return any(
+        """Whether the actor may read virtual directory ``path``. A rule that matches it decides, as for any path;
+        with none, where it may read something in a mount below it (``allows_any`` on the mount point, as a glob or
+        grep from ``path`` picks the mounts it searches), or where the policy has ``read_unmatched``."""
+        visible = join(*path)
+        if self.policy.matches(self.actor, visible):
+            return self.policy.allows(self.actor, "read", visible)
+        return self.policy.read_unmatched or any(
             mount.visible[: len(path)] == path and self.policy.allows_any(self.actor, "read", join(*mount.visible))
             for mount in self._mounts
         )
@@ -570,8 +575,9 @@ class VFSView:
     # Mapping
 
     def _target(self, path: str, action: Action | None = None, *, count_denials: bool = True) -> _Target:
-        """``path`` mapped to the real tree, after checking ``action`` on it (``Policy.check``). ENOENT outside
-        every mount."""
+        """``path`` mapped to the real tree, after checking ``action`` on it (``Policy.check``), except a read of a
+        virtual directory, which ``_virtual_readable`` decides (refused through ``Policy.check``, so counted). ENOENT
+        outside every mount."""
         segments = split(path)
         target: _Target | None = None
         for mount in self._mounts:
@@ -706,6 +712,8 @@ class VFSView:
                 # id None: a virtual directory, which _listable tells from a mount point by it
                 children.setdefault(name, Entry(join(*path, name), None, "dir", 0, None))
                 continue
+            if not self.policy.allows(self.actor, "read", join(*mount.visible)):
+                continue  # a mount point the actor may not read isn't listed: no need to stat it
             target = _Target(mount.visible, mount)
             try:
                 entry = await self._mapped(self._client.stat(_real(target)), target)

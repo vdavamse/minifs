@@ -387,6 +387,47 @@ async def test_a_virtual_directory_is_decided_by_the_mounts_below_it(vfs: VFSCli
     assert v.policy.denials == {("x", "read"): 2}
 
 
+async def test_a_rule_naming_a_virtual_directory_decides_it(vfs: VFSClient) -> None:
+    """A rule that names a virtual directory decides it, like any path: ``Rule("/a")`` with no actions hides ``/a``
+    though a mount below it may be read, and a ``/**`` read rule makes the listing agree with ``stat``."""
+    mounts = {"/a/b/ws": f"/workspaces/{W1}"}
+    hide_a = VFSView(vfs, mounts, Policy({"x": [Rule("/a"), Rule("/a/b/ws/**", "read")]}), "x")
+    await raises("EACCES", hide_a.stat("/a"), "/a")
+    assert [e.path for e in await hide_a.readdir("/")] == []
+    assert [e.path for e in await hide_a.readdir("/a/b")] == ["/a/b/ws"]  # /a/b is unmatched, a readable mount below
+    fallback = VFSView(vfs, mounts, Policy({"x": [Rule("/a/b/ws/**"), Rule("/**", "read")]}), "x")
+    assert [e.path for e in await fallback.readdir("/")] == ["/a"]
+    assert (await fallback.stat("/a")).kind == "dir"
+    assert [e.path for e in await fallback.readdir("/a/b")] == []  # the mount point is hidden by its rule
+    hide_root = VFSView(vfs, mounts, Policy({"x": [Rule("/"), Rule("/a/b/ws/**", "read")]}), "x")
+    await raises("EACCES", hide_root.readdir("/"), "/")
+
+
+async def test_read_unmatched_reads_virtual_directories(vfs: VFSClient) -> None:
+    """With ``read_unmatched``, a virtual directory no rule matches may be read even where the mount below it may
+    not be."""
+    old = VFSView(vfs, {"/a/b/ws": f"/workspaces/{W1}"}, Policy({"x": [Rule("/a/b/ws/**")]}, read_unmatched=True), "x")
+    assert [e.path for e in await old.readdir("/")] == ["/a"]
+    assert [e.path for e in await old.readdir("/a/b")] == []
+
+
+async def test_a_virtual_listing_doesnt_stat_a_hidden_mount_point(
+    vfs: VFSClient, policy: Policy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A virtual listing skips a mount point the actor may not read without stat-ing it."""
+    agent = VFSView(vfs, {"/workspace": f"/workspaces/{W1}", "/shared": "/docs"}, policy, "agent")
+    seen: list[str] = []
+    real_stat = vfs.stat
+
+    async def stat(path: str) -> Entry:
+        seen.append(path)
+        return await real_stat(path)
+
+    monkeypatch.setattr(vfs, "stat", stat)
+    assert [e.path for e in await agent.readdir("/")] == ["/workspace"]
+    assert seen == [f"/workspaces/{W1}"]
+
+
 async def test_glob_and_grep_from_the_root_skip_a_mount_no_rule_covers(vfs: VFSClient, policy: Policy) -> None:
     """A glob and a grep from the virtual root search only the mounts something in them may be read, and skipping a
     mount counts no denial."""
