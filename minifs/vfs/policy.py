@@ -35,7 +35,7 @@ other names: use ``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/works
 
 Each rule compiles its alternatives once into a regex (``Rule.regex``) over the joined path string (for a hide
 rule the dual string, every name followed by a NUL and its folded form), so a lookup without ``subtree`` is one
-``fullmatch`` per rule instead of the recursive per-segment match (``_rests``, kept for ``subtree``,
+``fullmatch`` per rule instead of the per-segment match (``_rests``, kept for ``subtree``,
 ``allows_any`` and as the reference the differential test checks by).
 """
 
@@ -539,17 +539,32 @@ def _rests(
     a remainder is empty or all ``**``, and may match a path below ``path`` if there is any remainder. Segments
     are tuples of alternatives, paired by position: a path segment matches a pattern segment if some form of it
     matches the pattern's form at the same position (raw against raw, folded against folded), and ``**`` is a
-    whole segment (the same in every alternative)."""
-    if not path:
-        return frozenset([pattern])
-    if not pattern:
-        return frozenset()
-    head = pattern[0]
-    if head[0] == "**":
-        return _rests(pattern[1:], path) | _rests(pattern, path[1:])
-    if any(fnmatchcase(p, q) for p, q in zip(path[0], head, strict=False)):
-        return _rests(pattern[1:], path[1:])
-    return frozenset()
+    whole segment (the same in every alternative). The match runs as a set of pattern positions advanced once
+    per path segment: linear in the path's depth, without recursion, so a path of any depth is decided (#145)."""
+    n = len(pattern)
+    states = {0}  # the positions in ``pattern`` reached: each rest is the suffix ``pattern[i:]``
+    for seg in path:
+        # ``**`` matches zero segments, so the position after each globstar is reached before ``seg`` is
+        # consumed; repeated, so a run of globstars is skipped whole (a stack-driven closure, no recursion).
+        stack = list(states)
+        while stack:
+            i = stack.pop()
+            if i < n and pattern[i][0] == "**" and i + 1 not in states:
+                states.add(i + 1)
+                stack.append(i + 1)
+        # Consume ``seg``: a globstar absorbs it and stays put, a segment that matches ``seg`` advances one.
+        nxt: set[int] = set()
+        for i in states:
+            if i >= n:  # the pattern is spent: no position past its end consumes a segment
+                continue
+            if pattern[i][0] == "**":
+                nxt.add(i)
+            elif any(fnmatchcase(p, q) for p, q in zip(seg, pattern[i], strict=False)):
+                nxt.add(i + 1)
+        states = nxt
+        if not states:
+            return frozenset()
+    return frozenset(pattern[i:] for i in states)
 
 
 def _only_globstars(rest: tuple[tuple[str, ...], ...]) -> bool:
