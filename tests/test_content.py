@@ -101,6 +101,42 @@ async def read_all(conn: AsyncConnection, node: UUID, chunk: int) -> tuple[bytes
         offset += len(data)
 
 
+async def one_extent_per_piece(conn: AsyncConnection, node: UUID, pieces: list[bytes]) -> None:
+    """Replaces the extents of ``node``'s current generation with one extent per piece, by raw SQL.
+
+    #83: appends of at most 4 KiB fill one extent instead of adding one each, so tests that need many small
+    extents lay them out directly, the way newline-ended appends used to. Every piece but the last must end
+    in ``\\n`` (only the last extent may end mid-line, as ``check_layout`` in tests/test_lines.py checks);
+    the inode's size and lines are set as ``check_layout`` computes them. ``utf8`` is generated, so it is
+    not inserted.
+    """
+    assert all(piece.endswith(b"\n") for piece in pieces[:-1]), "only the last piece may end mid-line"
+    row = await _one(conn, "SELECT generation FROM vfs_nodes WHERE id = %s", (node,))
+    generation = row[0]
+    assert isinstance(generation, int)
+    await conn.execute("DELETE FROM vfs_extents WHERE node_id = %s AND generation = %s", (node, generation))
+    offsets: list[int] = []
+    line_starts: list[int] = []
+    line_offsets: list[str] = []
+    offset = newlines = 0
+    for piece in pieces:
+        offsets.append(offset)
+        line_starts.append(newlines)
+        starts = [0] + [i + 1 for i, byte in enumerate(piece[:-1]) if byte == 0x0A]
+        line_offsets.append("{" + ",".join(map(str, starts)) + "}")
+        offset += len(piece)
+        newlines += piece.count(b"\n")
+    content = b"".join(pieces)
+    lines = newlines + (1 if content and not content.endswith(b"\n") else 0)
+    await conn.execute(
+        "INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
+        " SELECT %s, %s, o, ls, d, lo::int4[]"
+        " FROM unnest(%s::bigint[], %s::bigint[], %s::bytea[], %s::text[]) AS t(o, ls, d, lo)",
+        (node, generation, offsets, line_starts, pieces, line_offsets),
+    )
+    await conn.execute("UPDATE vfs_nodes SET size = %s, lines = %s WHERE id = %s", (offset, lines, node))
+
+
 # Schema
 
 
@@ -232,7 +268,8 @@ async def test_append_returns_offsets_and_keeps_generation(conn: AsyncConnection
     size, gen, mtime = await stat(conn, f)
     assert (size, gen) == (5, 0)
     assert mtime > mtime0
-    assert await extents(conn, f) == [(0, 0, 3), (0, 3, 2)]
+    # #83: 3 + 2 bytes are at most 4 KiB, so the second append re-cut the first extent with the data as one.
+    assert await extents(conn, f) == [(0, 0, 5)]
     assert await pread(conn, f, 0, 100) == (b"ab\nde", 5, 0)
 
 
@@ -345,8 +382,9 @@ async def test_repeatable_read_append_to_a_partial_line_after_a_concurrent_compa
     conn: AsyncConnection, db: str
 ) -> None:
     f = await create_file(conn, "log")
-    for part in [b"a\n", b"b\n", b"c"]:  # ends mid-line, so the next append rewrites the last extent
-        await append(conn, f, part)
+    # #83: small appends fill one extent, so the three (the last ends mid-line, so the next append rewrites
+    # it) are laid out by raw SQL, leaving compaction something to merge.
+    await one_extent_per_piece(conn, f, [b"a\n", b"b\n", b"c"])
     async with await AsyncConnection.connect(db) as late:
         await late.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
         await late.execute("SELECT 1")  # takes the snapshot
@@ -361,8 +399,9 @@ async def test_repeatable_read_append_to_a_partial_line_after_a_concurrent_compa
 
 async def test_repeatable_read_write_after_a_concurrent_compaction_must_retry(conn: AsyncConnection, db: str) -> None:
     f = await create_file(conn, "log")
-    for part in [b"a\n", b"b\n", b"c\n"]:
-        await append(conn, f, part)
+    # #83: small appends fill one extent, so the three are laid out by raw SQL, leaving compaction something
+    # to merge.
+    await one_extent_per_piece(conn, f, [b"a\n", b"b\n", b"c\n"])
     async with await AsyncConnection.connect(db) as late:
         await late.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
         await late.execute("SELECT 1")  # takes the snapshot
@@ -467,8 +506,8 @@ async def test_pread_of_one_extent_larger_than_the_limit(conn: AsyncConnection) 
 
 async def test_pread_spanning_extents(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
-    for part in [b"aaa\n", b"bbb\n", b"ccc\n", b"dddd"]:
-        await append(conn, f, part)
+    # #83: small appends fill one extent, so the four are laid out by raw SQL.
+    await one_extent_per_piece(conn, f, [b"aaa\n", b"bbb\n", b"ccc\n", b"dddd"])
     cur = await conn.execute("SELECT byte_offset, data FROM vfs_pread(%s, 2, 11)", (f,))
     assert [(o, bytes(d)) for o, d in await cur.fetchall()] == [(2, b"a\n"), (4, b"bbb\n"), (8, b"ccc\n"), (12, b"d")]
 
@@ -545,9 +584,9 @@ def max_buffer_hits(plan: str) -> int:
 
 async def test_pread_near_the_end_of_many_extents_uses_two_index_steps(conn: AsyncConnection) -> None:
     f = await create_file(conn, "log")
-    await conn.execute(
-        "SELECT vfs_append(%s, convert_to(format('line %%s\n', i), 'UTF8')) FROM generate_series(1, 12000) i", (f,)
-    )
+    # #83: small appends fill one extent, so the 12000 lines are laid out one extent each by raw SQL, the way
+    # newline-ended appends used to (the pattern test_lines.py's index-step test uses).
+    await one_extent_per_piece(conn, f, [f"line {i}\n".encode() for i in range(1, 12_001)])
     await conn.execute("ANALYZE vfs_extents")
     size, _, _ = await stat(conn, f)
     data, _, _ = await pread(conn, f, size - 30, 20)
@@ -571,11 +610,11 @@ async def test_compact_keeps_bytes_size_generation_and_mtime(conn: AsyncConnecti
     rng = random.Random(7)
     f = await create_file(conn, "f")
     await write(conn, f, b"")  # generation 1
-    content = b""
-    for _ in range(300):
-        part = rng.randbytes(rng.choice([1, 10, 100, 3000]) - 1).replace(b"\n", b" ") + b"\n"  # one extent each
-        await append(conn, f, part)
-        content += part
+    # #83: small appends fill one extent, so the 300 lines are laid out one extent each by raw SQL (each part
+    # ends in \n, so all 300 become extents, the layout newline-ended appends used to make).
+    parts = [rng.randbytes(rng.choice([1, 10, 100, 3000]) - 1).replace(b"\n", b" ") + b"\n" for _ in range(300)]
+    content = b"".join(parts)
+    await one_extent_per_piece(conn, f, parts)
     before = await stat(conn, f)
     lines = await _one(conn, "SELECT lines FROM vfs_nodes WHERE id = %s", (f,))
     xmin = await _one(conn, "SELECT xmin::text FROM vfs_nodes WHERE id = %s", (f,))
@@ -596,9 +635,9 @@ async def test_compact_keeps_bytes_size_generation_and_mtime(conn: AsyncConnecti
 
 async def test_compact_with_the_default_target(conn: AsyncConnection) -> None:
     f = await create_file(conn, "log")
-    await conn.execute(
-        "SELECT vfs_append(%s, decode(repeat('41', 99) || '0a', 'hex')) FROM generate_series(1, 2000)", (f,)
-    )
+    # #83: small appends fill one extent, so the 2000 identical 100-byte lines are laid out one extent each by
+    # raw SQL (the count compact then merges).
+    await one_extent_per_piece(conn, f, [b"A" * 99 + b"\n"] * 2000)
     assert len(await extents(conn, f)) == 2000
     await compact(conn, f)
     assert [n for _, _, n in await extents(conn, f)] == [65500, 65500, 65500, 3500]
@@ -607,16 +646,17 @@ async def test_compact_with_the_default_target(conn: AsyncConnection) -> None:
 
 async def test_compact_leaves_a_large_extent_whole(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
-    for part in [b"\n", b"\n", b"x" * 99 + b"\n", b"\n", b"\n", b"\n"]:
-        await append(conn, f, part)
+    # #83: small appends fill one extent, so the six pieces are laid out one extent each by raw SQL.
+    await one_extent_per_piece(conn, f, [b"\n", b"\n", b"x" * 99 + b"\n", b"\n", b"\n", b"\n"])
     assert await compact(conn, f, 10) == 3
     assert [n for _, _, n in await extents(conn, f)] == [2, 100, 3]
 
 
 async def test_compact_starts_pieces_only_at_short_extents(conn: AsyncConnection) -> None:
     f = await create_file(conn, "f")
-    for part in [b"xxxxx\n", b"\n", b"\n", b"yyyyy\n", b"\n"]:  # with target 10, extents of 5 bytes or more are full
-        await append(conn, f, part)
+    # #83: small appends fill one extent, so the five pieces (with target 10, extents of 5 bytes or more are
+    # full) are laid out one extent each by raw SQL.
+    await one_extent_per_piece(conn, f, [b"xxxxx\n", b"\n", b"\n", b"yyyyy\n", b"\n"])
     xs = await _one(conn, "SELECT ctid::text FROM vfs_extents WHERE node_id = %s AND byte_offset = 0", (f,))
     assert await compact(conn, f, 10) == 3  # the three short ones and yyyyy\n; xxxxx\n starts no piece
     assert [n for _, _, n in await extents(conn, f)] == [6, 9]
@@ -651,20 +691,24 @@ async def test_compact_of_an_empty_file(conn: AsyncConnection) -> None:
 
 async def test_appends_wait_for_compaction_and_stay_gap_free(conn: AsyncConnection, db: str) -> None:
     f = await create_file(conn, "log")
-    for i in range(50):
-        await append(conn, f, f"{i}\n".encode())
+    # #83: small appends fill one extent, so the 50 lines are laid out one extent each by raw SQL.
+    await one_extent_per_piece(conn, f, [f"{i}\n".encode() for i in range(50)])
     content, size = await read_all(conn, f, 1000)
+    # #83: over 4 KiB, so the append keeps the old behaviour (the last extent ends in \n): a new extent at the
+    # fresh size, gap-free after the compaction it waited for. A small one would re-cut the extent the
+    # compaction rewrote after the appender's snapshot was taken.
+    tail = b"tail" + b"x" * 4096
     async with await AsyncConnection.connect(db) as compactor, await AsyncConnection.connect(db) as appender:
         assert await compact(compactor, f) == 49  # transaction open, inode locked
-        task = asyncio.create_task(append(appender, f, b"tail"))
+        task = asyncio.create_task(append(appender, f, tail))
         await wait_until_blocked(conn, appender.info.backend_pid)
         # Readers don't wait, and see the old extents until the compaction commits.
         assert await read_all(conn, f, 7) == (content, size)
         await compactor.commit()
         assert await task == size
         await appender.commit()
-    assert await read_all(conn, f, 7) == (content + b"tail", size + 4)
-    assert [n for _, _, n in await extents(conn, f)] == [size, 4]
+    assert await read_all(conn, f, 7) == (content + tail, size + len(tail))
+    assert [n for _, _, n in await extents(conn, f)] == [size, len(tail)]
 
 
 async def test_concurrent_appends_and_compactions(conn: AsyncConnection, db: str) -> None:

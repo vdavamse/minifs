@@ -25,6 +25,7 @@ from minifs.vfs.core import VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.regex import RegexError
 from minifs.vfs.search import GrepHit, SearchRefused
+from tests.test_content import one_extent_per_piece
 from tests.test_lines import is_utf8
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
@@ -135,7 +136,12 @@ async def test_hits_equal_a_per_line_search(db_any_locale: str) -> None:
 @needs_oracle
 async def test_many_extents_and_a_new_generation(vfs: VFSClient, conn: AsyncConnection) -> None:
     chunks = [f"line {i} {'foo' if i % 7 == 0 else 'bar'}\n".encode() * 50 for i in range(40)]
-    await put(vfs, "/f.txt", *chunks)
+    # #83: small appends fill one extent, so the 40 chunks are laid out one extent each by raw SQL.
+    await vfs.create("/f.txt", b"", parents=True)
+    cur = await conn.execute("SELECT id FROM vfs_lookup(%s)", (["f.txt"],))
+    node = await cur.fetchone()
+    assert node is not None
+    await one_extent_per_piece(conn, node[0], chunks)
     cur = await conn.execute("SELECT count(*) FROM vfs_extents")
     assert (await cur.fetchone()) == (40,)
     files = {"/f.txt": b"".join(chunks)}
@@ -213,7 +219,12 @@ async def test_non_utf8_is_skipped(vfs: VFSClient, conn: AsyncConnection) -> Non
     await put(vfs, "/latin1", b"caf\xe9 foo\n")
     await put(vfs, "/nul", b"foo\x00bar\n")
     await put(vfs, "/png", b"\x89PNG\r\n\x1a\nfoo\n")
-    await put(vfs, "/mixed", b"bad \xff foo\n", b"good foo\n")  # two extents: one bad one skips the file
+    # #83: two small chunks would merge into one extent, so lay out the two (one bad, one good) by raw SQL:
+    # one bad extent skips the file.
+    await vfs.create("/mixed", b"", parents=True)
+    mixed = await (await conn.execute("SELECT id FROM vfs_lookup(%s)", (["mixed"],))).fetchone()
+    assert mixed is not None
+    await one_extent_per_piece(conn, mixed[0], [b"bad \xff foo\n", b"good foo\n"])
     await put(vfs, "/ok", b"foo\n")
     cur = await conn.execute(
         "SELECT count(*) FROM vfs_extents e JOIN vfs_nodes n ON n.id = e.node_id WHERE name = 'mixed'"
@@ -252,13 +263,16 @@ async def test_validity_follows_writes_appends_and_compaction(vfs: VFSClient, co
     async def state() -> tuple[list[bool], bool]:
         return await utf8_flags(conn, "f"), (await vfs.grep("foo")).hits != []
 
-    await put(vfs, "/f", b"foo\n", b"caf\xc3")  # the last extent ends mid-character: skipped, as when decoded
-    assert await state() == ([True, False], False)
-    await vfs.append("/f", b"\xa9\n")  # the append re-cuts the last extent, which is now whole
-    assert await state() == ([True, True], True)
+    # #83: each small append re-cuts the (<= 4 KiB) last extent into a single extent, so the file stays one
+    # extent whose validity flips with each operation until compaction/write replaces it (the flag list is the
+    # merged layout, not one flag per append).
+    await put(vfs, "/f", b"foo\n", b"caf\xc3")  # one extent ending mid-character: skipped, as when decoded
+    assert await state() == ([False], False)
+    await vfs.append("/f", b"\xa9\n")  # the append re-cuts the extent, which is now whole
+    assert await state() == ([True], True)
     await vfs.append("/f", b"\xff\n")
     await vfs.append("/f", b"ok\n")
-    assert await state() == ([True, True, False, True], False)
+    assert await state() == ([False], False)  # re-cut to one extent, still holding \xff
     await vfs.compact("/f")  # one extent, decoded again: still invalid
     assert await state() == ([False], False)
     await vfs.write("/f", b"foo\n")  # a new generation, valid
