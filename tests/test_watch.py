@@ -175,7 +175,9 @@ async def test_events_are_delivered_at_commit(conn: AsyncConnection, db: str, li
 async def test_compaction_emits_nothing(conn: AsyncConnection, listener: AsyncConnection) -> None:
     f = await create(conn, None, "log")
     for _ in range(5):
-        await append(conn, f, 10)
+        # #83: over 4 KiB, so each append is an extent of its own (10-byte appends would all merge into one),
+        # leaving compaction five extents to merge.
+        await append(conn, f, 5000)
     await payloads(listener, 6)
     cur = await conn.execute("SELECT removed, err FROM vfs_compact(%s)", (f,))
     assert await cur.fetchone() == (4, None)  # five extents merged into one

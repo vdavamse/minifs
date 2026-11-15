@@ -1,7 +1,8 @@
 """Errors reported by the minifs SQL functions, and by the schema's constraints.
 
 The functions return the expected outcomes (``OUTCOMES``: a missing path, a taken name, a lost compare-and-swap,
-...) in their ``err`` and ``err_detail`` columns (migration 009), and raise the faults (EINVAL, ENAMETOOLONG) as
+...) in their ``err`` and ``err_detail`` columns (migration 009), and raise the faults (EINVAL, ENAMETOOLONG, and
+since 023 EFBIG and EDQUOT) as
 SQLSTATE ``MFnnn``, where ``nnn`` is the Linux errno number, with the errno name as the message and the context in
 DETAIL (see ``vfs_raise`` in migration 003). The codes don't depend on the client platform's errno numbering;
 every errno has one, so ``vfs_raise`` can raise any of them.
@@ -31,9 +32,11 @@ SQLSTATE_BY_ERRNO: dict[str, str] = {
     "ENOTDIR": "MF020",
     "EISDIR": "MF021",
     "EINVAL": "MF022",
+    "EFBIG": "MF027",
     "ENAMETOOLONG": "MF036",
     "ENOTEMPTY": "MF039",
     "ESTALE": "MF116",
+    "EDQUOT": "MF122",
 }
 
 # The errnos the functions return rather than raise.

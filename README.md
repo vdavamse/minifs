@@ -179,6 +179,8 @@ Every write is visible to the next search at once, with no index lag. The transl
 
 Rules are ordered and the first match wins. A rule with no actions hides a path, so `Policy({"agent": [Rule("/workspace/**/.env*"), Rule("/workspace/**", "read", "write"), ...]})` makes `.env`, `.env.local` and the like invisible to `Read`, `Glob` and `Grep`. Rules that grant an action match names byte for byte and case-sensitively; a rule with no actions also hides case and Unicode variants of the names it spells (`.ENV`, a fullwidth `.env`), but not other names, which is why the example ends in `*`; a `[...]` class also matches the folded forms of what it lists, but a segment holding a negated class (`[!...]`) matches byte for byte only, literal letters included. A path no rule matches is refused (`Policy(rules, read_unmatched=True)` lets it be read, as before 0.1.0). So a real directory, the mount point included, is readable only where a rule matches it: `/workspace/**` covers `/workspace` itself, while `/workspace/src/**` alone leaves `/workspace` unreadable (`Glob` and `Grep` from `/` still reach `src`). The virtual directories above the mounts, such as `/`, may be read wherever something in a mount below them may, unless a rule names them. The policy is the tools' only permission gate.
 
+**Quotas.** A directory can be made a quota root: `VFSClient.set_quota(path, max_bytes=..., max_nodes=...)` caps the bytes of the files and the number of nodes below it, and every write below it is charged in the same statement — one that would take a limit over is `EDQUOT`, with nothing changed (a write that shrinks is never refused). Quotas nest, and a rename moves its subtree's usage from the quota roots above the source to those above the destination. `set_child_quota("/workspaces", ...)` gives every workspace a quota from its first mkdir: the existing child directories without a quota get one at once, and every directory created directly below inherits one at its creation. `quota(path)` reads a quota back; `minifs quota PATH [--bytes N|none] [--nodes N|none] [--remove] [--children] [--timeout SECONDS]` is the operator's CLI for the same (an omitted limit is kept, `none` clears that one limit). What is counted is the files' logical sizes; storage per byte is a small factor more.
+
 ## Configuration
 
 The tools read optional attributes from your deps:
@@ -240,6 +242,7 @@ Credentials: keep the password out of the command line, where other users see it
 ## Limits
 
 - Text first: files from kilobytes to a few megabytes. Images and PDFs can be read as attachments, other binaries are refused by `Read`, and non-UTF-8 files are skipped by `Grep`.
+- A file is at most 64 MiB (`MAX_FILE_SIZE`): a larger `create`, `write` or `append` is `EFBIG`, refused by the client before any round trip and by the server. What a directory holds in all is its quota's business (see *Workspaces and permissions*).
 - Not full POSIX: no hard links, permission bits, symlinks or writes at an arbitrary offset (writes replace or append).
 - `Grep` has no context lines (`-C`) or multiline mode, and `Glob` doesn't read `.gitignore`. It applies the exclude list above instead.
 - No compaction job ships yet. A file appended to one line at a time gains an extent per append. `VFSClient.compact(path)` merges them, and nothing reads differently afterwards.

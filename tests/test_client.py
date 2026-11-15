@@ -29,7 +29,7 @@ from minifs.vfs.client import (
     VFSClient,
     _gated,  # pyright: ignore[reportPrivateUsage]
 )
-from minifs.vfs.core import CONTROL_CHARACTERS, MAX_COMPONENTS, FileVersion, Kind, ReadResult, VFSError
+from minifs.vfs.core import CONTROL_CHARACTERS, MAX_COMPONENTS, MAX_FILE_SIZE, FileVersion, Kind, ReadResult, VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.search import SearchRefused
 from tests.test_tree import holding_the_lock, wait_until_blocked
@@ -646,8 +646,17 @@ async def test_pread_page_sorts_the_page_once(vfs: VFSClient, monkeypatch: pytes
     window that numbers read 1's rows, so a file built by many small appends doesn't spill the ~208 KB page to
     temp-disk sort once per extent. Under ``work_mem = '4MB'`` the old plan (``l`` below the window) spilled."""
     f = await vfs.create("/a/f", b"", parents=True)
-    for i in range(400):
-        await vfs.append("/a/f", b"line %04d\n" % i)  # an extent per append: 400 of them in the 4 KB sample
+    # An extent per line, 400 of them in the 4 KB sample: the layout small appends made before 023 (now they fill
+    # 4 KiB extents, #83), so raw SQL.
+    async with vfs.pool.connection() as conn:
+        await conn.execute(
+            "WITH l AS (SELECT i, convert_to(format('line %%s' || chr(10), lpad(i::text, 4, '0')), 'UTF8') AS d"
+            " FROM generate_series(0, 399) i)"
+            " INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
+            " SELECT %s, 0, 10 * i, i, d, '{0}' FROM l",
+            [f.id],
+        )
+        await conn.execute("UPDATE vfs_nodes SET size = 4000, lines = 400 WHERE id = %s", [f.id])
     await vfs.append("/a/f", b"".join(b"x" * 99 + b"\n" for _ in range(2000)))  # and a 200 KB tail
     async with vfs.pool.connection() as conn:
         cur = await conn.execute("SELECT count(*) FROM vfs_extents WHERE node_id = %s AND byte_offset < 4096", [f.id])
@@ -773,10 +782,10 @@ async def test_rename_and_claim(vfs: VFSClient) -> None:
 
 async def test_unlink_and_compact(vfs: VFSClient) -> None:
     await vfs.create("/log")
-    for i in range(10):
-        await vfs.append("/log", b"line %d\n" % i)
-    assert await vfs.compact("/log") == 9
-    assert (await vfs.pread("/log", 0, 7)).content == b"line 0\n"
+    for c in b"abc":  # lines over 4 KiB: an extent per append (vfs_append re-cuts smaller ones, #83)
+        await vfs.append("/log", bytes([c]) * 4999 + b"\n")
+    assert await vfs.compact("/log") == 2
+    assert (await vfs.pread("/log", 4998, 3)).content == b"a\nb"
     await vfs.unlink("/log")
     await raises("ENOENT", vfs.stat("/log"), "/log")
     await raises("EINVAL", vfs.unlink("/"))
@@ -812,6 +821,17 @@ async def test_over_deep_paths_are_refused(vfs: VFSClient) -> None:
     await vfs.mkdir_p("/b/" + "/".join(["d"] * 30))
     error = await raises("ENAMETOOLONG", vfs.rename("/b", "/" + "/".join(["d"] * 1000) + "/b"), "/b")
     assert isinstance(error.db_error, psycopg.Error) and "subtree" in error.detail
+
+
+async def test_over_cap_writes_are_refused_before_any_round_trip(vfs: VFSClient) -> None:
+    """#83: content over MAX_FILE_SIZE is refused by the client's own check, whatever the operation and
+    whether or not the file exists: no database error, no server detail, no query."""
+    data = bytes(MAX_FILE_SIZE + 1)
+    for call in (vfs.create("/f", data), vfs.write("/f", data), vfs.append("/f", data)):
+        error = await raises("EFBIG", call, "/f")
+        assert error.db_error is None and not error.detail  # no round trip happened
+        assert error.message == f"{MAX_FILE_SIZE + 1} bytes, over the {MAX_FILE_SIZE}-byte limit"
+    await raises("ENOENT", vfs.stat("/f"))  # nothing was created
 
 
 # Every errno the SQL layer reports comes back as a VFSError with that errno and the normalised path: the outcomes
@@ -857,15 +877,32 @@ async def _estale(vfs: VFSClient) -> Awaitable[object]:
     return vfs.write("/f", b"3", expect=version)
 
 
+async def _efbig(vfs: VFSClient) -> Awaitable[object]:
+    # The server's EFBIG: the client refuses over-cap data itself, so the file is already at the cap and a
+    # one-byte append takes it over. The raw insert leaves the size without extents, which vfs_append checks
+    # before it reads any.
+    async with vfs.pool.connection() as conn:
+        await conn.execute("INSERT INTO vfs_nodes (name, kind, size) VALUES ('f', 'file', %s)", (MAX_FILE_SIZE,))
+    return vfs.append("/f", b"x")
+
+
+async def _edquot(vfs: VFSClient) -> Awaitable[object]:
+    await vfs.mkdir("/q")
+    await vfs.set_quota("/q", max_bytes=10)
+    return vfs.create("/q/f", b"x" * 11)
+
+
 ERRNO_CASES: dict[str, tuple[Callable[[VFSClient], Awaitable[Awaitable[object]]], str]] = {
     "ENOENT": (_enoent, "/missing"),
     "EEXIST": (_eexist, "/f"),
     "ENOTDIR": (_enotdir, "/f/x"),
     "EISDIR": (_eisdir, "/d"),
     "EINVAL": (_einval, "/d"),
+    "EFBIG": (_efbig, "/f"),
     "ENAMETOOLONG": (_enametoolong, "/" + "a" * 256),
     "ENOTEMPTY": (_enotempty, "/d"),
     "ESTALE": (_estale, "/f"),
+    "EDQUOT": (_edquot, "/q/f"),
 }
 
 

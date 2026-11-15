@@ -32,6 +32,11 @@ controls, the Unicode line and paragraph separators, and the bidi embeddings, ov
 C0 control the server never sees: refused here, it can't surface as an encoding error (EIO) from psycopg."""
 
 
+MAX_FILE_SIZE = 64 * 1024 * 1024
+"""The largest a file may be, in bytes (migration 023's ``vfs_max_file_size()``): ``create`` and ``write`` refuse
+larger content, and ``append`` an append that would make the file larger, as EFBIG. It bounds the memory one write
+takes on the server, and what an appender can grow one file to; a workspace's total is its quota's business."""
+
 MAX_COMPONENTS = 1024
 """The most components a path may have, and the deepest a node may be (migration 022's ``vfs_max_components()``,
 which ``vfs_lookup``, ``vfs_mkdir_p`` and ``vfs_rename`` enforce). Each component is one index probe, and
@@ -104,6 +109,18 @@ class Entry:
         if self.kind != "file" or self.id is None or self.generation is None:
             return None
         return FileVersion(self.id, self.generation, self.size)
+
+
+@dataclass(frozen=True)
+class Quota:
+    """A directory's quota (migration 023): at most ``max_bytes`` bytes of files and ``max_nodes`` nodes below it
+    (None: no limit on that one), and what is used now. Every write below it is charged; one that would take it
+    over a limit is EDQUOT."""
+
+    max_bytes: int | None
+    max_nodes: int | None
+    used_bytes: int
+    used_nodes: int
 
 
 @dataclass(frozen=True)
