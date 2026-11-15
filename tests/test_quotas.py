@@ -389,38 +389,42 @@ async def test_a_directory_created_while_set_child_quota_runs_gets_the_quota(con
 
 
 async def test_a_rename_racing_a_create_of_its_destination_does_not_deadlock(conn: AsyncConnection, db: str) -> None:
-    """A cross-quota rename charges the destination's quota rows only after its UPDATE (023), so the ordering
-    that used to deadlock — a create of (q, 'x') holding the name and the quota row, a rename of another file
-    to (q, 'x') — has the rename wait on the name alone: the create commits, and the rename's UPDATE then hits
-    the unique violation minifs.db.errors maps to EEXIST (or finds the committed row and returns EEXIST). A
-    deadlock would raise DeadlockDetected and fail this test."""
+    """A cross-quota rename charges the destination's quota rows only after its UPDATE (023): quota rows are
+    every writer's last lock. A third connection holds q's quota row, so each statement stops at its charge:
+    the rename has already taken the name (q, 'x') by then, and a create of (q, 'x') waits on that name, not
+    holding q's row. Released, the rename commits and the create gets EEXIST. Had the rename charged first, it
+    would wait on q's row without the name, the create would insert (q, 'x') and wait on q's row too, and the
+    two would deadlock once the row was released (DeadlockDetected fails this test)."""
     q = await mkdir_p(conn, "q")
     src = await mkdir_p(conn, "src")
     assert q is not None and src is not None
     f = await create_data(conn, src, "f", b"x" * 10)
     await _one(conn, "SELECT used_bytes FROM vfs_set_quota(%s, 100, NULL)", (q,))
     async with (
-        await AsyncConnection.connect(db) as creator,
+        await AsyncConnection.connect(db) as holder,
         await AsyncConnection.connect(db) as renamer,
+        await AsyncConnection.connect(db) as creator,
     ):
-        # The create first: (q, 'x') is inserted and q is charged, both uncommitted.
-        await create_data(creator, q, "x", b"y" * 5)
+        await holder.execute("SELECT 1 FROM vfs_quotas WHERE root = %s FOR UPDATE", (q,))
         renamed = asyncio.create_task(rename(renamer, f, q, "x"))
-        await wait_until_blocked(creator, renamer.info.backend_pid)  # on the create's uncommitted name
-        await creator.commit()
+        await wait_until_blocked(holder, renamer.info.backend_pid)  # at its charge, the name already taken
+        created = asyncio.create_task(create_data(creator, q, "x", b"y" * 5))
+        await wait_until_blocked(holder, creator.info.backend_pid)  # on the rename's uncommitted name
+        await holder.commit()
+        assert await asyncio.wait_for(renamed, 10) is True
+        await renamer.commit()
         with pytest.raises((Returned, psycopg.Error)) as info:
-            await renamed
-        await renamer.rollback()
+            await asyncio.wait_for(created, 10)
+        await creator.rollback()
     error = info.value
-    assert not isinstance(error, psycopg.errors.DeadlockDetected), "the rename deadlocked with the create"
+    assert not isinstance(error, psycopg.errors.DeadlockDetected), "the create deadlocked with the rename"
     if isinstance(error, Returned):
-        assert error.errno == "EEXIST"  # the create was seen as committed before the UPDATE ran
+        assert error.errno == "EEXIST"
     else:
         assert errno_name(error) == "EEXIST", error  # the unique violation of the committed (q, 'x')
-    # The create won; the rename moved nothing and charged nothing.
-    assert await _one(conn, "SELECT count(*) FROM vfs_nodes WHERE parent_id = %s AND name = 'x'", (q,)) == (1,)
-    assert await _one(conn, "SELECT count(*) FROM vfs_nodes WHERE id = %s AND parent_id = %s", (f, src)) == (1,)
-    assert await _one(conn, "SELECT used_bytes, used_nodes FROM vfs_quotas WHERE root = %s", (q,)) == (5, 1)
+    # The rename won: f is q/x, and q is charged its 10 bytes and 1 node, not the create's.
+    assert await _one(conn, "SELECT parent_id, name FROM vfs_nodes WHERE id = %s", (f,)) == (q, "x")
+    assert await _one(conn, "SELECT used_bytes, used_nodes FROM vfs_quotas WHERE root = %s", (q,)) == (10, 1)
 
 
 # The 64 MiB file cap (EFBIG), at the SQL level; the over-cap content is built in SQL, not in Python
