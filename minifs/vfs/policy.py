@@ -360,8 +360,9 @@ def _folded_class(body: str) -> str:
     range fnmatch reads; a class with an ``x-y`` spanning more than 4096 code points (``_MAX_RANGE_SPAN``), even
     one fnmatch reads as literals, or with more than 16384 candidates in all (``_MAX_CLASS_CANDIDATES``), is
     returned as written and gains no folds: telling a range from literals would take a parse. Each candidate
-    is tried against the class as written with ``fnmatchcase``, and the single-character folds (``_fold_pattern``) of the members join the set; a member
-    that folds to several characters (the sharp s) is matched only as written.
+    is tried against the class as written with ``fnmatchcase``, and the single-character folds
+    (``_fold_pattern``) of the members join the set; a member that folds to several characters (the sharp s) is
+    matched only as written.
     Membership comes from fnmatch itself, so a parse difference can only lose an addition, never invent one
     (#148). Where the set gains nothing the class is returned as written; otherwise it is emitted as an
     explicit list of characters with no ranges to span unintended ones: a ``]`` comes first and a ``-`` last,
