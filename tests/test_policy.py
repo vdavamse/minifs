@@ -674,7 +674,8 @@ def test_rests_decides_deep_paths() -> None:
     for depth in (1000, 5000):
         deep = "/workspace" + "/.git" * depth
         assert policy.allows_any("a", "read", deep) is True, depth
-        assert isinstance(policy.allows("a", "read", deep, subtree=True), bool), depth  # no RecursionError
+        # the hide rule can still match below (a .git/**/config) and grants nothing: the subtree isn't readable
+        assert policy.allows("a", "read", deep, subtree=True) is False, depth
     rule = Rule("/workspace/**/.git/**/config")
     matched = split_trusted("/workspace" + "/.git" * 5000 + "/config")
     assert _matches_by_rests(rule, matched)  # the two globstars absorb the nest; "config" ends it
@@ -705,6 +706,16 @@ def test_rests_agree_with_the_recursive_matcher() -> None:
     booleans, so a rest that is present in one and absent in the other fails too. ``_rule_rests`` builds the
     path form itself (``_folded_alts`` for a hide rule, ``_exact_alts`` otherwise), and the reference is fed
     exactly that form."""
+    # Fixed edge cases the generator doesn't draw: the root rule's empty pattern, and runs of globstars.
+    for pattern_alts, path_alts in (
+        ((), ()),
+        ((), (("a",),)),
+        ((("**",),), ()),
+        ((("**",), ("**",)), (("a",), ("b",))),
+        ((("a",), ("**",), ("**",)), (("a",),)),
+    ):
+        assert _rests(pattern_alts, path_alts) == _recursive_rests(pattern_alts, path_alts), (pattern_alts, path_alts)
+    assert _rests((), (("a",),)) == frozenset()  # the root rule matches nothing below the root
     rng = random.Random(145)
     patterns = 0
     variants: tuple[tuple[Action, ...], ...] = ((), ("read",))  # the hide rule and the grant rule
