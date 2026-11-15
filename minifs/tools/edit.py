@@ -39,7 +39,7 @@ from bisect import bisect_left
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextvars import ContextVar
-from itertools import accumulate, chain, islice
+from itertools import accumulate, chain, islice, repeat
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ToolReturn
@@ -192,7 +192,7 @@ async def _edit(
         except UnicodeDecodeError:
             raise ModelRetry(f"Cannot edit {path}: it is not a UTF-8 text file") from None
         ending = detect_line_ending(content_old)
-        old = convert_to_line_ending(normalize_line_endings(old_string), ending)
+        old = normalize_line_endings(old_string)  # `replace` matches on the LF view, so oldString stays LF (#143)
         replacement = convert_to_line_ending(normalize_line_endings(new_string), ending)
         try:
             # In a thread, as pydantic-ai runs ladderframe's sync Edit: the fallback replacers scan the whole file,
@@ -702,10 +702,15 @@ def replace(
     if old_string == "":
         raise ValueError(EMPTY_OLD_STRING)
 
+    deadline = _Deadline(timeout)  # before the view: building it is part of the search's time
     view, crlf = _lf_view(content)
     old_v = old_string.replace("\r\n", "\n")  # new_string is taken as given: `_edit` gave it the file's ending
+    old_crs = old_v.count("\r")  # lone CRs the model wrote, which a match must hold too
+    hides_crs = len(view) != len(content)  # a CRLF pair or a final CR, which Read hides
+    # a file whose every line ends in CRLF, with no other CR: the view's occurrences of a search are the raw
+    # content's occurrences of the search with CRLF endings, so a replaceAll can be one str.replace
+    pure_crlf = crlf is None
 
-    deadline = _Deadline(timeout)
     token = _deadline.set(deadline)
     not_found = True
     refusal: _LongerBlock | None = None
@@ -731,6 +736,11 @@ def replace(
                     # escaped `\t` for a real tab).
                     if not search or (replace_all and search != old_v and not search.strip()):
                         continue
+                    # a CR the model wrote that the match leaves out (a line matcher strips a trailing one as
+                    # whitespace) is no match (#143): it can only have meant a line ending's CR, which Read hides,
+                    # and its newString's CR would then land before the file's own CRLF as a stray lone CR
+                    if old_crs and search.count("\r") < old_crs:
+                        continue
                     if search in seen:
                         continue
                     if seen_size + len(search) > _SEEN_BYTES:
@@ -755,11 +765,13 @@ def replace(
                         # one pass, no mapping: an LF file's view is the content, and a search with no CR or LF has
                         # the same occurrences in the content as in the view (a fold only touches a CRLF pair or a
                         # final CR, neither of which such a search can contain or straddle)
-                        if not crlf or ("\r" not in search and "\n" not in search):
-                            return _changed(content, content.replace(search, new_string), old_v, crlf)
-                        return _changed(
-                            content, _splice(content, view, crlf, search, index, new_string, True), old_v, crlf
-                        )
+                        if not hides_crs or ("\r" not in search and "\n" not in search):
+                            result = content.replace(search, new_string)
+                        elif pure_crlf:  # every LF a pair's, no lone CR: the search with CRLF endings, raw
+                            result = content.replace(search.replace("\n", "\r\n"), new_string)
+                        else:
+                            result = _splice(content, view, crlf, search, index, new_string, True)
+                        return _changed(content, result, old_v, hides_crs)
                     # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one
                     # call on a repetitive file ran for seconds that no deadline could interrupt.
                     if view.find(search, index + 1) != -1:
@@ -769,7 +781,7 @@ def replace(
                             raise ValueError(MULTIPLE_MATCHES)
                         continue
                     return _changed(
-                        content, _splice(content, view, crlf, search, index, new_string, False), old_v, crlf
+                        content, _splice(content, view, crlf, search, index, new_string, False), old_v, hides_crs
                     )
             except _LongerBlock as e:  # pending, not final (#117): a later replacer may still find the text
                 refusal = e
@@ -789,7 +801,7 @@ def replace(
             raise refusal
         raise ValueError(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
-            "and line endings." + _cr_hint(old_v, crlf)
+            "and line endings." + _cr_hint(old_v, hides_crs)
         )
     raise ValueError(MULTIPLE_MATCHES)
 
@@ -801,57 +813,70 @@ CR_HINT = (
 )
 
 
-def _cr_hint(old_v: str, crlf: array[int]) -> str:
+def _cr_hint(old_v: str, hides_crs: bool) -> str:
     """The line-ending hint for an error (#143): only where the file has CRLF pairs (or a final CR) Read hid, and
     oldString holds a CR, real or escaped where a line ending would be: a backslash-r before a newline, a
     backslash-n or the end (the escape matcher reads ``\\r`` as a CR, but ``C:\\repo`` is a path, not a line
     ending). A guess, so it says "if"."""
-    return CR_HINT if crlf and ("\r" in old_v or _ESCAPED_CR_ENDING.search(old_v)) else ""
+    return CR_HINT if hides_crs and ("\r" in old_v or _ESCAPED_CR_ENDING.search(old_v)) else ""
 
 
 _ESCAPED_CR_ENDING = re.compile(r"\\r(?:\\n|\n|$)")
 
 
-def _changed(content: str, result: str, old_v: str, crlf: array[int]) -> str:
+def _changed(content: str, result: str, old_v: str, hides_crs: bool) -> str:
     """``result``, unless the edit left the content as it was (#143): a fuzzy match can read as newString already,
     e.g. ``"foo\\r"`` -> ``"foo"`` on a CRLF file, where a line matcher strips the CR as whitespace and replaces
     ``foo`` by ``foo``. That edit reported success and changed nothing; now the model is told."""
     if result == content:
-        raise ValueError(NO_CHANGE + _cr_hint(old_v, crlf))
+        raise ValueError(NO_CHANGE + _cr_hint(old_v, hides_crs))
     return result
 
 
-def _lf_view(content: str) -> tuple[str, array[int]]:
+def _lf_view(content: str) -> tuple[str, array[int] | None]:
     """The LF view ``replace`` searches, and the view index of every LF that is a CRLF pair in ``content``,
     ascending (#143). Read shows the file this way: it drops the ``\\r`` of every line ending, and a final lone
     ``\\r`` too, so the model's ``oldString`` can hold neither, and matching on the view is matching on what the
     model saw. An LF file has no pair and no final CR: the view *is* the content and its indices are empty, so a
     match costs no mapping. The view mirrors Read's ``removesuffix("\\r")`` per line (read.py): if Read changes
-    which CRs it hides, this must change with it."""
-    if "\r" not in content:  # no pair and no final CR: skip the regex pass
+    which CRs it hides, this must change with it.
+
+    ``None`` for the indices means a pure CRLF file, every LF a pair's and no other CR (most CRLF files): every
+    LF of the view is then a pair's, so a span is mapped by counting the view's LFs before it, at C speed, and the
+    indices (a Python int per line, ~0.6 s on 10 MB of short lines) are never built."""
+    if "\r" not in content:  # no pair and no final CR: the view is the content
         return content, array("q")
     view = content.replace("\r\n", "\n")
-    # the k-th pair (0-based) starts at m.start() in the content, and its LF is at m.start() - k in the view: the
-    # k pairs before it are one character shorter each there
-    crlf = array("q", (m.start() - k for k, m in enumerate(re.finditer("\r\n", content))))
+    pairs = len(content) - len(view)
+    if pairs == content.count("\n") == content.count("\r"):
+        return view, None
+    crlf = _pair_lfs(content.split("\r\n"))
     if content.endswith("\r"):  # a final lone CR (a pair's CR is never the content's last character)
         view = view[:-1]
         crlf.append(len(view))  # past the view's end: a span that reaches the end stops before that CR, keeping it
     return view, crlf
 
 
-def _raw_span(crlf: array[int], start: int, end: int) -> tuple[int, int]:
+def _pair_lfs(pieces: list[str]) -> array[int]:
+    """The view index of each pair's LF, given the pieces between the pairs: the sum of the lengths of the pieces
+    before it, plus one per earlier LF, accumulated at C speed (no Python step per line)."""
+    return array("q", islice(accumulate(map(int.__add__, map(len, pieces[:-1]), repeat(1)), initial=-1), 1, None))
+
+
+def _raw_span(view: str, crlf: array[int] | None, start: int, end: int) -> tuple[int, int]:
     """The raw offsets of the view span ``[start, end)``: ``raw(i) = i + bisect_left(crlf, i)``, a view index plus
     the CRLF pairs the view hides before it (#143). A pair is never split: its LF is in ``crlf``, so ``raw`` jumps
     by two across it and no boundary can fall between its ``\\r`` and its ``\\n``. Without ``crlf`` the view is the
-    content, and the span is its own."""
+    content, and the span is its own; with ``None`` (a pure CRLF file) every LF before ``i`` is a pair's."""
+    if crlf is None:
+        return start + view.count("\n", 0, start), end + view.count("\n", 0, end)
     if not crlf:
         return start, end
     return start + bisect_left(crlf, start), end + bisect_left(crlf, end)
 
 
 def _splice(
-    content: str, view: str, crlf: array[int], search: str, index: int, new_string: str, replace_all: bool
+    content: str, view: str, crlf: array[int] | None, search: str, index: int, new_string: str, replace_all: bool
 ) -> str:
     """Substitute ``new_string`` for ``search`` in the raw ``content`` (#143): the occurrence at the view's
     ``index`` or, with ``replace_all``, every occurrence of the view, non-overlapping and left to right as
@@ -861,8 +886,10 @@ def _splice(
     short one cost a second or two, after the search's deadline."""
     size = len(search)
     if not replace_all:  # one occurrence: two slices and a join
-        start, end = _raw_span(crlf, index, index + size)
+        start, end = _raw_span(view, crlf, index, index + size)
         return content[:start] + new_string + content[end:]
+    if crlf is None:  # a pure CRLF file (``replace`` takes str.replace there; kept correct for any caller)
+        crlf = _pair_lfs(view.split("\n"))
     out = io.StringIO()
     cursor = 0  # the raw offset written so far
     k = 0  # the entries of crlf before the occurrence being mapped

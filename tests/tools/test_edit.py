@@ -135,14 +135,13 @@ async def test_a_fuzzy_match_in_a_mixed_endings_file(deps: Deps, client: VFSClie
 
 
 async def test_a_line_ending_cr_is_not_the_models_to_edit(deps: Deps, client: VFSClient) -> None:
-    """Through the tool (#143): ``_edit`` converts oldString to the file's ending and ``replace`` folds it back,
-    so a CR the model writes before a line end can only match a lone CR. On a CRLF file ``"foo\\r"`` -> ``"foo"``
-    matches ``foo`` and changes nothing, which is a retry naming the hidden line-ending CR, not a silent success;
-    a line that is CRLF in one place and LF in another is ambiguous, as Read shows both alike. The file is
-    unchanged either way."""
+    """Through the tool (#143): ``replace`` matches on the LF view, so a CR the model writes before a line end can
+    only match a lone CR. On a CRLF file ``"foo\\r"`` -> ``"foo"`` is "Could not find" with a hint naming the hidden
+    line-ending CR, not a silent success; a line that is CRLF in one place and LF in another is ambiguous, as
+    Read shows both alike. The file is unchanged either way."""
     await put(client, "win.txt", b"foo\r\nbar\r\n")
     message = await edit_retry(deps, "win.txt", "foo\r", "foo")
-    assert "No changes to apply" in message and "line ending" in message
+    assert "Could not find" in message and "line ending" in message
     assert await content(client, "win.txt") == b"foo\r\nbar\r\n"
     await put(client, "mixed.txt", b"foo\r\nbar\nfoo\nbar\r\n")
     assert "multiple matches" in await edit_retry(deps, "mixed.txt", "foo\nbar", "X")
