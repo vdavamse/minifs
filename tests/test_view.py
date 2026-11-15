@@ -1204,19 +1204,19 @@ def test_hide_rules_match_variants() -> None:
     # one segment and the folded match in another is hidden (matching only whole paths leaked it).
     exact_folded = Policy({"a": [Rule("/w/[!a-z]*/.env"), Rule("/w/**", "read")]})
     assert not exact_folded.allows("a", "read", "/w/Config/.ENV")  # Config byte for byte, .ENV folded
-    assert exact_folded.allows("a", "read", "/w/config/.env")  # config matches neither: [!a-z] folds to itself
+    assert exact_folded.allows("a", "read", "/w/config/.env")  # c is in [a-z], and a negated class doesn't fold
     sharp = Policy({"a": [Rule("/w/?/.env"), Rule("/w/**", "read")]})
     assert not sharp.allows("a", "read", "/w/" + chr(0xDF) + "/.ENV")  # ? is the sharp s byte for byte
     between = Policy({"a": [Rule("/w/[!a-z]*/.env"), Rule("/w/**", "read")]})
     assert not between.allows("a", "read", "/w/_p/.ENV")  # _ is not in [a-z] byte for byte
     capitals = Policy({"a": [Rule("/w/[A-Z]*"), Rule("/w/**", "read")]})
-    # #93: a segment with a class is exact-only: folding could turn [A-Z]* into another class, so it hides only
-    # what it matches byte for byte and no longer folds to [a-z]*. Readme is hidden (R is in [A-Z]); readme and
-    # a fullwidth R, which folding would have caught, are not. Spell the class with both cases to hide them too.
+    # #140: a hide rule's positive class also matches the folded forms of what it lists: [A-Z]* folds to an
+    # enumerated 52-letter class (#148), so Readme and README are hidden byte for byte (R is in [A-Z]), and
+    # readme and a fullwidth R, which fold to "readme", are hidden by the folded match too (r is in the list).
     assert not capitals.allows("a", "read", "/w/Readme")  # R is in [A-Z] byte for byte
-    assert capitals.allows("a", "read", "/w/readme")  # r is not in [A-Z] byte for byte
-    assert capitals.allows("a", "read", "/w/" + chr(0xFF32) + "eadme")  # a fullwidth R is not in [A-Z] either
-    assert capitals.allows("a", "read", "/w/_x")
+    assert not capitals.allows("a", "read", "/w/readme")  # folded: r is in the enumerated list (#140)
+    assert not capitals.allows("a", "read", "/w/" + chr(0xFF32) + "eadme")  # a fullwidth R folds to r (#140)
+    assert capitals.allows("a", "read", "/w/_x")  # _ is in neither [A-Z] nor the list, raw or folded
     both_ways = Policy({"a": [Rule("/w/Secret/[!a-z]*"), Rule("/w/**", "read")]})
     assert not both_ways.allows("a", "read", "/w/SECRET/README")  # SECRET folded, README byte for byte
     deep = Policy({"a": [Rule("/w/[!a-z]*/.env/**"), Rule("/w/**", "read")]})
@@ -1224,19 +1224,20 @@ def test_hide_rules_match_variants() -> None:
     assert not deep.allows("a", "read", "/w/Config", subtree=True)
     outside = Policy({"a": [Rule("/w/stra" + chr(0xDF) + "e"), Rule("/w/**", "read")]})
     assert not outside.allows("a", "read", "/w/STRASSE")  # a multi-character fold outside a class stays allowed
-    # #93: a hide rule no longer refuses a pattern whose folded form would read as glob syntax, or a class that
-    # folding would change: each segment folds only where folding keeps its glob structure, and any other
-    # segment matches byte for byte only, exactly as main does. So each of these is accepted (no ValueError),
-    # and each still means, byte for byte, what its pattern spells.
+    # #93: a hide rule no longer refuses a pattern whose folded form would read as glob syntax: each segment
+    # folds only where folding keeps its glob structure, and any other segment matches byte for byte only,
+    # exactly as main does. #140: a positive class no longer blocks folding either; it is replaced by the
+    # enumerated list of the characters it matches once folded (#148), while a segment with a negated class or
+    # with a character that folds to glob syntax stays exact-only. So each of these is accepted (no ValueError).
     for pattern in (
         "/w/a" + chr(0xFF0A),  # a fullwidth asterisk: it folds to *, so this segment stays exact-only
         "/w/a" + chr(0xFF1F),  # a fullwidth question mark: it folds to ?
         "/w/" + chr(0xFF3B) + "x",  # a fullwidth left square bracket: it folds to [
-        "/w/[Z-z]",  # a range folding would change to [z-z]
-        "/w/[A-z]*",  # a range folding would narrow to [a-z]
-        "/w/[!A-Z]*",  # a negated class folding would change to [!a-z]
-        "/w/[!R]*",  # likewise: the folded [!r]* excludes other names
-        "/w/stra[" + chr(0xDF) + "]e",  # the sharp s folds to "ss": two class members where one was spelled
+        "/w/[Z-z]",  # a class: it gains nothing, its only fold (Z to z) is a member already (#140)
+        "/w/[A-z]*",  # a class: likewise, A-Z folds to a-z, which the range spans already (#140)
+        "/w/[!A-Z]*",  # a negated class: the whole segment stays byte for byte only (#148)
+        "/w/[!R]*",  # likewise: no folded branch, so nothing to exclude
+        "/w/stra[" + chr(0xDF) + "]e",  # the sharp s folds to "ss": nothing gained, the class stays as written
         "/w/Hello" + chr(0x203C),  # a double exclamation mark: it folds to "!!"
         "/w/foo" + chr(0xFF0D) + "bar",  # a fullwidth hyphen-minus: it folds to -
     ):
@@ -1244,17 +1245,20 @@ def test_hide_rules_match_variants() -> None:
     assert Rule("/w/a" + chr(0xFF0A)).matches("/w/a" + chr(0xFF0A))  # byte for byte ...
     assert not Rule("/w/a" + chr(0xFF0A)).matches("/w/abc")  # ... the fullwidth asterisk is no wildcard
     assert Rule("/w/[!A-Z]*").matches("/w/readme")  # byte for byte, r is not in [A-Z]
+    assert not Rule("/w/[!A-Z]*").matches("/w/README")  # exact-only (#148): R is in [A-Z], so no match
     assert Rule("/w/[Z-z]").matches("/w/a")  # byte for byte, a is inside the range Z-z by code point
+    assert Rule("/w/[Z-z]").matches("/w/A")  # folded, A folds to a, inside the range Z-z (#140)
     # Folding a pattern doesn't drop format characters, so a zero-width space stays and can't join two * into
     # a globstar: *<zwsp>* hides the names carrying the zero-width space, not every name.
     joined = Rule("/w/*" + zwsp + "*/secret")
     assert not joined.matches("/w/anything/secret")
     assert joined.matches("/w/a" + zwsp + "b/secret")
     assert not Rule("/w/" + zwsp).matches("/w/" + chr(0x2060))  # a word joiner is another name: it drops out
-    # A segment with a class is exact-only, while another segment of the same rule still folds:
+    # A segment with a class folds too (#140): [Ss]ecret gains nothing (its s is already in the body), but the
+    # folded branch still matches the folded name, while another segment of the same rule folds as a whole:
     class_and_fold = Rule("/w/[Ss]ecret/.env")
     assert class_and_fold.matches("/w/Secret/.ENV")  # [Ss]ecret byte for byte, .ENV folded
-    assert not class_and_fold.matches("/w/SECRET/.env")  # SECRET doesn't match [Ss]ecret byte for byte
+    assert class_and_fold.matches("/w/SECRET/.env")  # folded: SECRET folds to "secret", s is in [Ss] (#140)
     assert _fold("ABC.Env") == "abc.env"  # the ASCII fast path is lower(), and exact
 
 
