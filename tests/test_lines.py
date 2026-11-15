@@ -724,9 +724,11 @@ async def test_cut_matches_the_reference_over_random_data(conn: AsyncConnection)
     rng = random.Random(83)
     alphabets = (b"\n", b"a\n", b"\\", b"\xff", b"\x00", b"abc")
     targets = (1, 2, 3, 7, 64)
-    datas = [bytes(rng.choice(alphabets[i % 6]) for _ in range(rng.randrange(0, 401))) for i in range(300)]
-    used = [targets[i % 5] for i in range(300)]
-    splits = [i % 2 == 0 for i in range(300)]
+    # Each drawn on its own: tied to the case's index, split_tail=True only ever met the alphabets that leave no
+    # newline-less tail, and the tail rule went untested.
+    datas = [bytes(rng.choice(rng.choice(alphabets)) for _ in range(rng.randrange(0, 401))) for _ in range(300)]
+    used = [rng.choice(targets) for _ in range(300)]
+    splits = [rng.random() < 0.5 for _ in range(300)]
     cur = await conn.execute(
         "SELECT q.i, c.rel_offset, c.rel_line, c.data, c.line_offsets"
         " FROM unnest(%s::bytea[], %s::int[], %s::bool[]) WITH ORDINALITY AS q(data, target, split, i)"
@@ -762,6 +764,8 @@ async def test_cut_matches_the_reference_on_the_edge_cases(conn: AsyncConnection
         (b"aaa\nbbb\n", 4),
         (b"aaaa\n", 4),  # a line of target + 1
         (b"aaa\naaaa\nbbb\n", 3),
+        (b"a\nb", 64),  # a tail that fits with the line before it: split_tail alone splits it off
+        (b"a\nb\nccc", 64),
     ]
     for data, target in cases:
         assert await cut_rows(conn, data, target, split_tail) == cut_reference(data, target, split_tail), (
