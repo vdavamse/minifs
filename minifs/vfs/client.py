@@ -196,6 +196,9 @@ def _root() -> _Ref:
 class VFSClient:
     """Path-based filesystem operations over the minifs SQL functions.
 
+    A client reaches the whole schema, every workspace included: it is code's access, not an agent's. An agent
+    gets tools over a ``VFSView`` (see "Tenant isolation" in docs/design.md).
+
     ``pool`` serves every operation; ``search_pool`` (default: ``pool``) serves the scans (glob, grep).
     Both come from ``minifs.db.pool``. ``cache`` is an optional ``DirCache``.
 
