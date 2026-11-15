@@ -6,14 +6,16 @@ import contextlib
 import json
 import logging
 import pickle
+import re
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from itertools import islice
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, AsyncTransaction
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
@@ -110,6 +112,334 @@ async def test_pread_ranges(vfs: VFSClient) -> None:
     await raises("EINVAL", vfs.pread("/f", 0, 2**31))
     await raises("EINVAL", vfs.pread("/f", 2**63))
     assert (await vfs.pread("/f", -(2**63))).offset == 0
+
+
+async def test_pread_file_reads_every_page_on_one_snapshot(pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every page is read on one connection, in one read-only REPEATABLE READ transaction: a file overwritten
+    while the read is in flight still comes back whole, as the version the read started on, with no ESTALE."""
+    vfs, other = VFSClient(pool), VFSClient(pool)
+    data = b"0123456789" * 4  # 40 bytes: 10 pages of 4 bytes
+    version = await vfs.create("/f", data)
+    statements: list[tuple[str, int]] = []  # (the statement's text, the id of the connection that ran it)
+    connections: list[AsyncConnection[Any]] = []
+    execute = AsyncConnection.execute
+    overwritten = False
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal overwritten
+        text = str(query)
+        if "vfs_pread" in text or "SET TRANSACTION" in text:
+            statements.append((text, id(self)))
+            if "vfs_pread" in text and not connections:
+                connections.append(self)
+                cur = await execute(
+                    self, "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
+                )
+                assert await cur.fetchone() == ("repeatable read", "on")
+        result = await execute(self, query, *args, **kwargs)
+        if "vfs_pread" in text and not overwritten:
+            overwritten = True
+            await other.write("/f", b"abcdefghij" * 4)  # during the read, on the other client's connection
+        return result
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    result = await vfs.pread_file("/f", 4)
+    monkeypatch.undo()
+    assert result.content == data  # the old content, not the overwrite's and no mix of the two
+    assert (result.id, result.generation, result.size, result.eof) == (version.id, version.generation, 40, True)
+    assert (await vfs.stat("/f")).generation == version.generation + 1  # the overwrite committed during the read
+    assert len([s for s in statements if "vfs_pread" in s[0]]) == -(-len(data) // 4)  # ceil(size / page)
+    assert not [s for s in statements if "SET TRANSACTION" in s[0]]  # the BEGIN says it: no extra round trip
+    assert len({conn for _, conn in statements}) == 1  # every statement on the same connection
+    # Reset before the connection went back to the pool, so whoever takes it next gets the default.
+    assert (connections[0].isolation_level, connections[0].read_only) == (None, None)
+
+
+async def test_pread_file_stops_after_a_page_over_max_size(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A file over ``max_size`` is refused on its first page's size: the rest isn't read."""
+    await vfs.create("/f", b"x" * 100)
+    statements: list[str] = []
+    execute = AsyncConnection.execute
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        if "vfs_pread" in str(query):
+            statements.append(str(query))
+        return await execute(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    result = await vfs.pread_file("/f", 10, max_size=50)
+    assert (result.content, result.eof, result.size) == (b"x" * 10, False, 100)
+    assert len(statements) == 1
+    statements.clear()
+    whole = await vfs.pread_file("/f", 10, max_size=100)
+    assert (whole.content, whole.eof, whole.size) == (b"x" * 100, True, 100)
+    assert len(statements) == 10
+
+
+async def test_pread_file_reads_a_long_line_in_one_statement(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A line over ~64 KB is one extent of its own (migration 007) and extents are pglz-compressed (migration
+    013), so ``substring`` decompresses one from its start up to a page's end: a 16 MiB page reads a 3 MB
+    single-line file in one statement, decompressing its extent once, where 1 MiB pages would decompress 1 + 2
+    + 3 MiB in all."""
+    data = b"x" * (3 * 1024 * 1024)  # one line, no \n: one extent of its own
+    await vfs.create("/f", data)
+    statements: list[str] = []
+    execute = AsyncConnection.execute
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        if "vfs_pread" in str(query):
+            statements.append(str(query))
+        return await execute(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    result = await vfs.pread_file("/f", 16 * 1024 * 1024, max_size=10 * 1024 * 1024)
+    assert len(statements) == 1, statements  # the whole file in one statement, as Edit's 10 MB cap reads it
+    assert (result.content, result.eof, result.size) == (data, True, len(data))
+
+
+async def test_pread_file_outcomes_and_einval(pool: Pool) -> None:
+    """The outcomes ``pread`` reports, and a fully cached stale path evicted, as ``pread_page`` checks it."""
+    cache = DictCache()
+    vfs, other = VFSClient(pool, cache=cache), VFSClient(pool)
+    f = await vfs.create("/d/f", b"data", parents=True)
+    await vfs.stat("/d/f")  # the whole path is cached
+    assert any(v[0] == f.id for v in cache.entries.values())
+    await other.unlink("/d/f")  # another client, invisible to this cache
+    await raises("ENOENT", vfs.pread_file("/d/f", 4), "/d/f")
+    assert all(v[0] != f.id for v in cache.entries.values())  # the stale link was evicted
+    await raises("ENOENT", vfs.pread_file("/missing", 4), "/missing")
+    await vfs.mkdir("/dir")
+    await raises("EISDIR", vfs.pread_file("/dir", 4), "/dir")
+    await raises("EISDIR", vfs.pread_file("/", 4), "/")
+    await vfs.create("/f", b"data")
+    await raises("EINVAL", vfs.pread_file("/f", 0), "/f")
+    await raises("EINVAL", vfs.pread_file("/f", 2**31), "/f")
+    await raises("EINVAL", vfs.pread_file("/f", 4, max_size=-1), "/f")
+    await vfs.create("/empty", b"")
+    result = await vfs.pread_file("/empty", 4)
+    assert (result.content, result.eof, result.size) == (b"", True, 0)
+
+
+async def test_pread_file_first_page_plan_stays_cheap(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gated first page's statement — the lookup part, which resolves the path around the call — stays under
+    ``jit_above_cost`` and sorts nothing. An EXPLAIN of the whole call sees only a Function Scan of constant cost
+    (plpgsql isn't inlined), so the body's own queries are checked in ``test_pread_file_page_queries_use_the_index``."""
+    await vfs.create("/a/b/f", b"0123456789" * 4, parents=True)
+    calls: list[tuple[str, Any]] = []
+    execute = AsyncConnection.execute
+
+    async def capturing(self: AsyncConnection[Any], query: Any, params: Any = None, *args: Any, **kwargs: Any) -> Any:
+        if "vfs_pread" in str(query) and "vfs_gate" in str(query):
+            calls.append((str(query), params))
+        return await execute(self, query, params, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", capturing)
+    await vfs.pread_file("/a/b/f", 4)
+    monkeypatch.undo()
+    assert len(calls) == 1, calls  # the gated first page alone; the later pages are plain function calls
+
+    def walk(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        yield node
+        for child in node.get("Plans", []):
+            yield from walk(child)
+
+    async with vfs.pool.connection() as conn:
+        for query, params in calls:
+            cur = await conn.execute(cast(Any, "EXPLAIN (FORMAT JSON) " + query), params)
+            row = await cur.fetchone()
+            assert row is not None
+            plan = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            cost = float(plan[0]["Plan"]["Total Cost"])
+            assert cost < 100_000, f"estimated cost {cost} passes jit_above_cost, of: {query[:70]}"
+            for node in walk(plan[0]["Plan"]):
+                assert node.get("Node Type") != "Sort", f"a Sort in the plan, of: {query[:70]}"
+
+
+async def test_pread_file_page_queries_use_the_index(vfs: VFSClient) -> None:
+    """Inside ``vfs_pread``, one index serves both the filter and the order of each of the body's two queries — the
+    descent to the extent that contains the offset, and the forward range scan — so a page over a file of many
+    extents neither sorts nor scans the table, and both plans stay under ``jit_above_cost``. An EXPLAIN of the whole
+    call can't show that (plpgsql isn't inlined into its plan), so these EXPLAIN the body's queries as the planner
+    sees them."""
+    version = await vfs.create("/f", b"line 0\n")
+    for i in range(1, 8):
+        await vfs.append("/f", f"line {i}\n".encode())  # every append is one more extent
+    async with vfs.pool.connection() as conn:
+        # The two queries below are a copy of ``vfs_pread``'s body: were the function changed, the EXPLAINs
+        # would check something else, so fail early and loudly instead of drifting.
+        cur = await conn.execute("SELECT pg_get_functiondef('vfs_pread(uuid, bigint, int)'::regprocedure)")
+        defrow = await cur.fetchone()
+        assert defrow is not None
+        functiondef = re.sub(r"\s+", " ", defrow[0])
+        for fragment in (
+            "e.byte_offset <= v_off ORDER BY e.byte_offset DESC LIMIT 1",  # step 1: the backward descent
+            "AND e.byte_offset >= v_start",  # step 2: the forward range scan,
+            "AND e.byte_offset < v_off + p_limit",  # bounded,
+            "AND e.byte_offset + length(e.data) > v_off",  # skipping extents that end before the offset,
+            "AND p_limit > 0 ORDER BY e.byte_offset",  # in offset order
+        ):
+            assert re.sub(r"\s+", " ", fragment) in functiondef, (
+                f"vfs_pread changed: {fragment!r} is gone from it; update this test's copy of the body queries"
+            )
+        cur = await conn.execute("SELECT generation, size FROM vfs_nodes WHERE id = %s", [version.id])
+        node_row = await cur.fetchone()
+        assert node_row is not None
+        generation, size = node_row
+        offset, limit = size // 2, 16
+        # The two queries of ``vfs_pread``'s body; the SQL text must match migration 009's ``vfs_pread``.
+        # Step 1: the extent containing the offset.
+        step1 = (
+            f"SELECT e.byte_offset FROM vfs_extents e"
+            f" WHERE e.node_id = '{version.id}'::uuid AND e.generation = {generation} AND e.byte_offset <= {offset}"
+            f" ORDER BY e.byte_offset DESC LIMIT 1"
+        )
+        cur = await conn.execute(cast(Any, step1))
+        start_row = await cur.fetchone()
+        assert start_row is not None
+        start = start_row[0]
+        # Step 2: the range scan forward from there.
+        step2 = (
+            f"SELECT {size}, {generation}, greatest(e.byte_offset, {offset}),"
+            f"       substring(e.data"
+            f"                 FROM (greatest({offset} - e.byte_offset, 0) + 1)::int"
+            f"                 FOR (least(e.byte_offset + length(e.data), {offset} + {limit})"
+            f"                      - greatest(e.byte_offset, {offset}))::int),"
+            f"       NULL::text, NULL::text"
+            f"  FROM vfs_extents e"
+            f" WHERE e.node_id = '{version.id}'::uuid AND e.generation = {generation}"
+            f"   AND e.byte_offset >= {start}"
+            f"   AND e.byte_offset < {offset} + {limit}"
+            f"   AND e.byte_offset + length(e.data) > {offset}"
+            f"   AND {limit} > 0"
+            f" ORDER BY e.byte_offset"
+        )
+
+        def walk(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
+            yield node
+            for child in node.get("Plans", []):
+                yield from walk(child)
+
+        async with conn.transaction():
+            # The table is tiny, so without this the planner may seq-scan it and sort, whatever indexes exist.
+            await conn.execute("SET LOCAL enable_seqscan = off")
+            for query in (step1, step2):
+                cur = await conn.execute(cast(Any, "EXPLAIN (FORMAT JSON) " + query))
+                row = await cur.fetchone()
+                assert row is not None
+                plan = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                cost = float(plan[0]["Plan"]["Total Cost"])
+                assert cost < 100_000, f"estimated cost {cost} passes jit_above_cost, of: {query[:70]}"
+                nodes = list(islice(walk(plan[0]["Plan"]), 100))  # a plan tree is a handful of nodes
+                assert not [n for n in nodes if n.get("Node Type") == "Sort"], f"a Sort in the plan, of: {query[:70]}"
+                assert any(
+                    "Index" in str(n.get("Node Type", "")) and n.get("Relation Name") == "vfs_extents" for n in nodes
+                ), f"no index on vfs_extents serves the plan, of: {query[:70]}"
+
+
+async def test_pread_file_holds_one_connection(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A read of many pages checks one connection out of the pool, once, and holds it for the whole read (the
+    page-per-pread reads before #124 checked one out per page)."""
+    await vfs.create("/f", b"0123456789" * 10)  # 100 bytes: 25 pages of 4 bytes
+    in_flight = peak = checkouts = 0
+    connection = vfs.pool.connection
+
+    @contextlib.asynccontextmanager
+    async def counted(*args: Any, **kwargs: Any) -> AsyncGenerator[AsyncConnection[Any]]:
+        nonlocal in_flight, peak, checkouts
+        checkouts += 1
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            async with connection(*args, **kwargs) as conn:
+                yield conn
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(vfs.pool, "connection", counted)
+    result = await vfs.pread_file("/f", 4)
+    assert result.content == b"0123456789" * 10
+    assert (checkouts, peak) == (1, 1)
+
+
+async def test_pread_file_idle_between_pages_is_etimedout(vfs: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gap between two pages that outlives the server's ``idle_in_transaction_session_timeout`` (25P03) is
+    ETIMEDOUT: the server closes the connection, the pool discards it, and a later read of the same file succeeds."""
+    await vfs.create("/f", b"0123456789")  # 10 bytes: 3 pages of 4
+    pages = 0
+    execute = AsyncConnection.execute
+
+    async def idling(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal pages
+        if "vfs_pread" in str(query):
+            pages += 1
+            if pages == 2:  # just before the 2nd page: bound the idle time, then idle past it
+                await execute(self, "SET LOCAL idle_in_transaction_session_timeout = '100ms'")
+                await asyncio.sleep(0.5)
+        return await execute(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", idling)
+    error = await raises("ETIMEDOUT", vfs.pread_file("/f", 4), "/f")
+    monkeypatch.undo()
+    assert error.db_error is not None and error.db_error.sqlstate == "25P03", error.db_error
+    assert pages == 2
+    assert (await vfs.pread_file("/f", 4)).content == b"0123456789"  # the pool replaced the killed connection
+
+
+@pytest.mark.parametrize("sqlstate", ["25P03", "25P04"])
+def test_the_servers_transaction_timeouts_map_to_etimedout(sqlstate: str) -> None:
+    """Both server timeouts that can end a whole-file read are ETIMEDOUT (``minifs.db.errors``): 25P03, the
+    ``idle_in_transaction_session_timeout`` of a gap between pages, and 25P04, the ``transaction_timeout`` of the
+    whole read (PostgreSQL 17+)."""
+    error_class = psycopg.errors.lookup(sqlstate)
+    assert error_class is not None
+    error = VFSError.from_db(error_class("the server ended the transaction"), "/f")
+    assert error is not None and error.errno == "ETIMEDOUT"
+    assert error.path == "/f"
+
+
+async def test_pread_file_retries_a_serialization_failure_after_more_ran(
+    vfs: VFSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A serialization failure (40001) at the read's COMMIT, after ``more`` fetched every later page, retries
+    the whole read (``retry_serializable``): the pages ``more`` had fetched are dropped with the failed attempt
+    (``_run`` clears them), so the retried read returns the file whole, with no duplicated bytes."""
+    data = b"0123456789" * 4  # 40 bytes: 10 pages of 4
+    await vfs.create("/f", data)
+    preads = failed_commits = 0
+    execute = AsyncConnection.execute
+    aexit = AsyncTransaction.__aexit__
+
+    async def counting(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal preads
+        if "vfs_pread" in str(query):
+            preads += 1
+        return await execute(self, query, *args, **kwargs)
+
+    async def failing_commit(self: AsyncTransaction, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        """The first clean exit rolls back and reports 40001, as a COMMIT the server refused would."""
+        nonlocal failed_commits
+        if exc_val is None and failed_commits == 0:
+            failed_commits += 1
+            error = psycopg.errors.SerializationFailure("could not serialize access due to concurrent update")
+            tx = cast(Any, self)
+            async with tx._conn.lock:
+                await tx._conn.wait(tx._exit_gen(type(error), error, None))
+            raise error
+        return await aexit(self, exc_type, exc_val, exc_tb)
+
+    monkeypatch.setattr(AsyncConnection, "execute", counting)
+    monkeypatch.setattr(AsyncTransaction, "__aexit__", failing_commit)
+    result = await vfs.pread_file("/f", 4)
+    monkeypatch.undo()
+    assert result.content == data  # the retried read's pages alone: none of the failed attempt's doubled
+    assert (result.eof, result.size) == (True, 40)
+    assert (preads, failed_commits) == (20, 1)  # both attempts read all 10 pages; only the retry committed
+
+
+async def test_a_snapshot_refuses_a_write(vfs: VFSClient) -> None:
+    """A ``snapshot`` transaction is READ ONLY, so ``_run`` refuses to run a write in one."""
+    with pytest.raises(TypeError, match="read-only"):
+        await vfs._run("/x", "SELECT 1", [], snapshot=True, write=True)  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_pread_lines(vfs: VFSClient) -> None:

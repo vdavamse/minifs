@@ -22,7 +22,7 @@ same terms and a mount point where the mount point itself may be read.
 
 What each operation needs:
 
-- ``read`` for ``stat``, ``readdir``, ``pread``, ``pread_lines``, ``glob`` and ``grep``;
+- ``read`` for ``stat``, ``readdir``, ``pread``, ``pread_file``, ``pread_lines``, ``glob`` and ``grep``;
 - ``write`` on the path for ``create``, ``mkdir``, ``mkdir_p``, ``write`` and ``unlink``, and on every directory
   between the mount point and the path when a call may create missing parents (``mkdir_p``, ``parents=True``);
 - ``write`` on both paths for ``rename`` and ``claim``, and ``read`` on the source. Moving a directory also
@@ -254,6 +254,13 @@ class VFSView:
         if target.real is None:
             raise VFSError("EISDIR", target.visible)
         return await self._mapped(self._client.pread(_real(target), offset, limit), target)
+
+    async def pread_file(self, path: str, page: int, max_size: int | None = None) -> ReadResult:
+        """``VFSClient.pread_file`` of ``path``."""
+        target = self._target(path, "read")
+        if target.real is None:
+            raise VFSError("EISDIR", target.visible)
+        return await self._mapped(self._client.pread_file(_real(target), page, max_size), target)
 
     async def pread_lines(
         self,

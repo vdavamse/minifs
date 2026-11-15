@@ -10,8 +10,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import pytest
+from psycopg import AsyncConnection
 
+import minifs.tools._text as text
 import minifs.tools.edit as edit_module
 from minifs.tools import TOOLS, Edit
 from minifs.tools.deps import EditSettings, ToolSettings
@@ -22,8 +25,9 @@ from minifs.tools.edit import (
     replace,
     trimmed_boundary_replacer,
 )
+from minifs.tools.errors import TIMED_OUT_EDIT_READ, TIMED_OUT_WRITE
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import ReadResult
+from minifs.vfs.core import FileVersion, ReadResult, VFSError
 from minifs.vfs.policy import Policy, Rule
 from minifs.vfs.view import VFSView, workspace_mounts
 from tests.tools.conftest import W1, W2, Deps, call_tool, retry_message, run_tool
@@ -109,6 +113,30 @@ async def test_keeps_crlf_and_bom(deps: Deps, client: VFSClient) -> None:
     await put(client, "win.txt", "\ufeffone\r\ntwo\r\nthree\r\n".encode())
     await edit(deps, "win.txt", "one\ntwo", "uno\ndos")
     assert await content(client, "win.txt") == "\ufeffuno\r\ndos\r\nthree\r\n".encode()
+
+
+async def test_a_fuzzy_match_keeps_the_crlf_line_ending(deps: Deps, client: VFSClient) -> None:
+    """A fuzzy candidate in a CRLF file ends with its last line's ``\\r``, the file's line ending rather than
+    text the model wrote, so the replacement keeps it and the file is left without a bare LF (#127); the same
+    in a BOM file."""
+    await put(client, "win.txt", b"alpha\r\nbeta\r\ngamma\r\ndelta\r\n")
+    await edit(deps, "win.txt", "alpha\nbetx\ngamma", "A\nB\nC")
+    assert await content(client, "win.txt") == b"A\r\nB\r\nC\r\ndelta\r\n"
+    await put(client, "bom.txt", "\ufeffalpha\r\nbeta\r\ngamma\r\ndelta\r\n".encode())
+    await edit(deps, "bom.txt", "alpha\nbetx\ngamma", "A\nB\nC")
+    assert await content(client, "bom.txt") == "\ufeffA\r\nB\r\nC\r\ndelta\r\n".encode()
+
+
+async def test_a_fuzzy_match_in_a_mixed_endings_file(deps: Deps, client: VFSClient) -> None:
+    """A mixed-endings file keeps today's semantics (#127): newString arrives converted to the detected
+    ending (CRLF), and only the matched span's bytes change. The candidate ``two\\nthree\\r\\nfour`` ends
+    before the file's own LF after ``four``, which is untouched, and the bytes around the span are kept."""
+    await put(client, "mixed.txt", b"one\r\ntwo\nthree\r\nfour\nfive\r\n")
+    await edit(deps, "mixed.txt", "two\nthrex\nfour", "2\n3\n4")
+    data = await content(client, "mixed.txt")
+    assert data == b"one\r\n2\r\n3\r\n4\nfive\r\n"
+    assert data.startswith(b"one\r\n")  # the bytes before the matched span are unchanged
+    assert data.endswith(b"\nfive\r\n")  # the file's own LF after the span, and what follows it, are unchanged
 
 
 async def test_a_block_that_leaves_out_lines_is_a_retry(deps: Deps, client: VFSClient) -> None:
@@ -309,17 +337,17 @@ async def test_size_cap(deps: Deps, client: VFSClient) -> None:
 
 
 async def test_a_file_grown_past_the_cap_is_refused_after_one_page(view: VFSView, client: VFSClient) -> None:
-    """The cap protects memory, so a file that grew past it after the stat isn't read in full first: one pread, of at
-    most the cap."""
+    """The cap protects memory, so a file that grew past it after the stat isn't read in full first: one
+    ``pread_file``, whose first page tells the size."""
     reads = 0
 
     class Growing(VFSView):
-        async def pread(self, path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        async def pread_file(self, path: str, page: int, max_size: int | None = None) -> ReadResult:
             nonlocal reads
             reads += 1
             if reads == 1:
                 await client.write(f"/workspaces/{W1}/notes.md", b"mine\n" * 100)
-            return await super().pread(path, offset, limit)
+            return await super().pread_file(path, page, max_size)
 
     growing = Growing(client, workspace_mounts(W1), view.policy, view.actor)
     small = Deps(growing, vfs_settings=ToolSettings(edit=EditSettings(max_bytes=100)))
@@ -390,3 +418,62 @@ async def test_a_lost_create_is_an_existing_file(view: VFSView, client: VFSClien
     racing = Racing(view, client, before_create=[create(client, "new.md", b"theirs\n")])
     assert "oldString cannot be empty" in await edit_retry(Deps(racing), "new.md", "", "mine\n")
     assert await content(client, "new.md") == b"theirs\n"
+
+
+# Timeouts (#84)
+
+
+async def test_a_read_that_times_out_says_the_read_was_slow(view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server timeout that cancels the read of the old text says the read was slow, not that the model should
+    write less at once, which a smaller replacement wouldn't change."""
+
+    async def timing_out(path: str, page: int, max_size: int | None = None) -> ReadResult:
+        raise VFSError("ETIMEDOUT", path)
+
+    monkeypatch.setattr(view, "pread_file", timing_out)
+    message = await edit_retry(Deps(view), "notes.md", "mine", "ours")
+    assert message == TIMED_OUT_EDIT_READ.format(path="/workspace/notes.md")
+
+
+async def test_a_write_that_times_out_still_says_to_write_less(view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The write's own ETIMEDOUT is still ``TIMED_OUT_WRITE``."""
+
+    async def failing(path: str, data: bytes, *, expect: FileVersion | None = None) -> FileVersion:
+        raise VFSError("ETIMEDOUT", path)
+
+    monkeypatch.setattr(view, "write", failing)
+    message = await edit_retry(Deps(view), "notes.md", "mine", "ours")
+    assert message == TIMED_OUT_WRITE.format(path="/workspace/notes.md")
+
+
+async def test_a_cancelled_page_is_a_slow_read_not_a_lost_race(
+    view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real cancellation path: a ``statement_timeout`` that cancels a page of the whole-file read (57014)
+    reaches ``Edit`` as ``ReadTimedOut``, whose message says to use ``Write``, and isn't retried as a lost race
+    (``_Lost``): the file is read once."""
+    monkeypatch.setattr(text, "PAGE", 4)  # notes.md is then several pages
+    reads = 0
+    preads = 0
+    execute = AsyncConnection.execute
+
+    async def cancelling(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal preads
+        if "vfs_pread" in str(query):
+            preads += 1
+            if preads == 2:  # the 2nd page of the one read
+                raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+        return await execute(self, query, *args, **kwargs)
+
+    class Counting(VFSView):
+        async def pread_file(self, path: str, page: int, max_size: int | None = None) -> ReadResult:
+            nonlocal reads
+            reads += 1
+            return await super().pread_file(path, page, max_size)
+
+    counting = Counting(client, workspace_mounts(W1), view.policy, view.actor)
+    monkeypatch.setattr(AsyncConnection, "execute", cancelling)
+    message = await edit_retry(Deps(counting), "notes.md", "mine", "ours")
+    monkeypatch.undo()
+    assert message == TIMED_OUT_EDIT_READ.format(path="/workspace/notes.md")
+    assert (reads, preads) == (1, 2)  # one read: the timeout wasn't retried as a lost race

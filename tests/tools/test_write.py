@@ -10,14 +10,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from psycopg import AsyncConnection
 
 import minifs.tools._text as text
 import minifs.tools.write as write_module
 from minifs.tools import TOOLS, Write
 from minifs.tools.deps import EditSettings, ToolSettings, WriteSettings
+from minifs.tools.errors import TIMED_OUT_READ, TIMED_OUT_WRITE
 from minifs.tools.write import DESCRIPTION
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import CONTROL_CHARACTERS, FileVersion, ReadResult
+from minifs.vfs.core import CONTROL_CHARACTERS, FileVersion, ReadResult, VFSError
 from minifs.vfs.policy import Policy, Rule
 from minifs.vfs.view import VFSView, workspace_mounts
 from tests.test_tree import holding_the_lock
@@ -324,31 +326,48 @@ async def test_a_denied_overwrite_reads_nothing(view: VFSView, client: VFSClient
             reads += 1
             return await super().pread(path, offset, limit)
 
+        async def pread_file(self, path: str, page: int, max_size: int | None = None) -> ReadResult:
+            nonlocal reads
+            reads += 1
+            return await super().pread_file(path, page, max_size)
+
     counting = Deps(Counting(client, workspace_mounts(W1), view.policy, view.actor))
     denied = await run_tool(Write, counting, content="x", filePath="log.md")
     assert denied == "Permission denied: write /workspace/log.md"
     assert reads == 0
 
 
-async def test_a_change_between_pages_is_tried_again(
+async def test_a_change_during_the_read_is_tried_again(
     view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The old text is read in pages; a write between two pages would mix versions, so the read starts over."""
+    """The old text is read on one snapshot: a write landing mid-read can't mix versions into it, so the
+    compare-and-swap finds the write and the whole read-replace-write starts over, against the new text."""
     monkeypatch.setattr(text, "PAGE", 4)
     await client.write(f"/workspaces/{W1}/notes.md", b"0123456789\n")
     reads = 0
+    changed = False
+    execute = AsyncConnection.execute
+
+    async def racing(self: AsyncConnection[Any], query: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal changed
+        first_page = not changed and "vfs_pread" in str(query)
+        result = await execute(self, query, *args, **kwargs)
+        if first_page:
+            changed = True  # after the read's first page, mid-transaction, on another connection
+            await client.write(f"/workspaces/{W1}/notes.md", b"abcdefghij\n")
+        return result
 
     class Paging(VFSView):
-        async def pread(self, path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        async def pread_file(self, path: str, page: int, max_size: int | None = None) -> ReadResult:
             nonlocal reads
             reads += 1
-            if reads == 2:
-                await client.write(f"/workspaces/{W1}/notes.md", b"abcdefghij\n")
-            return await super().pread(path, offset, limit)
+            return await super().pread_file(path, page, max_size)
 
     paging = Paging(client, {"/workspace": f"/workspaces/{W1}"}, view.policy, view.actor)
+    monkeypatch.setattr(AsyncConnection, "execute", racing)
     _, meta = await write(Deps(paging), "notes.md", "new\n")
-    assert reads == 2 + 3  # two pages before the change, then all three of the new version
+    monkeypatch.undo()
+    assert reads == 2  # the snapshot the write landed in, then the file as the write left it
     assert "-abcdefghij\n+new" in meta["diff"]
     assert await content(client, "notes.md") == b"new\n"
 
@@ -357,15 +376,21 @@ async def test_a_change_between_pages_is_tried_again(
 
 
 class Preads(VFSView):
-    """The agent's view, recording the ``(offset, limit)`` of each ``pread``."""
+    """The agent's view, recording the ``(offset, limit)`` of each BOM-head ``pread`` and the ``(page, max_size)``
+    of each whole-file ``pread_file``."""
 
     def __init__(self, view: VFSView, client: VFSClient) -> None:
         super().__init__(client, workspace_mounts(W1), view.policy, view.actor)
         self.preads: list[tuple[int, int]] = []
+        self.pread_files: list[tuple[int, int | None]] = []
 
     async def pread(self, path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
         self.preads.append((offset, limit))
         return await super().pread(path, offset, limit)
+
+    async def pread_file(self, path: str, page: int, max_size: int | None = None) -> ReadResult:
+        self.pread_files.append((page, max_size))
+        return await super().pread_file(path, page, max_size)
 
 
 def capped(vfs: VFSView, max_diff_bytes: int = 100) -> Deps:
@@ -385,7 +410,8 @@ async def test_over_the_cap_the_old_text_is_not_read(view: VFSView, client: VFSC
         "additions": None,
         "deletions": None,
     }
-    assert preads.preads == [(0, 3)]
+    assert preads.preads == [(0, 3)]  # the BOM head alone
+    assert preads.pread_files == []
     assert await content(client, "big.txt") == b"new\n"
 
 
@@ -429,8 +455,8 @@ async def test_over_the_cap_a_concurrent_writer_is_detected(view: VFSView, clien
 
 
 async def test_a_file_grown_past_the_cap_after_its_stat_is_not_diffed(view: VFSView, client: VFSClient) -> None:
-    """The size is checked again on the first page. ``TooLarge`` doesn't carry that page's version, so the
-    compare-and-swap uses that of the BOM read."""
+    """The size is checked again on the first page of the read. ``TooLarge`` doesn't carry that page's version, so
+    the compare-and-swap uses that of the BOM read."""
     big = f"/workspaces/{W1}/big.txt"
     await client.create(big, b"small\n")
 
@@ -443,67 +469,71 @@ async def test_a_file_grown_past_the_cap_after_its_stat_is_not_diffed(view: VFSV
     growing = Growing(view, client)
     _, meta = await write(capped(growing), "big.txt", "new\n")
     assert meta["diff"] == ""
-    assert growing.preads == [(0, 100), (0, 3)]
+    assert growing.pread_files == [(100, 100)]  # the refused read: one page, then the size
+    assert growing.preads == [(0, 3)]  # and the BOM head
     assert await content(client, "big.txt") == b"new\n"
 
 
 # read_file, which Write and Edit share
 
 
-async def test_read_file_reads_a_file_within_the_cap_in_one_pread(view: VFSView, client: VFSClient) -> None:
-    """A file within ``max_size`` is one statement: a 2.56 MB file, more than the old 1 MB page, is one pread
-    asking for the cap."""
+def test_page_covers_edits_default_cap() -> None:
+    """``PAGE`` stays large: a line longer than ~64 KB is one pglz-compressed extent, and a page that starts
+    inside it makes the server decompress it from its start (migration 013), so small pages would make a
+    long-line file cost about size²/page. At 16 MiB, Edit's default 10 MB cap is one statement."""
+    assert text.PAGE == 16 * 1024 * 1024
+    assert EditSettings().max_bytes <= text.PAGE
+
+
+async def test_read_file_reads_a_file_within_the_cap_in_one_call(view: VFSView, client: VFSClient) -> None:
+    """A file within ``max_size`` is one ``pread_file`` call, paged at ``min(max_size, PAGE)``: a 2.56 MB file
+    under a 4 MB cap is read whole, in pages of the cap (``PAGE`` is bigger)."""
     data = b"0123456789abcde\n" * 160_000
     await client.create(f"/workspaces/{W1}/big.txt", data)
     spy = Preads(view, client)
     got, version = await text.read_file(spy, "/workspace/big.txt", 4 * 1024 * 1024)
     assert got == data
     assert version.size == len(data)
-    assert spy.preads == [(0, 4 * 1024 * 1024)]
-
-
-def test_the_default_edit_cap_is_one_page() -> None:
-    """Edit's default cap fits in one page, so a default Edit reads its file in one statement."""
-    assert EditSettings().max_bytes <= text.PAGE
+    assert spy.pread_files == [(4 * 1024 * 1024, 4 * 1024 * 1024)]
 
 
 async def test_read_file_pages_past_page(view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A file larger than the page is still read in pages of at most ``PAGE`` bytes, here 4."""
+    """A file larger than the page is still read whole, in one ``pread_file`` call paged at ``PAGE``, here 4."""
     monkeypatch.setattr(text, "PAGE", 4)
     await client.create(f"/workspaces/{W1}/paged.txt", b"0123456789")
     spy = Preads(view, client)
     got, _ = await text.read_file(spy, "/workspace/paged.txt", 100)
     assert got == b"0123456789"
-    assert spy.preads == [(0, 4), (4, 4), (8, 4)]
+    assert spy.pread_files == [(4, 100)]
 
 
 async def test_read_file_without_a_cap_asks_for_page(view: VFSView, client: VFSClient) -> None:
-    """With no ``max_size``, or one over ``PAGE``, the first pread asks for ``PAGE``."""
+    """With no ``max_size``, or one over ``PAGE``, the pages are ``PAGE`` bytes."""
     await client.create(f"/workspaces/{W1}/whole.txt", b"abc\n")
     spy = Preads(view, client)
     got, _ = await text.read_file(spy, "/workspace/whole.txt")
     assert got == b"abc\n"
-    assert spy.preads == [(0, text.PAGE)]
+    assert spy.pread_files == [(text.PAGE, None)]
     spy = Preads(view, client)
     got, _ = await text.read_file(spy, "/workspace/whole.txt", 10 * text.PAGE)
     assert got == b"abc\n"
-    assert spy.preads == [(0, text.PAGE)]  # a cap over the page asks for the page
+    assert spy.pread_files == [(text.PAGE, 10 * text.PAGE)]  # a cap over the page still pages at PAGE
 
 
 async def test_read_file_with_a_zero_cap(view: VFSView, client: VFSClient) -> None:
     """``max_size == 0`` stays valid: an empty file reads as ``b""``, and any non-empty one is ``TooLarge`` after
-    one pread, which read nothing."""
+    one page of one byte."""
     await client.create(f"/workspaces/{W1}/empty.txt", b"")
     spy = Preads(view, client)
     got, _ = await text.read_file(spy, "/workspace/empty.txt", 0)
     assert got == b""
-    assert spy.preads == [(0, 0)]
+    assert spy.pread_files == [(1, 0)]
     await client.create(f"/workspaces/{W1}/one.txt", b"x")
     spy = Preads(view, client)
     with pytest.raises(text.TooLarge) as raised:
         await text.read_file(spy, "/workspace/one.txt", 0)
     assert raised.value.size == 1
-    assert spy.preads == [(0, 0)]
+    assert spy.pread_files == [(1, 0)]
 
 
 async def test_over_the_cap_write_only_rules_still_need_read(client: VFSClient) -> None:
@@ -574,6 +604,63 @@ async def test_a_write_that_times_out_is_a_retry_that_says_what_to_change(view: 
     assert not [e for e in await client.readdir(f"/workspaces/{W1}") if e.name == "big.txt"]
 
 
+async def test_a_read_that_times_out_writes_without_a_diff(
+    view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The old text only feeds the diff, so a read of it that times out is treated like a file over the cap: the
+    write happens anyway, without a diff, and the only read left is the BOM head — which still keeps the BOM of
+    a file that has one."""
+    preads = Preads(view, client)
+
+    async def timing_out(path: str, page: int, max_size: int | None = None) -> ReadResult:
+        raise VFSError("ETIMEDOUT", path)
+
+    monkeypatch.setattr(preads, "pread_file", timing_out)
+    result, meta = await write(Deps(preads), "notes.md", "yours\n")
+    assert result == "Wrote file successfully."
+    assert meta == {
+        "filepath": "/workspace/notes.md",
+        "exists": True,
+        "diff": "",
+        "additions": None,
+        "deletions": None,
+    }
+    assert preads.preads == [(0, 3)]  # the BOM head alone
+    assert await content(client, "notes.md") == b"yours\n"
+    # The head decides the BOM (``_read_old``'s ``source_bom``): a file with one keeps it through the timeout.
+    await client.create(f"/workspaces/{W1}/bom.txt", text.BOM.encode() + b"old\n")
+    result, meta = await write(Deps(preads), "bom.txt", "new\n")
+    assert result == "Wrote file successfully." and meta["diff"] == "" and meta["exists"] is True
+    assert preads.preads == [(0, 3), (0, 3)]  # one BOM head per write
+    assert await content(client, "bom.txt") == text.BOM.encode() + b"new\n"
+
+
+async def test_a_bom_read_that_times_out_is_a_slow_read_not_a_big_write(
+    view: VFSView, client: VFSClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout of the BOM-head ``pread`` blocks the write itself: it says the read was slow, not that the model
+    should write less at once, which a smaller payload wouldn't change."""
+    await client.create(f"/workspaces/{W1}/big.txt", b"old line\n" * 50)
+
+    async def timing_out(path: str, offset: int = 0, limit: int = 16_000) -> ReadResult:
+        raise VFSError("ETIMEDOUT", path)
+
+    monkeypatch.setattr(view, "pread", timing_out)
+    message = await retry_message(Write, capped(view), content="mine\n", filePath="big.txt")
+    assert message == TIMED_OUT_READ.format(path="/workspace/big.txt")
+
+
+async def test_a_write_that_times_out_still_says_to_write_less(view: VFSView, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The write's own ETIMEDOUT is still ``TIMED_OUT_WRITE``."""
+
+    async def failing(path: str, data: bytes, *, expect: FileVersion | None = None) -> FileVersion:
+        raise VFSError("ETIMEDOUT", path)
+
+    monkeypatch.setattr(view, "write", failing)
+    message = await retry_message(Write, Deps(view), content="mine\n", filePath="notes.md")
+    assert message == TIMED_OUT_WRITE.format(path="/workspace/notes.md")
+
+
 # Write limits (#83)
 
 
@@ -588,7 +675,7 @@ async def test_a_quota_refusal_gives_the_model_the_quota_text(view: VFSView, cli
 
 async def test_a_write_over_max_write_gives_the_model_the_efbig_text(view: VFSView, client: VFSClient) -> None:
     """EFBIG from the view's ``max_write`` reaches the model as a retry with its text, before any round trip."""
-    capped = VFSView(client, workspace_mounts(W1), view.policy, view.actor, max_write=10)
-    message = await retry_message(Write, Deps(capped), content="x" * 11, filePath="big.txt")
+    limited = VFSView(client, workspace_mounts(W1), view.policy, view.actor, max_write=10)
+    message = await retry_message(Write, Deps(limited), content="x" * 11, filePath="big.txt")
     assert message == "File too large: /workspace/big.txt. Split the content into smaller files."
     assert not [e for e in await client.readdir(f"/workspaces/{W1}") if e.name == "big.txt"]
