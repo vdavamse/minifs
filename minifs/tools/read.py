@@ -154,7 +154,7 @@ async def read(
         # The shown paths travel in the result's metadata, which pydantic-ai copies to the ``ToolReturnPart``
         # and never sends to the model; ``already_loaded`` reads them back from there, not from the text.
         return ToolReturn(return_value=output, metadata={"instructions": [path for path, _ in instructions]})
-    output += "\n</content>"
+    output += _CONTENT_END
     return output
 
 
@@ -380,7 +380,8 @@ def _instruction_texts(
 ) -> list[tuple[str, str]]:
     """``(path, block)`` pairs for the results ``found`` of the reads ``_instruction_reads`` built: each
     directory's wanted file, read with ``cap`` bytes (``_instruction_text``), as its reminder block. The paths
-    go in the result's metadata, the blocks in its text, from this one source (``already_loaded``)."""
+    go in the result's metadata, the blocks in its text, from this one source, so the metadata ``already_loaded``
+    reads always matches the blocks shown."""
     pairs: list[tuple[str, str]] = []
     for i in range(0, len(reads), len(INSTRUCTION_FILES)):
         group = slice(i, i + len(INSTRUCTION_FILES))
@@ -427,7 +428,12 @@ _FROM = "Instructions from: "
 """The marker that opens the first line of every block of a reminder, as ``_instruction_texts`` writes it. It is
 text for the model only: nothing reads it back."""
 
-_REMINDER = "\n</content>\n\n<system-reminder>\n"
+_CONTENT_END = "\n</content>"
+"""The closing tag of a file result's content. Inside the content every ``\\n`` is followed by a line number, an
+empty line, the footer or this tag, so its first occurrence is the real one, which ``already_loaded`` finds the
+reminder after."""
+
+_REMINDER = _CONTENT_END + "\n\n<system-reminder>\n"
 """The end of a file result's content and the start of its reminder, as ``read`` writes them."""
 
 _REMINDER_END = "\n</system-reminder>"
@@ -448,26 +454,48 @@ def _loaded_instructions(ctx: RunContext[HasVFS]) -> set[str]:
 def already_loaded(messages: list[Any]) -> set[str]:
     """Instruction files that earlier Read results in the conversation already showed the model.
 
-    What counts is the results' metadata, never their text: ``read`` records the paths it attached under
-    ``{"instructions": [...]}`` of its ``ToolReturn``, which pydantic-ai copies to the ``ToolReturnPart`` and
-    never sends to the model, so neither instruction text nor file text (both printed raw) can mark a file as
-    shown or hide one. A part counts only for ``Read``, only the ``str`` items of a ``list`` under
-    ``"instructions"`` of a ``dict`` metadata, and only while the result still carries its reminder: its content
-    ends with ``_REMINDER_END``, up to trailing whitespace (``rstrip``), which tolerates a history a store
-    rewrote with CRLF line ends or padded.
+    What counts is the results' metadata: ``read`` records the paths it attached under ``{"instructions": [...]}``
+    of its ``ToolReturn``, which pydantic-ai copies to the ``ToolReturnPart`` and never sends to the model. Parts
+    count only under the tool name ``Read``, and of those only the ``str`` items of a ``list`` under
+    ``"instructions"`` of a ``dict`` metadata. The message history is trusted input: a client that supplies raw
+    history JSON could set that metadata, as it could forge any other part.
+
+    Text can't mark a file as shown, but it can un-count a recorded one, which re-attaches it (the safe
+    direction): a recorded path counts only while the result still shows the model its block — the content ends
+    with ``_REMINDER_END``, up to trailing whitespace (``rstrip``, which tolerates a history a store rewrote with
+    CRLF line ends or padded), and the reminder, the text after the first ``\\n</content>`` (the real one, since
+    every content line is numbered; instruction text can't move it), still holds the path's header line (``_FROM`` + the path as a whole line, ended by LF or CRLF). A history
+    processor that trims the middle of a long result but keeps its tail leaves the closing tag, yet the blocks
+    are gone, so the text is an AND with the metadata: it can never supply a path on its own.
 
     A result whose reminder was cut off (a compacted or edited history) no longer shows the model those
-    instructions, and a history from before the metadata existed records nothing: both re-attach them, the safe
-    direction. The cost of a call is a metadata check per earlier result part, and one end-of-string check on
-    the few that say they showed instructions."""
+    instructions, and a history from before the metadata existed records nothing: both re-attach them. Note that
+    pydantic-ai's Vercel AI and AG-UI adapters (``load_messages``, also used by ``Agent.to_web``) rebuild the
+    ``ToolReturnPart`` without its metadata, so a history that comes back from the browser on each turn records
+    nothing and instruction files are attached again once per run; keep the history server-side
+    (``ModelMessagesTypeAdapter``) to avoid that. The cost of a call is a metadata check per earlier result part,
+    and a scan of the content of only the few whose metadata recorded paths."""
     loaded: set[str] = set()
     for message in messages:
         for part in getattr(message, "parts", []):
             if not (isinstance(part, ToolReturnPart) and part.tool_name == "Read"):
                 continue
             paths = _recorded_instructions(part.metadata)
-            if paths and isinstance(part.content, str) and part.content.rstrip().endswith(_REMINDER_END):
-                loaded.update(paths)
+            if not paths or not isinstance(part.content, str):
+                continue
+            content = part.content.rstrip()
+            if not content.endswith(_REMINDER_END):
+                continue  # no reminder for the model to see: nothing counts, whatever the metadata recorded
+            # Inside <content> every "\n" is followed by a line number, an empty line, the footer or the closing
+            # tag, so the first "\n</content>" is the real one (CRLF too) and the reminder follows it. Not the
+            # last "<system-reminder>": instruction text may hold one, which would un-count every earlier block.
+            start = content.find(_CONTENT_END)
+            if start == -1:
+                continue  # the content's end is gone: the store broke the result past recognition
+            reminder = content[start:]  # every header in it starts a line of its own
+            for path in paths:
+                if f"\n{_FROM}{path}\n" in reminder or f"\n{_FROM}{path}\r\n" in reminder:
+                    loaded.add(path)
     return loaded
 
 

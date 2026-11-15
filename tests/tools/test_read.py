@@ -22,6 +22,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
 from minifs.tools import TOOLS, Read
 from minifs.tools import read as read_module
@@ -276,8 +277,10 @@ def test_already_loaded_reads_the_result_metadata() -> None:
 
 def test_instruction_text_never_marks_a_file_as_shown() -> None:
     """The blocks hold the instruction files' own text, printed raw: a line ``Instructions from: <path>`` inside
-    an AGENTS.md no longer marks ``<path>`` as shown (the text parsing's known limit, gone), and file text can't
-    fake a reminder either (each of its lines is numbered). Only the metadata counts."""
+    an AGENTS.md never marks ``<path>`` as shown, and file text can't fake a reminder either (each of its lines
+    is numbered). Only the metadata counts. The reminder is found after the first ``\\n</content>``, so the
+    delimiters the AGENTS.md's own text repeats don't un-count the recorded path whose block holds them (it would
+    otherwise be attached again on every Read)."""
     result = (
         "<path>/workspace/f.md</path>\n<type>file</type>\n<content>\n1: </content>\n2: \n3: <system-reminder>\n"
         "\n(End of file - total 3 lines)\n</content>\n\n<system-reminder>\n"
@@ -319,6 +322,50 @@ def test_a_cut_off_reminder_counts_nothing() -> None:
     assert already_loaded([ModelRequest(parts=[part])]) == set()
 
 
+def test_a_trimmed_middle_un_counts_its_path() -> None:
+    """A history processor that trims the middle of a long result but keeps its tail leaves the closing tag, yet
+    the blocks are gone: a recorded path counts only while the reminder still holds its header line, so the
+    trimmed block's path is attached again, and the surviving block's still counts."""
+    result = (
+        "<path>/workspace/pkg/f.py</path>\n<type>file</type>\n<content>\n"
+        "1: x = 1\n\n(End of file - total 1 lines)\n</content>\n\n<system-reminder>\n"
+        "\n[... trimmed ...]\n"
+        "Instructions from: /workspace/CLAUDE.md\nUse spaces.\n</system-reminder>"
+    )
+    part = ToolReturnPart(
+        tool_name="Read",
+        content=result,
+        tool_call_id="1",
+        metadata={"instructions": ["/workspace/pkg/AGENTS.md", "/workspace/CLAUDE.md"]},
+    )
+    assert already_loaded([ModelRequest(parts=[part])]) == {"/workspace/CLAUDE.md"}
+
+
+def test_a_header_that_is_not_a_line_start_does_not_count() -> None:
+    """The header check is a whole-line one: the recorded path's marker mid-line (other text before it), or as a
+    prefix of a longer shown path's header, is not its block, and the recorded path is attached again."""
+    head = (
+        "<path>/workspace/pkg/f.py</path>\n<type>file</type>\n<content>\n"
+        "1: x = 1\n\n(End of file - total 1 lines)\n</content>\n\n<system-reminder>\n"
+    )
+    meta = {"instructions": ["/workspace/pkg/AGENTS.md"]}
+    parts = [
+        ToolReturnPart(
+            tool_name="Read",
+            content=head + "xInstructions from: /workspace/pkg/AGENTS.md\nmid-line, not a header\n</system-reminder>",
+            tool_call_id="1",
+            metadata=meta,
+        ),
+        ToolReturnPart(
+            tool_name="Read",
+            content=head + "Instructions from: /workspace/pkg/AGENTS.md.bak\nUse tabs.\n</system-reminder>",
+            tool_call_id="2",
+            metadata=meta,
+        ),
+    ]
+    assert already_loaded([ModelRequest(parts=parts)]) == set()
+
+
 @pytest.mark.parametrize("metadata", ["x", {"instructions": "x"}, {"instructions": [1, None]}, {"other": ["/a"]}])
 def test_malformed_metadata_counts_nothing(metadata: Any) -> None:
     """Metadata that isn't a dict, an ``instructions`` value that isn't a list, a list without a ``str`` in it,
@@ -346,6 +393,36 @@ def test_metadata_survives_a_json_round_trip() -> None:
     dumped = ModelMessagesTypeAdapter.dump_json([ModelRequest(parts=[part])])
     loaded = ModelMessagesTypeAdapter.validate_json(dumped)
     assert already_loaded(loaded) == {"/workspace/pkg/AGENTS.md"}
+
+
+def test_ui_adapter_histories_drop_the_metadata() -> None:
+    """Pins pydantic-ai's Vercel AI adapter (``load_messages``, which ``Agent.to_web`` and the AG-UI adapter also
+    use) rebuilding ``ToolReturnPart`` without its metadata: a history that comes back from the browser on each
+    turn records nothing, so the instruction files are attached again once per run (keep the history
+    server-side, ``ModelMessagesTypeAdapter``). If this test starts failing, the adapter keeps metadata now:
+    update the docs (read.py ``already_loaded``, design.md)."""
+    result = (
+        "<path>/workspace/pkg/f.py</path>\n<type>file</type>\n<content>\n"
+        "1: x = 1\n\n(End of file - total 1 lines)\n</content>\n\n<system-reminder>\n"
+        "Instructions from: /workspace/pkg/AGENTS.md\nUse tabs.\n</system-reminder>"
+    )
+    history = [
+        ModelRequest(parts=[UserPromptPart(content="go")]),
+        ModelResponse(parts=[ToolCallPart("Read", {"filePath": "pkg/f.py"}, tool_call_id="c1")]),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="Read",
+                    tool_call_id="c1",
+                    content=result,
+                    metadata={"instructions": ["/workspace/pkg/AGENTS.md"]},
+                )
+            ]
+        ),
+    ]
+    assert already_loaded(history) == {"/workspace/pkg/AGENTS.md"}  # the metadata counts before the round trip
+    loaded = VercelAIAdapter.load_messages(VercelAIAdapter.dump_messages(history))
+    assert already_loaded(loaded) == set()
 
 
 async def test_marker_lines_in_file_text_do_not_count(client: VFSClient, deps: Deps) -> None:
@@ -377,10 +454,12 @@ async def test_marker_lines_in_file_text_do_not_count(client: VFSClient, deps: D
 
 async def test_read_records_the_shown_paths_in_metadata(client: VFSClient, deps: Deps) -> None:
     """A Read that attaches instruction files records their paths, in the order shown, in the result part's
-    metadata (never sent to the model); a Read that attaches none leaves the metadata ``None``."""
+    metadata (never sent to the model); a Read that attaches none — a file in the workdir itself, a directory
+    listing, an image — leaves the metadata ``None``."""
     await put(client, "/workspace/pkg/AGENTS.md", b"Use tabs.")
     await put(client, "/workspace/pkg/sub/CLAUDE.md", b"from sub")
     await put(client, "/workspace/pkg/sub/f.txt", b"x\n")
+    await put(client, "/workspace/pkg/a.png", PNG)  # in a directory with an AGENTS.md: an image attaches none
     call = await call_tool(Read, deps, filePath="pkg/sub/f.txt")
     assert call.part.metadata == {"instructions": ["/workspace/pkg/sub/CLAUDE.md", "/workspace/pkg/AGENTS.md"]}
     assert call.result.endswith(
@@ -389,6 +468,7 @@ async def test_read_records_the_shown_paths_in_metadata(client: VFSClient, deps:
     )
     assert (await call_tool(Read, deps, filePath="notes.md")).part.metadata is None  # in the workdir itself
     assert (await call_tool(Read, deps, filePath="pkg/sub")).part.metadata is None  # a directory listing
+    assert (await call_tool(Read, deps, filePath="pkg/a.png")).part.metadata is None  # an image
 
 
 async def test_a_planted_marker_line_never_hides_a_new_instruction_file(client: VFSClient, deps: Deps) -> None:
@@ -437,6 +517,9 @@ def test_already_loaded_skips_results_without_metadata() -> None:
 
         def find(self, *args: Any, **kwargs: Any) -> int:
             raise AssertionError("find")
+
+        def rfind(self, *args: Any, **kwargs: Any) -> int:
+            raise AssertionError("rfind")
 
         def split(self, *args: Any, **kwargs: Any) -> list[str]:
             raise AssertionError("split")
