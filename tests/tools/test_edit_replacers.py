@@ -336,16 +336,22 @@ def _splice(
     return "".join(pieces)
 
 
-def _changed(content: str, result: str, old_v: str) -> str:
+def _cr_hint(old_v: str, crlf: list[int]) -> str:
+    """The oracle's line-ending hint (#143): where the file has CRs Read hid and oldString holds a CR, real or
+    escaped."""
+    if crlf and ("\r" in old_v or "\\r" in old_v):
+        return (
+            " If oldString was meant to hold a line ending's CR: Read doesn't show those, and oldString can't target"
+            " them; to change line endings, use Write."
+        )
+    return ""
+
+
+def _changed(content: str, result: str, old_v: str, crlf: list[int]) -> str:
     """The oracle's no-change check (#143): an edit that leaves the content as it was is refused."""
     if result == content:
-        cr = (
-            " A CR at the end of a line is the file's line ending, which Read doesn't show and oldString can't"
-            " target; to change line endings, use Write."
-        )
         raise ValueError(
-            "No changes to apply: the text oldString matched already reads as newString."
-            + (cr if "\r" in old_v else "")
+            "No changes to apply: the text oldString matched already reads as newString." + _cr_hint(old_v, crlf)
         )
     return result
 
@@ -395,7 +401,7 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
                 # departs from ladderframe (#143): an edit that leaves the content as it was is an error, not a
                 # silent success (a fuzzy match can already read as new_string)
                 if replace_all:
-                    return _changed(content, _splice(content, view, crlf, search, index, new_string, True), old_v)
+                    return _changed(content, _splice(content, view, crlf, search, index, new_string, True), old_v, crlf)
                 if index != view.rfind(search):
                     if search == old_v:
                         # departs from ladderframe (#110): an ambiguous exact oldString is reported, not skipped
@@ -404,7 +410,7 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
                         # error is safer.
                         raise ValueError(MULTIPLE_MATCHES)
                     continue
-                return _changed(content, _splice(content, view, crlf, search, index, new_string, False), old_v)
+                return _changed(content, _splice(content, view, crlf, search, index, new_string, False), old_v, crlf)
         except _LongerBlock as e:
             # departs from ladderframe (#117): pending, not final: a later replacer may still find the text.
             refusal = e
@@ -415,13 +421,9 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
         if refusal is not None:
             raise refusal
         # departs from ladderframe (#143): a CR in oldString can't be a line ending's, which Read hides
-        cr = (
-            " A CR at the end of a line is the file's line ending, which Read doesn't show and oldString can't"
-            " target; to change line endings, use Write."
-        )
         raise ValueError(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
-            "and line endings." + (cr if "\r" in old_v and crlf else "")
+            "and line endings." + _cr_hint(old_v, crlf)
         )
     raise ValueError(MULTIPLE_MATCHES)
 
@@ -893,15 +895,21 @@ def test_an_edit_that_changes_nothing_is_reported() -> None:
         with pytest.raises(ValueError, match="No changes to apply") as e:
             search("    foo\nbar\n", "foo  ", "    foo")  # line-trimmed: the candidate `    foo` is newString
         assert "line ending" not in str(e.value)
+        # an LF file hides no CR, so its no-op gets no line-ending hint (review 2 of #143)
+        with pytest.raises(ValueError, match="No changes to apply") as e:
+            search("a\nb\n", "a\r", "a")
+        assert "line ending" not in str(e.value)
 
 
 def test_could_not_find_names_the_line_ending_when_oldstring_holds_a_cr() -> None:
     """Review of #143: "Could not find ... including line endings" alone invites a retry with more CRs. When
-    oldString holds a CR and the file has CRLF pairs, the answer says the line-ending CR can't be targeted; an LF
-    file or a find without a CR gets the plain answer."""
+    oldString holds a CR, real or escaped (the escape matcher reads ``\\r`` as one), and the file has CRLF pairs,
+    the answer adds an "if" hint that a line-ending CR can't be targeted; an LF file or a find without a CR gets
+    the plain answer."""
     for search in (new.replace, replace):
-        with pytest.raises(ValueError, match="Could not find.*Read doesn't show"):
-            search("foo\r\nbar\r\n", "\r", "")
+        for find in ("\r", "foo\\r"):
+            with pytest.raises(ValueError, match="Could not find.*If oldString was meant.*Read doesn't show"):
+                search("foo\r\nbar\r\n", find, "")
         for content, find in (("foo\nbar\n", "x\r"), ("foo\r\nbar\r\n", "baz")):
             with pytest.raises(ValueError, match="Could not find") as e:
                 search(content, find, "")
@@ -918,7 +926,7 @@ def test_a_replace_all_without_line_breaks_in_a_crlf_file_is_one_str_replace() -
     big = "ab\r\n" * 2_500_000
     started = time.perf_counter()
     assert new.replace(big, "a", "x", True) == "xb\r\n" * 2_500_000
-    assert time.perf_counter() - started < 1.5
+    assert time.perf_counter() - started < 3  # loose for slow CI runners; the map took ~2 s
 
 
 def test_a_fuzzy_cr_removal_needs_a_lone_cr_in_the_file() -> None:
@@ -1178,13 +1186,14 @@ def test_the_uniqueness_check_is_linear() -> None:
 
 
 def test_a_million_replace_all_occurrences_are_substituted_in_one_pass() -> None:
-    """A million occurrences of a fuzzy candidate (the line-trimmed ``"x\\r"`` for the find ``"  x"``): the
-    ``starts`` and ``pieces`` lists of the old ``_substitute`` cost ~2.5 s and ~340 MB; one pass into an
-    ``io.StringIO`` is linear and small. The bound is generous: it guards against a quadratic regression, not a
-    benchmark."""
-    content = "x\r\n" * 1_000_000
+    """Half a million occurrences of a fuzzy two-line candidate in a CRLF file (the line-trimmed ``"x\\ny"`` of the
+    view, for the find ``"  x\\n  y"``), which goes through ``_splice``'s mapped one-pass loop, not the
+    ``str.replace`` path a candidate without line breaks takes: lists of pieces cost ~2.5 s and ~340 MB, one pass
+    into an ``io.StringIO`` is linear and small. The bound is generous: it guards against a quadratic regression,
+    not a benchmark."""
+    content = "x\r\ny\r\n" * 500_000
     begin = time.monotonic()
-    assert new.replace(content, "  x", "y", True) == "y\r\n" * 1_000_000
+    assert new.replace(content, "  x\r\n  y", "z\r\nw", True) == "z\r\nw\r\n" * 500_000
     assert time.monotonic() - begin < 5
 
 

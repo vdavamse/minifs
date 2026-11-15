@@ -755,8 +755,10 @@ def replace(
                         # the same occurrences in the content as in the view (a fold only touches a CRLF pair or a
                         # final CR, neither of which such a search can contain or straddle)
                         if not crlf or ("\r" not in search and "\n" not in search):
-                            return _changed(content, content.replace(search, new_string), old_v)
-                        return _changed(content, _splice(content, view, crlf, search, index, new_string, True), old_v)
+                            return _changed(content, content.replace(search, new_string), old_v, crlf)
+                        return _changed(
+                            content, _splice(content, view, crlf, search, index, new_string, True), old_v, crlf
+                        )
                     # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one
                     # call on a repetitive file ran for seconds that no deadline could interrupt.
                     if view.find(search, index + 1) != -1:
@@ -765,7 +767,9 @@ def replace(
                             # (#110)
                             raise ValueError(MULTIPLE_MATCHES)
                         continue
-                    return _changed(content, _splice(content, view, crlf, search, index, new_string, False), old_v)
+                    return _changed(
+                        content, _splice(content, view, crlf, search, index, new_string, False), old_v, crlf
+                    )
             except _LongerBlock as e:  # pending, not final (#117): a later replacer may still find the text
                 refusal = e
     except ReplaceTimeout:
@@ -784,24 +788,30 @@ def replace(
             raise refusal
         raise ValueError(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
-            "and line endings." + (NO_CHANGE_CR if "\r" in old_v and crlf else "")
+            "and line endings." + _cr_hint(old_v, crlf)
         )
     raise ValueError(MULTIPLE_MATCHES)
 
 
 NO_CHANGE = "No changes to apply: the text oldString matched already reads as newString."
-NO_CHANGE_CR = (
-    " A CR at the end of a line is the file's line ending, which Read doesn't show and oldString can't target; to"
-    " change line endings, use Write."
+CR_HINT = (
+    " If oldString was meant to hold a line ending's CR: Read doesn't show those, and oldString can't target them;"
+    " to change line endings, use Write."
 )
 
 
-def _changed(content: str, result: str, old_v: str) -> str:
+def _cr_hint(old_v: str, crlf: array[int]) -> str:
+    """The line-ending hint for an error (#143): only where the file has CRLF pairs (or a final CR) Read hid, and
+    oldString holds a CR, real or escaped (the escape matcher reads ``\\r`` as one). A guess, so it says "if"."""
+    return CR_HINT if crlf and ("\r" in old_v or "\\r" in old_v) else ""
+
+
+def _changed(content: str, result: str, old_v: str, crlf: array[int]) -> str:
     """``result``, unless the edit left the content as it was (#143): a fuzzy match can read as newString already,
     e.g. ``"foo\\r"`` -> ``"foo"`` on a CRLF file, where a line matcher strips the CR as whitespace and replaces
     ``foo`` by ``foo``. That edit reported success and changed nothing; now the model is told."""
     if result == content:
-        raise ValueError(NO_CHANGE + (NO_CHANGE_CR if "\r" in old_v else ""))
+        raise ValueError(NO_CHANGE + _cr_hint(old_v, crlf))
     return result
 
 
