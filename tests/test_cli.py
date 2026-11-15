@@ -491,8 +491,8 @@ def test_quota_show_set_remove(db: str, monkeypatch: pytest.MonkeyPatch, capsysb
     assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
     assert run(monkeypatch, db, "quota", "/q") == 0  # the quota is still there
     assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
-    assert run(monkeypatch, db, "quota", "/q", "--nodes", "9") == 0  # a flag omitted: no limit on that one
-    assert capsysbinary.readouterr().out == b"max_bytes=none max_nodes=9 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--nodes", "9") == 0  # an omitted limit is kept
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=9 used_bytes=30 used_nodes=1\n"
     assert run(monkeypatch, db, "quota", "/q", "--remove") == 0
     assert capsysbinary.readouterr().out == b"no quota\n"
     assert run(monkeypatch, db, "quota", "/q") == 0
@@ -517,9 +517,53 @@ def test_quota_children(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: 
     assert capsysbinary.readouterr().out == b"no quota\n"
 
 
+def test_quota_keeps_an_omitted_limit(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    """#83, review round 1: an omitted limit is kept (the current quota is read first and both limits are then
+    set), the value ``none`` clears that one limit, and both ``none`` removes the quota like ``--remove``."""
+    monkeypatch.setattr(sys, "stdin", _Stdin(b"x" * 30))
+    assert run(monkeypatch, db, "put", "-p", "/q/f") == 0
+    capsysbinary.readouterr()
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "100", "--nodes", "5") == 0
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "10") == 0  # --nodes omitted: the 5 is kept
+    assert capsysbinary.readouterr().out == b"max_bytes=10 max_nodes=5 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--nodes", "none") == 0  # "none" clears just that one limit
+    assert capsysbinary.readouterr().out == b"max_bytes=10 max_nodes=none used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--nodes", "7") == 0  # --bytes omitted: the 10 is kept
+    assert capsysbinary.readouterr().out == b"max_bytes=10 max_nodes=7 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "none", "--nodes", "NONE") == 0  # both: --remove
+    assert capsysbinary.readouterr().out == b"no quota\n"
+    assert run(monkeypatch, db, "quota", "/q") == 0
+    assert capsysbinary.readouterr().out == b"no quota\n"
+    # Without a quota there is nothing to keep: an omitted limit is no limit.
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "100") == 0
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=none used_bytes=30 used_nodes=1\n"
+
+
+def test_quota_timeout(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    """``--timeout`` is the client's write_timeout for this one command: setting a quota recounts its subtree,
+    which can be slow on a big one. 0.5 s is plenty for this tree."""
+    monkeypatch.setattr(sys, "stdin", _Stdin(b"x" * 30))
+    assert run(monkeypatch, db, "put", "-p", "/q/f") == 0
+    capsysbinary.readouterr()
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "100", "--nodes", "5", "--timeout", "0.5") == 0
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--timeout", "0.5") == 0  # a show accepts it too
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
+
+
 @pytest.mark.parametrize(
     "flags",
-    [("--remove", "--bytes", "10"), ("--bytes", "10", "--remove"), ("--remove", "--nodes", "10"), ("--children",)],
+    [
+        ("--remove", "--bytes", "10"),
+        ("--bytes", "10", "--remove"),
+        ("--remove", "--nodes", "10"),
+        ("--children",),
+        # A limit that is neither an integer >= 0 nor "none" is an argparse error too.
+        ("--bytes", "-1"),
+        ("--nodes", "-1"),
+        ("--bytes", "x"),
+    ],
 )
 def test_quota_flag_errors(
     db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture, flags: tuple[str, ...]

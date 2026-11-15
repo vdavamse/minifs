@@ -772,3 +772,31 @@ async def test_cut_matches_the_reference_on_the_edge_cases(conn: AsyncConnection
             data,
             target,
         )
+
+
+WINDOW = 1048576  # vfs_cut's encoding window (its c_window): this much is escaped and split at a time
+
+
+@pytest.mark.parametrize("target", [TARGET, 1])
+@pytest.mark.parametrize("split_tail", [False, True])
+async def test_cut_matches_the_reference_at_the_window_boundaries(
+    conn: AsyncConnection, target: int, split_tail: bool
+) -> None:
+    """Deterministic cases at the edges of the encoding windows, where 023's streaming cut carries an open line
+    from one window to the next: a \\n as a window's last byte and as the next window's first byte, data of
+    exactly one window, one with no \\n at all, and one a byte over. Long lines and few \\n, so that even at
+    target 1 the reference makes a row per line, not per byte."""
+    cases = [
+        b"x" * (WINDOW - 1) + b"\n",  # exactly one window, ending in \n
+        b"y" * (WINDOW - 1) + b"\n" + b"z" * 9 + b"\n",  # a \n as the window's last byte; the line before spans it
+        b"w" * WINDOW + b"\n" + b"v" * 9 + b"\n",  # a \n as the second window's first byte: that line spans
+        b"n" * WINDOW,  # exactly one window with no \n at all
+        b"m" * WINDOW + b"\n",  # one byte over a window, and its last byte is a \n
+    ]
+    for i, data in enumerate(cases):
+        assert await cut_rows(conn, data, target, split_tail) == cut_reference(data, target, split_tail), (
+            i,
+            len(data),
+            target,
+            split_tail,
+        )

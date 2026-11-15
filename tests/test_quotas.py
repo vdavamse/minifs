@@ -5,15 +5,17 @@ from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID
 
+import psycopg
 import pytest
 from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
+from minifs.db.errors import errno_name
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import MAX_FILE_SIZE, Quota
 from tests.test_client import raises
-from tests.test_tree import check, mkdir_p, raises_db_errno, wait_until_blocked
+from tests.test_tree import Returned, check, mkdir_p, raises_db_errno, rename, wait_until_blocked
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
 
@@ -54,6 +56,16 @@ async def create_hex(conn: AsyncConnection, name: str, size: int) -> UUID:
     check(row[1], row[2])
     assert isinstance(row[0], UUID)
     return row[0]
+
+
+async def quota_of_child(conn: AsyncConnection, parent: UUID, name: str) -> tuple[object, ...]:
+    """(max_bytes, max_nodes, used_bytes, used_nodes) of the quota of the directory ``parent/name``."""
+    return await _one(
+        conn,
+        "SELECT q.max_bytes, q.max_nodes, q.used_bytes, q.used_nodes FROM vfs_quotas q"
+        " JOIN vfs_nodes n ON n.id = q.root WHERE n.parent_id = %s AND n.name = %s",
+        (parent, name),
+    )
 
 
 # Accounting: every writer charges its change once, at its end
@@ -138,6 +150,30 @@ async def test_edquot_leaves_nothing_changed(vfs: VFSClient) -> None:
     assert (await vfs.stat("/src/g")).size == 50
     await raises("ENOENT", vfs.stat("/q/g"))
     assert await vfs.quota("/q") == Quota(100, 5, 60, 1)
+
+
+async def test_edquot_rolls_back_the_parents_a_create_made(vfs: VFSClient) -> None:
+    """A create with parents runs mkdir_p and the create in one statement and one transaction: an EDQUOT on the
+    file's bytes rolls the directories it created back too."""
+    await vfs.mkdir("/q")
+    await vfs.set_quota("/q", max_bytes=10)
+    await raises("EDQUOT", vfs.create("/q/a/b/f", b"x" * 11, parents=True), "/q/a/b/f")
+    await raises("ENOENT", vfs.stat("/q/a"))
+    assert await vfs.quota("/q") == Quota(10, None, 0, 0)
+
+
+async def test_a_cross_quota_rename_over_max_nodes_moves_nothing(vfs: VFSClient) -> None:
+    """The moved subtree's nodes join the quota roots above the destination: a directory of 2 nodes (itself and
+    one child) doesn't fit a quota of 2 nodes with 1 used, and nothing moves."""
+    await vfs.mkdir("/q")
+    await vfs.set_quota("/q", max_nodes=2)
+    await vfs.create("/q/f")
+    await vfs.mkdir_p("/src/d/e")
+    assert await vfs.quota("/q") == Quota(None, 2, 0, 1)
+    await raises("EDQUOT", vfs.rename("/src/d", "/q/d"), "/src/d")
+    assert await vfs.quota("/q") == Quota(None, 2, 0, 1)
+    assert (await vfs.stat("/src/d/e")).is_dir  # the subtree is untouched
+    await raises("ENOENT", vfs.stat("/q/d"))
 
 
 async def test_a_shrinking_write_is_never_refused(vfs: VFSClient) -> None:
@@ -226,6 +262,18 @@ async def test_child_quotas(vfs: VFSClient, conn: AsyncConnection) -> None:
     assert await _one(conn, "SELECT count(*) FROM vfs_quotas") == (5,)
 
 
+async def test_mkdir_p_over_an_inherited_max_nodes_is_edquot(vfs: VFSClient, conn: AsyncConnection) -> None:
+    """Every directory a mkdir_p creates inherits the child quota at its creation and counts the ones created
+    below it: 3 directories below an inherited max_nodes of 2 is EDQUOT, and since the whole call is one
+    transaction, nothing it created stays — not even the directory that got the quota."""
+    await vfs.mkdir("/workspaces")
+    assert await vfs.set_child_quota("/workspaces", max_nodes=2) == 0
+    await raises("EDQUOT", vfs.mkdir_p("/workspaces/w/a/b/c"), "/workspaces/w/a/b/c")
+    await raises("ENOENT", vfs.stat("/workspaces/w"))
+    assert await _one(conn, "SELECT count(*) FROM vfs_quotas") == (0,)  # the inherited row rolled back too
+    assert await _one(conn, "SELECT count(*) FROM vfs_quota_defaults") == (1,)  # the defaults row is committed
+
+
 # vfs_set_quota
 
 
@@ -270,6 +318,15 @@ async def test_the_quota_row_goes_with_its_directory(vfs: VFSClient, conn: Async
     assert await _one(conn, "SELECT count(*) FROM vfs_quotas") == (0,)
 
 
+async def test_unlink_removes_the_child_quota_defaults(vfs: VFSClient, conn: AsyncConnection) -> None:
+    """vfs_unlink of a directory removes its vfs_quota_defaults row too, not just its vfs_quotas row."""
+    await vfs.mkdir("/p")
+    assert await vfs.set_child_quota("/p", max_bytes=100) == 0
+    assert await _one(conn, "SELECT count(*) FROM vfs_quota_defaults") == (1,)
+    await vfs.unlink("/p")
+    assert await _one(conn, "SELECT count(*) FROM vfs_quota_defaults") == (0,)
+
+
 # Concurrency
 
 
@@ -299,6 +356,71 @@ async def test_a_create_without_a_quota_never_waits_on_one(conn: AsyncConnection
         assert await asyncio.wait_for(second, timeout=30) is not None  # it didn't wait for the first
         await first.rollback()
     assert await _one(conn, "SELECT count(*) FROM vfs_nodes WHERE parent_id = %s", (nq,)) == (1,)
+
+
+async def test_a_directory_created_while_set_child_quota_runs_gets_the_quota(conn: AsyncConnection, db: str) -> None:
+    """vfs_set_child_quota locks the parent FOR UPDATE (023): a mkdir_p that starts while the set is in flight
+    waits for it and then sees the defaults row, and one already in flight commits first and is seen by the
+    set's loop, a later statement with a later snapshot. Either way the new directory gets the quota."""
+    workspaces = await mkdir_p(conn, "workspaces")
+    assert workspaces is not None
+    async with await AsyncConnection.connect(db) as first:
+        cur = await first.execute("SELECT children, err FROM vfs_set_child_quota(%s, 100, 5)", (workspaces,))
+        assert await cur.fetchone() == (0, None)  # uncommitted: no existing child, nothing visible to others
+        made = asyncio.create_task(mkdir_p(conn, "workspaces", "new"))
+        await wait_until_blocked(first, conn.info.backend_pid)  # on the parent's FOR UPDATE
+        await first.commit()
+    assert await made is not None
+    assert await quota_of_child(conn, workspaces, "new") == (100, 5, 0, 0)  # inherited at its creation
+
+    # The other order: the mkdir_p is in flight (its FOR KEY SHARE on the parent holds), so the set waits for
+    # it to commit, and its loop then sees the directory and gives it the quota.
+    projects = await mkdir_p(conn, "projects")
+    assert projects is not None
+    async with await AsyncConnection.connect(db) as second:
+        assert await mkdir_p(second, "projects", "new") is not None  # uncommitted
+        setting = asyncio.create_task(
+            _one(conn, "SELECT children, err FROM vfs_set_child_quota(%s, 100, 5)", (projects,))
+        )
+        await wait_until_blocked(second, conn.info.backend_pid)  # on the mkdir_p's lock of the parent
+        await second.commit()
+    assert await setting == (1, None)  # the loop saw the committed directory
+    assert await quota_of_child(conn, projects, "new") == (100, 5, 0, 0)
+
+
+async def test_a_rename_racing_a_create_of_its_destination_does_not_deadlock(conn: AsyncConnection, db: str) -> None:
+    """A cross-quota rename charges the destination's quota rows only after its UPDATE (023), so the ordering
+    that used to deadlock — a create of (q, 'x') holding the name and the quota row, a rename of another file
+    to (q, 'x') — has the rename wait on the name alone: the create commits, and the rename's UPDATE then hits
+    the unique violation minifs.db.errors maps to EEXIST (or finds the committed row and returns EEXIST). A
+    deadlock would raise DeadlockDetected and fail this test."""
+    q = await mkdir_p(conn, "q")
+    src = await mkdir_p(conn, "src")
+    assert q is not None and src is not None
+    f = await create_data(conn, src, "f", b"x" * 10)
+    await _one(conn, "SELECT used_bytes FROM vfs_set_quota(%s, 100, NULL)", (q,))
+    async with (
+        await AsyncConnection.connect(db) as creator,
+        await AsyncConnection.connect(db) as renamer,
+    ):
+        # The create first: (q, 'x') is inserted and q is charged, both uncommitted.
+        await create_data(creator, q, "x", b"y" * 5)
+        renamed = asyncio.create_task(rename(renamer, f, q, "x"))
+        await wait_until_blocked(creator, renamer.info.backend_pid)  # on the create's uncommitted name
+        await creator.commit()
+        with pytest.raises((Returned, psycopg.Error)) as info:
+            await renamed
+        await renamer.rollback()
+    error = info.value
+    assert not isinstance(error, psycopg.errors.DeadlockDetected), "the rename deadlocked with the create"
+    if isinstance(error, Returned):
+        assert error.errno == "EEXIST"  # the create was seen as committed before the UPDATE ran
+    else:
+        assert errno_name(error) == "EEXIST", error  # the unique violation of the committed (q, 'x')
+    # The create won; the rename moved nothing and charged nothing.
+    assert await _one(conn, "SELECT count(*) FROM vfs_nodes WHERE parent_id = %s AND name = 'x'", (q,)) == (1,)
+    assert await _one(conn, "SELECT count(*) FROM vfs_nodes WHERE id = %s AND parent_id = %s", (f, src)) == (1,)
+    assert await _one(conn, "SELECT used_bytes, used_nodes FROM vfs_quotas WHERE root = %s", (q,)) == (5, 1)
 
 
 # The 64 MiB file cap (EFBIG), at the SQL level; the over-cap content is built in SQL, not in Python
