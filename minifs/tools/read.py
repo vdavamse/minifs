@@ -425,8 +425,9 @@ _ABSENT = frozenset({"ENOENT", "ENOTDIR", "EISDIR", "EACCES"})
 """What a lookup of an instruction file says when it's missing, a directory or the actor may not read it."""
 
 _FROM = "Instructions from: "
-"""The marker that opens the first line of every block of a reminder, as ``_instruction_texts`` writes it. It is
-text for the model only: nothing reads it back."""
+"""The marker that opens the first line of every block of a reminder, as ``_instruction_texts`` writes it.
+``already_loaded`` looks for it, with a recorded path, as a whole line of the reminder, to tell that block is still
+shown; it never takes a path from it."""
 
 _CONTENT_END = "\n</content>"
 """The closing tag of a file result's content. Inside the content every ``\\n`` is followed by a line number, an
@@ -464,9 +465,12 @@ def already_loaded(messages: list[Any]) -> set[str]:
     direction): a recorded path counts only while the result still shows the model its block — the content ends
     with ``_REMINDER_END``, up to trailing whitespace (``rstrip``, which tolerates a history a store rewrote with
     CRLF line ends or padded), and the reminder, the text after the first ``\\n</content>`` (the real one, since
-    every content line is numbered; instruction text can't move it), still holds the path's header line (``_FROM`` + the path as a whole line, ended by LF or CRLF). A history
-    processor that trims the middle of a long result but keeps its tail leaves the closing tag, yet the blocks
-    are gone, so the text is an AND with the metadata: it can never supply a path on its own.
+    every content line is numbered; instruction text can't move it), still holds the path's header line
+    (``_FROM`` + the path as a whole line, ended by LF or CRLF). A history processor that trims the middle of a
+    long result but keeps its tail leaves the closing tag, yet the blocks are gone, so the text is an AND with
+    the metadata: it can never supply a path on its own. The check is a substring test, so after such a trim a
+    surviving block whose own text holds a sibling's header line keeps that sibling (recorded in the same
+    result) counted.
 
     A result whose reminder was cut off (a compacted or edited history) no longer shows the model those
     instructions, and a history from before the metadata existed records nothing: both re-attach them. Note that
