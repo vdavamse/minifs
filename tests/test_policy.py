@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable
 from fnmatch import fnmatchcase
 from functools import partial
 
-from minifs.vfs.core import CONTROL_CHARACTERS, split, split_trusted
+from minifs.vfs.core import CONTROL_CHARACTERS, MAX_COMPONENTS, split, split_trusted
 from minifs.vfs.policy import (
     Action,
     Policy,
@@ -671,7 +671,7 @@ def test_rests_decides_deep_paths() -> None:
     ``/**`` read rule can grant below the deep nest (``allows_any`` is True), ``allows(subtree=True)`` answers
     without raising, and a full match through two globstars is still decided exactly."""
     policy = Policy({"a": [Rule("/workspace/**/.git/**/config"), Rule("/**", "read")]})
-    for depth in (1000, 5000):
+    for depth in (MAX_COMPONENTS - 1, MAX_COMPONENTS, 5000):  # at the stored-path limit, and past it
         deep = "/workspace" + "/.git" * depth
         assert policy.allows_any("a", "read", deep) is True, depth
         # the hide rule can still match below (a .git/**/config) and grants nothing: the subtree isn't readable
