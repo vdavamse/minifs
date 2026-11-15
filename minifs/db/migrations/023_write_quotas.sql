@@ -30,13 +30,16 @@
 --    vfs_set_quota(dir, max_bytes, max_nodes) sets a root's limits and recounts its usage under the row lock
 --    (both NULL removes the row); writes below that root wait for the recount, which scans its subtree.
 --    vfs_set_child_quota(dir, max_bytes, max_nodes) gives every directory created directly in dir that quota at
---    its creation (vfs_create, vfs_mkdir_p), and every existing child directory without a quota of its own gets
---    it now: set once on /workspaces, every workspace has a quota from its first mkdir. It locks dir FOR UPDATE,
---    so creates in dir wait for it, and one in flight finishes first and is seen. Calling it again with other
---    limits changes only the children without a quota (set_quota changes one that has one); a directory moved
---    into dir, rather than created there, gets none. Set both limits: without max_nodes an actor can create
---    nodes the byte limit doesn't see. Both are operator calls: a deployment that gives agents' code its own role can REVOKE EXECUTE on them
---    and the write privileges on vfs_quotas and vfs_quota_defaults from it.
+--    its creation (vfs_create, vfs_mkdir_p): set once on /workspaces, every workspace has a quota from its first
+--    mkdir. It locks dir FOR UPDATE only to set that, in a short transaction of its own; the caller
+--    (VFSClient.set_child_quota) then gives every existing child directory without a quota one, each in a
+--    transaction of its own (vfs_quota_pending_children, vfs_give_child_quota), so no write waits on the recount
+--    of another child. Calling it again with other limits changes only the children without a quota (set_quota
+--    changes one that has one); a directory moved into dir, rather than created there, gets none until the next
+--    call. If it stops halfway, calling it again finishes. Set both limits: without max_nodes an actor can create
+--    nodes the byte limit doesn't see. These are operator calls: a deployment that gives agents' code its own
+--    role can REVOKE EXECUTE on vfs_set_quota, vfs_set_child_quota and vfs_give_child_quota, and the write
+--    privileges on vfs_quotas and vfs_quota_defaults, from it.
 --
 --    What's counted is the files' logical sizes. Storage per byte is a small factor more (each line costs 4 bytes
 --    of line_offsets, each node and extent a row); max_nodes bounds the per-row part.
@@ -117,9 +120,12 @@ CREATE TABLE vfs_quota_defaults (
 
 
 -- The quota roots at p_start and above it (p_start included; NULL, the root, has none), bottom up. Walks
--- parent_id without locks. ENAMETOOLONG past vfs_max_components() steps (only a legacy tree, or a cycle, gets
--- there). Without any quota at all it reads nothing but vfs_quotas.
-CREATE FUNCTION vfs_quota_roots(p_start uuid) RETURNS uuid[]
+-- parent_id without locks. Past vfs_max_components() steps (only a legacy tree, or a cycle, gets there): a cycle
+-- is EINVAL; otherwise ENAMETOOLONG, or with p_partial the roots found so far. p_partial is for a charge that
+-- only gives usage back (unlink, a rename's source): a root it misses keeps that usage, which overstates it and
+-- never lets a write past a limit, so an over-deep legacy subtree can still be removed and moved up (022). A
+-- charge that adds usage needs every root. Without any quota at all it reads nothing but vfs_quotas.
+CREATE FUNCTION vfs_quota_roots(p_start uuid, p_partial boolean DEFAULT false) RETURNS uuid[]
 LANGUAGE plpgsql STABLE SET search_path FROM CURRENT AS $$
 DECLARE
     v_id uuid := p_start;
@@ -134,6 +140,10 @@ BEGIN
     WHILE v_id IS NOT NULL LOOP
         v_steps := v_steps + 1;
         IF v_steps > vfs_max_components() THEN
+            IF vfs_ancestors_cycle(p_start) THEN
+                PERFORM vfs_raise('EINVAL', format('the ancestors of %s form a cycle', p_start));
+            END IF;
+            EXIT WHEN p_partial;
             PERFORM vfs_raise('ENAMETOOLONG', format('%s is deeper than %s levels', p_start, vfs_max_components()));
         END IF;
         SELECT n.parent_id, EXISTS (SELECT FROM vfs_quotas q WHERE q.root = n.id) INTO v_up, v_has
@@ -275,45 +285,93 @@ BEGIN
 END $$;
 
 
--- Sets the quota every directory created directly in p_parent gets at its creation; both NULL stops it (the
--- quotas already given stay). Every existing child directory without a quota of its own gets it now (counted as
--- vfs_set_quota does). Returns how many it gave one to. err ENOENT, ENOTDIR; EINVAL as vfs_set_quota.
+-- Sets the quota every directory created directly in p_parent gets at its creation (vfs_quota_inherit); both NULL
+-- stops it (the quotas already given stay). err ENOENT, ENOTDIR; EINVAL as vfs_set_quota. Only that: the caller
+-- commits at once, then gives each existing child its quota in a transaction of its own
+-- (vfs_quota_pending_children, vfs_give_child_quota), so no write waits on a recount of other children.
+--
+-- FOR UPDATE, taken first (a FOR KEY SHARE before it, as vfs_lock_dir takes, would let two callers each hold one
+-- and deadlock upgrading): it conflicts with the FOR KEY SHARE that every create in p_parent, and every mkdir_p
+-- through it, takes on p_parent. A create in flight commits first, so its directory exists when the caller lists
+-- the children; one that starts later waits for this short transaction, then inherits. Writes that create
+-- nothing (append, write) don't wait.
 CREATE FUNCTION vfs_set_child_quota(p_parent uuid, p_max_bytes bigint, p_max_nodes bigint)
-RETURNS TABLE (children int, err text, err_detail text)
+RETURNS TABLE (err text, err_detail text)
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
-    v_child uuid;
+    v_dir boolean;
 BEGIN
     PERFORM vfs_check_node(p_parent);
     IF p_max_bytes < 0 OR p_max_nodes < 0 THEN
         PERFORM vfs_raise('EINVAL', format('invalid quota (%s bytes, %s nodes)', p_max_bytes, p_max_nodes));
     END IF;
-    SELECT l.err, l.err_detail INTO err, err_detail FROM vfs_lock_dir(p_parent) l;
-    IF err IS NOT NULL THEN
-        RETURN NEXT;
-        RETURN;
-    END IF;
-    -- FOR UPDATE conflicts with the FOR KEY SHARE every create in p_parent takes on it (vfs_lock_dir,
-    -- vfs_mkdir_p): one in flight commits first, and the loop below (a later statement, so a later snapshot)
-    -- sees its directory; one that starts later waits, and then sees the defaults row.
-    PERFORM FROM vfs_nodes n WHERE n.id = p_parent FOR UPDATE;
-    children := 0;
-    IF p_max_bytes IS NULL AND p_max_nodes IS NULL THEN
+    SELECT n.kind = 'dir' INTO v_dir FROM vfs_nodes n WHERE n.id = p_parent FOR UPDATE;
+    IF NOT FOUND THEN
+        err := 'ENOENT';
+        err_detail := format('directory %s does not exist', p_parent);
+    ELSIF NOT v_dir THEN
+        err := 'ENOTDIR';
+        err_detail := format('%s is a file', p_parent);
+    ELSIF p_max_bytes IS NULL AND p_max_nodes IS NULL THEN
         DELETE FROM vfs_quota_defaults d WHERE d.parent = p_parent;
-        RETURN NEXT;
-        RETURN;
+    ELSE
+        INSERT INTO vfs_quota_defaults AS d (parent, max_bytes, max_nodes)
+        VALUES (p_parent, p_max_bytes, p_max_nodes)
+            ON CONFLICT (parent) DO UPDATE SET max_bytes = EXCLUDED.max_bytes, max_nodes = EXCLUDED.max_nodes;
     END IF;
-    INSERT INTO vfs_quota_defaults AS d (parent, max_bytes, max_nodes) VALUES (p_parent, p_max_bytes, p_max_nodes)
-        ON CONFLICT (parent) DO UPDATE SET max_bytes = EXCLUDED.max_bytes, max_nodes = EXCLUDED.max_nodes;
-    FOR v_child IN
-        SELECT n.id FROM vfs_nodes n
-         WHERE n.parent_id = p_parent AND n.kind = 'dir' AND NOT EXISTS (SELECT FROM vfs_quotas q WHERE q.root = n.id)
-         ORDER BY n.id
-    LOOP
-        PERFORM FROM vfs_set_quota(v_child, p_max_bytes, p_max_nodes);
-        children := children + 1;
-    END LOOP;
     RETURN NEXT;
+END $$;
+
+
+-- The child directories of p_parent without a quota of their own, for the caller of vfs_set_child_quota to give
+-- one each with vfs_give_child_quota.
+CREATE FUNCTION vfs_quota_pending_children(p_parent uuid) RETURNS SETOF uuid
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
+    SELECT n.id FROM vfs_nodes n
+     WHERE n.parent_id = p_parent AND n.kind = 'dir' AND NOT EXISTS (SELECT FROM vfs_quotas q WHERE q.root = n.id)
+     ORDER BY n.id
+$$;
+
+
+-- Gives directory p_child the child quota of p_parent and counts its usage, as vfs_set_quota does; returns
+-- whether it did. False, changing nothing, if p_child is gone or no longer in p_parent (a rename moved it), if it
+-- has a quota of its own by now (vfs_set_quota, or it was created after the defaults and inherited), or if
+-- p_parent has no child quota any more. One transaction per child: a write races only its own child's first
+-- recount (the window vfs_set_quota documents for a new row).
+CREATE FUNCTION vfs_give_child_quota(p_child uuid, p_parent uuid) RETURNS boolean
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+    v_parent uuid;
+    v_max_bytes bigint;
+    v_max_nodes bigint;
+    v_bytes bigint;
+    v_nodes bigint;
+    v_given int;
+BEGIN
+    PERFORM vfs_check_node(p_child);
+    PERFORM vfs_check_node(p_parent);
+    -- FOR KEY SHARE conflicts with the FOR UPDATE a rename takes on the node it moves and with an unlink's
+    -- delete: one in flight commits first, and this reads the row it left (READ COMMITTED re-reads a locked row);
+    -- one that starts later waits for this to commit.
+    SELECT n.parent_id INTO v_parent FROM vfs_nodes n WHERE n.id = p_child AND n.kind = 'dir' FOR KEY SHARE;
+    IF NOT FOUND OR v_parent IS DISTINCT FROM p_parent THEN
+        RETURN false;
+    END IF;
+    SELECT d.max_bytes, d.max_nodes INTO v_max_bytes, v_max_nodes FROM vfs_quota_defaults d WHERE d.parent = p_parent;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    INSERT INTO vfs_quotas (root, max_bytes, max_nodes) VALUES (p_child, v_max_bytes, v_max_nodes)
+        ON CONFLICT (root) DO NOTHING;
+    GET DIAGNOSTICS v_given = ROW_COUNT;
+    IF v_given = 0 THEN
+        RETURN false;
+    END IF;
+    -- A later statement, so a later snapshot: it sees every charge committed before the insert (see
+    -- vfs_set_quota).
+    SELECT u.bytes, u.nodes - 1 INTO v_bytes, v_nodes FROM vfs_subtree_usage(p_child) u;
+    UPDATE vfs_quotas q SET used_bytes = v_bytes, used_nodes = v_nodes WHERE q.root = p_child;
+    RETURN true;
 END $$;
 
 
@@ -567,7 +625,8 @@ BEGIN
         DELETE FROM vfs_quotas q WHERE q.root = p_node;
         DELETE FROM vfs_quota_defaults d WHERE d.parent = p_node;
     END IF;
-    PERFORM vfs_charge(v_parent, -v_size, -1);
+    -- Only gives usage back, so a partial walk will do (vfs_quota_roots).
+    PERFORM vfs_charge_move('{}', vfs_quota_roots(v_parent, true), -v_size, -1);
     RETURN NEXT;
 END $$;
 
@@ -838,7 +897,7 @@ BEGIN
     -- After the UPDATE, so the quota rows are the last locks taken: an UPDATE waiting on a concurrent create of
     -- the same name while holding them would deadlock with that create's charge. The subtree is p_node's, so
     -- the move changes neither its usage nor the roots above the old parent.
-    v_from := vfs_quota_roots(v_parent);
+    v_from := vfs_quota_roots(v_parent, true);  -- the source only gives usage back
     v_to := vfs_quota_roots(p_new_parent);
     IF NOT (v_from @> v_to AND v_to @> v_from) THEN
         SELECT u.bytes, u.nodes INTO v_bytes, v_nodes FROM vfs_subtree_usage(p_node) u;

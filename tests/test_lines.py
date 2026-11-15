@@ -788,7 +788,7 @@ async def test_cut_matches_the_reference_at_the_window_boundaries(
     target 1 the reference makes a row per line, not per byte."""
     cases = [
         b"x" * (WINDOW - 1) + b"\n",  # exactly one window, ending in \n
-        b"y" * (WINDOW - 1) + b"\n" + b"z" * 9 + b"\n",  # a \n as the window's last byte; the line before spans it
+        b"y" * (WINDOW - 1) + b"\n" + b"z" * 9 + b"\n",  # a \n as the window's last byte: the line ends at the edge
         b"w" * WINDOW + b"\n" + b"v" * 9 + b"\n",  # a \n as the second window's first byte: that line spans
         b"n" * WINDOW,  # exactly one window with no \n at all
         b"m" * WINDOW + b"\n",  # one byte over a window, and its last byte is a \n

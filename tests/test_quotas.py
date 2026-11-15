@@ -15,7 +15,7 @@ from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
 from minifs.vfs.core import MAX_FILE_SIZE, Quota
 from tests.test_client import raises
-from tests.test_tree import Returned, check, mkdir_p, raises_db_errno, rename, wait_until_blocked
+from tests.test_tree import Returned, check, create, mkdir_p, raises_db_errno, rename, wait_until_blocked
 
 Pool = AsyncConnectionPool[AsyncConnection[Any]]
 
@@ -358,34 +358,149 @@ async def test_a_create_without_a_quota_never_waits_on_one(conn: AsyncConnection
     assert await _one(conn, "SELECT count(*) FROM vfs_nodes WHERE parent_id = %s", (nq,)) == (1,)
 
 
+async def give_pending(conn: AsyncConnection, parent: UUID) -> list[bool]:
+    """What VFSClient.set_child_quota does after vfs_set_child_quota: each pending child, one statement each."""
+    cur = await conn.execute("SELECT c FROM vfs_quota_pending_children(%s) c", (parent,))
+    return [
+        bool((await _one(conn, "SELECT vfs_give_child_quota(%s, %s)", (child, parent)))[0])
+        for (child,) in await cur.fetchall()
+    ]
+
+
 async def test_a_directory_created_while_set_child_quota_runs_gets_the_quota(conn: AsyncConnection, db: str) -> None:
     """vfs_set_child_quota locks the parent FOR UPDATE (023): a mkdir_p that starts while the set is in flight
-    waits for it and then sees the defaults row, and one already in flight commits first and is seen by the
-    set's loop, a later statement with a later snapshot. Either way the new directory gets the quota."""
+    waits for it and then sees the defaults row, and one already in flight commits first, so the pending children
+    listed after the set include it. Either way the new directory gets the quota."""
     workspaces = await mkdir_p(conn, "workspaces")
     assert workspaces is not None
     async with await AsyncConnection.connect(db) as first:
-        cur = await first.execute("SELECT children, err FROM vfs_set_child_quota(%s, 100, 5)", (workspaces,))
-        assert await cur.fetchone() == (0, None)  # uncommitted: no existing child, nothing visible to others
+        cur = await first.execute("SELECT err FROM vfs_set_child_quota(%s, 100, 5)", (workspaces,))
+        assert await cur.fetchone() == (None,)  # uncommitted
         made = asyncio.create_task(mkdir_p(conn, "workspaces", "new"))
         await wait_until_blocked(first, conn.info.backend_pid)  # on the parent's FOR UPDATE
         await first.commit()
     assert await made is not None
     assert await quota_of_child(conn, workspaces, "new") == (100, 5, 0, 0)  # inherited at its creation
+    assert await give_pending(conn, workspaces) == []
 
     # The other order: the mkdir_p is in flight (its FOR KEY SHARE on the parent holds), so the set waits for
-    # it to commit, and its loop then sees the directory and gives it the quota.
+    # it to commit; the directory is then a pending child and gets the quota.
     projects = await mkdir_p(conn, "projects")
     assert projects is not None
     async with await AsyncConnection.connect(db) as second:
         assert await mkdir_p(second, "projects", "new") is not None  # uncommitted
-        setting = asyncio.create_task(
-            _one(conn, "SELECT children, err FROM vfs_set_child_quota(%s, 100, 5)", (projects,))
-        )
+        setting = asyncio.create_task(_one(conn, "SELECT err FROM vfs_set_child_quota(%s, 100, 5)", (projects,)))
         await wait_until_blocked(second, conn.info.backend_pid)  # on the mkdir_p's lock of the parent
         await second.commit()
-    assert await setting == (1, None)  # the loop saw the committed directory
+    assert await setting == (None,)
+    assert await give_pending(conn, projects) == [True]
     assert await quota_of_child(conn, projects, "new") == (100, 5, 0, 0)
+
+
+async def test_giving_child_quotas_blocks_no_write_elsewhere(conn: AsyncConnection, db: str) -> None:
+    """#83 review round 2: a child's quota is given and recounted in a transaction of its own, with no lock on
+    the parent, so while one is in flight a mkdir_p into another workspace, into the same one, and a new
+    workspace (which inherits the committed child quota) all go through without waiting."""
+    workspaces = await mkdir_p(conn, "workspaces")
+    ws1 = await mkdir_p(conn, "workspaces", "ws1")
+    assert workspaces is not None and ws1 is not None
+    assert await mkdir_p(conn, "workspaces", "ws2") is not None
+    assert await _one(conn, "SELECT err FROM vfs_set_child_quota(%s, 100, 5)", (workspaces,)) == (None,)
+    async with await AsyncConnection.connect(db) as giver:
+        cur = await giver.execute("SELECT vfs_give_child_quota(%s, %s)", (ws1, workspaces))
+        assert await cur.fetchone() == (True,)  # uncommitted, ws1's quota row locked
+        for path in (("workspaces", "ws2", "a"), ("workspaces", "ws1", "b"), ("workspaces", "ws3")):
+            assert await asyncio.wait_for(mkdir_p(conn, *path), timeout=10) is not None, path
+        await giver.commit()
+    assert await quota_of_child(conn, workspaces, "ws3") == (100, 5, 0, 0)
+    # ws1's first recount ran before b was made and b's charge didn't see the uncommitted row: the documented
+    # window of a new row, now one child wide. A recount fixes it.
+    assert await quota_of_child(conn, workspaces, "ws1") == (100, 5, 0, 0)
+    assert await give_pending(conn, workspaces) == [True]  # ws2
+
+
+async def test_two_child_quota_sets_on_one_parent_take_turns(conn: AsyncConnection, db: str) -> None:
+    """The parent's FOR UPDATE is the set's first lock, so a second set waits for the first instead of the two
+    deadlocking on an upgrade from FOR KEY SHARE; the later one wins."""
+    parent = await mkdir_p(conn, "p")
+    assert parent is not None
+    async with (
+        await AsyncConnection.connect(db) as first,
+        await AsyncConnection.connect(db) as second,
+    ):
+        await first.execute("SELECT err FROM vfs_set_child_quota(%s, 100, 5)", (parent,))
+        later = asyncio.create_task(_one(second, "SELECT err FROM vfs_set_child_quota(%s, 7, 1)", (parent,)))
+        await wait_until_blocked(first, second.info.backend_pid)
+        await first.commit()
+        assert await asyncio.wait_for(later, timeout=10) == (None,)
+        await second.commit()
+    assert await _one(conn, "SELECT max_bytes, max_nodes FROM vfs_quota_defaults WHERE parent = %s", (parent,)) == (
+        7,
+        1,
+    )
+
+
+async def test_a_child_moved_away_or_given_its_own_quota_is_skipped(conn: AsyncConnection, db: str) -> None:
+    """vfs_give_child_quota re-reads the child under its lock: a child a rename in flight moves out of the parent
+    gets nothing, nor does one that has a quota of its own by then (it isn't overwritten)."""
+    workspaces = await mkdir_p(conn, "workspaces")
+    moved = await mkdir_p(conn, "workspaces", "moved")
+    own = await mkdir_p(conn, "workspaces", "own")
+    other = await mkdir_p(conn, "other")
+    assert workspaces is not None and moved is not None and own is not None and other is not None
+    assert await _one(conn, "SELECT err FROM vfs_set_child_quota(%s, 100, 5)", (workspaces,)) == (None,)
+    async with await AsyncConnection.connect(db) as renamer:
+        assert await rename(renamer, moved, other, "moved")  # uncommitted
+        giving = asyncio.create_task(_one(conn, "SELECT vfs_give_child_quota(%s, %s)", (moved, workspaces)))
+        await wait_until_blocked(renamer, conn.info.backend_pid)  # on the rename's lock of the child
+        await renamer.commit()
+    assert await giving == (False,)
+    assert await _one(conn, "SELECT count(*) FROM vfs_quotas WHERE root = %s", (moved,)) == (0,)
+    await _one(conn, "SELECT used_bytes FROM vfs_set_quota(%s, 7, NULL)", (own,))
+    assert await _one(conn, "SELECT vfs_give_child_quota(%s, %s)", (own, workspaces)) == (False,)
+    assert await _one(conn, "SELECT max_bytes, max_nodes FROM vfs_quotas WHERE root = %s", (own,)) == (7, None)
+    # Once the child quota is stopped, nothing is given either.
+    fresh = await mkdir_p(conn, "workspaces", "fresh")
+    assert fresh is not None
+    await conn.execute("DELETE FROM vfs_quotas WHERE root = %s", (fresh,))
+    assert await _one(conn, "SELECT err FROM vfs_set_child_quota(%s, NULL, NULL)", (workspaces,)) == (None,)
+    assert await _one(conn, "SELECT vfs_give_child_quota(%s, %s)", (fresh, workspaces)) == (False,)
+
+
+async def test_a_legacy_over_deep_node_can_still_be_removed_and_moved_up(conn: AsyncConnection) -> None:
+    """With a quota anywhere, an unlink and a rename's source walk their ancestors only up to the cap (#83
+    review round 2): a node of a legacy chain deeper than vfs_max_components() can still be removed, and moved up
+    (022's repair). A root the walk misses keeps the usage given back, which only overstates it. A charge that
+    adds usage there is still ENAMETOOLONG."""
+    q = await mkdir_p(conn, "q")
+    assert q is not None
+    await _one(conn, "SELECT used_bytes FROM vfs_set_quota(%s, NULL, 5000)", (q,))
+    await conn.execute(
+        """
+        DO $$
+        DECLARE v_parent uuid := (SELECT id FROM vfs_nodes WHERE parent_id IS NULL AND name = 'q'); v_id uuid;
+        BEGIN
+            FOR i IN 1..1100 LOOP
+                INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (v_parent, 'd', 'dir') RETURNING id INTO v_id;
+                v_parent := v_id;
+            END LOOP;
+            INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (v_parent, 'leaf', 'dir');
+        END $$"""
+    )
+    leaf, deepest = await _one(conn, "SELECT id, parent_id FROM vfs_nodes WHERE name = 'leaf'")
+    assert isinstance(leaf, UUID) and isinstance(deepest, UUID)
+    with raises_db_errno("ENAMETOOLONG"):  # adding usage needs every root
+        await create(conn, deepest, "f", "dir")
+    gone = await _one(
+        conn, "INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (%s, 'gone', 'dir') RETURNING id", (deepest,)
+    )
+    assert await _one(conn, "SELECT err FROM vfs_unlink(%s)", gone) == (None,)  # removed: the walk stops at the cap
+    assert await rename(conn, leaf, q, "up")  # moved up: the source walk stops at the cap
+    assert await _one(conn, "SELECT used_nodes FROM vfs_quotas WHERE root = %s", (q,)) == (1,)  # added at q
+    sub = await mkdir_p(conn, "q", "up", "x")
+    assert sub is not None
+    with raises_db_errno("ENAMETOOLONG"):  # a move down past the cap: the destination needs every root
+        await rename(conn, sub, deepest, "x")
 
 
 async def test_a_rename_racing_a_create_of_its_destination_does_not_deadlock(conn: AsyncConnection, db: str) -> None:

@@ -21,7 +21,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from minifs._regex import RegexError
 from minifs.db.migrate import MigrationError, applied_versions, load_migrations, migrate
 from minifs.db.pool import Connector, open_pool
-from minifs.vfs.client import DEFAULT_WRITE_TIMEOUT, MAX_TIMEOUT, VFSClient
+from minifs.vfs.client import DEFAULT_LOCK_TIMEOUT, DEFAULT_WRITE_TIMEOUT, MAX_TIMEOUT, VFSClient
 from minifs.vfs.core import MAX_FILE_SIZE, Quota, VFSError, normalize
 from minifs.vfs.glob import GlobError
 from minifs.vfs.search import DEFAULT_LIMIT, MAX_NODES, TIMEOUT, SearchRefused
@@ -122,8 +122,9 @@ def main(argv: list[str] | None = None) -> int:
     quota.add_argument(
         "--timeout",
         type=_timeout,
-        help=f"seconds the write may run, over 0 and at most {MAX_TIMEOUT:g} (default {DEFAULT_WRITE_TIMEOUT:g}): "
-        "setting a quota recounts its subtree, which can be slow on a big one",
+        help=f"seconds each write may run and wait for locks, over 0 and at most {MAX_TIMEOUT:g} (default "
+        f"{DEFAULT_WRITE_TIMEOUT:g} to run, {DEFAULT_LOCK_TIMEOUT:g} to wait): setting a quota recounts its subtree, "
+        "which can be slow on a big one, and --children waits for the creates in PATH",
     )
     rm = _add_dsn(commands.add_parser("rm", help="remove files or empty directories"))
     rm.add_argument("paths", nargs="+", metavar="path")
@@ -171,10 +172,11 @@ def main(argv: list[str] | None = None) -> int:
         dsn, secrets = _connection(args, label)
         if args.command == "db":
             return asyncio.run(_migrate(dsn) if args.db_command == "migrate" else _status(dsn))
-        # quota's --timeout is the client's write_timeout for this one command: setting a quota recounts its
-        # subtree, which can outlast the default. The other commands keep their own timeouts.
-        write_timeout = args.timeout if args.command == "quota" else None
-        return asyncio.run(_with_client(dsn, _VFS_COMMANDS[args.command], args, write_timeout=write_timeout))
+        # quota's --timeout is the client's write and lock timeout for this one command: setting a quota
+        # recounts its subtree, which can outlast the default, and a child quota waits for the creates in its
+        # parent. The other commands keep their own timeouts.
+        timeout = args.timeout if args.command == "quota" else None
+        return asyncio.run(_with_client(dsn, _VFS_COMMANDS[args.command], args, timeout=timeout))
     except (MigrationError, VFSError, GlobError, RegexError, SearchRefused, psycopg.Error, OSError) as e:
         if isinstance(e, psycopg.Error) and any(len(s) < _MIN_MASKED for s in secrets):
             # Masking a password this short would garble the message and show where it matched.
@@ -368,14 +370,17 @@ async def _with_client(
     dsn: str,
     command: Callable[[VFSClient, argparse.Namespace], Awaitable[int]],
     args: argparse.Namespace,
-    write_timeout: float | None = None,
+    timeout: float | None = None,
 ) -> int:
     connector = Connector(dsn)
     # Connect once directly, so a bad DSN or password reports libpq's error at once rather than a pool timeout.
     async with await connector():
         pass
     async with open_pool(connector, min_size=1, max_size=1, name="minifs-cli") as pool:
-        client = VFSClient(pool) if write_timeout is None else VFSClient(pool, write_timeout=write_timeout)
+        if timeout is None:
+            client = VFSClient(pool)
+        else:  # the lock timeout stays above the server's deadlock_timeout (see VFSClient)
+            client = VFSClient(pool, write_timeout=timeout, lock_timeout=max(timeout, DEFAULT_LOCK_TIMEOUT))
         return await command(client, args)
 
 
@@ -472,7 +477,8 @@ async def _quota(vfs: VFSClient, args: argparse.Namespace) -> int:
         max_bytes = args.max_bytes
         max_nodes = args.max_nodes
         if max_bytes is _OMITTED or max_nodes is _OMITTED:
-            # An omitted limit is kept: the current quota supplies it (without a quota, it is no limit).
+            # An omitted limit is kept: the current quota supplies it (without a quota, it is no limit). Read and
+            # set are two transactions, so two operators setting one quota at once can each undo the other's.
             current = await vfs.quota(args.path)
             if max_bytes is _OMITTED:
                 max_bytes = current.max_bytes if current is not None else None

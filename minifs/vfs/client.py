@@ -764,10 +764,21 @@ class VFSClient:
         """Gives every directory created directly in directory ``path`` from now on a quota of ``max_bytes`` and
         ``max_nodes`` (as ``set_quota``), and every existing child directory without a quota now; returns how
         many existing ones got it. Both None stops it (the quotas given stay). Set it on ``/workspaces`` and every
-        workspace gets a quota at its first mkdir. ENOENT, ENOTDIR; EINVAL for the root or a negative limit."""
+        workspace gets a quota at its first mkdir. ENOENT, ENOTDIR; EINVAL for the root or a negative limit.
+
+        Not one transaction: the child quota is set first, in a short one (creates in ``path`` wait for it), then
+        each existing child gets its quota and its recount in a transaction of its own, so no write waits on the
+        recount of another child. If it fails halfway, calling it again gives the rest theirs."""
         ref = self._quota_ref(path)
         rows = await self._call(path, [ref], "vfs_set_child_quota({0}, %s, %s)", [max_bytes, max_nodes], write=True)
-        return rows[0][3]
+        if max_bytes is None and max_nodes is None:
+            return 0
+        parent = rows[0][0]
+        given = 0
+        for (child,) in await self._run(path, "SELECT c FROM vfs_quota_pending_children(%s) c", [parent]):
+            rows = await self._run(path, "SELECT vfs_give_child_quota(%s, %s)", [child, parent], write=True)
+            given += rows[0][0]
+        return given
 
     def _quota_ref(self, path: str) -> _Ref:
         segments = split(path)
