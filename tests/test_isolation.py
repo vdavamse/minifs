@@ -5,10 +5,11 @@ The recipe, which ``Tenants`` installs and these tests prove:
 - an owner role (LOGIN, NOSUPERUSER) owns a fresh database and, in it, one schema per tenant;
 - each schema is migrated by the owner connecting with ``options=-c search_path=<schema>`` in the conninfo:
   the migrations install into the connection's ``current_schema()``;
-- each tenant role (LOGIN, NOSUPERUSER, not the owner) gets, from the owner, USAGE on its schema,
-  SELECT/INSERT/UPDATE/DELETE on all its tables and EXECUTE on all its functions (which include
-  ``vfs_channel()``, the migration 018 trust boundary a watcher needs), and connects with its own
-  ``options=-c search_path=<schema>``;
+- each tenant role (LOGIN, NOSUPERUSER, not the owner) gets, from the owner, ``WRITER`` (or ``READER``)
+  below: USAGE on its schema, the table privileges the functions use and no more (none on
+  ``vfs_schema_version`` or ``vfs_channel_name``), and EXECUTE on the functions except the operator's quota
+  calls and the notification triggers, revoked from PUBLIC too (functions are executable by PUBLIC by
+  default); it connects with its own ``options=-c search_path=<schema>``. docs/design.md copies this recipe;
 - ``public`` is left alone: every SQL function is ``SET search_path FROM CURRENT``, so nothing escapes
   into it or reads out of it.
 
@@ -26,7 +27,7 @@ import asyncio
 import re
 import uuid
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, LiteralString
 
 import psycopg
 import pytest
@@ -36,12 +37,35 @@ from psycopg.conninfo import make_conninfo
 from minifs.db.migrate import migrate
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import VFSError
+from minifs.vfs.core import Quota, VFSError
 from minifs.vfs.watch import Watcher
 from tests.conftest import PgServer
 
 SCHEMA_A = "tenant_a"
 SCHEMA_B = "tenant_b"
+
+# The recipe's grants, as docs/design.md gives them ({s}: the schema, {r}: the tenant role).
+_FUNCTIONS: LiteralString = "EXECUTE ON ALL FUNCTIONS IN SCHEMA {s}"
+_OPERATOR: LiteralString = (
+    "EXECUTE ON FUNCTION {s}.vfs_set_quota(uuid, bigint, bigint), {s}.vfs_set_child_quota(uuid, bigint, bigint),"
+    " {s}.vfs_give_child_quota(uuid, uuid), {s}.vfs_notify(), {s}.vfs_notify_truncate()"
+)
+WRITER: list[LiteralString] = [
+    "GRANT USAGE ON SCHEMA {s} TO {r}",
+    "GRANT SELECT, INSERT, UPDATE, DELETE ON {s}.vfs_nodes, {s}.vfs_extents TO {r}",
+    "GRANT SELECT, INSERT, DELETE, UPDATE (used_bytes, used_nodes) ON {s}.vfs_quotas TO {r}",
+    "GRANT SELECT, DELETE ON {s}.vfs_quota_defaults TO {r}",
+    f"REVOKE {_FUNCTIONS} FROM PUBLIC",
+    f"GRANT {_FUNCTIONS} TO {{r}}",
+    f"REVOKE {_OPERATOR} FROM {{r}}",
+]
+READER: list[LiteralString] = [
+    "GRANT USAGE ON SCHEMA {s} TO {r}",
+    "GRANT SELECT ON {s}.vfs_nodes, {s}.vfs_extents, {s}.vfs_quotas, {s}.vfs_quota_defaults TO {r}",
+    f"REVOKE {_FUNCTIONS} FROM PUBLIC",
+    f"GRANT {_FUNCTIONS} TO {{r}}",
+    f"REVOKE {_OPERATOR}, {{s}}.vfs_channel() FROM {{r}}",  # a reader that watches keeps vfs_channel()
+]
 
 
 class Tenants:
@@ -122,13 +146,8 @@ class Tenants:
 
     @staticmethod
     async def _grant(conn: AsyncConnection[Any], schema: str, role: str, *, write: bool) -> None:
-        identified = sql.Identifier(schema), sql.Identifier(role)
-        await conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(*identified))
-        privileges = sql.SQL("SELECT, INSERT, UPDATE, DELETE") if write else sql.SQL("SELECT")
-        await conn.execute(sql.SQL("GRANT {} ON ALL TABLES IN SCHEMA {} TO {}").format(privileges, *identified))
-        # ALL FUNCTIONS includes vfs_channel(): EXECUTE on it is what lets the role's watcher learn the
-        # schema's NOTIFY channel name (migration 018).
-        await conn.execute(sql.SQL("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {} TO {}").format(*identified))
+        for statement in WRITER if write else READER:
+            await conn.execute(sql.SQL(statement).format(s=sql.Identifier(schema), r=sql.Identifier(role)))
 
 
 @pytest.fixture
@@ -178,6 +197,8 @@ def _foreign_schema_is_closed(conninfo: str, foreign: str) -> None:
             conn.execute(sql.SQL("SELECT * FROM {}.vfs_nodes").format(sql.Identifier(foreign)))
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute(sql.SQL("SELECT * FROM {}.vfs_lookup(ARRAY['workspaces'])").format(sql.Identifier(foreign)))
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):  # nor learn its channel (migration 018)
+            conn.execute(sql.SQL("SELECT {}.vfs_channel()").format(sql.Identifier(foreign)))
         conn.execute(sql.SQL("SET search_path = {}").format(sql.Identifier(foreign)))
         with pytest.raises((psycopg.errors.InsufficientPrivilege, psycopg.errors.UndefinedFunction)):
             conn.execute("SELECT * FROM vfs_lookup(ARRAY['workspaces'])")
@@ -241,3 +262,47 @@ async def test_a_read_only_role_reads_but_cannot_write(tenants: Tenants) -> None
         with pytest.raises(VFSError) as missing:
             await client.stat("/workspaces/w/g")
         assert missing.value.errno == "ENOENT"
+
+
+async def test_a_tenant_role_writes_under_its_quota_but_cannot_administer_it(tenants: Tenants) -> None:
+    """The writer's grants are what the functions use: under a quota the owner set, the tenant role creates,
+    renames into the quota root, and removes a directory with its quota rows, and the charges apply (EDQUOT
+    over the limit). It can't call the operator's quota functions, write the migration-version table or the
+    channel row, or run the notification triggers. What it can still do, since the functions are SECURITY
+    INVOKER and need the rest, is the documented gap: delete or reset its own quota row."""
+    owner = tenants.owner_conninfo(SCHEMA_A)
+    async with open_pool(Connector(owner), max_size=2) as pool:
+        operator = VFSClient(pool)
+        await operator.mkdir_p("/workspaces/w")
+        await operator.mkdir_p("/elsewhere/d")
+        assert await operator.set_child_quota("/workspaces/w", max_bytes=100, max_nodes=10) == 0
+        await operator.set_quota("/workspaces/w", max_bytes=100, max_nodes=10)
+    async with open_pool(Connector(tenants.conninfo(tenants.role_a, SCHEMA_A)), max_size=2) as pool:
+        client = VFSClient(pool)
+        await client.create("/workspaces/w/f", b"x" * 60)
+        await client.mkdir("/workspaces/w/sub")  # inherits the child quota: an INSERT into vfs_quotas
+        await client.rename("/elsewhere/d", "/workspaces/w/d")  # charges both sides: FOR UPDATE, UPDATE
+        with pytest.raises(VFSError) as over:
+            await client.create("/workspaces/w/g", b"y" * 50)
+        assert over.value.errno == "EDQUOT"
+        await client.unlink("/workspaces/w/sub")  # deletes its quota row
+        assert await client.quota("/workspaces/w") == Quota(100, 10, 60, 2)
+        w = (await client.stat("/workspaces/w")).id
+        async with pool.connection() as conn:
+            for statement, params in [
+                ("SELECT vfs_set_quota(%s, 1000000000, NULL)", (w,)),
+                ("SELECT vfs_set_child_quota(%s, 1000000000, NULL)", (w,)),
+                ("SELECT vfs_give_child_quota(%s, %s)", (w, w)),
+                ("INSERT INTO vfs_schema_version (version, name, checksum) VALUES (999, 'x', 'x')", ()),
+                ("DELETE FROM vfs_schema_version", ()),
+                ("DELETE FROM vfs_channel_name", ()),
+                ("SELECT * FROM vfs_channel_name", ()),
+                ("UPDATE vfs_quotas SET max_bytes = 1000000000", ()),
+                ("UPDATE vfs_quota_defaults SET max_bytes = 1000000000", ()),
+                ("SELECT vfs_notify()", ()),
+            ]:
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    await conn.execute(statement.encode(), params)
+                await conn.rollback()
+    async with open_pool(Connector(owner), max_size=2) as pool:
+        assert await VFSClient(pool).quota("/workspaces/w") == Quota(100, 10, 60, 2)

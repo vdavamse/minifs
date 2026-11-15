@@ -340,28 +340,59 @@ The tools follow opencode's file-tool contracts (which Claude Code's resemble): 
 
 ## Tenant isolation
 
-**The trust boundary is the database connection.** `VFSView` maps visible paths to real ones and checks the policy in Python; that is what stands between the model and the tree, and it is enough against the model, which only reaches the tree through the tools. Code that holds a connection is past it. `VFSClient`, `Watcher`, the CLI, an ingestion job and a `VFSView` built with any mounts all read and write the whole schema: every workspace, `/docs`, and the quota rows. The SQL functions are `SECURITY INVOKER` (only `vfs_channel()` and the notification triggers are definer functions, migration 018), so a role that can call `vfs_create` holds the table privileges it uses and can also write `vfs_nodes` directly. The policy and the quotas are therefore advisory against such a role. Three things follow for a deployment:
+**The trust boundary is the database connection.** `VFSView` maps visible paths to real ones and checks the policy in Python. That is what stands between the model and the tree, and it is enough against the model, which reaches the tree only through the tools. Code that holds a connection is past it. `VFSClient`, `Watcher`, the CLI, an ingestion job, and a `VFSView` built with any mounts all read and write the whole schema: every workspace, `/docs`, and the quota rows. A process that serves several tenants from one pool, cache and watcher holds that access for all of them; `VFSView` and `ViewWatch` keep each view to its own mounts. The SQL functions are `SECURITY INVOKER`; only `vfs_channel()` and the notification triggers are definer functions (migration 018). So a role that can call `vfs_create` holds the table privileges it uses, and can also write `vfs_nodes` directly. The policy and the quotas are therefore advisory against such a role. Four rules follow for a deployment:
 
 - **No connection for agents.** An agent gets tools over a `VFSView`. A DSN, a `VFSClient` or the CLI makes it a principal over the whole schema.
-- **Mounts come from the authenticated session.** `workspace_mounts(workspace_id)` with a wrong but valid id mounts another tenant's workspace, and `_check_mount` can't tell (it refuses only the malformed mounts that would expose more than one workspace). Take the id from the session the host authenticated, never from the model's output or a field of the request (the confused-deputy bug).
-- **A role per kind of job.** A role with `SELECT` on the tables and `EXECUTE` on the functions reads everything and writes nothing: every write function fails on privileges, which the client passes on as `psycopg.errors.InsufficientPrivilege` (no errno: it is a deployment fault, not an outcome). Quotas (`vfs_set_quota`, `vfs_set_child_quota`, `vfs_give_child_quota`) and migrations belong to the schema's owner.
+- **Mounts come from the authenticated session.** `workspace_mounts(workspace_id)` with a wrong but valid id mounts another tenant's workspace, and `_check_mount` can't tell; it refuses only the malformed mounts that would span workspaces. Take the id from the session the host authenticated, never from the model's output or a field of the request (the confused-deputy bug).
+- **A role per kind of job.** A reader gets `SELECT` and `EXECUTE` (below) and writes nothing. Every write function fails on privileges, which the client passes on as `psycopg.errors.InsufficientPrivilege`: it has no errno because it is a deployment fault, not an outcome. Migrations and the quota calls (`vfs_set_quota`, `vfs_set_child_quota`, `vfs_give_child_quota`) stay with the schema's owner.
+- **`/docs` is shared.** Every workspace's agent reads it, so whatever can write it can put text in front of every tenant's agent, prompt injection included. That means the ingestion role, and any policy that grants an agent `write` there. Treat writing `/docs` as writing to all tenants.
 
-**Isolation that Postgres enforces: a schema per tenant.** The migrations install into the connection's `current_schema()`, every function is `SET search_path FROM CURRENT`, and each schema has its own notification channel, whose name only a role with `EXECUTE` on that schema's `vfs_channel()` learns. So one schema (or one database) per tenant, with one role each, separates tenants at the database: a role without `USAGE` on another tenant's schema can't read its tables, call its functions or learn its channel. `tests/test_isolation.py` runs this recipe:
+**Isolation that Postgres enforces: a schema per tenant.** The migrations install into the connection's `current_schema()`. Every PL/pgSQL function is `SET search_path FROM CURRENT` (`uuidv7()`, a SQL-standard body from 002, binds its names at creation), and each schema has its own notification channel, whose name only a role with `EXECUTE` on that schema's `vfs_channel()` learns. So one schema (or one database) per tenant, with one role each, separates tenants' data at the database. A role without `USAGE` on another tenant's schema can't read its tables, call its functions or learn its channel. `tests/test_isolation.py` runs this recipe, statement for statement:
 
 ```sql
--- As the owner role:
+-- As the owner role, which owns the database and every tenant schema:
 CREATE SCHEMA tenant_a;
--- Migrate with the owner, connected with options=-c search_path=tenant_a: minifs db migrate.
+-- Migrate as the owner, connected with options=-c search_path=tenant_a: minifs db migrate.
 CREATE ROLE minifs_a LOGIN;
 GRANT USAGE ON SCHEMA tenant_a TO minifs_a;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA tenant_a TO minifs_a;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA tenant_a TO minifs_a;  -- vfs_channel() included, for the watcher
+-- The tables the functions write, and no more: nothing on vfs_schema_version or vfs_channel_name.
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_a.vfs_nodes, tenant_a.vfs_extents TO minifs_a;
+GRANT SELECT, INSERT, DELETE, UPDATE (used_bytes, used_nodes) ON tenant_a.vfs_quotas TO minifs_a;
+GRANT SELECT, DELETE ON tenant_a.vfs_quota_defaults TO minifs_a;
+-- Functions are executable by PUBLIC by default: revoke that, grant them to the role, and take back the
+-- operator's quota calls and the triggers (018 revokes the triggers and vfs_channel() from PUBLIC).
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA tenant_a FROM PUBLIC;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA tenant_a TO minifs_a;
+REVOKE EXECUTE ON FUNCTION tenant_a.vfs_set_quota(uuid, bigint, bigint),
+    tenant_a.vfs_set_child_quota(uuid, bigint, bigint), tenant_a.vfs_give_child_quota(uuid, uuid),
+    tenant_a.vfs_notify(), tenant_a.vfs_notify_truncate() FROM minifs_a;
 -- The tenant's processes connect as minifs_a with options=-c search_path=tenant_a.
 ```
 
-Create the schema before migrating it (`current_schema()` is NULL while the `search_path` names no existing schema, and `migrate` refuses that), and grant after migrating, since `ON ALL ... IN SCHEMA` covers only what exists: grant again after a migration that adds tables or functions, or set `ALTER DEFAULT PRIVILEGES IN SCHEMA tenant_a` once. A tenant role that only reads gets `SELECT` instead of the four table privileges.
+A reader gets `USAGE`, `SELECT` on the four tables and the same `EXECUTE`, minus `vfs_channel()` unless it watches. Order matters:
+- Create the schema before migrating it: `current_schema()` is NULL while the `search_path` names no existing schema, and `migrate` refuses that.
+- Grant after migrating, since `ON ALL ... IN SCHEMA` covers only what exists. Rerun the grants after every migration that adds functions. `ALTER DEFAULT PRIVILEGES FOR ROLE <owner>` would also hand the tenant new operator functions, so a re-grant you review is safer.
+- A dump without ACLs (`pg_dump --no-acl`) loses these grants and 018's revokes alike; see [Watch](#watch).
+- On a cluster upgraded from PostgreSQL 14 or older, also `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
 
-**Rejected: row-level security keyed on a session setting.** The issue proposed a `workspace` column on both tables, kept by create and rename, and policies that compare it with `current_setting('minifs.workspace')`, which `VFSView` would set in each transaction. Any role that can connect can set that setting to any value, so the policies would stop only a path-mapping bug in the process that also sets it. `_check_mount` already refuses the mounts that would reach another workspace, a confused deputy passes the same wrong id to both, and a leaked DSN sets what it likes. The price would be a column to keep exact on every cross-workspace move (a subtree rewrite), a predicate on every scan, and one more round trip per statement. Postgres can only enforce separation between principals it authenticates, which here means a role per tenant.
+**What a role still can't be denied: its own quota row.** The writers are invoker functions that charge `vfs_quotas` and remove the rows of a directory they delete, so a writing role needs `INSERT`, `DELETE` and `UPDATE (used_bytes, used_nodes)` there. With them it can reset or delete its own quota row outright. Quotas bind the tools, and bind a tenant's code only as far as it goes through the tools, until the quota writes move into definer functions.
+
+**What a schema per tenant doesn't hide.** In one database, the catalogs and statistics views are visible to every role:
+- `pg_namespace` lists every schema, so use opaque schema and role names, not customer names;
+- `pg_stat_user_tables` shows another schema's row counts and write activity;
+- `pg_total_relation_size` of a table's oid shows its size;
+- `pg_stat_activity` shows other roles' sessions, but not their queries.
+
+Row contents, names and the channel stay hidden. A database per tenant keeps the per-table statistics apart, though `pg_database` and `pg_roles` are cluster-wide. In that case, revoke `CONNECT` on each database from PUBLIC and grant it to its tenant's role, since every role may connect to every database by default.
+
+**Resources are shared.** The recipe isolates data, not capacity. Tenants share the cluster's disk, connections, CPU and I/O, and a tenant role that writes directly, or resets its quota, can fill the disk for everyone. Set a `CONNECTION LIMIT` and role-level `statement_timeout` and `idle_in_transaction_session_timeout` on each tenant role, and watch disk per schema. Tenants that must not affect each other belong in separate clusters.
+
+**Rejected: row-level security keyed on a session setting.** The issue proposed a `workspace` column on both tables, kept by create and rename, and policies that compare it with `current_setting('minifs.workspace')`, which `VFSView` would set in each transaction. Any role that can connect can set that setting to any value, so the policies would stop only a path-mapping bug in the process that also sets it. `_check_mount` already refuses the malformed mounts that would span workspaces; a wrong but valid id is a confused deputy that passes the same id to both, and a leaked DSN sets what it likes. RLS keyed on `current_user`, with a role per tenant and a table mapping roles to workspaces, would be enforced, and it would avoid one migration per schema. A schema per tenant is preferred because:
+- it needs no column to keep exact on every cross-workspace move (a subtree rewrite);
+- it adds no predicate to every scan;
+- it doesn't depend on policies that never bind the table owner or a `BYPASSRLS` role.
+
+Either way, Postgres can enforce separation only between principals it authenticates: here, a role per tenant.
 
 ## Testing
 
