@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import contextlib
 import random
+import re
 import time
-from collections.abc import Callable
+import warnings
+from collections.abc import Callable, Iterable
+from fnmatch import fnmatchcase
 from functools import partial
 
 from minifs.vfs.core import CONTROL_CHARACTERS, split, split_trusted
@@ -18,9 +21,11 @@ from minifs.vfs.policy import (
     Rule,
     _fold_pattern,  # pyright: ignore[reportPrivateUsage]
     _fold_segment,  # pyright: ignore[reportPrivateUsage]
+    _folded_class,  # pyright: ignore[reportPrivateUsage]
     _matches_by_rests,  # pyright: ignore[reportPrivateUsage]
     _path_string,  # pyright: ignore[reportPrivateUsage]
     _pattern_alts,  # pyright: ignore[reportPrivateUsage]
+    _segment_regex,  # pyright: ignore[reportPrivateUsage]
 )
 
 ACTIONS: tuple[Action, ...] = ("read", "write", "append")
@@ -30,6 +35,8 @@ SOH = chr(1)  # another control character, so a class fnmatch reads as "any char
 FW_LOWER_A = chr(0xFF41)  # fullwidth "a": folds to "a"
 FW_ASTERISK = chr(0xFF0A)  # fullwidth asterisk: folds to "*", so such a pattern segment isn't foldable
 FW_SOLIDUS = chr(0xFF0F)  # fullwidth solidus: folds to "/", a NUL in the dual string
+FW_DIGIT_FIVE = chr(0xFF15)  # fullwidth "5": inside the raw FW_SOLIDUS-FW_DIGIT_NINE range
+FW_DIGIT_NINE = chr(0xFF19)  # fullwidth "9": folds to "9"
 SHARP_S = chr(0xDF)  # folds to "ss"
 FI_LIGATURE = chr(0xFB01)  # folds to "fi"
 COMBINING_ACUTE = chr(0x301)
@@ -67,7 +74,12 @@ LITERALS = [
     "e" + COMBINING_ACUTE,
     E_ACUTE,
 ]
-FW_RANGE_CLASS = "[" + FW_UPPER_A + "-" + FW_UPPER_Z + "]"  # a fullwidth range: it gains "a-z" folded (#140)
+ASCII_UPPER = [chr(cp) for cp in range(ord("A"), ord("Z") + 1)]
+ASCII_LOWER = [chr(cp) for cp in range(ord("a"), ord("z") + 1)]
+ASCII_DIGITS = [chr(cp) for cp in range(ord("0"), ord("9") + 1)]
+FW_RANGE_CLASS = "[" + FW_UPPER_A + "-" + FW_UPPER_Z + "]"  # a fullwidth range: it gains "a"-"z" (#140)
+# #148: an endpoint folds to "/", which _alt_regex spells as the NUL in both the pattern and the dual string.
+SOLIDUS_RANGE_CLASS = "[" + FW_SOLIDUS + "-" + FW_DIGIT_NINE + "]"
 CLASSES = [
     "[a-c]",
     "[!a]",
@@ -79,6 +91,9 @@ CLASSES = [
     "[!b-a]",
     "[a-cA-C]",  # #140: mixed-case members, so a folded class branch is exercised
     FW_RANGE_CLASS,  # #140: a fullwidth range, so a non-ASCII class body folds
+    "[0-Z]",  # #148: a range spanning punctuation: the folded class must not widen past its members
+    "[]-A-Z]",  # #148: a leading ] is a literal member, and the - after it parses as fnmatch parses it
+    SOLIDUS_RANGE_CLASS,  # #148: an endpoint folds to "/": the dual string's NUL machinery is exercised
 ]
 TOKENS = LITERALS + ["*", "?"] + CLASSES
 NAMES = LITERALS + [
@@ -89,6 +104,9 @@ NAMES = LITERALS + [
     "fi",
     ".Env",
     "x" + ZWSP,
+    "5",
+    "9",
+    FW_DIGIT_FIVE,
     FW_UPPER_A,
     FW_UPPER_B,
     FW_UPPER_S * 2,
@@ -199,22 +217,39 @@ def test_a_negated_empty_range_matches_a_newline() -> None:
         assert not policy.allows("agent", "write", hidden), ascii(hidden)
 
 
-def test_fold_segment_folds_a_class_member_by_member() -> None:
-    """#140: ``_fold_segment`` folds the literal runs of a hide rule's segment and gives each class the folded
-    forms of the members and ranges it lists, so ``[A-Z]*`` also matches "readme". A member already in the body
-    or folding to several characters (the sharp s) adds nothing, a negated class gains the same forms (so it
-    excludes them), and a segment whose folded runs would gain glob syntax stays None: byte for byte only."""
-    assert _fold_segment("[A-Z]*") == "[A-Za-z]*"
-    assert _fold_segment("[Ee]nv") == "[Ee]nv"  # e is already in the body: nothing to add
-    assert _fold_segment("Sec[A-Z]") == "sec[A-Za-z]"  # the literal run folds as well
-    assert _fold_segment("[!A-Z]*") == "[!A-Za-z]*"  # a negated class excludes the folded range too
-    assert _fold_segment("[!R]*") == "[!Rr]*"  # a single member gains its fold
-    assert _fold_segment("[a-cA-C]") == "[a-cA-Ca-c]"  # a-c is there already; A-C gains it
-    assert _fold_segment(FW_RANGE_CLASS) == FW_RANGE_CLASS[:-1] + "a-z]"  # the fullwidth range gains a-z
+def test_fold_segment_enumerates_a_positive_class() -> None:
+    """#140, #148: ``_fold_segment`` folds the literal runs of a hide rule's segment and replaces each positive
+    class with the explicit list of the characters it matches once folded (``_folded_class``), so ``[A-Z]*`` also
+    matches "readme" and nothing else, asserted by behaviour rather than by exact text. A negated class leaves
+    the whole segment byte for byte only (None), a member that folds to several characters (the sharp s) adds
+    nothing, a class that gains nothing stays as written, and a segment whose folded runs would gain glob
+    syntax stays None."""
+    folded = _fold_segment("[A-Z]*")
+    assert folded is not None and folded.endswith("*")
+    letters = folded[:-1]  # the explicit class: the 52 letters and no range that could span "_"
+    assert all(fnmatchcase(c, letters) for c in ASCII_LOWER + ASCII_UPPER)
+    assert not fnmatchcase("_", letters)
+    plain = _fold_segment("[A-Z]")
+    assert plain is not None and plain == letters
+    assert _fold_segment("Sec[A-Z]") == "sec" + plain  # the literal run folds as well
+    assert _fold_segment("[Ee]nv") == "[Ee]nv"  # e and E are both present, and E folds to e: nothing to add
+    assert _fold_segment("[a-cA-C]") == "[a-cA-C]"  # A-C folds to a-c, which is a member already
+    assert _fold_segment("[!A-Z]*") is None  # a negated class: the whole segment stays byte for byte only
+    assert _fold_segment("[!R]*") is None
+    assert _fold_segment("[!A-]") is None
+    fw = _fold_segment(FW_RANGE_CLASS)
+    assert fw is not None
+    # the fullwidth range gains a-z, its members' folds, and nothing else
+    assert all(fnmatchcase(c, fw) for c in [*ASCII_LOWER, FW_UPPER_A, FW_UPPER_Z])
+    assert not fnmatchcase("A", fw) and not fnmatchcase("_", fw) and not fnmatchcase("-", fw)
+    wide = "[A-" + FW_UPPER_Z + "]x"  # a range wider than 4096: the class stays as written, gaining no folds
+    assert _fold_segment(wide) == "[A-" + FW_UPPER_Z + "]x"
     sharp = "stra[" + SHARP_S + "]e"
     assert _fold_segment(sharp) == sharp  # the sharp s folds to "ss": matched only as written
-    assert _fold_segment("[A-]") == "[Aa-]"  # a trailing - stays last and literal, not the start of a range
-    assert _fold_segment("[!A-]") == "[!Aa-]"
+    a_dash = _fold_segment("[A-]")
+    assert a_dash is not None
+    assert all(fnmatchcase(c, a_dash) for c in ("A", "a", "-"))  # the trailing - stays literal
+    assert not fnmatchcase("_", a_dash)
     assert not Rule("/w/[A-]").matches("/w/_")  # [A-a] would have hidden _ and B-Z
     assert Rule("/w/[A-]").matches("/w/a") and Rule("/w/[A-]").matches("/w/-")
     assert _fold_segment("Secret") == "secret"  # a class-free segment folds whole, as before
@@ -222,6 +257,180 @@ def test_fold_segment_folds_a_class_member_by_member() -> None:
     assert _fold_segment("a" + FW_ASTERISK) is None  # the folded run gains a *
     assert _fold_segment(FW_LOWER_A + chr(0xFF3B)) is None  # the folded run gains a [
     assert _fold_segment("[A") is None  # a [ not closed in the segment: a rule refuses it before folding
+
+
+def _oracle_class_chars(body: str) -> tuple[set[str] | None, list[str]]:
+    """The characters a positive class ``body`` must match once folded, and its candidates, computed
+    independently of ``_folded_class`` (the oracle of #148): the members are the candidates ``fnmatchcase``
+    accepts for the class as written (its characters and every code point of each ``x-y`` triple in it), and
+    the set gains the single-character folds of those members. A triple spanning more than 4096 code points
+    leaves the class as written (None: no folds gained)."""
+    token = "[" + body + "]"
+    candidates = sorted(set(body))
+    for start in range(len(body) - 2):
+        x, dash, y = body[start : start + 3]
+        if dash == "-":
+            if ord(y) - ord(x) > 4096:
+                return None, candidates
+            candidates += [chr(cp) for cp in range(ord(x), ord(y) + 1)]
+    members: set[str] = set()
+    for c in candidates:
+        if fnmatchcase(c, token):
+            members.add(c)
+    chars = set(members)
+    for c in members:
+        folded = _fold_pattern(c)
+        if len(folded) == 1:
+            chars.add(folded)
+    return chars, candidates
+
+
+def _check_emitted_class(body: str, probe: Iterable[str]) -> None:
+    """Checks an emitted class two ways (#148): it matches a character of ``probe`` exactly where the oracle
+    (``_oracle_class_chars``) holds that character, and it compiles through ``_segment_regex`` with the warnings
+    as errors (no ``re.error``, no FutureWarning)."""
+    chars, _ = _oracle_class_chars(body)
+    emitted = _folded_class(body)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        re.compile(_segment_regex(emitted, "/"))
+    assert chars is not None, ascii(body)
+    for c in probe:
+        assert fnmatchcase(c, emitted) == (c in chars), (ascii(body), ascii(emitted), ascii(c))
+
+
+def test_folded_class_emits_an_explicit_list_of_its_members_and_their_folds() -> None:
+    """#148: an emitted class matches exactly the members of the body and their single-character folds,
+    checked two ways (``_check_emitted_class``), including the bodies whose structure the old splicing got
+    wrong: a range spanning punctuation, a leading ``]``, a trailing ``-``, a fullwidth solidus endpoint and
+    a ``!`` the sorted order would put first."""
+    for body, probe in (
+        ("A-Z", ASCII_LOWER + ASCII_UPPER + ["_", "^", "`", chr(0xC0)]),
+        ("0-Z", ASCII_LOWER + ASCII_UPPER + ASCII_DIGITS + ["_", "^", "`"]),  # not [0-Z0-z]: no "_"
+        ("A-", ["A", "a", "-", "_", "B"]),  # the trailing - stays literal, it can't start a range
+        ("A!", ["A", "!", "a", "_", "z"]),  # the emitted list can't read as a negation
+        ("]-A-Z", ["-", "Z", "z", "A", "b", "]"]),  # a leading ] parses as fnmatch parses it
+        ("Za!--", ASCII_DIGITS + [".", ":", "!", "-", "Z", "a", "z", "b"]),
+        (chr(0xC0) + "-" + chr(0xDE), [chr(0xC0), chr(0xD7), chr(0xE0), chr(0xF7), chr(0xDE), "a"]),
+        (FW_SOLIDUS + "-" + FW_DIGIT_NINE, [FW_SOLIDUS, FW_DIGIT_NINE, FW_DIGIT_FIVE, "/", "9", "5", "0", "#"]),
+        ("^" + FW_LOWER_A, ["^", "a", FW_LOWER_A, "b"]),  # translate escapes a leading ^ in the list
+        ("[a", ["[", "a", "A", "b", "]"]),  # translate escapes a leading [ in the list
+    ):
+        _check_emitted_class(body, probe)
+
+
+def test_folded_class_never_hides_more_than_its_members_and_their_folds() -> None:
+    """#148 review regressions: splicing folded members and ranges into the class text could widen it:
+    ``[0-Z]`` became ``[0-Z0-z]``, which matches ``_``; the folded range of U+00C0-U+00DE spanned U+00F7; a
+    trailing ``-`` moved and joined another range; a reversed range gained what it never matched raw. Enumeration takes
+    the membership from fnmatch itself, so it can lose an addition but never invent one."""
+
+    def policy_for(pattern: str) -> Policy:
+        return Policy({"agent": [Rule(pattern), Rule("/w/**", "read")]})
+
+    def hides(pattern: str, *names: str) -> None:
+        policy = policy_for(pattern)
+        for name in names:
+            assert not policy.allows("agent", "read", f"/w/{name}"), (ascii(pattern), ascii(name))
+
+    def keeps(pattern: str, *names: str) -> None:
+        policy = policy_for(pattern)
+        for name in names:
+            assert policy.allows("agent", "read", f"/w/{name}"), (ascii(pattern), ascii(name))
+
+    keeps("/w/[0-Z]*", "_config", "^x", "`x")  # the old [0-Z0-z] spanned "_", "^" and "`"
+    keeps("/w/[" + chr(0xC0) + "-" + chr(0xDE) + "]*", chr(0xF7) + "x")  # the old folded range spanned U+00F7
+    keeps("/w/[" + chr(0xFF21) + "-Z]", *ASCII_LOWER)  # a reversed range matches nothing raw, gains nothing
+    keeps("/w/[_-Z]", *ASCII_LOWER)  # likewise
+    keeps("/w/[Za!--]", *ASCII_DIGITS, ".", ":")  # the old parse of "!--" moved the trailing "-"
+    hides("/w/[]-A-Z]", "-", "Z", "z")  # what it matches raw, and the fold of its "Z"
+    keeps("/w/[]-A-Z]", "b", "A")  # and nothing else: the raw class matches neither "b" nor "A"
+
+
+def test_a_class_folding_to_a_solidus_agrees_with_the_reference_matcher() -> None:
+    """#148: a fullwidth solidus member folds to "/" in the emitted list, which is fine for single characters:
+    ``_alt_regex`` replaces "/" with the NUL in both the pattern and the dual string, and ``_rests`` compares
+    "/" with "/": ``Rule.matches`` and ``_matches_by_rests`` must agree. The range spans the fullwidth
+    solidus and digits, so the class gains "/" and "0"-"9"."""
+    hide = Rule("/w/" + SOLIDUS_RANGE_CLASS)
+    for path in ("/w/#", "/w/!", "/w/5", "/w/9", "/w/" + FW_DIGIT_FIVE, "/w/" + FW_SOLIDUS):
+        assert hide.matches(path) == _matches_by_rests(hide, split_trusted(path)), ascii(path)
+    assert hide.matches("/w/" + FW_DIGIT_FIVE)  # raw: the fullwidth 5 is inside the range as written
+    assert hide.matches("/w/9")  # folded: the fullwidth 9 endpoint folds to "9"
+    assert hide.matches("/w/5")  # folded: the fullwidth 5 is a member and folds to "5"
+    assert not hide.matches("/w/#")  # "#" is in neither the raw range nor the emitted list
+
+
+def test_folded_class_agrees_with_an_independent_enumeration() -> None:
+    """The oracle property of ``_folded_class`` (#148): over 300 random positive bodies built from a pool of
+    tricky characters and ranges between random pool characters, the emitted class matches a character exactly
+    where the independently written enumeration (``_oracle_class_chars``) holds it (for every candidate and
+    for 50 random characters outside them), and compiles through ``_segment_regex`` with the warnings as
+    errors. Bodies ``Rule`` refuses are skipped, as main would never build them."""
+    rng = random.Random(148)
+    pool = [
+        "a",
+        "B",
+        "m",
+        "Z",
+        "z",
+        "0",
+        "5",
+        "9",
+        "_",
+        "-",
+        "]",
+        FW_LOWER_A,
+        FW_UPPER_A,
+        FW_UPPER_R,
+        FW_UPPER_Z,
+        SHARP_S,
+        FI_LIGATURE,
+        FW_SOLIDUS,
+        FW_DIGIT_NINE,
+        chr(0xC0),
+        chr(0xDE),
+        chr(0xF7),
+        E_ACUTE,
+        "e" + COMBINING_ACUTE,
+    ]
+    checked = wide = 0
+    while checked < 300:
+        parts: list[str] = []
+        if rng.random() < 0.25:
+            parts.append("]")  # sometimes a ] first, where it is a literal member
+        for _ in range(rng.randint(1, 4)):
+            if rng.random() < 0.4:
+                parts.append(f"{rng.choice(pool)}-{rng.choice(pool)}")  # a range between random pool characters
+            else:
+                parts.append(rng.choice(pool))
+        body = "".join(parts)
+        try:
+            Rule(f"/w/[{body}]")
+        except ValueError:
+            continue  # a body main refuses (a [: or a [^ it would read literally): the oracle doesn't judge it
+        chars, candidates = _oracle_class_chars(body)
+        emitted = _folded_class(body)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            re.compile(_segment_regex(emitted, "/"))
+        if chars is None:  # a range wider than 4096: the class stays as written
+            assert emitted == f"[{body}]", ascii(body)
+            wide += 1
+            checked += 1
+            continue
+        known = set(candidates)
+        outside: list[str] = []
+        while len(outside) < 50:
+            cp = rng.choice(
+                [rng.randint(1, 0x2FFF), rng.randint(0x3100, 0xD7FF), rng.randint(0xE000, 0x10FFFF)]
+            )  # no surrogate
+            if chr(cp) not in known:
+                outside.append(chr(cp))
+        for c in candidates + outside:
+            assert fnmatchcase(c, emitted) == (c in chars), (ascii(body), ascii(emitted), ascii(c))
+        checked += 1
+    assert checked - wide >= 150, wide  # most bodies are enumerated, not left as written
 
 
 def test_class_free_segments_fold_exactly_as_before() -> None:
@@ -250,9 +459,9 @@ def test_class_free_segments_fold_exactly_as_before() -> None:
 
 
 def test_a_hide_rule_class_matches_the_folded_names() -> None:
-    """#140: a hide rule's class also matches the folded forms of what it lists, so ``[A-Z]*`` hides readme
-    too; a negated class excludes those folded forms as well, so it adds no case variants; a member that folds
-    to several characters is matched only as written; and a grant rule stays byte-exact."""
+    """#140, #148: a hide rule's positive class also matches the folded forms of what it lists, so ``[A-Z]*``
+    hides readme too; a segment with a negated class matches byte for byte only, so it adds no case variants;
+    a member that folds to several characters is matched only as written; and a grant rule stays byte-exact."""
     fw_readme = FW_UPPER_R + "eadme"  # a fullwidth R: it folds to "readme"
 
     def policy_for(pattern: str) -> Policy:
@@ -268,12 +477,12 @@ def test_a_hide_rule_class_matches_the_folded_names() -> None:
         for name in names:
             assert policy.allows("agent", "read", f"/w/{name}"), (ascii(pattern), ascii(name))
 
-    hides("/w/[A-Z]*", "readme", "README", "Readme", fw_readme)  # [A-Za-z]* matches every folded "readme"
-    keeps("/w/[A-Z]*", "_x")  # _ is in neither [A-Z] nor [A-Za-z], raw or folded
+    hides("/w/[A-Z]*", "readme", "README", "Readme", fw_readme)  # the 52-letter list matches every "readme"
+    keeps("/w/[A-Z]*", "_x")  # _ is in neither [A-Z] nor the enumerated list, raw or folded
     hides("/w/[!a-z]*", "README")  # byte for byte, R is not in [a-z] ...
-    keeps("/w/[!a-z]*", "readme")  # ... and the negated class excludes the folded forms too: no case variants
+    keeps("/w/[!a-z]*", "readme")  # ... and a negated class doesn't fold: no case variants
     hides("/w/[!A-Z]*", "readme")  # byte for byte, r is not in [A-Z] ...
-    keeps("/w/[!A-Z]*", "README")  # ... folded, r is in [A-Za-z], so [!A-Za-z]* excludes it
+    keeps("/w/[!A-Z]*", "README")  # ... and the segment is byte for byte only, where R is in [A-Z] (#148)
     hides("/w/stra[" + SHARP_S + "]e", "stra" + SHARP_S + "e")  # byte for byte ...
     keeps("/w/stra[" + SHARP_S + "]e", "strasse")  # ... the sharp s folds to "ss": matched only as written
     hides("/w/[Ee]nv", "ENV", "env")  # the folded [Ee]nv matches "env"

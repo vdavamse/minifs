@@ -20,10 +20,11 @@ segment of the folded pattern against the folded name, where folding a name drop
 The byte-exact and the folded match are tried per segment, not per character, so one segment that needs both
 (``[!a-z]*.env`` against ``Config.ENV``) isn't hidden; spell such rules as two rules or with ``*``. A hide rule
 that missed a variant would leak it, while a loosened grant would grant more than written, so a rule with some
-actions is a grant and stays exact. A hide rule's ``[...]`` class also matches the folded form of the
-characters and ranges it lists (``[A-Z]`` hides ``readme`` too); a negated class excludes those folded forms
-as well, so it adds no case variants (``[!a-z]*`` hides ``README`` but not ``readme``); and a member that
-folds to several characters (the sharp s) is matched only as written. A segment with a character that folds
+actions is a grant and stays exact. A hide rule's positive ``[...]`` class also matches the folded forms of
+the characters it lists or spans (``[A-Z]`` hides ``readme`` too); a segment with a negated class
+(``[!...]``) matches byte for byte only (``[!a-z]*`` hides ``README`` but not ``readme``); a member that
+folds to several characters (the sharp s) is matched only as written; and a class with a range spanning more
+than 4096 code points gains no folds. A segment with a character that folds
 to glob syntax (the fullwidth asterisk U+FF0A folds to ``*``) still matches byte for byte only. A ``?``
 matches one character of the folded name (the sharp s folds to ``ss``). Suffixes and trailing spaces are
 other names: use ``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/workspace/Makefile")`` also hides
@@ -72,11 +73,11 @@ class Rule:
     """``actions`` granted on the paths ``pattern`` matches: ``Rule("/docs/**", "read")``. A rule with no actions
     hides those paths instead: it matches what ``pattern`` matches byte for byte and, in addition, the case and
     Unicode variants of the names it spells, each segment of the folded pattern against the folded name, the two
-    tried per segment (``alternatives``). A ``[...]`` class also matches the folded form of the characters and
-    ranges it lists (``[A-Z]`` hides ``readme`` too), a negated class excludes those folded forms as well
-    (``[!a-z]*`` hides ``README`` but not ``readme``), and a member that folds to several characters (the sharp s)
-    is matched only as written; a segment with a character that folds to glob syntax matches byte for byte only.
-    A rule that grants matches byte for byte."""
+    tried per segment (``alternatives``). A positive ``[...]`` class also matches the folded forms of the
+    characters it lists or spans (``[A-Z]`` hides ``readme`` too), a segment with a negated class (``[!...]``)
+    matches byte for byte only (``[!a-z]*`` hides ``README`` but not ``readme``), and a member that folds to
+    several characters (the sharp s) is matched only as written; a segment with a character that folds to glob
+    syntax matches byte for byte only. A rule that grants matches byte for byte."""
 
     pattern: str
     actions: frozenset[Action]
@@ -266,8 +267,10 @@ def _pattern_alts(segment: str) -> tuple[str, ...]:
     ``(s,)``, otherwise, so it matches byte for byte only (what ``_rests`` does with a 1-tuple). A segment without
     a ``[...]`` class folds exactly as before #140: whole, and only where folding keeps its glob syntax (no folded
     glob character, no change in the count of ``*`` or ``?``, and ``**`` stays ``("**",)``: a whole segment, not
-    two wildcards). A segment with a class folds member by member instead (``_class_additions``), so the class
-    also matches the folded forms of what it lists (#140) and the raw match stays exactly what it was."""
+    two wildcards). A segment with a positive class enumerates it instead (``_folded_class``): the class is
+    replaced by an explicit list of the characters it matches once folded, so it also matches the folded
+    forms of what it lists (#140) and the raw match stays exactly what it was; a segment with a negated
+    class (``[!...]``) doesn't fold at all and stays byte for byte only (#148)."""
     folded = _fold_segment(segment)
     return (segment, folded) if folded is not None else (segment,)
 
@@ -283,7 +286,7 @@ def _fold_pattern(segment: str) -> str:
 
 
 _GLOB_SYNTAX = "*?[]{}\\"  # a folded literal run holding one of these would read as glob syntax: can't fold
-_CLASS_SPECIAL = "]\\-!^["  # a class addition holding one of these would change the class's structure: never added
+_MAX_RANGE_SPAN = 4096  # a class with a range wider than this gains no folds (_folded_class)
 
 
 def _fold_run(run: str) -> str | None:
@@ -299,10 +302,12 @@ def _fold_segment(segment: str) -> str | None:
     stays byte-for-byte only. Literal runs fold whole (``_fold_run``), with the ``*`` and ``?`` between them kept
     as they are, so folding can't change the count of wildcards; a run whose folded form gains glob syntax can't
     fold, and neither can ``**``, which is a whole segment, not two wildcards. A class is scanned exactly as
-    ``_bad_class`` scans it (an optional ``!``, a ``]`` first in the class is literal, up to the closing ``]``)
-    and keeps its body as written, which gains the folded forms of the members and ranges it lists
-    (``_class_additions``), so ``[A-Z]*`` folds to ``[A-Za-z]*`` and hides ``readme`` too. A ``[`` not closed
-    within the segment can't fold, but ``_no_literal_globs`` has refused such a pattern before this is reached."""
+    ``_bad_class`` scans it (an optional ``!``, a ``]`` first in the class is literal, up to the closing ``]``).
+    A positive class is replaced by the explicit list of the characters it matches once folded
+    (``_folded_class``), so ``[A-Z]*`` folds to a 52-letter class and hides ``readme`` too; a negated class
+    (``[!...]``) folds no character and refuses the whole segment, which matches byte for byte only as before
+    #140 (#148). A ``[`` not closed within the segment can't fold, but ``_no_literal_globs`` has refused such a
+    pattern before this is reached."""
     if segment == "**":
         return None
     parts: list[str] = []
@@ -320,16 +325,13 @@ def _fold_segment(segment: str) -> str | None:
                 j += 1
             if j >= n:
                 return None  # a [ fnmatch reads literally: a rule pattern can't hold one (_no_literal_globs)
+            body = segment[i + 1 : j]
+            if body.startswith("!"):
+                return None  # a negated class doesn't fold: the whole segment stays byte for byte only (#148)
             folded = _fold_run(run)
             if folded is None:
                 return None
-            body = segment[i + 1 : j]
-            additions = _class_additions(body)
-            if additions and body.endswith("-") and body not in ("-", "!-"):
-                body = body[:-1] + additions + "-"  # a trailing - is literal: kept last, it can't start a range
-            else:
-                body += additions
-            parts += [folded, f"[{body}]"]
+            parts += [folded, _folded_class(body)]
             run = ""
             i = j + 1
         elif c in "*?":
@@ -346,46 +348,42 @@ def _fold_segment(segment: str) -> str | None:
     return None if folded is None else "".join(parts) + folded
 
 
-def _class_additions(body: str) -> str:
-    """The folded forms a hide rule's class gains (#140), appended to its ``body`` (the class as written, after
-    the ``[`` and before the ``]``, a leading ``!`` included): the fold of each member and range the body lists
-    that isn't in it yet, so ``[A-Z]`` also matches ``a``-``z``, a negated class (``[!A-Z]``) excludes those
-    folded forms as well, and a member that folds to several characters (the sharp s folds to ``ss``) is matched
-    only as written. Members are parsed as fnmatch parses them: a ``]`` first in the body is a literal member,
-    and ``x-y`` is a range where its ``-`` is neither first nor last. A single member ``c`` contributes its fold
-    ``fc`` where that is one character, another than ``c``, none that would change the class's structure
-    (``_CLASS_SPECIAL``) and not in the body or the additions so far; a range ``lo-hi`` contributes ``flo-fhi``
-    where both folds are one character, other than the endpoints, structurally safe and ordered (``flo <= fhi``),
-    so the class gains no impossible range."""
-    members = body[1:] if body.startswith("!") else body  # the negation folds with the class, not as a member
-    additions: list[str] = []
-    added = ""
-    i, n = 0, len(members)
-    if n and members[0] == "]":  # a ] first in the body is a literal member, not the closing one
-        i = 1
-    while i < n:
-        if i + 2 < n and members[i + 1] == "-":  # a range: its - is neither first nor last
-            lo, hi = members[i], members[i + 2]
-            flo, fhi = _fold_pattern(lo), _fold_pattern(hi)
-            if (
-                len(flo) == 1
-                and len(fhi) == 1
-                and (flo, fhi) != (lo, hi)
-                and flo not in _CLASS_SPECIAL
-                and fhi not in _CLASS_SPECIAL
-                and flo <= fhi
-            ):
-                additions.append(f"{flo}-{fhi}")
-                added += f"{flo}-{fhi}"
-            i += 3
-        else:
-            c = members[i]
-            fc = _fold_pattern(c)
-            if len(fc) == 1 and fc != c and fc not in _CLASS_SPECIAL and fc not in body and fc not in added:
-                additions.append(fc)
-                added += fc
-            i += 1
-    return "".join(additions)
+def _folded_class(body: str) -> str:
+    """A positive ``[...]`` class of a hide rule's segment, spelled as the characters it matches once folded
+    (#140): ``body`` is the class text between the brackets (a negated class doesn't fold: ``_fold_segment``
+    refuses the whole segment instead). The members are enumerated, not parsed: the candidates are the
+    characters of ``body`` and, for every ``x-y`` in it, each code point from ``x`` to ``y``, a superset of every
+    range fnmatch reads; a class with an ``x-y`` spanning more than 4096 code points (``_MAX_RANGE_SPAN``) is
+    returned as written and gains no folds. Each candidate is tried against the class as written with
+    ``fnmatchcase``, and the single-character folds (``_fold_pattern``) of the members join the set; a member
+    that folds to several characters (the sharp s) is matched only as written.
+    Membership comes from fnmatch itself, so a parse difference can only lose an addition, never invent one
+    (#148). Where the set gains nothing the class is returned as written; otherwise it is emitted as an
+    explicit list of characters with no ranges to span unintended ones: a ``]`` comes first and a ``-`` last,
+    where both are literal, and a leading ``!`` is swapped with the next character so the list can't read as a
+    negation (``fnmatch.translate`` escapes what could still misread: ``^``, ``[`` and the set operators). A
+    member that folds to ``/`` (a fullwidth solidus) is one character and fine as such: ``_alt_regex`` replaces
+    ``/`` with the NUL in both the pattern and the dual string, and ``_rests`` compares ``/`` with ``/``."""
+    token = f"[{body}]"
+    candidates = set(body)
+    for i in range(1, len(body) - 1):
+        if body[i] == "-":
+            lo, hi = ord(body[i - 1]), ord(body[i + 1])
+            if hi - lo > _MAX_RANGE_SPAN:
+                return token  # too wide to enumerate: the class stays as written and gains no folds
+            candidates.update(map(chr, range(lo, hi + 1)))
+    members = {c for c in candidates if fnmatchcase(c, token)}
+    folds = {fold for c in members if len(fold := _fold_pattern(c)) == 1}
+    chars = members | folds
+    if chars == members:
+        return token  # nothing to add: the body stays as written
+    middle = "".join(sorted(chars - {"]", "-"}))
+    out = ("]" if "]" in chars else "") + middle + ("-" if "-" in chars else "")
+    if out.startswith("!"):  # a leading ! would read as a negation
+        if len(out) == 1:
+            return "!"  # a lone ! is a literal, not a negated empty class
+        out = out[1] + out[0] + out[2:]
+    return f"[{out}]"
 
 
 def _segment_regex(segment: str, exclude: str) -> str:
