@@ -478,7 +478,7 @@ def already_loaded(messages: list[Any]) -> set[str]:
     ``ToolReturnPart`` without its metadata, so a history that comes back from the browser on each turn records
     nothing and instruction files are attached again once per run; keep the history server-side
     (``ModelMessagesTypeAdapter``) to avoid that. The cost of a call is a metadata check per earlier result part,
-    and a scan of the content of only the few whose metadata recorded paths."""
+    and, only for the few whose metadata recorded paths, a check of the end and one pass over the reminder."""
     loaded: set[str] = set()
     for message in messages:
         for part in getattr(message, "parts", []):
@@ -487,8 +487,8 @@ def already_loaded(messages: list[Any]) -> set[str]:
             paths = _recorded_instructions(part.metadata)
             if not paths or not isinstance(part.content, str):
                 continue
-            content = part.content.rstrip()
-            if not content.endswith(_REMINDER_END):
+            content = part.content
+            if not content[-_TAIL:].rstrip().endswith(_REMINDER_END):
                 continue  # no reminder for the model to see: nothing counts, whatever the metadata recorded
             # Inside <content> every "\n" is followed by a line number, an empty line, the footer or the closing
             # tag, so the first "\n</content>" is the real one (CRLF too) and the reminder follows it. Not the
@@ -496,11 +496,15 @@ def already_loaded(messages: list[Any]) -> set[str]:
             start = content.find(_CONTENT_END)
             if start == -1:
                 continue  # the content's end is gone: the store broke the result past recognition
-            reminder = content[start:]  # every header in it starts a line of its own
-            for path in paths:
-                if f"\n{_FROM}{path}\n" in reminder or f"\n{_FROM}{path}\r\n" in reminder:
-                    loaded.add(path)
+            # Every header in the reminder is a line of its own: collect them once (a CRLF line keeps its "\r").
+            headers = {line.removesuffix("\r") for line in content[start:].split("\n") if line.startswith(_FROM)}
+            loaded.update(path for path in paths if _FROM + path in headers)
     return loaded
+
+
+_TAIL = len(_REMINDER_END) + 256
+"""How much of a result's end ``already_loaded`` strips to find ``_REMINDER_END``, so it doesn't copy the whole
+result; a store that padded it with more whitespace than that re-attaches its instructions (the safe direction)."""
 
 
 def _recorded_instructions(metadata: Any) -> list[str]:
