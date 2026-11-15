@@ -281,17 +281,40 @@ async def test_create_of_a_taken_name_with_data_changes_nothing(conn: AsyncConne
 
 
 async def test_append_to_a_partial_line_rewrites_only_the_last_extent(conn: AsyncConnection) -> None:
+    # Lines over 4 KiB, so each append past them starts an extent of its own (vfs_append re-cuts smaller ones).
+    a, b = b"a" * 5000 + b"\n", b"b" * 5000 + b"\n"
     f = await create_file(conn, "f")
-    for part in [b"a\n", b"b\n", b"c"]:
+    for part in [a, b, b"c"]:
         await append(conn, f, part)
     cur = await conn.execute("SELECT byte_offset, ctid::text FROM vfs_extents WHERE node_id = %s ORDER BY 1", (f,))
     before = await cur.fetchall()
-    assert await append(conn, f, b"d\ne") == 5
+    assert len(before) == 3
+    assert await append(conn, f, b"d\ne") == 10003
     cur = await conn.execute("SELECT byte_offset, ctid::text FROM vfs_extents WHERE node_id = %s ORDER BY 1", (f,))
     after = await cur.fetchall()
     assert after[:2] == before[:2]  # untouched
     assert after[2] != before[2]
-    await check_layout(conn, f, b"a\nb\ncd\ne")
+    await check_layout(conn, f, a + b + b"cd\ne")
+
+
+async def test_short_appends_fill_an_extent_instead_of_adding_one_each(conn: AsyncConnection) -> None:
+    """#83: an extent row costs about 200 bytes that no quota counts, so 1-byte appends each adding a row would
+    store some 200 times what they're charged. vfs_append re-cuts a last extent under 4 KiB together with the
+    data: about one row per 2 KiB of file, whatever the appends, newline-ended or not, alternating or not."""
+    f = await create_file(conn, "log")
+    await conn.execute("SELECT vfs_append(%s, '\\x0a'::bytea) FROM generate_series(1, 20000)", (f,))
+    assert await one(conn, "SELECT count(*) FROM vfs_extents WHERE node_id = %s", (f,)) == (5,)  # 20000 / 4096
+    await check_layout(conn, f, b"\n" * 20000)
+    g = await create_file(conn, "chatty")
+    pattern = [b"x", b"\n", b"yy", b"z\nw", b"\n\n"]
+    await conn.execute(
+        "SELECT vfs_append(%s, (ARRAY[%s, %s, %s, %s, %s]::bytea[])[1 + i %% 5]) FROM generate_series(0, 9999) i",
+        (g, *pattern),
+    )
+    content = b"".join(pattern) * 2000
+    (rows,) = await one(conn, "SELECT count(*) FROM vfs_extents WHERE node_id = %s", (g,))
+    assert isinstance(rows, int) and rows <= len(content) // 2048 + 1, rows
+    await check_layout(conn, g, content)
 
 
 # vfs_pread_lines
@@ -360,10 +383,19 @@ async def test_pread_lines_while_another_session_appends(conn: AsyncConnection, 
 
 
 async def test_line_reads_of_many_extents_use_index_steps(conn: AsyncConnection) -> None:
+    # One extent per line, as appends of whole lines made before 023 (now they fill 4 KiB extents, #83, and
+    # vfs_compact only merges): raw SQL, checked by check_layout.
     f = await create_file(conn, "log")
     await conn.execute(
-        "SELECT vfs_append(%s, convert_to(format('line %%s\n', i), 'UTF8')) FROM generate_series(1, 20000) i", (f,)
+        "WITH l AS (SELECT i, convert_to(format('line %%s\n', i), 'UTF8') AS d FROM generate_series(1, 20000) i)"
+        " INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
+        " SELECT %s, 0, coalesce(sum(length(d)) OVER (ORDER BY i ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW), 0),"
+        " i - 1, d, '{0}' FROM l",
+        (f,),
     )
+    content = "".join(f"line {i}\n" for i in range(1, 20001)).encode()
+    await conn.execute("UPDATE vfs_nodes SET size = %s, lines = 20000 WHERE id = %s", (len(content), f))
+    await check_layout(conn, f, content)
     await conn.execute("ANALYZE vfs_extents")
     for first in [1, 10_000, 19_990]:
         cur = await conn.execute("SELECT data FROM vfs_pread_lines(%s, %s, 5, 1000)", (f, first))
@@ -641,7 +673,9 @@ async def test_appends_ending_mid_line_rewrite_only_the_partial_line(conn: Async
         content += part
         after = await (await conn.execute(query, (f,))).fetchall()
         assert after[: max(len(before) - 1, 0)] == before[:-1], "only the last extent was rewritten"
-        assert (await extent_rows(conn, f))[-1][3] == f"{i:04}-head".encode()
+        last = (await extent_rows(conn, f))[-1][3]
+        # The partial line alone, or a last extent of at most 4 KiB that the append re-cut whole (#83).
+        assert last == f"{i:04}-head".encode() or (len(last) <= 4096 and last.endswith(f"{i:04}-head".encode()))
     await check_layout(conn, f, content)
 
 
@@ -671,16 +705,18 @@ async def test_repeatable_read_append_to_a_newline_ended_file_after_a_concurrent
 ) -> None:
     # The file ends with \n, so the append deletes nothing, and compaction only locked the inode, so nothing
     # conflicts: the append counts lines from the last extent its snapshot sees, whose numbers compaction kept.
+    # The last line is over 4 KiB, so the append doesn't re-cut that extent (vfs_append does for smaller ones).
+    long = b"b" * 5000 + b"\n"
     f = await create_file(conn, "log")
-    for part in [b"a\n", b"b\n", b"c\n"]:
+    for part in [b"a\n", long]:
         await append(conn, f, part)
     async with await AsyncConnection.connect(db) as late:
         await late.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
         await late.execute("SELECT 1")  # takes the snapshot
-        assert await compact(conn, f) == 2
-        assert await append(late, f, b"d") == 6
+        assert await compact(conn, f) == 1
+        assert await append(late, f, b"d") == 5003
         await late.commit()
-    await check_layout(conn, f, b"a\nb\nc\nd")
+    await check_layout(conn, f, b"a\n" + long + b"d")
 
 
 # The streaming vfs_cut of 023 against 007's rule, literally reimplemented in Python: the same rows, whatever

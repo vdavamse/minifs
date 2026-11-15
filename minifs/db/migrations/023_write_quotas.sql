@@ -19,8 +19,8 @@
 --    deadlock; and a charge is the last lock a writer takes, vfs_rename's after its UPDATE), adds the change to
 --    each and raises EDQUOT if an increase takes one over its max, which rolls the whole write back. A decrease (a shrinking write, an unlink) is never refused, even over a lowered max.
 --    Quotas nest: every quota root above the change is charged. vfs_rename moves the moved subtree's bytes and
---    nodes from the quota roots above the source to those above the destination (a bounded scan of the subtree,
---    only when the two sets of roots differ). vfs_compact changes no size.
+--    nodes from the quota roots above the source to those above the destination (a scan of the whole subtree,
+--    capped in depth only, while the moved node is locked; only when the two sets of roots differ). vfs_compact changes no size.
 --
 --    Cost: every write under a quota root holds that root's row until it commits, so writers in one workspace
 --    take turns there (writers of one file already take turns on its inode). Put quotas on the workspaces, not
@@ -41,8 +41,10 @@
 --    role can REVOKE EXECUTE on vfs_set_quota, vfs_set_child_quota and vfs_give_child_quota, and the write
 --    privileges on vfs_quotas and vfs_quota_defaults, from it.
 --
---    What's counted is the files' logical sizes. Storage per byte is a small factor more (each line costs 4 bytes
---    of line_offsets, each node and extent a row); max_nodes bounds the per-row part.
+--    What's counted is the files' logical sizes. Storage per byte is a small factor more: each line costs 4 bytes
+--    of line_offsets, and each node and extent a row of about 200 bytes. max_nodes bounds the node rows, and
+--    vfs_append keeps the extent rows to about one per 2 KiB of file (it re-cuts a last extent under 4 KiB with
+--    the appended data rather than adding a row per append).
 --
 --    Best effort, by design: the ancestor walk takes no locks (it would put a lock on every directory above every
 --    write), so a write that races a move of one of its ancestors to another quota root may be charged to the
@@ -174,10 +176,10 @@ BEGIN
     END IF;
     FOR v_q IN
         SELECT q.root, q.max_bytes, q.max_nodes, q.used_bytes, q.used_nodes FROM vfs_quotas q
-         WHERE q.root = ANY (p_from || p_to) ORDER BY q.root FOR UPDATE
+         WHERE q.root = ANY (p_from || p_to) AND (q.root = ANY (p_from)) <> (q.root = ANY (p_to))  -- changed ones only
+         ORDER BY q.root FOR UPDATE
     LOOP
         v_sign := (v_q.root = ANY (p_to))::int - (v_q.root = ANY (p_from))::int;
-        CONTINUE WHEN v_sign = 0;
         v_bytes := v_sign * p_bytes;
         v_nodes := v_sign * p_nodes;
         IF v_bytes > 0 AND v_q.used_bytes + v_bytes > v_q.max_bytes THEN
@@ -643,7 +645,12 @@ END $$;
 -- the file would pass vfs_max_file_size(), EDQUOT over a quota.
 --
 -- When the file ends mid-line, its last extent is deleted and cut again together with p_data, so extents keep
--- starting at line starts (migration 007).
+-- starting at line starts (migration 007). Since 023, so does a last extent that would hold at most 4 KiB with
+-- p_data, ending in \n or not, cut as one extent (no split tail): appends of short lines fill an extent row
+-- instead of adding one each (an extent row costs about 200 bytes of storage, which no quota counts, so one row
+-- per 1-byte append would store some 200 times what the quota charges). A row is left behind only once it
+-- holds over 4 KiB together with the append that follows it, so a file has about one extent row per 2 KiB at
+-- most, and an append rewrites at most 4 KiB.
 CREATE OR REPLACE FUNCTION vfs_append(p_node uuid, p_data bytea) RETURNS TABLE (byte_offset bigint, err text, err_detail text)
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
@@ -653,6 +660,7 @@ DECLARE
     v_line bigint;                                  -- the number of \n before v_off
     v_last bytea;                                   -- the file's last extent
     v_lines bigint;
+    v_split boolean := true;                        -- vfs_cut's p_split_tail
 BEGIN
     IF p_data IS NULL THEN
         PERFORM vfs_raise('EINVAL', 'data is NULL');
@@ -678,6 +686,11 @@ BEGIN
         v_off := 0;
         v_line := 0;
         v_last := ''::bytea;
+        v_split := length(p_data) > 4096;
+    ELSIF length(v_last) + length(p_data) <= 4096 THEN
+        -- Small: the last extent and p_data become one extent (4 KiB is under the 65536 target, so one piece).
+        DELETE FROM vfs_extents e WHERE e.node_id = p_node AND e.generation = v_gen AND e.byte_offset = v_off;
+        v_split := false;
     ELSIF get_byte(v_last, length(v_last) - 1) = 10 THEN
         v_off := v_size;                            -- ends with \n: the new data starts a line
         v_line := v_line + v_lines;
@@ -688,7 +701,7 @@ BEGIN
     WITH ins AS (
         INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)
         SELECT p_node, v_gen, v_off + c.rel_offset, v_line + c.rel_line, c.data, c.line_offsets
-          FROM vfs_cut(v_last || p_data, 65536, true) c
+          FROM vfs_cut(v_last || p_data, 65536, v_split) c
         RETURNING vfs_extents.line_start + cardinality(vfs_extents.line_offsets) AS lines_after
     )
     SELECT max(ins.lines_after) INTO v_lines FROM ins;

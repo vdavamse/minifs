@@ -101,12 +101,14 @@ async def test_charges_of_every_operation(vfs: VFSClient) -> None:
     await vfs.rename("/out", "/q/back")
     assert await vfs.quota("/q") == Quota(100, 5, 25, 4)
     # Compaction changes no size, so it charges nothing.
+    # Lines over 4 KiB, so each append makes an extent of its own (vfs_append re-cuts smaller ones) to compact.
+    await vfs.set_quota("/q", max_bytes=20_000, max_nodes=5)
     await vfs.create("/q/log")
-    for i in range(3):
-        await vfs.append("/q/log", f"line {i}\n".encode())
-    assert await vfs.quota("/q") == Quota(100, 5, 46, 5)
-    assert await vfs.compact("/q/log") == 2
-    assert await vfs.quota("/q") == Quota(100, 5, 46, 5)
+    for c in b"ab":
+        await vfs.append("/q/log", bytes([c]) * 4999 + b"\n")
+    assert await vfs.quota("/q") == Quota(20_000, 5, 10_025, 5)
+    assert await vfs.compact("/q/log") == 1
+    assert await vfs.quota("/q") == Quota(20_000, 5, 10_025, 5)
 
 
 async def test_every_quota_root_up_the_chain_is_charged(vfs: VFSClient) -> None:
