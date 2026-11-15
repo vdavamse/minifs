@@ -11,7 +11,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from minifs import cli
 from minifs.cli import main
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import ReadResult
+from minifs.vfs.core import MAX_FILE_SIZE, ReadResult
 
 Capture = pytest.CaptureFixture[bytes]
 
@@ -476,3 +476,123 @@ def test_sslpassword_is_a_password(monkeypatch: pytest.MonkeyPatch, capsysbinary
     assert "warning: --dsn holds a password" in err
     assert 'invalid sslmode value: "****"' in err
     assert "PH-7f3a" not in err
+
+
+# The quota command (#83)
+
+
+def test_quota_show_set_remove(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    monkeypatch.setattr(sys, "stdin", _Stdin(b"x" * 30))
+    assert run(monkeypatch, db, "put", "-p", "/q/f") == 0
+    capsysbinary.readouterr()
+    assert run(monkeypatch, db, "quota", "/q") == 0
+    assert capsysbinary.readouterr().out == b"no quota\n"
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "100", "--nodes", "5") == 0
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q") == 0  # the quota is still there
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--nodes", "9") == 0  # an omitted limit is kept
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=9 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--remove") == 0
+    assert capsysbinary.readouterr().out == b"no quota\n"
+    assert run(monkeypatch, db, "quota", "/q") == 0
+    assert capsysbinary.readouterr().out == b"no quota\n"
+    # A missing directory and a file are the usual errors.
+    assert run(monkeypatch, db, "quota", "/missing") == 1
+    assert capsysbinary.readouterr().err.startswith(b"minifs quota: ENOENT: /missing")
+    assert run(monkeypatch, db, "quota", "/q/f") == 1
+    assert capsysbinary.readouterr().err.startswith(b"minifs quota: ENOTDIR: /q/f")
+
+
+def test_quota_children(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    for name in ("a", "b"):
+        monkeypatch.setattr(sys, "stdin", _Stdin(b"x"))
+        assert run(monkeypatch, db, "put", "-p", f"/workspaces/{name}/f") == 0
+    capsysbinary.readouterr()
+    assert run(monkeypatch, db, "quota", "/workspaces", "--children", "--bytes", "100", "--nodes", "5") == 0
+    assert capsysbinary.readouterr().out == b"2 existing directories got the quota\n"
+    assert run(monkeypatch, db, "quota", "/workspaces/a") == 0
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=1 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/workspaces", "--children", "--remove") == 0
+    assert capsysbinary.readouterr().out == b"no quota\n"
+
+
+def test_quota_keeps_an_omitted_limit(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    """#83, review round 1: an omitted limit is kept (the current quota is read first and both limits are then
+    set), the value ``none`` clears that one limit, and both ``none`` removes the quota like ``--remove``."""
+    monkeypatch.setattr(sys, "stdin", _Stdin(b"x" * 30))
+    assert run(monkeypatch, db, "put", "-p", "/q/f") == 0
+    capsysbinary.readouterr()
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "100", "--nodes", "5") == 0
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "10") == 0  # --nodes omitted: the 5 is kept
+    assert capsysbinary.readouterr().out == b"max_bytes=10 max_nodes=5 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--nodes", "none") == 0  # "none" clears just that one limit
+    assert capsysbinary.readouterr().out == b"max_bytes=10 max_nodes=none used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--nodes", "7") == 0  # --bytes omitted: the 10 is kept
+    assert capsysbinary.readouterr().out == b"max_bytes=10 max_nodes=7 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "none", "--nodes", "NONE") == 0  # both: --remove
+    assert capsysbinary.readouterr().out == b"no quota\n"
+    assert run(monkeypatch, db, "quota", "/q") == 0
+    assert capsysbinary.readouterr().out == b"no quota\n"
+    # Without a quota there is nothing to keep: an omitted limit is no limit.
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "100") == 0
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=none used_bytes=30 used_nodes=1\n"
+
+
+def test_quota_timeout(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    """``--timeout`` is the client's write_timeout for this one command: setting a quota recounts its subtree,
+    which can be slow on a big one. 0.5 s is plenty for this tree."""
+    monkeypatch.setattr(sys, "stdin", _Stdin(b"x" * 30))
+    assert run(monkeypatch, db, "put", "-p", "/q/f") == 0
+    capsysbinary.readouterr()
+    assert run(monkeypatch, db, "quota", "/q", "--bytes", "100", "--nodes", "5", "--timeout", "0.5") == 0
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
+    assert run(monkeypatch, db, "quota", "/q", "--timeout", "0.5") == 0  # a show accepts it too
+    assert capsysbinary.readouterr().out == b"max_bytes=100 max_nodes=5 used_bytes=30 used_nodes=1\n"
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ("--remove", "--bytes", "10"),
+        ("--bytes", "10", "--remove"),
+        ("--remove", "--nodes", "10"),
+        ("--children",),
+        # A limit that is neither an integer >= 0 nor "none" is an argparse error too.
+        ("--bytes", "-1"),
+        ("--nodes", "-1"),
+        ("--bytes", "x"),
+    ],
+)
+def test_quota_flag_errors(
+    db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture, flags: tuple[str, ...]
+) -> None:
+    with pytest.raises(SystemExit) as info:
+        run(monkeypatch, db, "quota", "/q", *flags)
+    assert info.value.code == 2
+    assert b"usage:" in capsysbinary.readouterr().err
+
+
+class _BigStdin:
+    """A stdin whose ``buffer.read(n)`` returns exactly the ``n`` bytes asked for, recording each ``n``."""
+
+    def __init__(self) -> None:
+        self.asked: list[int] = []
+        self.buffer = self
+
+    def read(self, size: int = -1) -> bytes:
+        self.asked.append(size)
+        return b"x" * size
+
+
+def test_put_over_the_file_cap_is_efbig(db: str, monkeypatch: pytest.MonkeyPatch, capsysbinary: Capture) -> None:
+    """#83: put reads at most MAX_FILE_SIZE + 1 bytes and refuses the excess before any database call."""
+    stdin = _BigStdin()
+    monkeypatch.setattr(sys, "stdin", stdin)
+    assert run(monkeypatch, db, "put", "/big") == 1
+    err = capsysbinary.readouterr().err.decode()
+    assert f"minifs put: EFBIG: /big: over the {MAX_FILE_SIZE}-byte limit" in err
+    assert stdin.asked == [MAX_FILE_SIZE + 1]  # the read is bounded
+    assert run(monkeypatch, db, "ls") == 0  # and nothing was created
+    assert capsysbinary.readouterr().out == b""

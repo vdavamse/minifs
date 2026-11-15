@@ -1,5 +1,5 @@
-"""``minifs`` command line: ``db migrate`` / ``db status``, and ``ls``, ``cat``, ``put``, ``rm``, ``mv``, ``glob``,
-``grep`` for humans debugging the tree."""
+"""``minifs`` command line: ``db migrate`` / ``db status``, and ``ls``, ``cat``, ``put``, ``quota``, ``rm``, ``mv``,
+``glob``, ``grep`` for humans debugging the tree."""
 
 from __future__ import annotations
 
@@ -21,12 +21,20 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from minifs._regex import RegexError
 from minifs.db.migrate import MigrationError, applied_versions, load_migrations, migrate
 from minifs.db.pool import Connector, open_pool
-from minifs.vfs.client import MAX_TIMEOUT, VFSClient
-from minifs.vfs.core import VFSError
+from minifs.vfs.client import DEFAULT_LOCK_TIMEOUT, DEFAULT_WRITE_TIMEOUT, MAX_TIMEOUT, VFSClient
+from minifs.vfs.core import MAX_FILE_SIZE, Quota, VFSError, normalize
 from minifs.vfs.glob import GlobError
 from minifs.vfs.search import DEFAULT_LIMIT, MAX_NODES, TIMEOUT, SearchRefused
 
 _CAT_CHUNK = 1 << 20
+
+
+class _Omitted:
+    """The value of a quota limit flag (``--bytes``, ``--nodes``) that wasn't given: distinct from the None that
+    its value ``none`` parses to, since an omitted limit is kept and ``none`` clears it."""
+
+
+_OMITTED = _Omitted()
 
 
 def _max_nodes(text: str) -> int | None:
@@ -39,6 +47,20 @@ def _max_nodes(text: str) -> int | None:
         raise argparse.ArgumentTypeError(f"invalid max_nodes value: {text!r}") from None
     if value < 0:
         raise argparse.ArgumentTypeError(f"max_nodes must be >= 0 or 'none', not {value}")
+    return value
+
+
+def _limit(text: str) -> int | None:
+    """A quota limit argument (``--bytes``, ``--nodes``): an int >= 0, or the word ``none`` in any case for no
+    limit on that one."""
+    if text.casefold() == "none":
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid limit: {text!r} (an integer >= 0, or 'none')") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"a limit must be >= 0 or 'none', not {value}")
     return value
 
 
@@ -71,6 +93,39 @@ def main(argv: list[str] | None = None) -> int:
     put.add_argument("source", nargs="?", help="local file to copy (default: stdin)")
     put.add_argument("-a", "--append", action="store_true", help="append instead of replacing the content")
     put.add_argument("-p", "--parents", action="store_true", help="create missing parent directories")
+    quota = _add_dsn(commands.add_parser("quota", help="show or set the quota of a directory"))
+    quota.add_argument("path")
+    quota.add_argument(
+        "--bytes",
+        type=_limit,
+        default=_OMITTED,
+        dest="max_bytes",
+        metavar="N",
+        help='cap on the bytes of the files below PATH ("none": no cap; omitted: keep the current cap)',
+    )
+    quota.add_argument(
+        "--nodes",
+        type=_limit,
+        default=_OMITTED,
+        dest="max_nodes",
+        metavar="N",
+        help='cap on the number of nodes below PATH ("none": no cap; omitted: keep the current cap)',
+    )
+    quota.add_argument("--remove", action="store_true", help="remove the quota (with --children: stop giving one)")
+    quota.add_argument(
+        "--children",
+        action="store_true",
+        help="set the quota of the directories created directly in PATH, not of PATH itself: there is no quota to "
+        "keep, so an omitted limit is no limit; re-running this with other limits changes only the child "
+        "directories without a quota of their own; setting both limits is recommended",
+    )
+    quota.add_argument(
+        "--timeout",
+        type=_timeout,
+        help=f"seconds each write may run and wait for locks, over 0 and at most {MAX_TIMEOUT:g} (default "
+        f"{DEFAULT_WRITE_TIMEOUT:g} to run, {DEFAULT_LOCK_TIMEOUT:g} to wait): setting a quota recounts its subtree, "
+        "which can be slow on a big one, and --children waits for the creates in PATH",
+    )
     rm = _add_dsn(commands.add_parser("rm", help="remove files or empty directories"))
     rm.add_argument("paths", nargs="+", metavar="path")
     glob = _add_dsn(commands.add_parser("glob", help="list the files matching a glob pattern, newest first"))
@@ -103,6 +158,13 @@ def main(argv: list[str] | None = None) -> int:
     mv.add_argument("src")
     mv.add_argument("dst")
     args = parser.parse_args(argv)
+    if args.command == "quota":
+        # The flag rules are argparse errors, so they are reported with the quota parser's usage (exit code 2).
+        # A given limit (even "none") is not _OMITTED; an omitted one is.
+        if args.remove and (args.max_bytes is not _OMITTED or args.max_nodes is not _OMITTED):
+            quota.error("--remove can't be combined with --bytes or --nodes")
+        if args.children and not (args.remove or args.max_bytes is not _OMITTED or args.max_nodes is not _OMITTED):
+            quota.error("--children needs --bytes, --nodes or --remove")
 
     label = f"db {args.db_command}" if args.command == "db" else args.command
     secrets: list[str] = []
@@ -110,7 +172,11 @@ def main(argv: list[str] | None = None) -> int:
         dsn, secrets = _connection(args, label)
         if args.command == "db":
             return asyncio.run(_migrate(dsn) if args.db_command == "migrate" else _status(dsn))
-        return asyncio.run(_with_client(dsn, _VFS_COMMANDS[args.command], args))
+        # quota's --timeout is the client's write and lock timeout for this one command: setting a quota
+        # recounts its subtree, which can outlast the default, and a child quota waits for the creates in its
+        # parent. The other commands keep their own timeouts.
+        timeout = args.timeout if args.command == "quota" else None
+        return asyncio.run(_with_client(dsn, _VFS_COMMANDS[args.command], args, timeout=timeout))
     except (MigrationError, VFSError, GlobError, RegexError, SearchRefused, psycopg.Error, OSError) as e:
         if isinstance(e, psycopg.Error) and any(len(s) < _MIN_MASKED for s in secrets):
             # Masking a password this short would garble the message and show where it matched.
@@ -301,14 +367,21 @@ def _mask(text: str, secrets: list[str]) -> str:
 
 
 async def _with_client(
-    dsn: str, command: Callable[[VFSClient, argparse.Namespace], Awaitable[int]], args: argparse.Namespace
+    dsn: str,
+    command: Callable[[VFSClient, argparse.Namespace], Awaitable[int]],
+    args: argparse.Namespace,
+    timeout: float | None = None,
 ) -> int:
     connector = Connector(dsn)
     # Connect once directly, so a bad DSN or password reports libpq's error at once rather than a pool timeout.
     async with await connector():
         pass
     async with open_pool(connector, min_size=1, max_size=1, name="minifs-cli") as pool:
-        return await command(VFSClient(pool), args)
+        if timeout is None:
+            client = VFSClient(pool)
+        else:  # the lock timeout stays above the server's deadlock_timeout (see VFSClient)
+            client = VFSClient(pool, write_timeout=timeout, lock_timeout=max(timeout, DEFAULT_LOCK_TIMEOUT))
+        return await command(client, args)
 
 
 async def _ls(vfs: VFSClient, args: argparse.Namespace) -> int:
@@ -340,7 +413,15 @@ async def _cat(vfs: VFSClient, args: argparse.Namespace) -> int:
 
 
 async def _put(vfs: VFSClient, args: argparse.Namespace) -> int:
-    data = Path(args.source).read_bytes() if args.source else sys.stdin.buffer.read()
+    # The read is bounded (#83): more than a file may hold is refused before any database call, so an
+    # oversized source is never read whole only for the write to fail.
+    if args.source:
+        with open(args.source, "rb") as source:
+            data = source.read(MAX_FILE_SIZE + 1)
+    else:
+        data = sys.stdin.buffer.read(MAX_FILE_SIZE + 1)
+    if len(data) > MAX_FILE_SIZE:
+        raise VFSError("EFBIG", normalize(args.path), f"over the {MAX_FILE_SIZE}-byte limit")
     # Look the path up, then create or write (#35). Both cost two statements for a new file; neither raises on the
     # server, which returns ENOENT. The fallback below only covers a file removed since the stat.
     try:
@@ -359,6 +440,53 @@ async def _put(vfs: VFSClient, args: argparse.Namespace) -> int:
         if e.errno != "ENOENT":  # removed since the stat
             raise
         await vfs.create(args.path, data, parents=args.parents)
+    return 0
+
+
+def _quota_line(quota: Quota) -> str:
+    """The one line ``minifs quota`` prints: the limits (``none``: no limit on that one) and the usage."""
+
+    def shown(value: int | None) -> str:
+        return "none" if value is None else str(value)
+
+    return (
+        f"max_bytes={shown(quota.max_bytes)} max_nodes={shown(quota.max_nodes)}"
+        f" used_bytes={quota.used_bytes} used_nodes={quota.used_nodes}"
+    )
+
+
+async def _quota(vfs: VFSClient, args: argparse.Namespace) -> int:
+    if args.children:
+        # A child quota has no row to read: an omitted limit is no limit here, unlike a quota's own.
+        max_bytes = None if args.max_bytes is _OMITTED else args.max_bytes
+        max_nodes = None if args.max_nodes is _OMITTED else args.max_nodes
+        if args.remove or (max_bytes is None and max_nodes is None):  # both "none" is --remove
+            await vfs.set_child_quota(args.path)
+            print("no quota")
+            return 0
+        given = await vfs.set_child_quota(args.path, max_bytes=max_bytes, max_nodes=max_nodes)
+        print(f"{given} existing directories got the quota")
+        return 0
+    if args.remove:
+        await vfs.set_quota(args.path)
+        print("no quota")
+        return 0
+    if args.max_bytes is _OMITTED and args.max_nodes is _OMITTED:
+        quota = await vfs.quota(args.path)
+    else:
+        max_bytes = args.max_bytes
+        max_nodes = args.max_nodes
+        if max_bytes is _OMITTED or max_nodes is _OMITTED:
+            # An omitted limit is kept: the current quota supplies it (without a quota, it is no limit). Read and
+            # set are two transactions, so two operators setting one quota at once can each undo the other's.
+            current = await vfs.quota(args.path)
+            if max_bytes is _OMITTED:
+                max_bytes = current.max_bytes if current is not None else None
+            if max_nodes is _OMITTED:
+                max_nodes = current.max_nodes if current is not None else None
+        # Both None (two "none"s, or nothing to keep) removes the quota, as --remove does.
+        quota = await vfs.set_quota(args.path, max_bytes=max_bytes, max_nodes=max_nodes)
+    print("no quota" if quota is None else _quota_line(quota))
     return 0
 
 
@@ -404,6 +532,7 @@ _VFS_COMMANDS: dict[str, Callable[[VFSClient, argparse.Namespace], Awaitable[int
     "ls": _ls,
     "cat": _cat,
     "put": _put,
+    "quota": _quota,
     "rm": _rm,
     "mv": _mv,
     "glob": _glob,

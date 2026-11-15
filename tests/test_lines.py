@@ -281,17 +281,40 @@ async def test_create_of_a_taken_name_with_data_changes_nothing(conn: AsyncConne
 
 
 async def test_append_to_a_partial_line_rewrites_only_the_last_extent(conn: AsyncConnection) -> None:
+    # Lines over 4 KiB, so each append past them starts an extent of its own (vfs_append re-cuts smaller ones).
+    a, b = b"a" * 5000 + b"\n", b"b" * 5000 + b"\n"
     f = await create_file(conn, "f")
-    for part in [b"a\n", b"b\n", b"c"]:
+    for part in [a, b, b"c"]:
         await append(conn, f, part)
     cur = await conn.execute("SELECT byte_offset, ctid::text FROM vfs_extents WHERE node_id = %s ORDER BY 1", (f,))
     before = await cur.fetchall()
-    assert await append(conn, f, b"d\ne") == 5
+    assert len(before) == 3
+    assert await append(conn, f, b"d\ne") == 10003
     cur = await conn.execute("SELECT byte_offset, ctid::text FROM vfs_extents WHERE node_id = %s ORDER BY 1", (f,))
     after = await cur.fetchall()
     assert after[:2] == before[:2]  # untouched
     assert after[2] != before[2]
-    await check_layout(conn, f, b"a\nb\ncd\ne")
+    await check_layout(conn, f, a + b + b"cd\ne")
+
+
+async def test_short_appends_fill_an_extent_instead_of_adding_one_each(conn: AsyncConnection) -> None:
+    """#83: an extent row costs about 200 bytes that no quota counts, so 1-byte appends each adding a row would
+    store some 200 times what they're charged. vfs_append re-cuts a last extent under 4 KiB together with the
+    data: about one row per 2 KiB of file, whatever the appends, newline-ended or not, alternating or not."""
+    f = await create_file(conn, "log")
+    await conn.execute("SELECT vfs_append(%s, '\\x0a'::bytea) FROM generate_series(1, 20000)", (f,))
+    assert await one(conn, "SELECT count(*) FROM vfs_extents WHERE node_id = %s", (f,)) == (5,)  # 20000 / 4096
+    await check_layout(conn, f, b"\n" * 20000)
+    g = await create_file(conn, "chatty")
+    pattern = [b"x", b"\n", b"yy", b"z\nw", b"\n\n"]
+    await conn.execute(
+        "SELECT vfs_append(%s, (ARRAY[%s, %s, %s, %s, %s]::bytea[])[1 + i %% 5]) FROM generate_series(0, 9999) i",
+        (g, *pattern),
+    )
+    content = b"".join(pattern) * 2000
+    (rows,) = await one(conn, "SELECT count(*) FROM vfs_extents WHERE node_id = %s", (g,))
+    assert isinstance(rows, int) and rows <= len(content) // 2048 + 1, rows
+    await check_layout(conn, g, content)
 
 
 # vfs_pread_lines
@@ -360,10 +383,19 @@ async def test_pread_lines_while_another_session_appends(conn: AsyncConnection, 
 
 
 async def test_line_reads_of_many_extents_use_index_steps(conn: AsyncConnection) -> None:
+    # One extent per line, as appends of whole lines made before 023 (now they fill 4 KiB extents, #83, and
+    # vfs_compact only merges): raw SQL, checked by check_layout.
     f = await create_file(conn, "log")
     await conn.execute(
-        "SELECT vfs_append(%s, convert_to(format('line %%s\n', i), 'UTF8')) FROM generate_series(1, 20000) i", (f,)
+        "WITH l AS (SELECT i, convert_to(format('line %%s\n', i), 'UTF8') AS d FROM generate_series(1, 20000) i)"
+        " INSERT INTO vfs_extents (node_id, generation, byte_offset, line_start, data, line_offsets)"
+        " SELECT %s, 0, coalesce(sum(length(d)) OVER (ORDER BY i ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW), 0),"
+        " i - 1, d, '{0}' FROM l",
+        (f,),
     )
+    content = "".join(f"line {i}\n" for i in range(1, 20001)).encode()
+    await conn.execute("UPDATE vfs_nodes SET size = %s, lines = 20000 WHERE id = %s", (len(content), f))
+    await check_layout(conn, f, content)
     await conn.execute("ANALYZE vfs_extents")
     for first in [1, 10_000, 19_990]:
         cur = await conn.execute("SELECT data FROM vfs_pread_lines(%s, %s, 5, 1000)", (f, first))
@@ -641,7 +673,9 @@ async def test_appends_ending_mid_line_rewrite_only_the_partial_line(conn: Async
         content += part
         after = await (await conn.execute(query, (f,))).fetchall()
         assert after[: max(len(before) - 1, 0)] == before[:-1], "only the last extent was rewritten"
-        assert (await extent_rows(conn, f))[-1][3] == f"{i:04}-head".encode()
+        last = (await extent_rows(conn, f))[-1][3]
+        # The partial line alone, or a last extent of at most 4 KiB that the append re-cut whole (#83).
+        assert last == f"{i:04}-head".encode() or (len(last) <= 4096 and last.endswith(f"{i:04}-head".encode()))
     await check_layout(conn, f, content)
 
 
@@ -671,13 +705,134 @@ async def test_repeatable_read_append_to_a_newline_ended_file_after_a_concurrent
 ) -> None:
     # The file ends with \n, so the append deletes nothing, and compaction only locked the inode, so nothing
     # conflicts: the append counts lines from the last extent its snapshot sees, whose numbers compaction kept.
+    # The last line is over 4 KiB, so the append doesn't re-cut that extent (vfs_append does for smaller ones).
+    long = b"b" * 5000 + b"\n"
     f = await create_file(conn, "log")
-    for part in [b"a\n", b"b\n", b"c\n"]:
+    for part in [b"a\n", long]:
         await append(conn, f, part)
     async with await AsyncConnection.connect(db) as late:
         await late.set_isolation_level(psycopg.IsolationLevel.REPEATABLE_READ)
         await late.execute("SELECT 1")  # takes the snapshot
-        assert await compact(conn, f) == 2
-        assert await append(late, f, b"d") == 6
+        assert await compact(conn, f) == 1
+        assert await append(late, f, b"d") == 5003
         await late.commit()
-    await check_layout(conn, f, b"a\nb\nc\nd")
+    await check_layout(conn, f, b"a\n" + long + b"d")
+
+
+# The streaming vfs_cut of 023 against 007's rule, literally reimplemented in Python: the same rows, whatever
+# the data, the target and the split_tail flag.
+
+
+def cut_reference(data: bytes, target: int, split_tail: bool) -> list[tuple[int, int, bytes, list[int]]]:
+    """007's vfs_cut in Python: first the length of every line (each ``\\n`` ends a line; a last line without
+    one is the tail), then the placement loop with the ``p_split_tail`` rule."""
+    lengths = [len(line) for line in split_lines(data)]
+    tail = bool(data) and not data.endswith(b"\n")
+    pieces: list[tuple[int, int, bytes, list[int]]] = []
+    rel_offset = 0
+    rel_line = 0
+    pos = 0  # where the current line starts
+    offsets: list[int] = []
+    for i, length in enumerate(lengths, 1):
+        if pos > rel_offset and (pos - rel_offset + length > target or (split_tail and tail and i == len(lengths))):
+            pieces.append((rel_offset, rel_line, data[rel_offset:pos], offsets))
+            rel_line += len(offsets)
+            rel_offset = pos
+            offsets = []
+        offsets.append(pos - rel_offset)
+        pos += length
+    if pos > rel_offset:
+        pieces.append((rel_offset, rel_line, data[rel_offset:pos], offsets))
+    return pieces
+
+
+async def cut_rows(
+    conn: AsyncConnection, data: bytes, target: int, split_tail: bool
+) -> list[tuple[int, int, bytes, list[int]]]:
+    """The rows of ``vfs_cut(data, target, split_tail)``, as ``cut_reference`` returns them."""
+    cur = await conn.execute("SELECT * FROM vfs_cut(%s, %s, %s)", (data, target, split_tail))
+    return [(o, n, bytes(d), list(lo)) for o, n, d, lo in await cur.fetchall()]
+
+
+async def test_cut_matches_the_reference_over_random_data(conn: AsyncConnection) -> None:
+    """300 short cases over newline-heavy alphabets (including the bytes the escape encoding expands), small
+    targets and both split_tail values, all cut in one statement."""
+    rng = random.Random(83)
+    alphabets = (b"\n", b"a\n", b"\\", b"\xff", b"\x00", b"abc")
+    targets = (1, 2, 3, 7, 64)
+    # Each drawn on its own: tied to the case's index, split_tail=True only ever met the alphabets that leave no
+    # newline-less tail, and the tail rule went untested.
+    datas = [bytes(rng.choice(rng.choice(alphabets)) for _ in range(rng.randrange(0, 401))) for _ in range(300)]
+    used = [rng.choice(targets) for _ in range(300)]
+    splits = [rng.random() < 0.5 for _ in range(300)]
+    cur = await conn.execute(
+        "SELECT q.i, c.rel_offset, c.rel_line, c.data, c.line_offsets"
+        " FROM unnest(%s::bytea[], %s::int[], %s::bool[]) WITH ORDINALITY AS q(data, target, split, i)"
+        " LEFT JOIN LATERAL vfs_cut(q.data, q.target, q.split) c ON true"
+        " ORDER BY q.i, c.rel_offset",
+        (datas, used, splits),
+    )
+    got: dict[int, list[tuple[int, int, bytes, list[int]]]] = {}
+    for i, rel_offset, rel_line, data, offsets in await cur.fetchall():
+        if rel_offset is not None:  # a LEFT JOIN row of a case vfs_cut gave no rows for (empty data)
+            got.setdefault(i, []).append((rel_offset, rel_line, bytes(data), list(offsets)))
+    for i, data in enumerate(datas):
+        assert got.get(i + 1, []) == cut_reference(data, used[i], splits[i]), (data, used[i], splits[i])
+
+
+async def test_cut_matches_the_reference_across_the_encoding_windows(conn: AsyncConnection) -> None:
+    """Over 1 MB, with lines spanning the encoding windows: 023 places each line as its ``\\n`` is found and
+    carries an open line across windows, where 007 kept every line's length first; the rows are the same."""
+    rng = random.Random(83)
+    data = b"".join(rng.choice([b"\n", b"ab\\", b"\xff\x00" * 50, b"x" * 3000]) for _ in range(400))
+    data += b"L" * 1_500_000 + b"\n" + b"\xff" * 1_200_000 + b"\ntail"
+    for split_tail in (False, True):
+        assert await cut_rows(conn, data, TARGET, split_tail) == cut_reference(data, TARGET, split_tail)
+
+
+@pytest.mark.parametrize("split_tail", [False, True])
+async def test_cut_matches_the_reference_on_the_edge_cases(conn: AsyncConnection, split_tail: bool) -> None:
+    cases = [
+        (b"", 1),  # empty data
+        (b"\n", 1),  # a single \n
+        (b"no newlines at all", 3),  # no \n at all
+        (b"aaa\n", 4),  # a line exactly target long
+        (b"aaa\nbbb\n", 4),
+        (b"aaaa\n", 4),  # a line of target + 1
+        (b"aaa\naaaa\nbbb\n", 3),
+        (b"a\nb", 64),  # a tail that fits with the line before it: split_tail alone splits it off
+        (b"a\nb\nccc", 64),
+    ]
+    for data, target in cases:
+        assert await cut_rows(conn, data, target, split_tail) == cut_reference(data, target, split_tail), (
+            data,
+            target,
+        )
+
+
+WINDOW = 1048576  # vfs_cut's encoding window (its c_window): this much is escaped and split at a time
+
+
+@pytest.mark.parametrize("target", [TARGET, 1])
+@pytest.mark.parametrize("split_tail", [False, True])
+async def test_cut_matches_the_reference_at_the_window_boundaries(
+    conn: AsyncConnection, target: int, split_tail: bool
+) -> None:
+    """Deterministic cases at the edges of the encoding windows, where 023's streaming cut carries an open line
+    from one window to the next: a \\n as a window's last byte and as the next window's first byte, data of
+    exactly one window, one with no \\n at all, and one a byte over. Long lines and few \\n, so that even at
+    target 1 the reference makes a row per line, not per byte."""
+    cases = [
+        b"x" * (WINDOW - 1) + b"\n",  # exactly one window, ending in \n
+        b"y" * (WINDOW - 1) + b"\n" + b"z" * 9 + b"\n",  # a \n as the window's last byte: the line ends at the edge
+        b"w" * WINDOW + b"\n" + b"v" * 9 + b"\n",  # a \n as the second window's first byte: that line spans
+        b"n" * WINDOW,  # exactly one window with no \n at all
+        b"m" * WINDOW + b"\n",  # one byte over a window, and its last byte is a \n
+    ]
+    for i, data in enumerate(cases):
+        assert await cut_rows(conn, data, target, split_tail) == cut_reference(data, target, split_tail), (
+            i,
+            len(data),
+            target,
+            split_tail,
+        )

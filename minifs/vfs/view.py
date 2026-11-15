@@ -61,6 +61,7 @@ from minifs.vfs import glob as globbing
 from minifs.vfs import search as searching
 from minifs.vfs.client import DEFAULT_LINE_BYTES, DEFAULT_LINE_LIMIT, DEFAULT_READ_LIMIT, MAX_TIMEOUT, VFSClient
 from minifs.vfs.core import (
+    MAX_FILE_SIZE,
     Entry,
     FileVersion,
     GlobResult,
@@ -174,7 +175,10 @@ class VFSView:
     rules for, for mounts that nest, visibly or in the real tree (two visible names for one node would let
     the policy on one name be bypassed through the other), and for a mount with a prefix that isn't in normal
     form, a real prefix of ``/``, or one in ``/workspaces`` that isn't one whole workspace. Build an agent's
-    mounts with ``workspace_mounts``. ``watcher`` (the process's, ``VFS.watcher``) serves ``watch``."""
+    mounts with ``workspace_mounts``. ``watcher`` (the process's, ``VFS.watcher``) serves ``watch``.
+    ``max_write`` caps the bytes of one ``create``, ``write`` or ``append`` for this actor (EFBIG over it, before any
+    round trip); it can only lower the file size cap every write has (``MAX_FILE_SIZE``), and is None for that cap.
+    What a workspace holds in all is capped by its quota (``VFSClient.set_child_quota``), not by the view."""
 
     def __init__(
         self,
@@ -184,6 +188,7 @@ class VFSView:
         actor: str,
         *,
         watcher: Watcher | None = None,
+        max_write: int | None = None,
     ) -> None:
         if actor not in policy.actors:
             raise ValueError(f"the policy has no rules for actor {actor!r}")
@@ -200,6 +205,9 @@ class VFSView:
         self.policy = policy
         self.actor = actor
         self._watcher = watcher
+        if max_write is not None and not 0 <= max_write <= MAX_FILE_SIZE:
+            raise ValueError(f"max_write must be between 0 and {MAX_FILE_SIZE} bytes, not {max_write}")
+        self.max_write = MAX_FILE_SIZE if max_write is None else max_write
 
     # Reads
 
@@ -645,6 +653,8 @@ class VFSView:
         target = self._creatable(path, parents)
         if target.is_mount_point:  # the mount's root is missing: it can only become a directory
             raise VFSError("EISDIR", target.visible, "a mount point")
+        if data is not None:
+            self._check_write(target, data)
         return await self._mapped(self._client.create(_real(target), data, parents=parents), target)
 
     async def mkdir(self, path: str, *, parents: bool = False) -> UUID:
@@ -666,6 +676,7 @@ class VFSView:
         target = self._target(path, "append")
         if target.real is None:
             raise VFSError("EISDIR", target.visible)
+        self._check_write(target, data)
         return await self._mapped(self._client.append(_real(target), data), target)
 
     async def write(self, path: str, data: bytes, *, expect: FileVersion | None = None) -> FileVersion:
@@ -673,6 +684,7 @@ class VFSView:
         target = self._target(path, "write")
         if target.real is None:
             raise VFSError("EISDIR", target.visible)
+        self._check_write(target, data)
         return await self._mapped(self._client.write(_real(target), data, expect=expect), target)
 
     async def rename(self, src: str, dst: str) -> None:
@@ -727,6 +739,11 @@ class VFSView:
             if not (virtual_read and self._virtual_readable(target.path)):
                 self.policy.check(self.actor, action, target.visible, count_denials=count_denials)
         return target
+
+    def _check_write(self, target: _Target, data: bytes) -> None:
+        """EFBIG at ``target`` for ``data`` over ``max_write``, after the policy check (a denial comes first)."""
+        if len(data) > self.max_write:
+            raise VFSError("EFBIG", target.visible, f"{len(data)} bytes, over the {self.max_write}-byte limit")
 
     def _creatable(self, path: str, parents: bool) -> _Target:
         """``path``, to be created (with its missing parents); EEXIST for a virtual directory."""

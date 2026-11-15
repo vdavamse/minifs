@@ -659,3 +659,23 @@ async def test_a_write_that_times_out_still_says_to_write_less(view: VFSView, mo
     monkeypatch.setattr(view, "write", failing)
     message = await retry_message(Write, Deps(view), content="mine\n", filePath="notes.md")
     assert message == TIMED_OUT_WRITE.format(path="/workspace/notes.md")
+
+
+# Write limits (#83)
+
+
+async def test_a_quota_refusal_gives_the_model_the_quota_text(view: VFSView, client: VFSClient) -> None:
+    """EDQUOT (migration 023) reaches the model as a retry with the quota text, at the visible path, and
+    leaves nothing written."""
+    await client.set_quota(f"/workspaces/{W1}", max_bytes=10)
+    message = await retry_message(Write, Deps(view), content="x" * 50, filePath="big.txt")
+    assert message == "Quota exceeded at /workspace/big.txt: remove files you no longer need, or write less."
+    assert not [e for e in await client.readdir(f"/workspaces/{W1}") if e.name == "big.txt"]
+
+
+async def test_a_write_over_max_write_gives_the_model_the_efbig_text(view: VFSView, client: VFSClient) -> None:
+    """EFBIG from the view's ``max_write`` reaches the model as a retry with its text, before any round trip."""
+    limited = VFSView(client, workspace_mounts(W1), view.policy, view.actor, max_write=10)
+    message = await retry_message(Write, Deps(limited), content="x" * 11, filePath="big.txt")
+    assert message == "File too large: /workspace/big.txt. Split the content into smaller files."
+    assert not [e for e in await client.readdir(f"/workspaces/{W1}") if e.name == "big.txt"]
