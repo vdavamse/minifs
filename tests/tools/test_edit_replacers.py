@@ -338,8 +338,8 @@ def _splice(
 
 def _cr_hint(old_v: str, crlf: list[int]) -> str:
     """The oracle's line-ending hint (#143): where the file has CRs Read hid and oldString holds a CR, real or
-    escaped."""
-    if crlf and ("\r" in old_v or "\\r" in old_v):
+    escaped where a line ending would be (before a newline, a backslash-n or the end; ``C:\\repo`` is a path)."""
+    if crlf and ("\r" in old_v or re.search(r"\\r(?:\\n|\n|$)", old_v)):
         return (
             " If oldString was meant to hold a line ending's CR: Read doesn't show those, and oldString can't target"
             " them; to change line endings, use Write."
@@ -772,26 +772,27 @@ def test_an_ambiguous_match_outranks_a_refusal() -> None:
 
 
 CRLF_BLOCK = "def f():\r\n    alpha = 1\r\n    beta  = 2\r\n    gamma = 3\r\nend\r\n"
-"""A CRLF file for the #127 cases: the replacers split on ``\\n``, so every line keeps its ``\\r`` and a
-whole-line candidate ends with it, the file's line ending."""
+"""A CRLF file for the #127 cases. On the raw content the replacers split on ``\\n``, so every line kept its
+``\\r`` and a whole-line candidate ended with it, the file's line ending, which the replacement dropped. Since
+#143 they run on the LF view, where no line ending has a CR, and the span is mapped back around it."""
 
 
 def test_a_fuzzy_match_in_a_crlf_file_keeps_the_line_ending() -> None:
-    """A fuzzy candidate in a CRLF file ends with its last line's ``\\r``: that ``\\r`` is the file's line
-    ending, not text the model wrote, and the CRLF-converted newString doesn't end in ``\\r``, so the
-    replacement keeps it and the file is left without a bare LF (#127)."""
+    """The issue's repro (#127): a fuzzy block match in a CRLF file left a bare LF, as the raw candidate ended
+    with its last line's ``\\r`` and the replacement didn't. On the LF view the candidate ends before the line
+    ending, and the mapped span leaves the whole ``\\r\\n`` in the file (#143)."""
     for search in (new.replace, replace):
         assert search("alpha\r\nbeta\r\ngamma\r\ndelta\r\n", "alpha\r\nbetx\r\ngamma", "A\r\nB\r\nC") == (
             "A\r\nB\r\nC\r\ndelta\r\n"
         )
 
 
-def test_each_line_based_replacers_candidate_keeps_its_trailing_cr() -> None:
-    """Each line-based replacer's candidate in a CRLF file ends with its last line's ``\\r``, and the
-    replacement keeps it, so the output has no bare LF (#127). Each find routes to the named replacer (the
-    earlier ones find nothing). The indentation-flexible matcher isn't here: its candidate compares equal to the
-    de-indented find, so it ends in ``\r`` only when the find does, and that CR is then the model's own, which
-    the END rule leaves to the model. The context-aware find departs from the issue's
+def test_each_line_based_replacer_keeps_the_crlf_line_ending() -> None:
+    """Each line-based replacer's match in a CRLF file keeps the file's line ending, so the output has no bare LF
+    (#127). On the raw content each candidate ended with its last line's ``\\r``, which the replacement dropped;
+    on the LF view (#143) it ends before the line ending, which the mapped span leaves in the file. Each find
+    routes to the named replacer on the view (the earlier ones find nothing). The indentation-flexible matcher
+    isn't here: line-trimmed always finds the same window first. The context-aware find departs from the issue's
     example (a ``zzz = 9`` middle between two exact middles still scores 0.78 at the block anchors, which win):
     with one exact and one wholly different middle the block score is 0.5 (< 0.65) and the context match is
     1/2 (>= 0.5), so the context-aware matcher is the one that yields."""
@@ -822,7 +823,9 @@ def test_each_line_based_replacers_candidate_keeps_its_trailing_cr() -> None:
         ),
     ]
     for replacer, find, new_string, expected in cases:
-        assert next(islice(replacer(CRLF_BLOCK, find), 1)).endswith("\r"), replacer.__name__
+        view, _ = _lf_view(CRLF_BLOCK)
+        candidate = next(islice(replacer(view, find.replace("\r\n", "\n")), 1))  # the named replacer yields
+        assert "\r" not in candidate, replacer.__name__
         for search in (new.replace, replace):
             out = search(CRLF_BLOCK, find, new_string)
             assert out == expected, (replacer.__name__, find)
@@ -840,18 +843,18 @@ def test_replace_all_keeps_the_crlf_ending_of_every_fuzzy_candidate() -> None:
 
 
 def test_deleting_a_fuzzy_crlf_block_leaves_its_line_ending() -> None:
-    """Deleting a block with an empty newString leaves its candidate's trailing ``\\r`` plus the ``\\n`` that
-    follows it in the file, ``\\r\\n``, as an LF file leaves ``\\n`` (#127)."""
+    """Deleting a block with an empty newString leaves the line ending after it, ``\\r\\n``, as an LF file leaves
+    ``\\n`` (#127): the view span ends before that line's LF, and maps back to end before its CR (#143)."""
     for search in (new.replace, replace):
         assert search("alpha\r\nbeta\r\ngamma\r\ndelta\r\n", "alpha\r\nbetx\r\ngamma", "") == "\r\ndelta\r\n"
         assert search("alpha\nbeta\ngamma\ndelta\n", "alpha\nbetx\ngamma", "") == "\ndelta\n"
 
 
-def test_the_crlf_guard_looks_at_the_file_not_at_oldstring() -> None:
-    """A find whose last line ends with a ``\\r`` of its own still gets the file's line ending kept: the guard
-    is the ``\\n`` right after the occurrence in the file, not what oldString ends with (#127), and a fuzzy
-    replacer may match an oldString whose trailing ``\\r`` was whitespace it ignored. With an oldString guard
-    the line-trimmed candidate's trailing CR was dropped here, leaving a bare LF after the replacement."""
+def test_a_find_ending_in_a_cr_of_its_own_keeps_the_files_line_ending() -> None:
+    """A find whose last line ends with a lone ``\\r`` of its own, which line-trimmed ignores as whitespace,
+    still leaves the file's line ending in place (#127): #127's first guard looked at what oldString ended with
+    and dropped the candidate's trailing CR here, leaving a bare LF. On the LF view the file's lone CRs are
+    content like any other character and the span maps back around the pairs (#143)."""
     content = '  \r\n\x1c\r\n\r\n`xx\r\n\\\r\n\r\n\r\r\r\n\xa0\r\n\r\n\r\n\x1c"\r\n\\$ '
     find = "  \r\n   `xx\r\n \\\r\n \r\n  \r\r"
     for search in (new.replace, replace):
@@ -910,7 +913,11 @@ def test_could_not_find_names_the_line_ending_when_oldstring_holds_a_cr() -> Non
         for find in ("\r", "foo\\r"):
             with pytest.raises(ValueError, match="Could not find.*If oldString was meant.*Read doesn't show"):
                 search("foo\r\nbar\r\n", find, "")
-        for content, find in (("foo\nbar\n", "x\r"), ("foo\r\nbar\r\n", "baz")):
+        for content, find in (
+            ("foo\nbar\n", "x\r"),
+            ("foo\r\nbar\r\n", "baz"),
+            ('p = "C:\\repo\\app"\r\nx\r\n', 'p = "C:\\repos\\app"'),  # a path's backslash-r is no line ending
+        ):
             with pytest.raises(ValueError, match="Could not find") as e:
                 search(content, find, "")
             assert "Read doesn't show" not in str(e.value)
@@ -994,12 +1001,11 @@ def test_replace_all_maps_every_occurrence_back_on_its_own() -> None:
 
 
 def test_a_candidate_starting_with_lf_takes_the_cr_of_its_pair() -> None:
-    """A candidate that starts with ``\\n`` right after a ``\\r`` holds the pair's ``\\n``, so the pair's
-    ``\\r`` joins the span (START rule, #127). The old code split the pair and left a lone CR: the escape
-    matcher unescapes the literal ``\\n`` of oldString to a real one, and the replacement of the candidate
-    ``"\\nfoo"`` gave ``"x\\r\\r\\nFOO\\r\\ny\\r\\n"``."""
+    """A candidate that starts with a pair's ``\\n`` takes the pair's ``\\r`` too: the escape matcher unescapes
+    the literal ``\\n`` of oldString to a real one, and the view span starting at that LF maps back to start at its
+    CR (#143). Before #127 the pair was split and a lone CR left: ``"x\\r\\r\\nFOO\\r\\ny\\r\\n"``."""
     content = "x\r\nfoo\r\ny\r\n"
-    assert next(islice(new.escape_normalized_replacer(content, "\\nfoo"), 1)) == "\nfoo"
+    assert next(islice(new.escape_normalized_replacer(_lf_view(content)[0], "\\nfoo"), 1)) == "\nfoo"
     for search in (new.replace, replace):
         assert search(content, "\\nfoo", "\r\nFOO") == "x\r\nFOO\r\ny\r\n"
         assert search(content, "\\nfoo", "FOO") == "xFOO\r\ny\r\n"
@@ -1037,12 +1043,12 @@ def test_an_escaped_lf_cr_candidate_needs_a_lone_cr_in_the_file() -> None:
 
 
 def test_a_file_ending_in_a_lone_cr_keeps_it() -> None:
-    """A candidate's trailing ``\\r`` at the very end of the file (no ``\\n`` after) is a line ending the model
-    never saw a pair of: the END rule counts the end of the file like a following ``\\n`` and keeps the CR
-    (#127); the old guard dropped it. The line-trimmed candidate for ``"  a\\n  b"`` in ``"a\\r\\nb\\r"`` is
-    ``"a\\r\\nb\\r"``. The newString is the CRLF one ``_edit`` passes for this file; with a bare-LF one (a
-    caller's own doing) the file's final CR is still kept."""
-    assert next(islice(new.line_trimmed_replacer("a\r\nb\r", "  a\n  b"), 1)) == "a\r\nb\r"
+    """A final lone ``\\r`` (no ``\\n`` after) is hidden by Read like a line ending's, so the view drops it and a
+    span reaching the view's end maps back to stop before it: the CR stays (#127, #143). On the raw content the
+    line-trimmed candidate was ``"a\\r\\nb\\r"`` and #127's first guard dropped the CR; on the view it is
+    ``"a\\nb"``. The newString is the CRLF one ``_edit`` passes for this file; with a bare-LF one (a caller's own
+    doing) the file's final CR is still kept."""
+    assert next(islice(new.line_trimmed_replacer(_lf_view("a\r\nb\r")[0], "  a\n  b"), 1)) == "a\nb"
     for search in (new.replace, replace):
         assert search("a\r\nb\r", "  a\n  b", "A\r\nB") == "A\r\nB\r"
         assert search("a\r\nb\r", "  a\n  b", "A\nB") == "A\nB\r"

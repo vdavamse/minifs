@@ -9,9 +9,10 @@ interrupt. ``replace`` departs from ladderframe on purpose where it edited the w
 exact ``oldString`` is reported, block anchors alone don't take the line between them, a block-anchored match
 longer than ``oldString``, whose extra non-blank lines would be deleted unseen, is refused with a retry unless
 a stricter replacer finds the text, with ``replaceAll`` a whitespace candidate of a non-blank ``oldString``
-is refused, and a fuzzy match is made on an LF view of the file and mapped back, so a match never splits a CRLF
-line ending; a line-ending CR, which Read hides, can't be targeted by ``oldString`` (#127, #143),
-and an edit that leaves the file as it was is reported rather than a silent success (#143).
+is refused, every match is made on an LF view of the file (the file as Read shows it) and mapped back, so a
+match never splits a CRLF line ending, a line-ending CR can't be targeted by ``oldString``, and in a file of mixed
+endings a CRLF line and an LF line read alike, so an ``oldString`` matching both is ambiguous (#127, #143), and
+an edit that leaves the file as it was is reported rather than a silent success (#143).
 ``replace`` runs under a deadline (``EditSettings.timeout``), since the whole search runs in a worker thread that
 can't be cancelled and holds the GIL while it works (#80).
 
@@ -802,8 +803,13 @@ CR_HINT = (
 
 def _cr_hint(old_v: str, crlf: array[int]) -> str:
     """The line-ending hint for an error (#143): only where the file has CRLF pairs (or a final CR) Read hid, and
-    oldString holds a CR, real or escaped (the escape matcher reads ``\\r`` as one). A guess, so it says "if"."""
-    return CR_HINT if crlf and ("\r" in old_v or "\\r" in old_v) else ""
+    oldString holds a CR, real or escaped where a line ending would be: a backslash-r before a newline, a
+    backslash-n or the end (the escape matcher reads ``\\r`` as a CR, but ``C:\\repo`` is a path, not a line
+    ending). A guess, so it says "if"."""
+    return CR_HINT if crlf and ("\r" in old_v or _ESCAPED_CR_ENDING.search(old_v)) else ""
+
+
+_ESCAPED_CR_ENDING = re.compile(r"\\r(?:\\n|\n|$)")
 
 
 def _changed(content: str, result: str, old_v: str, crlf: array[int]) -> str:

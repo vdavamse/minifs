@@ -112,9 +112,8 @@ async def test_keeps_crlf_and_bom(deps: Deps, client: VFSClient) -> None:
 
 
 async def test_a_fuzzy_match_keeps_the_crlf_line_ending(deps: Deps, client: VFSClient) -> None:
-    """A fuzzy candidate in a CRLF file ends with its last line's ``\\r``, the file's line ending rather than
-    text the model wrote, so the replacement keeps it and the file is left without a bare LF (#127); the same
-    in a BOM file."""
+    """A fuzzy match in a CRLF file keeps the file's line ending and leaves no bare LF (#127); the same in a BOM
+    file. The match is made on the LF view and mapped back, so the span ends before the ``\\r\\n`` (#143)."""
     await put(client, "win.txt", b"alpha\r\nbeta\r\ngamma\r\ndelta\r\n")
     await edit(deps, "win.txt", "alpha\nbetx\ngamma", "A\nB\nC")
     assert await content(client, "win.txt") == b"A\r\nB\r\nC\r\ndelta\r\n"
@@ -124,15 +123,30 @@ async def test_a_fuzzy_match_keeps_the_crlf_line_ending(deps: Deps, client: VFSC
 
 
 async def test_a_fuzzy_match_in_a_mixed_endings_file(deps: Deps, client: VFSClient) -> None:
-    """A mixed-endings file keeps today's semantics (#127): newString arrives converted to the detected
-    ending (CRLF), and only the matched span's bytes change. The candidate ``two\\nthree\\r\\nfour`` ends
-    before the file's own LF after ``four``, which is untouched, and the bytes around the span are kept."""
+    """In a mixed-endings file newString arrives converted to the detected ending (CRLF), and only the matched
+    span's bytes change (#127). The view candidate ``two\\nthree\\nfour`` maps back to ``two\\nthree\\r\\nfour``,
+    which ends before the file's own LF after ``four``; that LF and the bytes around the span are kept (#143)."""
     await put(client, "mixed.txt", b"one\r\ntwo\nthree\r\nfour\nfive\r\n")
     await edit(deps, "mixed.txt", "two\nthrex\nfour", "2\n3\n4")
     data = await content(client, "mixed.txt")
     assert data == b"one\r\n2\r\n3\r\n4\nfive\r\n"
     assert data.startswith(b"one\r\n")  # the bytes before the matched span are unchanged
     assert data.endswith(b"\nfive\r\n")  # the file's own LF after the span, and what follows it, are unchanged
+
+
+async def test_a_line_ending_cr_is_not_the_models_to_edit(deps: Deps, client: VFSClient) -> None:
+    """Through the tool (#143): ``_edit`` converts oldString to the file's ending and ``replace`` folds it back,
+    so a CR the model writes before a line end can only match a lone CR. On a CRLF file ``"foo\\r"`` -> ``"foo"``
+    matches ``foo`` and changes nothing, which is a retry naming the hidden line-ending CR, not a silent success;
+    a line that is CRLF in one place and LF in another is ambiguous, as Read shows both alike. The file is
+    unchanged either way."""
+    await put(client, "win.txt", b"foo\r\nbar\r\n")
+    message = await edit_retry(deps, "win.txt", "foo\r", "foo")
+    assert "No changes to apply" in message and "line ending" in message
+    assert await content(client, "win.txt") == b"foo\r\nbar\r\n"
+    await put(client, "mixed.txt", b"foo\r\nbar\nfoo\nbar\r\n")
+    assert "multiple matches" in await edit_retry(deps, "mixed.txt", "foo\nbar", "X")
+    assert await content(client, "mixed.txt") == b"foo\r\nbar\nfoo\nbar\r\n"
 
 
 async def test_a_block_that_leaves_out_lines_is_a_retry(deps: Deps, client: VFSClient) -> None:
