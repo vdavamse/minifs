@@ -414,9 +414,14 @@ def replace(content: str, old_string: str, new_string: str, replace_all: bool = 
         # found it more than once, the ambiguity is (the refused block is not what was meant).
         if refusal is not None:
             raise refusal
+        # departs from ladderframe (#143): a CR in oldString can't be a line ending's, which Read hides
+        cr = (
+            " A CR at the end of a line is the file's line ending, which Read doesn't show and oldString can't"
+            " target; to change line endings, use Write."
+        )
         raise ValueError(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
-            "and line endings."
+            "and line endings." + (cr if "\r" in old_v and crlf else "")
         )
     raise ValueError(MULTIPLE_MATCHES)
 
@@ -888,6 +893,32 @@ def test_an_edit_that_changes_nothing_is_reported() -> None:
         with pytest.raises(ValueError, match="No changes to apply") as e:
             search("    foo\nbar\n", "foo  ", "    foo")  # line-trimmed: the candidate `    foo` is newString
         assert "line ending" not in str(e.value)
+
+
+def test_could_not_find_names_the_line_ending_when_oldstring_holds_a_cr() -> None:
+    """Review of #143: "Could not find ... including line endings" alone invites a retry with more CRs. When
+    oldString holds a CR and the file has CRLF pairs, the answer says the line-ending CR can't be targeted; an LF
+    file or a find without a CR gets the plain answer."""
+    for search in (new.replace, replace):
+        with pytest.raises(ValueError, match="Could not find.*Read doesn't show"):
+            search("foo\r\nbar\r\n", "\r", "")
+        for content, find in (("foo\nbar\n", "x\r"), ("foo\r\nbar\r\n", "baz")):
+            with pytest.raises(ValueError, match="Could not find") as e:
+                search(content, find, "")
+            assert "Read doesn't show" not in str(e.value)
+
+
+def test_a_replace_all_without_line_breaks_in_a_crlf_file_is_one_str_replace() -> None:
+    """Review of #143: an exact replaceAll in a CRLF file went through the span map, about 500 times slower than
+    ``str.replace`` (2 s on 10 MB) and after the deadline. A search with no CR or LF has the same occurrences in the
+    content as in the view, so ``str.replace`` on the content is exact; the result matches the oracle's mapped
+    splice, a final lone CR included."""
+    for content in ("ab\r\nab\nab\rab\r", "\r\nab\r\n"):
+        assert new.replace(content, "a", "x", True) == replace(content, "a", "x", True) == content.replace("a", "x")
+    big = "ab\r\n" * 2_500_000
+    started = time.perf_counter()
+    assert new.replace(big, "a", "x", True) == "xb\r\n" * 2_500_000
+    assert time.perf_counter() - started < 1.5
 
 
 def test_a_fuzzy_cr_removal_needs_a_lone_cr_in_the_file() -> None:

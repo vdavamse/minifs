@@ -751,8 +751,11 @@ def replace(
                     # the CRs Read hides — a line ending's, and the content's final lone one — are no match's to
                     # take, since the model never saw them and oldString can't name them.
                     if replace_all:
-                        if search == old_v and not crlf:
-                            return _changed(content, content.replace(search, new_string), old_v)  # an LF file
+                        # one pass, no mapping: an LF file's view is the content, and a search with no CR or LF has
+                        # the same occurrences in the content as in the view (a fold only touches a CRLF pair or a
+                        # final CR, neither of which such a search can contain or straddle)
+                        if not crlf or ("\r" not in search and "\n" not in search):
+                            return _changed(content, content.replace(search, new_string), old_v)
                         return _changed(content, _splice(content, view, crlf, search, index, new_string, True), old_v)
                     # A second occurrence, searched forwards: str.rfind has no linear-time algorithm, and one
                     # call on a repetitive file ran for seconds that no deadline could interrupt.
@@ -781,7 +784,7 @@ def replace(
             raise refusal
         raise ValueError(
             "Could not find oldString in the file. It must match exactly, including whitespace, indentation, "
-            "and line endings."
+            "and line endings." + (NO_CHANGE_CR if "\r" in old_v and crlf else "")
         )
     raise ValueError(MULTIPLE_MATCHES)
 
@@ -807,8 +810,11 @@ def _lf_view(content: str) -> tuple[str, array[int]]:
     ascending (#143). Read shows the file this way: it drops the ``\\r`` of every line ending, and a final lone
     ``\\r`` too, so the model's ``oldString`` can hold neither, and matching on the view is matching on what the
     model saw. An LF file has no pair and no final CR: the view *is* the content and its indices are empty, so a
-    match costs no mapping."""
-    view = content.replace("\r\n", "\n")  # the same object where the content has no CRLF pair
+    match costs no mapping. The view mirrors Read's ``removesuffix("\\r")`` per line (read.py): if Read changes
+    which CRs it hides, this must change with it."""
+    if "\r" not in content:  # no pair and no final CR: skip the regex pass
+        return content, array("q")
+    view = content.replace("\r\n", "\n")
     # the k-th pair (0-based) starts at m.start() in the content, and its LF is at m.start() - k in the view: the
     # k pairs before it are one character shorter each there
     crlf = array("q", (m.start() - k for k, m in enumerate(re.finditer("\r\n", content))))
