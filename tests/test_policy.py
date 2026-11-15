@@ -242,6 +242,8 @@ def test_fold_segment_enumerates_a_positive_class() -> None:
     # the fullwidth range gains a-z, its members' folds, and nothing else
     assert all(fnmatchcase(c, fw) for c in [*ASCII_LOWER, FW_UPPER_A, FW_UPPER_Z])
     assert not fnmatchcase("A", fw) and not fnmatchcase("_", fw) and not fnmatchcase("-", fw)
+    many = "[A-Z" + "".join(chr(b) + "-" + chr(b + 4000) for b in range(0x4E00, 0x4E00 + 5 * 4001, 4001)) + "]"
+    assert _fold_segment(many) == many  # five 4000-wide ranges: over 16384 candidates in all, no folds gained
     wide = "[A-" + FW_UPPER_Z + "]x"  # a range wider than 4096: the class stays as written, gaining no folds
     assert _fold_segment(wide) == "[A-" + FW_UPPER_Z + "]x"
     sharp = "stra[" + SHARP_S + "]e"

@@ -23,8 +23,11 @@ that missed a variant would leak it, while a loosened grant would grant more tha
 actions is a grant and stays exact. A hide rule's positive ``[...]`` class also matches the folded forms of
 the characters it lists or spans (``[A-Z]`` hides ``readme`` too); a segment with a negated class
 (``[!...]``) matches byte for byte only (``[!a-z]*`` hides ``README`` but not ``readme``); a member that
-folds to several characters (the sharp s) is matched only as written; and a class with a range spanning more
-than 4096 code points gains no folds. A segment with a character that folds
+folds to several characters (the sharp s) is matched only as written; a class whose text holds an ``x-y``
+spanning more than 4096 code points (a range, or a literal ``-`` between two far-apart characters), or whose
+spans add up to more than 16384, gains no folds; and a combining mark next to a class doesn't compose with
+what the class matches (``[A-Z]`` + U+0301 hides ``E`` + U+0301 but not its variants). A segment with a
+character that folds
 to glob syntax (the fullwidth asterisk U+FF0A folds to ``*``) still matches byte for byte only. A ``?``
 matches one character of the folded name (the sharp s folds to ``ss``). Suffixes and trailing spaces are
 other names: use ``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/workspace/Makefile")`` also hides
@@ -286,7 +289,8 @@ def _fold_pattern(segment: str) -> str:
 
 
 _GLOB_SYNTAX = "*?[]{}\\"  # a folded literal run holding one of these would read as glob syntax: can't fold
-_MAX_RANGE_SPAN = 4096  # a class with a range wider than this gains no folds (_folded_class)
+_MAX_RANGE_SPAN = 4096  # a class with an x-y wider than this gains no folds (_folded_class)
+_MAX_CLASS_CANDIDATES = 16384  # nor does a class whose x-y spans together enumerate more candidates than this
 
 
 def _fold_run(run: str) -> str | None:
@@ -353,9 +357,10 @@ def _folded_class(body: str) -> str:
     (#140): ``body`` is the class text between the brackets (a negated class doesn't fold: ``_fold_segment``
     refuses the whole segment instead). The members are enumerated, not parsed: the candidates are the
     characters of ``body`` and, for every ``x-y`` in it, each code point from ``x`` to ``y``, a superset of every
-    range fnmatch reads; a class with an ``x-y`` spanning more than 4096 code points (``_MAX_RANGE_SPAN``) is
-    returned as written and gains no folds. Each candidate is tried against the class as written with
-    ``fnmatchcase``, and the single-character folds (``_fold_pattern``) of the members join the set; a member
+    range fnmatch reads; a class with an ``x-y`` spanning more than 4096 code points (``_MAX_RANGE_SPAN``), even
+    one fnmatch reads as literals, or with more than 16384 candidates in all (``_MAX_CLASS_CANDIDATES``), is
+    returned as written and gains no folds: telling a range from literals would take a parse. Each candidate
+    is tried against the class as written with ``fnmatchcase``, and the single-character folds (``_fold_pattern``) of the members join the set; a member
     that folds to several characters (the sharp s) is matched only as written.
     Membership comes from fnmatch itself, so a parse difference can only lose an addition, never invent one
     (#148). Where the set gains nothing the class is returned as written; otherwise it is emitted as an
@@ -372,6 +377,8 @@ def _folded_class(body: str) -> str:
             if hi - lo > _MAX_RANGE_SPAN:
                 return token  # too wide to enumerate: the class stays as written and gains no folds
             candidates.update(map(chr, range(lo, hi + 1)))
+            if len(candidates) > _MAX_CLASS_CANDIDATES:
+                return token  # many ranges together: likewise, so building a rule stays cheap
     members = {c for c in candidates if fnmatchcase(c, token)}
     folds = {fold for c in members if len(fold := _fold_pattern(c)) == 1}
     chars = members | folds
@@ -379,9 +386,7 @@ def _folded_class(body: str) -> str:
         return token  # nothing to add: the body stays as written
     middle = "".join(sorted(chars - {"]", "-"}))
     out = ("]" if "]" in chars else "") + middle + ("-" if "-" in chars else "")
-    if out.startswith("!"):  # a leading ! would read as a negation
-        if len(out) == 1:
-            return "!"  # a lone ! is a literal, not a negated empty class
+    if out.startswith("!"):  # a leading ! would read as a negation; chars gained a fold, so it has a second
         out = out[1] + out[0] + out[2:]
     return f"[{out}]"
 
