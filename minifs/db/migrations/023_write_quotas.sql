@@ -16,17 +16,26 @@
 --    limit on that one. Every writer charges its change once, at its end, through vfs_charge: it walks from the
 --    changed node up to the root (no locks; at most vfs_max_components() steps, the depth cap of 022), locks the
 --    quota rows it finds FOR UPDATE in root id order (one order for every charge, so two charges never
---    deadlock), adds the change to each and raises EDQUOT if an increase takes one over its max, which rolls the
---    whole write back. A decrease (a shrinking write, an unlink) is never refused, even over a lowered max.
+--    deadlock; and a charge is the last lock a writer takes, vfs_rename's after its UPDATE), adds the change to
+--    each and raises EDQUOT if an increase takes one over its max, which rolls the whole write back. A decrease (a shrinking write, an unlink) is never refused, even over a lowered max.
 --    Quotas nest: every quota root above the change is charged. vfs_rename moves the moved subtree's bytes and
 --    nodes from the quota roots above the source to those above the destination (a bounded scan of the subtree,
 --    only when the two sets of roots differ). vfs_compact changes no size.
 --
+--    Cost: every write under a quota root holds that root's row until it commits, so writers in one workspace
+--    take turns there (writers of one file already take turns on its inode). Put quotas on the workspaces, not
+--    on /workspaces itself, which would make every write in the deployment take turns on one row. Once any
+--    quota exists, every write walks its ancestors (one probe per level; workspaces are a few levels deep).
+--
 --    vfs_set_quota(dir, max_bytes, max_nodes) sets a root's limits and recounts its usage under the row lock
---    (both NULL removes the row). vfs_set_child_quota(dir, max_bytes, max_nodes) gives every directory created
---    directly in dir that quota at its creation (vfs_create, vfs_mkdir_p), and every existing child directory
---    without a quota of its own gets it now: set once on /workspaces, every workspace has a quota from its first
---    mkdir. Both are operator calls: a deployment that gives agents' code its own role can REVOKE EXECUTE on them
+--    (both NULL removes the row); writes below that root wait for the recount, which scans its subtree.
+--    vfs_set_child_quota(dir, max_bytes, max_nodes) gives every directory created directly in dir that quota at
+--    its creation (vfs_create, vfs_mkdir_p), and every existing child directory without a quota of its own gets
+--    it now: set once on /workspaces, every workspace has a quota from its first mkdir. It locks dir FOR UPDATE,
+--    so creates in dir wait for it, and one in flight finishes first and is seen. Calling it again with other
+--    limits changes only the children without a quota (set_quota changes one that has one); a directory moved
+--    into dir, rather than created there, gets none. Set both limits: without max_nodes an actor can create
+--    nodes the byte limit doesn't see. Both are operator calls: a deployment that gives agents' code its own role can REVOKE EXECUTE on them
 --    and the write privileges on vfs_quotas and vfs_quota_defaults from it.
 --
 --    What's counted is the files' logical sizes. Storage per byte is a small factor more (each line costs 4 bytes
@@ -35,7 +44,7 @@
 --    Best effort, by design: the ancestor walk takes no locks (it would put a lock on every directory above every
 --    write), so a write that races a move of one of its ancestors to another quota root may be charged to the
 --    old roots, while the move's scan, which doesn't see the uncommitted write, leaves it out of what it moves.
---    The total charged over all quotas stays exact, and vfs_set_quota recounts a root. A row that vfs_set_quota
+--    If the source has no quota root the write is charged to none. vfs_set_quota recounts a root. A row that vfs_set_quota
 --    creates may also miss a write that commits while the row isn't committed yet (call it again to recount).
 --    vfs_create by parent id is charged like any create; raw SQL is not charged at all.
 --
@@ -284,6 +293,10 @@ BEGIN
         RETURN NEXT;
         RETURN;
     END IF;
+    -- FOR UPDATE conflicts with the FOR KEY SHARE every create in p_parent takes on it (vfs_lock_dir,
+    -- vfs_mkdir_p): one in flight commits first, and the loop below (a later statement, so a later snapshot)
+    -- sees its directory; one that starts later waits, and then sees the defaults row.
+    PERFORM FROM vfs_nodes n WHERE n.id = p_parent FOR UPDATE;
     children := 0;
     IF p_max_bytes IS NULL AND p_max_nodes IS NULL THEN
         DELETE FROM vfs_quota_defaults d WHERE d.parent = p_parent;
@@ -818,15 +831,18 @@ BEGIN
         RETURN NEXT;
         RETURN;
     END IF;
+    -- A create that commits between the check and here surfaces as unique_violation on
+    -- vfs_nodes_parent_name_key, which minifs.db.errors maps to EEXIST. (Catching it here would cost a
+    -- subtransaction on every rename.)
+    UPDATE vfs_nodes n SET parent_id = p_new_parent, name = p_new_name, ctime = now() WHERE n.id = p_node;
+    -- After the UPDATE, so the quota rows are the last locks taken: an UPDATE waiting on a concurrent create of
+    -- the same name while holding them would deadlock with that create's charge. The subtree is p_node's, so
+    -- the move changes neither its usage nor the roots above the old parent.
     v_from := vfs_quota_roots(v_parent);
     v_to := vfs_quota_roots(p_new_parent);
     IF NOT (v_from @> v_to AND v_to @> v_from) THEN
         SELECT u.bytes, u.nodes INTO v_bytes, v_nodes FROM vfs_subtree_usage(p_node) u;
         PERFORM vfs_charge_move(v_from, v_to, v_bytes, v_nodes);
     END IF;
-    -- A create that commits between the check and here surfaces as unique_violation on
-    -- vfs_nodes_parent_name_key, which minifs.db.errors maps to EEXIST. (Catching it here would cost a
-    -- subtransaction on every rename.)
-    UPDATE vfs_nodes n SET parent_id = p_new_parent, name = p_new_name, ctime = now() WHERE n.id = p_node;
     RETURN NEXT;
 END $$;

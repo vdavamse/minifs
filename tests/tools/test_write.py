@@ -583,7 +583,7 @@ async def test_a_quota_refusal_gives_the_model_the_quota_text(view: VFSView, cli
     await client.set_quota(f"/workspaces/{W1}", max_bytes=10)
     message = await retry_message(Write, Deps(view), content="x" * 50, filePath="big.txt")
     assert message == (
-        "Workspace quota exceeded at /workspace/big.txt: remove files you no longer need, or write less."
+        "Quota exceeded at /workspace/big.txt: remove files you no longer need, or write less."
     )
     assert not [e for e in await client.readdir(f"/workspaces/{W1}") if e.name == "big.txt"]
 

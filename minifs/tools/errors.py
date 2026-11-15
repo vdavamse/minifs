@@ -29,7 +29,7 @@ MESSAGES: dict[str, str] = {
     "EBUSY": "Path is a mount point and can't be moved or removed: {path}",
     "ESTALE": "{path} was modified since it was read. Read it again before writing.",
     "EFBIG": "File too large: {path}. Split the content into smaller files.",
-    "EDQUOT": "Workspace quota exceeded at {path}: remove files you no longer need, or write less.",
+    "EDQUOT": "Quota exceeded at {path}: remove files you no longer need, or write less.",
     "ENAMETOOLONG": "File name or path too long (names up to 255 bytes, paths up to 1024 components): {path}",
     "EAGAIN": "{path} is locked by another write in progress. Try again.",
     "ETIMEDOUT": "Timed out on {path}. Try again.",  # Write and Edit add what to change
