@@ -9,8 +9,9 @@ import contextlib
 import random
 import re
 import time
+import unicodedata
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from fnmatch import fnmatchcase
 from functools import partial
 
@@ -19,6 +20,7 @@ from minifs.vfs.policy import (
     Action,
     Policy,
     Rule,
+    _class_end,  # pyright: ignore[reportPrivateUsage]
     _exact_alts,  # pyright: ignore[reportPrivateUsage]
     _fold_pattern,  # pyright: ignore[reportPrivateUsage]
     _fold_segment,  # pyright: ignore[reportPrivateUsage]
@@ -221,6 +223,22 @@ def test_a_negated_empty_range_matches_a_newline() -> None:
         assert not policy.allows("agent", "write", hidden), ascii(hidden)
 
 
+def test_class_end() -> None:
+    """``_class_end`` (#151) scans a class as fnmatch does: a ``]`` first in the class, after any ``!``, is a
+    literal member and doesn't close it, and a ``[`` no ``]`` closes within the segment has no end (None)."""
+    for segment, start, want in (
+        ("[a]", 0, 2),
+        ("[]a]", 0, 3),
+        ("[!]a]", 0, 4),
+        ("[!a]", 0, 3),
+        ("x[a-c]y", 1, 5),
+        ("[a", 0, None),
+        ("[]", 0, None),  # the ] first in the class is literal: nothing closes it
+        ("[!]", 0, None),
+    ):
+        assert _class_end(segment, start) == want, (ascii(segment), start)
+
+
 def test_fold_segment_enumerates_a_positive_class() -> None:
     """#140, #148: ``_fold_segment`` folds the literal runs of a hide rule's segment and replaces each positive
     class with the explicit list of the characters it matches once folded (``_folded_class``), so ``[A-Z]*`` also
@@ -265,64 +283,59 @@ def test_fold_segment_enumerates_a_positive_class() -> None:
     assert _fold_segment("[A") is None  # a [ not closed in the segment: a rule refuses it before folding
 
 
-def _oracle_class_chars(body: str) -> tuple[set[str] | None, list[str]]:
-    """The characters a positive class ``body`` must match once folded, and its candidates, computed
-    independently of ``_folded_class`` (the oracle of #148): the members are the candidates ``fnmatchcase``
-    accepts for the class as written (its characters and every code point of each ``x-y`` triple in it), and
-    the set gains the single-character folds of those members. A triple spanning more than 4096 code points
-    leaves the class as written (None: no folds gained)."""
-    token = "[" + body + "]"
-    candidates = sorted(set(body))
-    for start in range(len(body) - 2):
-        x, dash, y = body[start : start + 3]
-        if dash == "-":
-            if ord(y) - ord(x) > 4096:
-                return None, candidates
-            candidates += [chr(cp) for cp in range(ord(x), ord(y) + 1)]
-    members: set[str] = set()
-    for c in candidates:
-        if fnmatchcase(c, token):
-            members.add(c)
-    chars = set(members)
-    for c in members:
-        folded = _fold_pattern(c)
-        if len(folded) == 1:
-            chars.add(folded)
-    return chars, candidates
+def _fold_char(c: str) -> str:
+    """One character folded, written for the oracle (#151) straight on unicodedata: NFKC, case fold, NFKC. It
+    shares no code with the minifs fold functions, so it agrees with ``_fold_pattern`` by construction of both,
+    not by reuse."""
+    return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", c).casefold())
 
 
-def _check_emitted_class(body: str, probe: Iterable[str]) -> None:
-    """Checks an emitted class two ways (#148): it matches a character of ``probe`` exactly where the oracle
-    (``_oracle_class_chars``) holds that character, and it compiles through ``_segment_regex`` with the warnings
-    as errors (no ``re.error``, no FutureWarning)."""
-    chars, _ = _oracle_class_chars(body)
+# Every character the oracle enumerates: the planes below 0x1000 (ASCII, Latin, Greek, punctuation) and the
+# fullwidth block, so a body drawn from either pool has every member and every fold of a member inside it.
+UNIVERSE = [chr(cp) for cp in range(1, 0x1000)] + [chr(cp) for cp in range(0xFF00, 0xFFF0)]
+
+
+def _brute_force_class(body: str) -> set[str]:
+    """The characters a positive class ``body`` must match once folded, computed by brute force (#151): every
+    character of the universe is tried against the class as written with ``fnmatchcase``, and the
+    single-character folds of the members join the set. It shares no code with ``_folded_class``: no candidates,
+    no ``x-y`` triple scanning, no width or size caps, so a candidate strategy that missed a range fnmatch reads
+    would disagree with it."""
+    members = {c for c in UNIVERSE if fnmatchcase(c, "[" + body + "]")}
+    return members | {f for c in members if len(f := _fold_char(c)) == 1}
+
+
+def _assert_emitted(body: str) -> None:
+    """Asserts an emitted class two ways (#151): it compiles through ``_segment_regex`` with the warnings as
+    errors (no ``re.error``, no FutureWarning), and it matches a character of the universe, or of the brute-force
+    oracle's set (``_brute_force_class``), exactly where the oracle holds that character."""
+    expected = _brute_force_class(body)
     emitted = _folded_class(body)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         re.compile(_segment_regex(emitted, "/"))
-    assert chars is not None, ascii(body)
-    for c in probe:
-        assert fnmatchcase(c, emitted) == (c in chars), (ascii(body), ascii(emitted), ascii(c))
+    for c in set(UNIVERSE) | expected:
+        assert fnmatchcase(c, emitted) == (c in expected), (ascii(body), ascii(emitted), ascii(c))
 
 
 def test_folded_class_emits_an_explicit_list_of_its_members_and_their_folds() -> None:
     """#148: an emitted class matches exactly the members of the body and their single-character folds,
-    checked two ways (``_check_emitted_class``), including the bodies whose structure the old splicing got
-    wrong: a range spanning punctuation, a leading ``]``, a trailing ``-``, a fullwidth solidus endpoint and
-    a ``!`` the sorted order would put first."""
-    for body, probe in (
-        ("A-Z", ASCII_LOWER + ASCII_UPPER + ["_", "^", "`", chr(0xC0)]),
-        ("0-Z", ASCII_LOWER + ASCII_UPPER + ASCII_DIGITS + ["_", "^", "`"]),  # not [0-Z0-z]: no "_"
-        ("A-", ["A", "a", "-", "_", "B"]),  # the trailing - stays literal, it can't start a range
-        ("A!", ["A", "!", "a", "_", "z"]),  # the emitted list can't read as a negation
-        ("]-A-Z", ["-", "Z", "z", "A", "b", "]"]),  # a leading ] parses as fnmatch parses it
-        ("Za!--", ASCII_DIGITS + [".", ":", "!", "-", "Z", "a", "z", "b"]),
-        (chr(0xC0) + "-" + chr(0xDE), [chr(0xC0), chr(0xD7), chr(0xE0), chr(0xF7), chr(0xDE), "a"]),
-        (FW_SOLIDUS + "-" + FW_DIGIT_NINE, [FW_SOLIDUS, FW_DIGIT_NINE, FW_DIGIT_FIVE, "/", "9", "5", "0", "#"]),
-        ("^" + FW_LOWER_A, ["^", "a", FW_LOWER_A, "b"]),  # translate escapes a leading ^ in the list
-        ("[a", ["[", "a", "A", "b", "]"]),  # translate escapes a leading [ in the list
+    checked against the brute-force oracle (``_assert_emitted``, #151), including the bodies whose structure the
+    old splicing got wrong: a range spanning punctuation, a leading ``]``, a trailing ``-``, a fullwidth solidus
+    endpoint and a ``!`` the sorted order would put first."""
+    for body in (
+        "A-Z",
+        "0-Z",  # not [0-Z0-z]: no "_"
+        "A-",  # the trailing - stays literal, it can't start a range
+        "A!",  # the emitted list can't read as a negation
+        "]-A-Z",  # a leading ] parses as fnmatch parses it
+        "Za!--",
+        chr(0xC0) + "-" + chr(0xDE),
+        FW_SOLIDUS + "-" + FW_DIGIT_NINE,
+        "^" + FW_LOWER_A,  # translate escapes a leading ^ in the list
+        "[a",  # translate escapes a leading [ in the list
     ):
-        _check_emitted_class(body, probe)
+        _assert_emitted(body)
 
 
 def test_folded_class_never_hides_more_than_its_members_and_their_folds() -> None:
@@ -367,76 +380,68 @@ def test_a_class_folding_to_a_solidus_agrees_with_the_reference_matcher() -> Non
     assert not hide.matches("/w/#")  # "#" is in neither the raw range nor the emitted list
 
 
-def test_folded_class_agrees_with_an_independent_enumeration() -> None:
-    """The oracle property of ``_folded_class`` (#148): over 300 random positive bodies built from a pool of
-    tricky characters and ranges between random pool characters, the emitted class matches a character exactly
-    where the independently written enumeration (``_oracle_class_chars``) holds it (for every candidate and
-    for 50 random characters outside them), and compiles through ``_segment_regex`` with the warnings as
-    errors. Bodies ``Rule`` refuses are skipped, as main would never build them."""
-    rng = random.Random(148)
-    pool = [
-        "a",
-        "B",
-        "m",
-        "Z",
-        "z",
-        "0",
-        "5",
-        "9",
-        "_",
-        "-",
-        "]",
-        FW_LOWER_A,
-        FW_UPPER_A,
-        FW_UPPER_R,
-        FW_UPPER_Z,
-        SHARP_S,
-        FI_LIGATURE,
-        FW_SOLIDUS,
-        FW_DIGIT_NINE,
-        chr(0xC0),
-        chr(0xDE),
-        chr(0xF7),
-        E_ACUTE,
-        "e" + COMBINING_ACUTE,
-    ]
-    checked = wide = 0
-    while checked < 300:
+def test_folded_class_agrees_with_a_brute_force_oracle() -> None:
+    """The oracle property of ``_folded_class`` (#151): over 200 random positive bodies ``Rule`` accepts, the
+    emitted class matches a character exactly where the brute-force enumeration (``_brute_force_class``) holds
+    it, and compiles through ``_segment_regex`` with the warnings as errors. The oracle shares no code with
+    ``_folded_class``: no ``_fold_pattern``, no ``x-y`` triple scanning, no 4096/16384 caps. It enumerates the
+    whole universe with ``fnmatchcase`` and folds with ``unicodedata``, so a candidate strategy that missed a
+    range fnmatch reads would fail it. Bodies are drawn from two pools, both keeping every span and every
+    candidate count below the caps, so the caps can never trigger and every body is enumerated: a narrow one
+    (code points 0x21..0xFFF, weighted towards ``]``, ``-``, ASCII letters, the Latin capitals with the sharp s
+    and the Greek capitals) and a fullwidth one (0xFF01..0xFFEF, no ASCII at all, so no ``-`` and no ``]`` is
+    ever a member there)."""
+    rng = random.Random(151)
+    weighted: list[str] = (
+        ["]", "-"]
+        + ASCII_UPPER
+        + ASCII_LOWER
+        + [chr(cp) for cp in range(0xC0, 0xDF)]  # the Latin capitals up to THORN
+        + [SHARP_S]
+        + [chr(cp) for cp in range(0x391, 0x3AA)]  # the Greek capitals
+    )
+
+    def narrow_part() -> str:
+        if rng.random() < 0.5:
+            return chr(rng.randint(0x21, 0xFFF))  # any narrow character: punctuation, Latin, Greek, format
+        return rng.choice(weighted)
+
+    def narrow_body() -> str:
         parts: list[str] = []
         if rng.random() < 0.25:
             parts.append("]")  # sometimes a ] first, where it is a literal member
         for _ in range(rng.randint(1, 4)):
             if rng.random() < 0.4:
-                parts.append(f"{rng.choice(pool)}-{rng.choice(pool)}")  # a range between random pool characters
+                parts.append(f"{narrow_part()}-{narrow_part()}")  # a range between random pool characters
             else:
-                parts.append(rng.choice(pool))
-        body = "".join(parts)
+                parts.append(narrow_part())
+        return "".join(parts)
+
+    def fullwidth_body() -> str:
+        def draw() -> str:
+            return chr(rng.randint(0xFF01, 0xFFEF))
+
+        parts: list[str] = []
+        for _ in range(rng.randint(1, 4)):
+            if rng.random() < 0.4:
+                parts.append(f"{draw()}-{draw()}")
+            else:
+                parts.append(draw())
+        return "".join(parts)
+
+    checked = folded = 0
+    while checked < 200:
+        body = narrow_body() if rng.random() < 0.5 else fullwidth_body()
+        if body.startswith("!"):
+            continue  # a negated class: _fold_segment refuses the segment before _folded_class is reached
         try:
             Rule(f"/w/[{body}]")
         except ValueError:
-            continue  # a body main refuses (a [: or a [^ it would read literally): the oracle doesn't judge it
-        chars, candidates = _oracle_class_chars(body)
-        emitted = _folded_class(body)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            re.compile(_segment_regex(emitted, "/"))
-        if chars is None:  # a range wider than 4096: the class stays as written
-            assert emitted == f"[{body}]", ascii(body)
-            wide += 1
-            checked += 1
-            continue
-        known = set(candidates)
-        outside: list[str] = []
-        while len(outside) < 50:
-            cp = rng.choice(
-                [rng.randint(1, 0x2FFF), rng.randint(0x3100, 0xD7FF), rng.randint(0xE000, 0x10FFFF)]
-            )  # no surrogate
-            if chr(cp) not in known:
-                outside.append(chr(cp))
-        for c in candidates + outside:
-            assert fnmatchcase(c, emitted) == (c in chars), (ascii(body), ascii(emitted), ascii(c))
+            continue  # a body main refuses (a backslash, [^ or [: it would read literally): not judged here
+        _assert_emitted(body)
+        folded += _folded_class(body) != f"[{body}]"
         checked += 1
-    assert checked - wide >= 150, wide  # most bodies are enumerated, not left as written
+    assert folded >= 50, folded  # enough bodies whose members gained folds, so an explicit list was emitted
 
 
 def test_class_free_segments_fold_exactly_as_before() -> None:

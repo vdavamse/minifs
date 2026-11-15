@@ -226,25 +226,36 @@ class Policy:
             raise PolicyDenied(path, actor, action)
 
 
+def _class_end(segment: str, start: int) -> int | None:
+    """The index of the ``]`` closing the class whose ``[`` is ``segment[start]``, or None when no ``]`` closes
+    it within ``segment``. Scans as fnmatch does: an optional ``!`` right after the ``[`` is skipped, then a
+    ``]`` right after that (a literal member), then the scan advances to the next ``]``. Each caller decides
+    what an unclosed ``[`` means: ``_bad_class`` reports it, ``_fold_segment`` doesn't fold the segment, and
+    ``_segment_regex`` asserts, because ``_no_literal_globs`` refused such a rule first."""
+    n = len(segment)
+    j = start + 1
+    if j < n and segment[j] == "!":
+        j += 1
+    if j < n and segment[j] == "]":
+        j += 1
+    while j < n and segment[j] != "]":
+        j += 1
+    return None if j >= n else j
+
+
 def _bad_class(segment: str) -> bool:
     """Whether ``segment`` has a ``[`` that fnmatch reads literally because no ``]`` closes it (``[!/]*`` is split
-    by its ``/``), or a class with ``[:`` in it (a POSIX class, which fnmatch doesn't know). Scans as fnmatch does:
-    a ``]`` first in a class, after any ``!``, is literal."""
+    by its ``/``), or a class with ``[:`` in it (a POSIX class, which fnmatch doesn't know). Classes are scanned
+    by ``_class_end``: a ``]`` first in a class, after any ``!``, is literal."""
     i, n = 0, len(segment)
     while i < n:
         c, i = segment[i], i + 1
         if c != "[":
             continue
-        j = i
-        if j < n and segment[j] == "!":
-            j += 1
-        if j < n and segment[j] == "]":
-            j += 1
-        while j < n and segment[j] != "]":
-            j += 1
-        if j >= n or "[:" in segment[i:j]:
+        end = _class_end(segment, i - 1)
+        if end is None or "[:" in segment[i:end]:
             return True
-        i = j + 1
+        i = end + 1
     return False
 
 
@@ -305,8 +316,8 @@ def _fold_segment(segment: str) -> str | None:
     """The folded alternative of a hide rule's pattern ``segment`` (#140), or None when the segment can't fold and
     stays byte-for-byte only. Literal runs fold whole (``_fold_run``), with the ``*`` and ``?`` between them kept
     as they are, so folding can't change the count of wildcards; a run whose folded form gains glob syntax can't
-    fold, and neither can ``**``, which is a whole segment, not two wildcards. A class is scanned exactly as
-    ``_bad_class`` scans it (an optional ``!``, a ``]`` first in the class is literal, up to the closing ``]``).
+    fold, and neither can ``**``, which is a whole segment, not two wildcards. A class is scanned by
+    ``_class_end`` (an optional ``!``, a ``]`` first in the class is literal, up to the closing ``]``).
     A positive class is replaced by the explicit list of the characters it matches once folded
     (``_folded_class``), so ``[A-Z]*`` folds to a 52-letter class and hides ``readme`` too; a negated class
     (``[!...]``) folds no character and refuses the whole segment, which matches byte for byte only as before
@@ -320,14 +331,8 @@ def _fold_segment(segment: str) -> str | None:
     while i < n:
         c = segment[i]
         if c == "[":
-            j = i + 1
-            if j < n and segment[j] == "!":
-                j += 1
-            if j < n and segment[j] == "]":
-                j += 1
-            while j < n and segment[j] != "]":
-                j += 1
-            if j >= n:
+            j = _class_end(segment, i)
+            if j is None:
                 return None  # a [ fnmatch reads literally: a rule pattern can't hold one (_no_literal_globs)
             body = segment[i + 1 : j]
             if body.startswith("!"):
@@ -407,8 +412,8 @@ def _segment_regex(segment: str, exclude: str) -> str:
     matches makes the matcher try every way of sharing it between the stars (``/w/*a*a*a*a*b`` against 250 ``a``
     takes seconds); taking the leftmost match of a piece loses nothing, because the star after it absorbs whatever
     follows, and a segment's regex is followed only by ``/``, a NUL or the end of the string, so no piece has to
-    reach past a separator. Classes are scanned exactly as ``_bad_class`` scans them, which ``_no_literal_globs``
-    has been through, so every ``[`` closes within the segment."""
+    reach past a separator. Classes are scanned by ``_class_end``, which ``_no_literal_globs`` has been through,
+    so every ``[`` closes within the segment."""
     chunks: list[list[str]] = [[]]  # the pieces the stars divide the segment into: one more than the stars
     after_star = False
     i, n = 0, len(segment)
@@ -423,14 +428,8 @@ def _segment_regex(segment: str, exclude: str) -> str:
         if c == "?":
             chunks[-1].append(f"[^{exclude}]")
         elif c == "[":
-            j = i
-            if j < n and segment[j] == "!":
-                j += 1
-            if j < n and segment[j] == "]":
-                j += 1
-            while j < n and segment[j] != "]":
-                j += 1
-            if j >= n:
+            j = _class_end(segment, i - 1)
+            if j is None:
                 raise AssertionError(f"unclosed [ in rule segment {segment!r}")
             translated = translate(segment[i - 1 : j + 1])
             shape = re.fullmatch(r"\(\?s:(.*)\)\\[Zz]", translated, re.DOTALL)
