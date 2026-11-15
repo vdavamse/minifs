@@ -314,7 +314,7 @@ The tools follow opencode's file-tool contracts (which Claude Code's resemble): 
 **Errors.** A mistake the model can fix by calling again raises `ModelRetry` with a message that says what to change: `File not found` (with up to three similar names from inside the view), an offset past the end, a bad pattern (rg's message), a scope over the cap, a timeout. A path outside the view gets each tool's not-found error, so errors never reveal what exists beyond the chroot. A policy denial is returned as the result, `Permission denied: <action> <path>`, since retrying won't help. An internal error in `Grep` never ends the run: a translator bug is a retry that asks for a simpler pattern, and anything else (a database that isn't UTF8, an unforeseen `RuntimeError`) is a result, `Grep failed: internal error...`, with the cause in the log. `minifs.tools.errors.tool_error` does the mapping at each tool's boundary.
 
 **Where the tools differ from disk-based implementations of the same contracts:**
-- The view's policy is the only permission gate.
+- The view's policy is the only permission gate, and it binds the model's tool calls, not code that holds a connection (see [Tenant isolation](#tenant-isolation)).
 - Writes are compare-and-swap checked in the database, not a per-path lock in one process.
 - `Edit` has a 10 MB cap and a 10 second deadline on the search for `oldString`, and `Write` skips the diff of an old file over 1 MB.
 - There's no `.gitignore`: a default exclude list of unambiguous caches applies instead, configurable in `ToolSettings`.
@@ -337,6 +337,31 @@ The tools follow opencode's file-tool contracts (which Claude Code's resemble): 
 **Protecting the database.** Every search statement runs under a timeout. Scope caps (files and bytes, from `vfs_nodes`) refuse an oversized search before any content is read. Output is capped at 100 results with a hint to narrow. Search has its own pool. A read replica would also isolate search load, at the price of read-your-writes consistency. Every write runs under `lock_timeout` and `statement_timeout`: a lock wait that runs out (EAGAIN) or a cancelled write (ETIMEDOUT) is a retry for the model, and the connection goes back to the pool instead of waiting behind the write that holds the file.
 
 **What to watch:** tool latency and calls per run; search duration, bytes scanned, timeouts, refusals and translator rejections by construct; writes that run out of their lock wait (EAGAIN) or are cancelled (ETIMEDOUT), each a warning in the `minifs.vfs.client` log; the directory cache's hit rate (`cache.stats()`); extents per file; policy denials (`Policy.denials`, by actor and action).
+
+## Tenant isolation
+
+**The trust boundary is the database connection.** `VFSView` maps visible paths to real ones and checks the policy in Python; that is what stands between the model and the tree, and it is enough against the model, which only reaches the tree through the tools. Code that holds a connection is past it. `VFSClient`, `Watcher`, the CLI, an ingestion job and a `VFSView` built with any mounts all read and write the whole schema: every workspace, `/docs`, and the quota rows. The SQL functions are `SECURITY INVOKER` (only `vfs_channel()` and the notification triggers are definer functions, migration 018), so a role that can call `vfs_create` holds the table privileges it uses and can also write `vfs_nodes` directly. The policy and the quotas are therefore advisory against such a role. Three things follow for a deployment:
+
+- **No connection for agents.** An agent gets tools over a `VFSView`. A DSN, a `VFSClient` or the CLI makes it a principal over the whole schema.
+- **Mounts come from the authenticated session.** `workspace_mounts(workspace_id)` with a wrong but valid id mounts another tenant's workspace, and `_check_mount` can't tell (it refuses only the malformed mounts that would expose more than one workspace). Take the id from the session the host authenticated, never from the model's output or a field of the request (the confused-deputy bug).
+- **A role per kind of job.** A role with `SELECT` on the tables and `EXECUTE` on the functions reads everything and writes nothing: every write function fails on privileges, which the client passes on as `psycopg.errors.InsufficientPrivilege` (no errno: it is a deployment fault, not an outcome). Quotas (`vfs_set_quota`, `vfs_set_child_quota`, `vfs_give_child_quota`) and migrations belong to the schema's owner.
+
+**Isolation that Postgres enforces: a schema per tenant.** The migrations install into the connection's `current_schema()`, every function is `SET search_path FROM CURRENT`, and each schema has its own notification channel, whose name only a role with `EXECUTE` on that schema's `vfs_channel()` learns. So one schema (or one database) per tenant, with one role each, separates tenants at the database: a role without `USAGE` on another tenant's schema can't read its tables, call its functions or learn its channel. `tests/test_isolation.py` runs this recipe:
+
+```sql
+-- As the owner role:
+CREATE SCHEMA tenant_a;
+-- Migrate with the owner, connected with options=-c search_path=tenant_a: minifs db migrate.
+CREATE ROLE minifs_a LOGIN;
+GRANT USAGE ON SCHEMA tenant_a TO minifs_a;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA tenant_a TO minifs_a;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA tenant_a TO minifs_a;  -- vfs_channel() included, for the watcher
+-- The tenant's processes connect as minifs_a with options=-c search_path=tenant_a.
+```
+
+Create the schema before migrating it (`current_schema()` is NULL while the `search_path` names no existing schema, and `migrate` refuses that), and grant after migrating, since `ON ALL ... IN SCHEMA` covers only what exists: grant again after a migration that adds tables or functions, or set `ALTER DEFAULT PRIVILEGES IN SCHEMA tenant_a` once. A tenant role that only reads gets `SELECT` instead of the four table privileges.
+
+**Rejected: row-level security keyed on a session setting.** The issue proposed a `workspace` column on both tables, kept by create and rename, and policies that compare it with `current_setting('minifs.workspace')`, which `VFSView` would set in each transaction. Any role that can connect can set that setting to any value, so the policies would stop only a path-mapping bug in the process that also sets it. `_check_mount` already refuses the mounts that would reach another workspace, a confused deputy passes the same wrong id to both, and a leaked DSN sets what it likes. The price would be a column to keep exact on every cross-workspace move (a subtree rewrite), a predicate on every scan, and one more round trip per statement. Postgres can only enforce separation between principals it authenticates, which here means a role per tenant.
 
 ## Testing
 

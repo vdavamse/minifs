@@ -106,7 +106,8 @@ def workspace_mounts(workspace_id: UUID | str) -> dict[str, str]:
     ``workspace_id`` isn't a UUID (``""`` or ``..`` would mount other workspaces).
 
     The supported way to give an agent its workspace: build the mounts here rather than by hand.
-    ``VFSView`` refuses the hand-built mistakes it can see (see ``_check_mount``), not a wrong id."""
+    ``VFSView`` refuses the hand-built mistakes it can see (see ``_check_mount``), not a wrong id: take
+    ``workspace_id`` from the session the host authenticated, never from the model's output or a request field."""
     return {"/workspace": f"{WORKSPACES}/{UUID(str(workspace_id))}", "/docs": "/docs"}
 
 
@@ -175,7 +176,8 @@ class VFSView:
     rules for, for mounts that nest, visibly or in the real tree (two visible names for one node would let
     the policy on one name be bypassed through the other), and for a mount with a prefix that isn't in normal
     form, a real prefix of ``/``, or one in ``/workspaces`` that isn't one whole workspace. Build an agent's
-    mounts with ``workspace_mounts``. ``watcher`` (the process's, ``VFS.watcher``) serves ``watch``.
+    mounts with ``workspace_mounts``. ``watcher`` (the process's, ``VFS.watcher``) serves ``watch``. The view
+    binds the model's tool calls, not the code that builds it: whoever holds ``client`` holds the whole schema.
     ``max_write`` caps the bytes of one ``create``, ``write`` or ``append`` for this actor (EFBIG over it, before any
     round trip); it can only lower the file size cap every write has (``MAX_FILE_SIZE``), and is None for that cap.
     What a workspace holds in all is capped by its quota (``VFSClient.set_child_quota``), not by the view."""
