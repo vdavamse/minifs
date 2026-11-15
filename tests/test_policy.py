@@ -16,8 +16,11 @@ from minifs.vfs.policy import (
     Action,
     Policy,
     Rule,
+    _fold_pattern,  # pyright: ignore[reportPrivateUsage]
+    _fold_segment,  # pyright: ignore[reportPrivateUsage]
     _matches_by_rests,  # pyright: ignore[reportPrivateUsage]
     _path_string,  # pyright: ignore[reportPrivateUsage]
+    _pattern_alts,  # pyright: ignore[reportPrivateUsage]
 )
 
 ACTIONS: tuple[Action, ...] = ("read", "write", "append")
@@ -33,6 +36,8 @@ COMBINING_ACUTE = chr(0x301)
 E_ACUTE = chr(0xE9)  # what "e" + COMBINING_ACUTE folds to: NFKC composes them
 FW_UPPER_A = chr(0xFF21)  # fullwidth "A": folds to "a"
 FW_UPPER_B = chr(0xFF22)
+FW_UPPER_R = chr(0xFF32)  # fullwidth "R": folds to "r"
+FW_UPPER_Z = chr(0xFF3A)  # fullwidth "Z": folds to "z"
 FW_UPPER_S = chr(0xFF33)
 FW_LOWER_S = chr(0xFF53)
 FW_UPPER_F = chr(0xFF26)
@@ -62,7 +67,19 @@ LITERALS = [
     "e" + COMBINING_ACUTE,
     E_ACUTE,
 ]
-CLASSES = ["[a-c]", "[!a]", "[A-Z]", "[]a]", "[!]x]", "[z-a]", "[!z-a]", "[!b-a]"]
+FW_RANGE_CLASS = "[" + FW_UPPER_A + "-" + FW_UPPER_Z + "]"  # a fullwidth range: it gains "a-z" folded (#140)
+CLASSES = [
+    "[a-c]",
+    "[!a]",
+    "[A-Z]",
+    "[]a]",
+    "[!]x]",
+    "[z-a]",
+    "[!z-a]",
+    "[!b-a]",
+    "[a-cA-C]",  # #140: mixed-case members, so a folded class branch is exercised
+    FW_RANGE_CLASS,  # #140: a fullwidth range, so a non-ASCII class body folds
+]
 TOKENS = LITERALS + ["*", "?"] + CLASSES
 NAMES = LITERALS + [
     "B",
@@ -180,6 +197,88 @@ def test_a_negated_empty_range_matches_a_newline() -> None:
         assert policy.matches("agent", hidden) == (first is not None), ascii(hidden)
         assert not policy.allows("agent", "read", hidden), ascii(hidden)  # the hide rule grants nothing
         assert not policy.allows("agent", "write", hidden), ascii(hidden)
+
+
+def test_fold_segment_folds_a_class_member_by_member() -> None:
+    """#140: ``_fold_segment`` folds the literal runs of a hide rule's segment and gives each class the folded
+    forms of the members and ranges it lists, so ``[A-Z]*`` also matches "readme". A member already in the body
+    or folding to several characters (the sharp s) adds nothing, a negated class gains the same forms (so it
+    excludes them), and a segment whose folded runs would gain glob syntax stays None: byte for byte only."""
+    assert _fold_segment("[A-Z]*") == "[A-Za-z]*"
+    assert _fold_segment("[Ee]nv") == "[Ee]nv"  # e is already in the body: nothing to add
+    assert _fold_segment("Sec[A-Z]") == "sec[A-Za-z]"  # the literal run folds as well
+    assert _fold_segment("[!A-Z]*") == "[!A-Za-z]*"  # a negated class excludes the folded range too
+    assert _fold_segment("[!R]*") == "[!Rr]*"  # a single member gains its fold
+    assert _fold_segment("[a-cA-C]") == "[a-cA-Ca-c]"  # a-c is there already; A-C gains it
+    assert _fold_segment(FW_RANGE_CLASS) == FW_RANGE_CLASS[:-1] + "a-z]"  # the fullwidth range gains a-z
+    sharp = "stra[" + SHARP_S + "]e"
+    assert _fold_segment(sharp) == sharp  # the sharp s folds to "ss": matched only as written
+    assert _fold_segment("[A-]") == "[Aa-]"  # a trailing - stays last and literal, not the start of a range
+    assert _fold_segment("[!A-]") == "[!Aa-]"
+    assert not Rule("/w/[A-]").matches("/w/_")  # [A-a] would have hidden _ and B-Z
+    assert Rule("/w/[A-]").matches("/w/a") and Rule("/w/[A-]").matches("/w/-")
+    assert _fold_segment("Secret") == "secret"  # a class-free segment folds whole, as before
+    assert _fold_segment("**") is None  # a whole segment, not two wildcards
+    assert _fold_segment("a" + FW_ASTERISK) is None  # the folded run gains a *
+    assert _fold_segment(FW_LOWER_A + chr(0xFF3B)) is None  # the folded run gains a [
+    assert _fold_segment("[A") is None  # a [ not closed in the segment: a rule refuses it before folding
+
+
+def test_class_free_segments_fold_exactly_as_before() -> None:
+    """#140 changed only segments with a class: a class-free segment must give exactly the alternatives the
+    whole-segment fold of #93 gave, folded string included, so a hide rule never hides less than before. The
+    old logic, copied here as the reference over generated segments of the literals' pool (which holds no "[",
+    so every segment is class-free)."""
+
+    def old_pattern_alts(segment: str) -> tuple[str, ...]:
+        folded = _fold_pattern(segment)
+        foldable = (
+            "[" not in segment
+            and not any(c in folded for c in "[]{}\\")
+            and segment.count("*") == folded.count("*")
+            and segment.count("?") == folded.count("?")
+            and segment != "**"
+        )
+        return (segment, folded) if foldable else (segment,)
+
+    rng = random.Random(140)
+    tokens = LITERALS + ["*", "?"]
+    for _ in range(3000):
+        segment = "".join(rng.choice(tokens) for _ in range(rng.randint(1, 5)))
+        assert _pattern_alts(segment) == old_pattern_alts(segment), ascii(segment)
+    assert _pattern_alts("**") == ("**",) == old_pattern_alts("**")
+
+
+def test_a_hide_rule_class_matches_the_folded_names() -> None:
+    """#140: a hide rule's class also matches the folded forms of what it lists, so ``[A-Z]*`` hides readme
+    too; a negated class excludes those folded forms as well, so it adds no case variants; a member that folds
+    to several characters is matched only as written; and a grant rule stays byte-exact."""
+    fw_readme = FW_UPPER_R + "eadme"  # a fullwidth R: it folds to "readme"
+
+    def policy_for(pattern: str) -> Policy:
+        return Policy({"agent": [Rule(pattern), Rule("/w/**", "read")]})
+
+    def hides(pattern: str, *names: str) -> None:
+        policy = policy_for(pattern)
+        for name in names:
+            assert not policy.allows("agent", "read", f"/w/{name}"), (ascii(pattern), ascii(name))
+
+    def keeps(pattern: str, *names: str) -> None:
+        policy = policy_for(pattern)
+        for name in names:
+            assert policy.allows("agent", "read", f"/w/{name}"), (ascii(pattern), ascii(name))
+
+    hides("/w/[A-Z]*", "readme", "README", "Readme", fw_readme)  # [A-Za-z]* matches every folded "readme"
+    keeps("/w/[A-Z]*", "_x")  # _ is in neither [A-Z] nor [A-Za-z], raw or folded
+    hides("/w/[!a-z]*", "README")  # byte for byte, R is not in [a-z] ...
+    keeps("/w/[!a-z]*", "readme")  # ... and the negated class excludes the folded forms too: no case variants
+    hides("/w/[!A-Z]*", "readme")  # byte for byte, r is not in [A-Z] ...
+    keeps("/w/[!A-Z]*", "README")  # ... folded, r is in [A-Za-z], so [!A-Za-z]* excludes it
+    hides("/w/stra[" + SHARP_S + "]e", "stra" + SHARP_S + "e")  # byte for byte ...
+    keeps("/w/stra[" + SHARP_S + "]e", "strasse")  # ... the sharp s folds to "ss": matched only as written
+    hides("/w/[Ee]nv", "ENV", "env")  # the folded [Ee]nv matches "env"
+    grant = Rule("/w/[A-Z]*", "read")
+    assert not grant.matches("/w/readme") and grant.matches("/w/Readme")  # a grant stays byte-exact
 
 
 def _best_of(call: Callable[[], bool], runs: int = 5, bound: float = 0.05) -> tuple[bool, float]:

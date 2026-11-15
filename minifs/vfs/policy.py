@@ -20,12 +20,14 @@ segment of the folded pattern against the folded name, where folding a name drop
 The byte-exact and the folded match are tried per segment, not per character, so one segment that needs both
 (``[!a-z]*.env`` against ``Config.ENV``) isn't hidden; spell such rules as two rules or with ``*``. A hide rule
 that missed a variant would leak it, while a loosened grant would grant more than written, so a rule with some
-actions is a grant and stays exact. A segment folds only where folding keeps its glob syntax: a segment with a
-``[...]`` class, or one with a character that folds to glob syntax (the fullwidth asterisk U+FF0A folds to
-``*``), matches byte for byte only, so spell such a class with both cases (``[Ee]``). A ``?`` matches one
-character of the folded name (the sharp s folds to ``ss``). Suffixes and trailing spaces are other names: use
-``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/workspace/Makefile")`` also hides ``MAKEFILE``, and a
-hide rule naming ``/Docs/**`` hides the ``/docs`` mount.
+actions is a grant and stays exact. A hide rule's ``[...]`` class also matches the folded form of the
+characters and ranges it lists (``[A-Z]`` hides ``readme`` too); a negated class excludes those folded forms
+as well, so it adds no case variants (``[!a-z]*`` hides ``README`` but not ``readme``); and a member that
+folds to several characters (the sharp s) is matched only as written. A segment with a character that folds
+to glob syntax (the fullwidth asterisk U+FF0A folds to ``*``) still matches byte for byte only. A ``?``
+matches one character of the folded name (the sharp s folds to ``ss``). Suffixes and trailing spaces are
+other names: use ``*`` (``.env*``). Over-hiding is the trade-off: ``Rule("/workspace/Makefile")`` also hides
+``MAKEFILE``, and a hide rule naming ``/Docs/**`` hides the ``/docs`` mount.
 
 Each rule compiles its alternatives once into a regex (``Rule.regex``) over the joined path string (for a hide
 rule the dual string, every name followed by a NUL and its folded form), so a lookup without ``subtree`` is one
@@ -70,9 +72,11 @@ class Rule:
     """``actions`` granted on the paths ``pattern`` matches: ``Rule("/docs/**", "read")``. A rule with no actions
     hides those paths instead: it matches what ``pattern`` matches byte for byte and, in addition, the case and
     Unicode variants of the names it spells, each segment of the folded pattern against the folded name, the two
-    tried per segment (``alternatives``). A segment folds only where folding keeps its glob syntax: one with a
-    ``[...]`` class, or with a character that folds to glob syntax, matches byte for byte only. A rule that
-    grants matches byte for byte."""
+    tried per segment (``alternatives``). A ``[...]`` class also matches the folded form of the characters and
+    ranges it lists (``[A-Z]`` hides ``readme`` too), a negated class excludes those folded forms as well
+    (``[!a-z]*`` hides ``README`` but not ``readme``), and a member that folds to several characters (the sharp s)
+    is matched only as written; a segment with a character that folds to glob syntax matches byte for byte only.
+    A rule that grants matches byte for byte."""
 
     pattern: str
     actions: frozenset[Action]
@@ -258,21 +262,14 @@ def _no_literal_globs(pattern: str, segments: tuple[str, ...]) -> None:
 
 def _pattern_alts(segment: str) -> tuple[str, ...]:
     """The alternatives a hide rule's pattern ``segment`` matches by: the raw and the folded segment, ``(s, f)``,
-    where folding keeps its glob structure, so the segment also matches the folded name; the raw segment alone,
-    ``(s,)``, otherwise, so it matches byte for byte only (what ``_rests`` does with a 1-tuple). Folding doesn't
-    keep the structure where the segment has a ``[`` (a class, whose members, ranges or negation folding could
-    change), where the folded form has glob syntax the raw one doesn't spell as such (a fullwidth asterisk folds
-    to ``*``, a fullwidth bracket to ``[``), where folding changes the count of ``*`` or ``?``, or where the
-    segment is ``**``, which stays ``("**",)``: a whole segment, not two wildcards."""
-    folded = _fold_pattern(segment)
-    foldable = (
-        "[" not in segment
-        and not any(c in folded for c in "[]{}\\")
-        and segment.count("*") == folded.count("*")
-        and segment.count("?") == folded.count("?")
-        and segment != "**"
-    )
-    return (segment, folded) if foldable else (segment,)
+    where the segment folds (``_fold_segment``), so the segment also matches the folded name; the raw segment alone,
+    ``(s,)``, otherwise, so it matches byte for byte only (what ``_rests`` does with a 1-tuple). A segment without
+    a ``[...]`` class folds exactly as before #140: whole, and only where folding keeps its glob syntax (no folded
+    glob character, no change in the count of ``*`` or ``?``, and ``**`` stays ``("**",)``: a whole segment, not
+    two wildcards). A segment with a class folds member by member instead (``_class_additions``), so the class
+    also matches the folded forms of what it lists (#140) and the raw match stays exactly what it was."""
+    folded = _fold_segment(segment)
+    return (segment, folded) if folded is not None else (segment,)
 
 
 def _fold_pattern(segment: str) -> str:
@@ -283,6 +280,112 @@ def _fold_pattern(segment: str) -> str:
     if segment.isascii():
         return segment.lower()
     return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", segment).casefold())
+
+
+_GLOB_SYNTAX = "*?[]{}\\"  # a folded literal run holding one of these would read as glob syntax: can't fold
+_CLASS_SPECIAL = "]\\-!^["  # a class addition holding one of these would change the class's structure: never added
+
+
+def _fold_run(run: str) -> str | None:
+    """A literal ``run`` of a hide rule's pattern segment folded (``_fold_pattern``), or None where folding gains
+    glob syntax the run doesn't spell as such (the fullwidth asterisk U+FF0A folds to ``*``, a fullwidth bracket
+    to ``[``), which would read as structure: then the whole segment can't fold and matches byte for byte only."""
+    folded = _fold_pattern(run)
+    return None if any(c in folded for c in _GLOB_SYNTAX) else folded
+
+
+def _fold_segment(segment: str) -> str | None:
+    """The folded alternative of a hide rule's pattern ``segment`` (#140), or None when the segment can't fold and
+    stays byte-for-byte only. Literal runs fold whole (``_fold_run``), with the ``*`` and ``?`` between them kept
+    as they are, so folding can't change the count of wildcards; a run whose folded form gains glob syntax can't
+    fold, and neither can ``**``, which is a whole segment, not two wildcards. A class is scanned exactly as
+    ``_bad_class`` scans it (an optional ``!``, a ``]`` first in the class is literal, up to the closing ``]``)
+    and keeps its body as written, which gains the folded forms of the members and ranges it lists
+    (``_class_additions``), so ``[A-Z]*`` folds to ``[A-Za-z]*`` and hides ``readme`` too. A ``[`` not closed
+    within the segment can't fold, but ``_no_literal_globs`` has refused such a pattern before this is reached."""
+    if segment == "**":
+        return None
+    parts: list[str] = []
+    run = ""  # the literal characters since the last "*", "?" or class
+    i, n = 0, len(segment)
+    while i < n:
+        c = segment[i]
+        if c == "[":
+            j = i + 1
+            if j < n and segment[j] == "!":
+                j += 1
+            if j < n and segment[j] == "]":
+                j += 1
+            while j < n and segment[j] != "]":
+                j += 1
+            if j >= n:
+                return None  # a [ fnmatch reads literally: a rule pattern can't hold one (_no_literal_globs)
+            folded = _fold_run(run)
+            if folded is None:
+                return None
+            body = segment[i + 1 : j]
+            additions = _class_additions(body)
+            if additions and body.endswith("-") and body not in ("-", "!-"):
+                body = body[:-1] + additions + "-"  # a trailing - is literal: kept last, it can't start a range
+            else:
+                body += additions
+            parts += [folded, f"[{body}]"]
+            run = ""
+            i = j + 1
+        elif c in "*?":
+            folded = _fold_run(run)
+            if folded is None:
+                return None
+            parts += [folded, c]
+            run = ""
+            i += 1
+        else:
+            run += c
+            i += 1
+    folded = _fold_run(run)
+    return None if folded is None else "".join(parts) + folded
+
+
+def _class_additions(body: str) -> str:
+    """The folded forms a hide rule's class gains (#140), appended to its ``body`` (the class as written, after
+    the ``[`` and before the ``]``, a leading ``!`` included): the fold of each member and range the body lists
+    that isn't in it yet, so ``[A-Z]`` also matches ``a``-``z``, a negated class (``[!A-Z]``) excludes those
+    folded forms as well, and a member that folds to several characters (the sharp s folds to ``ss``) is matched
+    only as written. Members are parsed as fnmatch parses them: a ``]`` first in the body is a literal member,
+    and ``x-y`` is a range where its ``-`` is neither first nor last. A single member ``c`` contributes its fold
+    ``fc`` where that is one character, another than ``c``, none that would change the class's structure
+    (``_CLASS_SPECIAL``) and not in the body or the additions so far; a range ``lo-hi`` contributes ``flo-fhi``
+    where both folds are one character, other than the endpoints, structurally safe and ordered (``flo <= fhi``),
+    so the class gains no impossible range."""
+    members = body[1:] if body.startswith("!") else body  # the negation folds with the class, not as a member
+    additions: list[str] = []
+    added = ""
+    i, n = 0, len(members)
+    if n and members[0] == "]":  # a ] first in the body is a literal member, not the closing one
+        i = 1
+    while i < n:
+        if i + 2 < n and members[i + 1] == "-":  # a range: its - is neither first nor last
+            lo, hi = members[i], members[i + 2]
+            flo, fhi = _fold_pattern(lo), _fold_pattern(hi)
+            if (
+                len(flo) == 1
+                and len(fhi) == 1
+                and (flo, fhi) != (lo, hi)
+                and flo not in _CLASS_SPECIAL
+                and fhi not in _CLASS_SPECIAL
+                and flo <= fhi
+            ):
+                additions.append(f"{flo}-{fhi}")
+                added += f"{flo}-{fhi}"
+            i += 3
+        else:
+            c = members[i]
+            fc = _fold_pattern(c)
+            if len(fc) == 1 and fc != c and fc not in _CLASS_SPECIAL and fc not in body and fc not in added:
+                additions.append(fc)
+                added += fc
+            i += 1
+    return "".join(additions)
 
 
 def _segment_regex(segment: str, exclude: str) -> str:
