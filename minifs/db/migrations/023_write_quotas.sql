@@ -194,12 +194,14 @@ BEGIN
 END $$;
 
 
--- Charges p_bytes and p_nodes (either may be negative) to every quota root at p_start and above it.
+-- Charges p_bytes and p_nodes (either may be negative) to every quota root at p_start and above it. A charge
+-- that only gives usage back walks partially (vfs_quota_roots), so a decrease is never refused, even in a legacy
+-- subtree deeper than the cap.
 CREATE FUNCTION vfs_charge(p_start uuid, p_bytes bigint, p_nodes bigint) RETURNS void
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
     IF p_bytes <> 0 OR p_nodes <> 0 THEN
-        PERFORM vfs_charge_move('{}', vfs_quota_roots(p_start), p_bytes, p_nodes);
+        PERFORM vfs_charge_move('{}', vfs_quota_roots(p_start, p_bytes <= 0 AND p_nodes <= 0), p_bytes, p_nodes);
     END IF;
 END $$;
 
@@ -292,9 +294,11 @@ END $$;
 --
 -- FOR UPDATE, taken first (a FOR KEY SHARE before it, as vfs_lock_dir takes, would let two callers each hold one
 -- and deadlock upgrading): it conflicts with the FOR KEY SHARE that every create in p_parent, and every mkdir_p
--- through it, takes on p_parent. A create in flight commits first, so its directory exists when the caller lists
--- the children; one that starts later waits for this short transaction, then inherits. Writes that create
--- nothing (append, write) don't wait.
+-- through it, takes on p_parent. Every create that holds one when this gets the lock has committed, so its
+-- directory exists when the caller lists the children; one that starts after waits for this short transaction,
+-- then inherits. While this waits, new creates can still take FOR KEY SHARE ahead of it (Postgres queues only
+-- the lockers that sleep), so under steady create traffic it can run out its lock_timeout (EAGAIN): call again.
+-- Writes that create nothing (append, write) don't wait.
 CREATE FUNCTION vfs_set_child_quota(p_parent uuid, p_max_bytes bigint, p_max_nodes bigint)
 RETURNS TABLE (err text, err_detail text)
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
@@ -350,10 +354,11 @@ DECLARE
 BEGIN
     PERFORM vfs_check_node(p_child);
     PERFORM vfs_check_node(p_parent);
-    -- FOR KEY SHARE conflicts with the FOR UPDATE a rename takes on the node it moves and with an unlink's
+    -- FOR SHARE conflicts with any UPDATE of the row (a rename's, whether or not it takes FOR UPDATE first:
+    -- changing parent_id alone is a no-key update, which FOR KEY SHARE would let through) and with an unlink's
     -- delete: one in flight commits first, and this reads the row it left (READ COMMITTED re-reads a locked row);
     -- one that starts later waits for this to commit.
-    SELECT n.parent_id INTO v_parent FROM vfs_nodes n WHERE n.id = p_child AND n.kind = 'dir' FOR KEY SHARE;
+    SELECT n.parent_id INTO v_parent FROM vfs_nodes n WHERE n.id = p_child AND n.kind = 'dir' FOR SHARE;
     IF NOT FOUND OR v_parent IS DISTINCT FROM p_parent THEN
         RETURN false;
     END IF;
@@ -625,8 +630,7 @@ BEGIN
         DELETE FROM vfs_quotas q WHERE q.root = p_node;
         DELETE FROM vfs_quota_defaults d WHERE d.parent = p_node;
     END IF;
-    -- Only gives usage back, so a partial walk will do (vfs_quota_roots).
-    PERFORM vfs_charge_move('{}', vfs_quota_roots(v_parent, true), -v_size, -1);
+    PERFORM vfs_charge(v_parent, -v_size, -1);  -- only gives usage back: a partial walk (vfs_charge)
     RETURN NEXT;
 END $$;
 
@@ -896,12 +900,15 @@ BEGIN
     UPDATE vfs_nodes n SET parent_id = p_new_parent, name = p_new_name, ctime = now() WHERE n.id = p_node;
     -- After the UPDATE, so the quota rows are the last locks taken: an UPDATE waiting on a concurrent create of
     -- the same name while holding them would deadlock with that create's charge. The subtree is p_node's, so
-    -- the move changes neither its usage nor the roots above the old parent.
-    v_from := vfs_quota_roots(v_parent, true);  -- the source only gives usage back
-    v_to := vfs_quota_roots(p_new_parent);
-    IF NOT (v_from @> v_to AND v_to @> v_from) THEN
-        SELECT u.bytes, u.nodes INTO v_bytes, v_nodes FROM vfs_subtree_usage(p_node) u;
-        PERFORM vfs_charge_move(v_from, v_to, v_bytes, v_nodes);
+    -- the move changes neither its usage nor the roots above the old parent. A rename that keeps the parent
+    -- keeps every root (and walks nothing: in a legacy subtree over the cap it isn't refused, as 022 promises).
+    IF v_parent IS DISTINCT FROM p_new_parent THEN
+        v_from := vfs_quota_roots(v_parent, true);  -- the source only gives usage back
+        v_to := vfs_quota_roots(p_new_parent);
+        IF NOT (v_from @> v_to AND v_to @> v_from) THEN
+            SELECT u.bytes, u.nodes INTO v_bytes, v_nodes FROM vfs_subtree_usage(p_node) u;
+            PERFORM vfs_charge_move(v_from, v_to, v_bytes, v_nodes);
+        END IF;
     END IF;
     RETURN NEXT;
 END $$;

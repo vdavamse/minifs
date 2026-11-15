@@ -13,7 +13,7 @@ from psycopg_pool import AsyncConnectionPool
 from minifs.db.errors import errno_name
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import MAX_FILE_SIZE, Quota
+from minifs.vfs.core import MAX_FILE_SIZE, Quota, VFSError
 from tests.test_client import raises
 from tests.test_tree import Returned, check, create, mkdir_p, raises_db_errno, rename, wait_until_blocked
 
@@ -467,6 +467,28 @@ async def test_a_child_moved_away_or_given_its_own_quota_is_skipped(conn: AsyncC
     assert await _one(conn, "SELECT vfs_give_child_quota(%s, %s)", (fresh, workspaces)) == (False,)
 
 
+async def test_set_child_quota_carries_on_past_a_child_that_runs_out_of_time(
+    pool: Pool, vfs: VFSClient, conn: AsyncConnection, db: str
+) -> None:
+    """#83 review round 3: a child whose give runs out of time (here EAGAIN, behind a lock another connection
+    holds) is skipped, the children after it still get their quota, and the error names that child's path and
+    every child left without one; calling again finishes."""
+    for name in ("a", "b", "c"):
+        await vfs.mkdir_p(f"/workspaces/{name}")
+    b = await _one(conn, "SELECT n.id FROM vfs_nodes n WHERE n.name = 'b'")
+    async with await AsyncConnection.connect(db) as holder:
+        await holder.execute("SELECT FROM vfs_nodes WHERE id = %s FOR UPDATE", b)
+        with pytest.raises(VFSError) as info:
+            await VFSClient(pool, lock_timeout=0.2).set_child_quota("/workspaces", max_bytes=100, max_nodes=5)
+        await holder.rollback()
+    assert (info.value.errno, info.value.path) == ("EAGAIN", "/workspaces/b")
+    assert "2 child directories got the quota, 1 didn't (/workspaces/b)" in info.value.message
+    assert await vfs.quota("/workspaces/a") == Quota(100, 5, 0, 0)
+    assert await vfs.quota("/workspaces/b") is None
+    assert await vfs.quota("/workspaces/c") == Quota(100, 5, 0, 0)
+    assert await vfs.set_child_quota("/workspaces", max_bytes=100, max_nodes=5) == 1
+
+
 async def test_a_legacy_over_deep_node_can_still_be_removed_and_moved_up(conn: AsyncConnection) -> None:
     """With a quota anywhere, an unlink and a rename's source walk their ancestors only up to the cap (#83
     review round 2): a node of a legacy chain deeper than vfs_max_components() can still be removed, and moved up
@@ -495,6 +517,14 @@ async def test_a_legacy_over_deep_node_can_still_be_removed_and_moved_up(conn: A
         conn, "INSERT INTO vfs_nodes (parent_id, name, kind) VALUES (%s, 'gone', 'dir') RETURNING id", (deepest,)
     )
     assert await _one(conn, "SELECT err FROM vfs_unlink(%s)", gone) == (None,)  # removed: the walk stops at the cap
+    assert await rename(conn, leaf, deepest, "renamed")  # same parent: walks nothing, refused for nothing (022)
+    # A shrinking write gives usage back, so it walks partially too (a raw file: creating one there is refused).
+    f = await _one(
+        conn,
+        "INSERT INTO vfs_nodes (parent_id, name, kind, size) VALUES (%s, 'f', 'file', 10) RETURNING id",
+        (deepest,),
+    )
+    assert await _one(conn, "SELECT err FROM vfs_write(%s, 'x')", f) == (None,)
     assert await rename(conn, leaf, q, "up")  # moved up: the source walk stops at the cap
     assert await _one(conn, "SELECT used_nodes FROM vfs_quotas WHERE root = %s", (q,)) == (1,)  # added at q
     sub = await mkdir_p(conn, "q", "up", "x")

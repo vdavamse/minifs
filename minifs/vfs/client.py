@@ -768,16 +768,36 @@ class VFSClient:
 
         Not one transaction: the child quota is set first, in a short one (creates in ``path`` wait for it), then
         each existing child gets its quota and its recount in a transaction of its own, so no write waits on the
-        recount of another child. If it fails halfway, calling it again gives the rest theirs."""
+        recount of another child. A child that runs out of time (EAGAIN, ETIMEDOUT: a big one's recount can outlast
+        ``write_timeout``) is skipped and the others still get theirs; then the first such error is raised, for
+        that child's path, naming every child left without a quota. Calling it again gives the rest theirs."""
         ref = self._quota_ref(path)
         rows = await self._call(path, [ref], "vfs_set_child_quota({0}, %s, %s)", [max_bytes, max_nodes], write=True)
         if max_bytes is None and max_nodes is None:
             return 0
         parent = rows[0][0]
         given = 0
-        for (child,) in await self._run(path, "SELECT c FROM vfs_quota_pending_children(%s) c", [parent]):
-            rows = await self._run(path, "SELECT vfs_give_child_quota(%s, %s)", [child, parent], write=True)
+        failed: list[tuple[str, VFSError]] = []
+        pending = "SELECT n.id, n.name FROM vfs_quota_pending_children(%s) c JOIN vfs_nodes n ON n.id = c ORDER BY n.id"
+        for child, name in await self._run(path, pending, [parent]):
+            child_path = f"{normalize(path).rstrip('/')}/{name}"
+            try:
+                rows = await self._run(child_path, "SELECT vfs_give_child_quota(%s, %s)", [child, parent], write=True)
+            except VFSError as e:
+                if e.errno not in ("EAGAIN", "ETIMEDOUT"):
+                    raise
+                failed.append((child_path, e))
+                continue
             given += rows[0][0]
+        if failed:
+            first_path, first = failed[0]
+            names = ", ".join(p for p, _ in failed)
+            raise VFSError(
+                first.errno,
+                first_path,
+                message=f"{given} child directories got the quota, {len(failed)} didn't ({names}): call again, "
+                "with a longer write_timeout for a big one",
+            )
         return given
 
     def _quota_ref(self, path: str) -> _Ref:
