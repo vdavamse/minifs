@@ -14,17 +14,21 @@ from collections.abc import Callable, Iterable
 from fnmatch import fnmatchcase
 from functools import partial
 
-from minifs.vfs.core import CONTROL_CHARACTERS, split, split_trusted
+from minifs.vfs.core import CONTROL_CHARACTERS, MAX_COMPONENTS, split, split_trusted
 from minifs.vfs.policy import (
     Action,
     Policy,
     Rule,
+    _exact_alts,  # pyright: ignore[reportPrivateUsage]
     _fold_pattern,  # pyright: ignore[reportPrivateUsage]
     _fold_segment,  # pyright: ignore[reportPrivateUsage]
+    _folded_alts,  # pyright: ignore[reportPrivateUsage]
     _folded_class,  # pyright: ignore[reportPrivateUsage]
     _matches_by_rests,  # pyright: ignore[reportPrivateUsage]
     _path_string,  # pyright: ignore[reportPrivateUsage]
     _pattern_alts,  # pyright: ignore[reportPrivateUsage]
+    _rests,  # pyright: ignore[reportPrivateUsage]
+    _rule_rests,  # pyright: ignore[reportPrivateUsage]
     _segment_regex,  # pyright: ignore[reportPrivateUsage]
 )
 
@@ -659,3 +663,77 @@ def test_a_path_holding_a_nul_is_decided_by_the_reference_matcher() -> None:
         first = next((rule for rule in policy.rules["agent"] if _matches_by_rests(rule, segments)), None)
         assert policy.matches("agent", path) == (first is not None), ascii(path)
         assert policy.allows("agent", "read", path) == (first is not None and first.grants("read")), ascii(path)
+
+
+def test_rests_decides_deep_paths() -> None:
+    """#145: ``_rests`` recursed once per path segment, so a deep enough path overflowed the stack. It now runs
+    as a set of pattern positions advanced once per segment, so the issue's repro is decided at any depth: the
+    ``/**`` read rule can grant below the deep nest (``allows_any`` is True), ``allows(subtree=True)`` answers
+    without raising, and a full match through two globstars is still decided exactly."""
+    policy = Policy({"a": [Rule("/workspace/**/.git/**/config"), Rule("/**", "read")]})
+    for depth in (MAX_COMPONENTS - 1, MAX_COMPONENTS, 5000):  # at the stored-path limit, and past it
+        deep = "/workspace" + "/.git" * depth
+        assert policy.allows_any("a", "read", deep) is True, depth
+        # the hide rule can still match below (a .git/**/config) and grants nothing: the subtree isn't readable
+        assert policy.allows("a", "read", deep, subtree=True) is False, depth
+    rule = Rule("/workspace/**/.git/**/config")
+    matched = split_trusted("/workspace" + "/.git" * 5000 + "/config")
+    assert _matches_by_rests(rule, matched)  # the two globstars absorb the nest; "config" ends it
+    assert not _matches_by_rests(rule, split_trusted("/workspace" + "/.git" * 5000))  # no "config": no match
+
+
+def _recursive_rests(
+    pattern: tuple[tuple[str, ...], ...], path: tuple[tuple[str, ...], ...]
+) -> frozenset[tuple[tuple[str, ...], ...]]:
+    """The old recursive ``_rests``, copied here as the reference the iterative one (#145) is checked against.
+    No cache: it is only ever called on the short paths ``_random_path`` builds, where the recursion is safe."""
+    if not path:
+        return frozenset([pattern])
+    if not pattern:
+        return frozenset()
+    head = pattern[0]
+    if head[0] == "**":
+        return _recursive_rests(pattern[1:], path) | _recursive_rests(pattern, path[1:])
+    if any(fnmatchcase(p, q) for p, q in zip(path[0], head, strict=False)):
+        return _recursive_rests(pattern[1:], path[1:])
+    return frozenset()
+
+
+def test_rests_agree_with_the_recursive_matcher() -> None:
+    """The iterative ``_rests`` (#145) returns exactly the frozensets the old recursive matcher returned: over
+    2000 random patterns, each as a hide ``Rule(p)`` and a grant ``Rule(p, "read")`` (skipping the patterns
+    ``Rule`` refuses), against a few random paths each. The exact frozensets are compared, not just the match
+    booleans, so a rest that is present in one and absent in the other fails too. ``_rule_rests`` builds the
+    path form itself (``_folded_alts`` for a hide rule, ``_exact_alts`` otherwise), and the reference is fed
+    exactly that form."""
+    # Fixed edge cases the generator doesn't draw: the root rule's empty pattern, and runs of globstars.
+    for pattern_alts, path_alts in (
+        ((), ()),
+        ((), (("a",),)),
+        ((("**",),), ()),
+        ((("**",), ("**",)), (("a",), ("b",))),
+        ((("a",), ("**",), ("**",)), (("a",),)),
+    ):
+        assert _rests(pattern_alts, path_alts) == _recursive_rests(pattern_alts, path_alts), (pattern_alts, path_alts)
+    assert _rests((), (("a",),)) == frozenset()  # the root rule matches nothing below the root
+    rng = random.Random(145)
+    patterns = 0
+    variants: tuple[tuple[Action, ...], ...] = ((), ("read",))  # the hide rule and the grant rule
+    while patterns < 2000:
+        pattern = _random_pattern(rng)
+        rules: list[Rule] = []
+        for actions in variants:
+            with contextlib.suppress(ValueError):
+                rules.append(Rule(pattern, *actions))
+        if not rules:
+            continue  # a pattern Rule refuses (as main would): nothing to compare
+        patterns += 1
+        for rule in rules:
+            for _ in range(3):
+                path = _random_path(rng)
+                segments = split_trusted(path)
+                path_alts = _folded_alts(segments) if rule.hides else _exact_alts(segments)
+                want = _recursive_rests(rule.alternatives, path_alts)
+                name = f"pattern {ascii(rule.pattern)} hides={rule.hides} on path {ascii(path)}"
+                assert _rests(rule.alternatives, path_alts) == want, name
+                assert _rule_rests(rule, segments) == want, name
