@@ -1,5 +1,5 @@
-"""``minifs`` command line: ``db migrate`` / ``db status``, and ``ls``, ``cat``, ``put``, ``rm``, ``mv``, ``glob``,
-``grep`` for humans debugging the tree."""
+"""``minifs`` command line: ``db migrate`` / ``db status``, and ``ls``, ``cat``, ``put``, ``quota``, ``rm``, ``mv``,
+``glob``, ``grep`` for humans debugging the tree."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from minifs._regex import RegexError
 from minifs.db.migrate import MigrationError, applied_versions, load_migrations, migrate
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs.client import MAX_TIMEOUT, VFSClient
-from minifs.vfs.core import VFSError
+from minifs.vfs.core import MAX_FILE_SIZE, Quota, VFSError, normalize
 from minifs.vfs.glob import GlobError
 from minifs.vfs.search import DEFAULT_LIMIT, MAX_NODES, TIMEOUT, SearchRefused
 
@@ -71,6 +71,18 @@ def main(argv: list[str] | None = None) -> int:
     put.add_argument("source", nargs="?", help="local file to copy (default: stdin)")
     put.add_argument("-a", "--append", action="store_true", help="append instead of replacing the content")
     put.add_argument("-p", "--parents", action="store_true", help="create missing parent directories")
+    quota = _add_dsn(commands.add_parser("quota", help="show or set the quota of a directory"))
+    quota.add_argument("path")
+    quota.add_argument(
+        "--bytes", type=int, dest="max_bytes", metavar="N", help="cap on the bytes of the files below PATH"
+    )
+    quota.add_argument("--nodes", type=int, dest="max_nodes", metavar="N", help="cap on the number of nodes below PATH")
+    quota.add_argument("--remove", action="store_true", help="remove the quota (with --children: stop giving one)")
+    quota.add_argument(
+        "--children",
+        action="store_true",
+        help="set the quota of the directories created directly in PATH, not of PATH itself",
+    )
     rm = _add_dsn(commands.add_parser("rm", help="remove files or empty directories"))
     rm.add_argument("paths", nargs="+", metavar="path")
     glob = _add_dsn(commands.add_parser("glob", help="list the files matching a glob pattern, newest first"))
@@ -103,6 +115,12 @@ def main(argv: list[str] | None = None) -> int:
     mv.add_argument("src")
     mv.add_argument("dst")
     args = parser.parse_args(argv)
+    if args.command == "quota":
+        # The flag rules are argparse errors, so they are reported with the quota parser's usage (exit code 2).
+        if args.remove and (args.max_bytes is not None or args.max_nodes is not None):
+            quota.error("--remove can't be combined with --bytes or --nodes")
+        if args.children and not (args.remove or args.max_bytes is not None or args.max_nodes is not None):
+            quota.error("--children needs --bytes, --nodes or --remove")
 
     label = f"db {args.db_command}" if args.command == "db" else args.command
     secrets: list[str] = []
@@ -340,7 +358,15 @@ async def _cat(vfs: VFSClient, args: argparse.Namespace) -> int:
 
 
 async def _put(vfs: VFSClient, args: argparse.Namespace) -> int:
-    data = Path(args.source).read_bytes() if args.source else sys.stdin.buffer.read()
+    # The read is bounded (#83): more than a file may hold is refused before any database call, so an
+    # oversized source is never read whole only for the write to fail.
+    if args.source:
+        with open(args.source, "rb") as source:
+            data = source.read(MAX_FILE_SIZE + 1)
+    else:
+        data = sys.stdin.buffer.read(MAX_FILE_SIZE + 1)
+    if len(data) > MAX_FILE_SIZE:
+        raise VFSError("EFBIG", normalize(args.path), f"over the {MAX_FILE_SIZE}-byte limit")
     # Look the path up, then create or write (#35). Both cost two statements for a new file; neither raises on the
     # server, which returns ENOENT. The fallback below only covers a file removed since the stat.
     try:
@@ -359,6 +385,39 @@ async def _put(vfs: VFSClient, args: argparse.Namespace) -> int:
         if e.errno != "ENOENT":  # removed since the stat
             raise
         await vfs.create(args.path, data, parents=args.parents)
+    return 0
+
+
+def _quota_line(quota: Quota) -> str:
+    """The one line ``minifs quota`` prints: the limits (``none``: no limit on that one) and the usage."""
+
+    def shown(value: int | None) -> str:
+        return "none" if value is None else str(value)
+
+    return (
+        f"max_bytes={shown(quota.max_bytes)} max_nodes={shown(quota.max_nodes)}"
+        f" used_bytes={quota.used_bytes} used_nodes={quota.used_nodes}"
+    )
+
+
+async def _quota(vfs: VFSClient, args: argparse.Namespace) -> int:
+    if args.children:
+        if args.remove:
+            await vfs.set_child_quota(args.path)
+            print("no quota")
+        else:
+            given = await vfs.set_child_quota(args.path, max_bytes=args.max_bytes, max_nodes=args.max_nodes)
+            print(f"{given} existing directories got the quota")
+        return 0
+    if args.remove:
+        await vfs.set_quota(args.path)
+        print("no quota")
+        return 0
+    if args.max_bytes is None and args.max_nodes is None:
+        quota = await vfs.quota(args.path)
+    else:
+        quota = await vfs.set_quota(args.path, max_bytes=args.max_bytes, max_nodes=args.max_nodes)
+    print("no quota" if quota is None else _quota_line(quota))
     return 0
 
 
@@ -404,6 +463,7 @@ _VFS_COMMANDS: dict[str, Callable[[VFSClient, argparse.Namespace], Awaitable[int
     "ls": _ls,
     "cat": _cat,
     "put": _put,
+    "quota": _quota,
     "rm": _rm,
     "mv": _mv,
     "glob": _glob,

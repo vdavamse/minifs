@@ -681,3 +681,90 @@ async def test_repeatable_read_append_to_a_newline_ended_file_after_a_concurrent
         assert await append(late, f, b"d") == 6
         await late.commit()
     await check_layout(conn, f, b"a\nb\nc\nd")
+
+
+# The streaming vfs_cut of 023 against 007's rule, literally reimplemented in Python: the same rows, whatever
+# the data, the target and the split_tail flag.
+
+
+def cut_reference(data: bytes, target: int, split_tail: bool) -> list[tuple[int, int, bytes, list[int]]]:
+    """007's vfs_cut in Python: first the length of every line (each ``\\n`` ends a line; a last line without
+    one is the tail), then the placement loop with the ``p_split_tail`` rule."""
+    lengths = [len(line) for line in split_lines(data)]
+    tail = bool(data) and not data.endswith(b"\n")
+    pieces: list[tuple[int, int, bytes, list[int]]] = []
+    rel_offset = 0
+    rel_line = 0
+    pos = 0  # where the current line starts
+    offsets: list[int] = []
+    for i, length in enumerate(lengths, 1):
+        if pos > rel_offset and (pos - rel_offset + length > target or (split_tail and tail and i == len(lengths))):
+            pieces.append((rel_offset, rel_line, data[rel_offset:pos], offsets))
+            rel_line += len(offsets)
+            rel_offset = pos
+            offsets = []
+        offsets.append(pos - rel_offset)
+        pos += length
+    if pos > rel_offset:
+        pieces.append((rel_offset, rel_line, data[rel_offset:pos], offsets))
+    return pieces
+
+
+async def cut_rows(
+    conn: AsyncConnection, data: bytes, target: int, split_tail: bool
+) -> list[tuple[int, int, bytes, list[int]]]:
+    """The rows of ``vfs_cut(data, target, split_tail)``, as ``cut_reference`` returns them."""
+    cur = await conn.execute("SELECT * FROM vfs_cut(%s, %s, %s)", (data, target, split_tail))
+    return [(o, n, bytes(d), list(lo)) for o, n, d, lo in await cur.fetchall()]
+
+
+async def test_cut_matches_the_reference_over_random_data(conn: AsyncConnection) -> None:
+    """300 short cases over newline-heavy alphabets (including the bytes the escape encoding expands), small
+    targets and both split_tail values, all cut in one statement."""
+    rng = random.Random(83)
+    alphabets = (b"\n", b"a\n", b"\\", b"\xff", b"\x00", b"abc")
+    targets = (1, 2, 3, 7, 64)
+    datas = [bytes(rng.choice(alphabets[i % 6]) for _ in range(rng.randrange(0, 401))) for i in range(300)]
+    used = [targets[i % 5] for i in range(300)]
+    splits = [i % 2 == 0 for i in range(300)]
+    cur = await conn.execute(
+        "SELECT q.i, c.rel_offset, c.rel_line, c.data, c.line_offsets"
+        " FROM unnest(%s::bytea[], %s::int[], %s::bool[]) WITH ORDINALITY AS q(data, target, split, i)"
+        " LEFT JOIN LATERAL vfs_cut(q.data, q.target, q.split) c ON true"
+        " ORDER BY q.i, c.rel_offset",
+        (datas, used, splits),
+    )
+    got: dict[int, list[tuple[int, int, bytes, list[int]]]] = {}
+    for i, rel_offset, rel_line, data, offsets in await cur.fetchall():
+        if rel_offset is not None:  # a LEFT JOIN row of a case vfs_cut gave no rows for (empty data)
+            got.setdefault(i, []).append((rel_offset, rel_line, bytes(data), list(offsets)))
+    for i, data in enumerate(datas):
+        assert got.get(i + 1, []) == cut_reference(data, used[i], splits[i]), (data, used[i], splits[i])
+
+
+async def test_cut_matches_the_reference_across_the_encoding_windows(conn: AsyncConnection) -> None:
+    """Over 1 MB, with lines spanning the encoding windows: 023 places each line as its ``\\n`` is found and
+    carries an open line across windows, where 007 kept every line's length first; the rows are the same."""
+    rng = random.Random(83)
+    data = b"".join(rng.choice([b"\n", b"ab\\", b"\xff\x00" * 50, b"x" * 3000]) for _ in range(400))
+    data += b"L" * 1_500_000 + b"\n" + b"\xff" * 1_200_000 + b"\ntail"
+    for split_tail in (False, True):
+        assert await cut_rows(conn, data, TARGET, split_tail) == cut_reference(data, TARGET, split_tail)
+
+
+@pytest.mark.parametrize("split_tail", [False, True])
+async def test_cut_matches_the_reference_on_the_edge_cases(conn: AsyncConnection, split_tail: bool) -> None:
+    cases = [
+        (b"", 1),  # empty data
+        (b"\n", 1),  # a single \n
+        (b"no newlines at all", 3),  # no \n at all
+        (b"aaa\n", 4),  # a line exactly target long
+        (b"aaa\nbbb\n", 4),
+        (b"aaaa\n", 4),  # a line of target + 1
+        (b"aaa\naaaa\nbbb\n", 3),
+    ]
+    for data, target in cases:
+        assert await cut_rows(conn, data, target, split_tail) == cut_reference(data, target, split_tail), (
+            data,
+            target,
+        )

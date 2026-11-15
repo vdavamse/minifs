@@ -44,7 +44,7 @@ Every operation is a SQL function, so every client (the tools, ingestion jobs, t
 
 ## Storage model
 
-Two tables. `vfs_nodes` holds inodes and directory entries; `vfs_extents` holds file bytes as variable-length, line-aligned extents (migrations 003, 004 and 007; abridged):
+Four tables. `vfs_nodes` holds inodes and directory entries; `vfs_extents` holds file bytes as variable-length, line-aligned extents (migrations 003, 004 and 007); `vfs_quotas` and `vfs_quota_defaults` hold the write quotas (migration 023; abridged):
 
 ```sql
 CREATE TABLE vfs_nodes (                         -- inode + directory entry (no hard links)
@@ -78,6 +78,22 @@ CREATE TABLE vfs_extents (
 );
 ALTER TABLE vfs_extents ALTER COLUMN data SET COMPRESSION pglz;   -- migration 013
 CREATE INDEX vfs_extents_not_utf8_idx ON vfs_extents (node_id, generation) WHERE NOT utf8;   -- migration 015
+
+CREATE TABLE vfs_quotas (                        -- a row makes a directory a quota root (migration 023)
+    root        uuid PRIMARY KEY REFERENCES vfs_nodes (id) ON DELETE CASCADE,
+    max_bytes   bigint CHECK (max_bytes >= 0),   -- cap on the sum of the file sizes below root; NULL: no limit
+    max_nodes   bigint CHECK (max_nodes >= 0),   -- cap on the nodes below root (root itself not included)
+    used_bytes  bigint NOT NULL DEFAULT 0,
+    used_nodes  bigint NOT NULL DEFAULT 0,
+    CHECK (max_bytes IS NOT NULL OR max_nodes IS NOT NULL)
+);
+
+CREATE TABLE vfs_quota_defaults (                -- the quota every directory created directly in parent gets
+    parent      uuid PRIMARY KEY REFERENCES vfs_nodes (id) ON DELETE CASCADE,
+    max_bytes   bigint CHECK (max_bytes >= 0),
+    max_nodes   bigint CHECK (max_nodes >= 0),
+    CHECK (max_bytes IS NOT NULL OR max_nodes IS NOT NULL)
+);
 ```
 
 | Choice | Why | Rejected |
@@ -101,6 +117,8 @@ CREATE INDEX vfs_extents_not_utf8_idx ON vfs_extents (node_id, generation) WHERE
 
 **Moves never create cycles.** Moving a directory locks the destination's ancestors while it checks that the source isn't among them, so `mv /a /a/b/c` is `EINVAL`, even under concurrent moves. Moving a file walks them without locks, to count how deep the destination is. Paths and nodes are capped at 1024 levels (`vfs_max_components()`, migration 022; the client's `MAX_COMPONENTS` refuses an over-long path before any round trip): `vfs_lookup` and `vfs_mkdir_p` refuse more components as `ENAMETOOLONG`, and `vfs_rename` refuses a destination deeper than the cap, a node that would land past it, and a subtree that a deeper move would push over it. An ancestor walk that doesn't end within the cap is a real cycle (still `EINVAL`, now told apart from the too-deep case by `vfs_ancestors_cycle`'s lock-free walk, where the old 10,000-step guess called both a cycle) or a too-deep destination (`ENAMETOOLONG`). The subtree check takes no locks on descendants, so it is best effort under a concurrent mkdir inside the moved subtree (as is a file's depth check), and it reads every directory of the subtree down to the room left, so moving a wide tree deeper costs more. A move that doesn't go deeper never scans it, so an over-deep legacy subtree can always be moved up by id.
 
+**Quotas.** A row in `vfs_quotas` makes a directory a quota root: `max_bytes` caps the sum of the sizes of the files below it and `max_nodes` the number of nodes below it (files and directories, not the root itself); NULL is no limit on that one (migration 023). Every writer charges its change once, at its end, through `vfs_charge`, which walks from the changed node up to the root without locks, locks the quota rows it finds `FOR UPDATE` in root id order (one order for every charge, so two charges never deadlock), and raises `EDQUOT` — rolling the whole write back — if an increase takes a root over its max. A decrease (a shrinking write, an unlink) is never refused, even over a lowered max, and quotas nest: every quota root above the change is charged. `vfs_rename` moves the moved subtree's bytes and nodes from the quota roots above the source to those above the destination (a bounded scan, only when the two sets of roots differ); a quota on the moved directory itself moves with it, and `vfs_compact` changes no size. `vfs_set_quota(dir, max_bytes, max_nodes)` sets a root's limits and recounts its usage under the row lock (both NULL removes the row); `vfs_set_child_quota` gives every directory created directly in a directory that quota at its creation, and every existing child directory without a quota of its own right away, so one call on `/workspaces` gives every workspace a quota from its first mkdir. What is counted is the files' logical sizes; storage per byte is a small factor more, and `max_nodes` bounds the per-row part. Accounting is best effort by design: the ancestor walk takes no locks, so a write that races a move of one of its ancestors to another quota root may be charged to the old roots while the move's scan leaves it out — the total charged over all quotas stays exact, and `vfs_set_quota` recounts a root. Separately, a file is at most `vfs_max_file_size()` bytes — 64 MiB, the client's `MAX_FILE_SIZE`, which refuses larger content before any round trip — and `vfs_create`, `vfs_write` and `vfs_append` refuse anything larger as `EFBIG`; `vfs_cut` places each line as soon as it finds its `\n`, so it holds one extent's line offsets, not the length of every line of the write.
+
 ## Operations and errors
 
 | Operation | Function | POSIX analogue | Locking |
@@ -117,7 +135,7 @@ CREATE INDEX vfs_extents_not_utf8_idx ON vfs_extents (node_id, generation) WHERE
 | Glob, search | `vfs_glob(...)`, `vfs_search(...)` | `find`, `rg` | None |
 | Compact | `vfs_compact(node, target)` | — | Inode `FOR UPDATE` |
 
-**Outcomes are returned, faults raised** (migration 009). Expected outcomes (`ENOENT`, `ENOTDIR`, `EISDIR`, `EEXIST`, `ESTALE`, `ENOTEMPTY`) come back in `err` and `err_detail` result columns, with nothing changed. A missing path an agent guessed then costs no server log entry and doesn't abort the caller's transaction. Only faults (`EINVAL`, `ENAMETOOLONG`, broken invariants) raise, with a custom SQLSTATE that maps to the errno.
+**Outcomes are returned, faults raised** (migration 009). Expected outcomes (`ENOENT`, `ENOTDIR`, `EISDIR`, `EEXIST`, `ESTALE`, `ENOTEMPTY`) come back in `err` and `err_detail` result columns, with nothing changed. A missing path an agent guessed then costs no server log entry and doesn't abort the caller's transaction. Only faults (`EINVAL`, `ENAMETOOLONG`, broken invariants, and since migration 023 the write refusals `EFBIG` and `EDQUOT`, which roll the whole write back) raise, with a custom SQLSTATE that maps to the errno.
 
 **One statement per operation.** The client resolves an operation's paths inside the statement that operates on them: each path is a `vfs_lookup` subquery, and the function runs only if every lookup succeeded. So a `stat`, a read or a write is one round trip, and it never sees the NULL id of a failed lookup, which for a directory would mean the root.
 
