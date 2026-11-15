@@ -27,7 +27,7 @@ from minifs.vfs.client import (
     VFSClient,
     _gated,  # pyright: ignore[reportPrivateUsage]
 )
-from minifs.vfs.core import CONTROL_CHARACTERS, MAX_COMPONENTS, FileVersion, Kind, ReadResult, VFSError
+from minifs.vfs.core import CONTROL_CHARACTERS, MAX_COMPONENTS, MAX_FILE_SIZE, FileVersion, Kind, ReadResult, VFSError
 from minifs.vfs.glob import GlobError
 from minifs.vfs.search import SearchRefused
 from tests.test_tree import holding_the_lock, wait_until_blocked
@@ -484,6 +484,17 @@ async def test_over_deep_paths_are_refused(vfs: VFSClient) -> None:
     assert isinstance(error.db_error, psycopg.Error) and "subtree" in error.detail
 
 
+async def test_over_cap_writes_are_refused_before_any_round_trip(vfs: VFSClient) -> None:
+    """#83: content over MAX_FILE_SIZE is refused by the client's own check, whatever the operation and
+    whether or not the file exists: no database error, no server detail, no query."""
+    data = bytes(MAX_FILE_SIZE + 1)
+    for call in (vfs.create("/f", data), vfs.write("/f", data), vfs.append("/f", data)):
+        error = await raises("EFBIG", call, "/f")
+        assert error.db_error is None and not error.detail  # no round trip happened
+        assert error.message == f"{MAX_FILE_SIZE + 1} bytes, over the {MAX_FILE_SIZE}-byte limit"
+    await raises("ENOENT", vfs.stat("/f"))  # nothing was created
+
+
 # Every errno the SQL layer reports comes back as a VFSError with that errno and the normalised path: the outcomes
 # it returns (migration 009) with no database error, the faults it raises with theirs.
 
@@ -527,15 +538,32 @@ async def _estale(vfs: VFSClient) -> Awaitable[object]:
     return vfs.write("/f", b"3", expect=version)
 
 
+async def _efbig(vfs: VFSClient) -> Awaitable[object]:
+    # The server's EFBIG: the client refuses over-cap data itself, so the file is already at the cap and a
+    # one-byte append takes it over. The raw insert leaves the size without extents, which vfs_append checks
+    # before it reads any.
+    async with vfs.pool.connection() as conn:
+        await conn.execute("INSERT INTO vfs_nodes (name, kind, size) VALUES ('f', 'file', %s)", (MAX_FILE_SIZE,))
+    return vfs.append("/f", b"x")
+
+
+async def _edquot(vfs: VFSClient) -> Awaitable[object]:
+    await vfs.mkdir("/q")
+    await vfs.set_quota("/q", max_bytes=10)
+    return vfs.create("/q/f", b"x" * 11)
+
+
 ERRNO_CASES: dict[str, tuple[Callable[[VFSClient], Awaitable[Awaitable[object]]], str]] = {
     "ENOENT": (_enoent, "/missing"),
     "EEXIST": (_eexist, "/f"),
     "ENOTDIR": (_enotdir, "/f/x"),
     "EISDIR": (_eisdir, "/d"),
     "EINVAL": (_einval, "/d"),
+    "EFBIG": (_efbig, "/f"),
     "ENAMETOOLONG": (_enametoolong, "/" + "a" * 256),
     "ENOTEMPTY": (_enotempty, "/d"),
     "ESTALE": (_estale, "/f"),
+    "EDQUOT": (_edquot, "/q/f"),
 }
 
 

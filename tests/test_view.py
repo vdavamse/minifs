@@ -18,7 +18,7 @@ from psycopg_pool import AsyncConnectionPool
 from minifs.db.pool import Connector, open_pool
 from minifs.vfs import glob as globbing
 from minifs.vfs.client import VFSClient
-from minifs.vfs.core import Entry, GlobResult, ReadResult, VFSError
+from minifs.vfs.core import MAX_FILE_SIZE, Entry, GlobResult, ReadResult, VFSError
 from minifs.vfs.glob import GlobError, GlobMatch, compile_excludes, compile_glob
 from minifs.vfs.policy import DEFAULT_POLICY, Policy, PolicyDenied, Rule, _fold  # pyright: ignore[reportPrivateUsage]
 from minifs.vfs.search import GrepResult, SearchRefused
@@ -1561,3 +1561,50 @@ async def test_a_result_path_that_is_not_a_path_is_eio(
     messages = [r.getMessage() for r in caplog.records if "isn't absolute" in r.getMessage()]
     assert len(messages) == 1
     assert fake not in messages[0]
+
+
+# The write cap and the quotas (#83)
+
+
+async def test_max_write_caps_one_write(vfs: VFSClient, policy: Policy) -> None:
+    """``max_write`` caps the bytes of one write for this actor, refused at the visible path before any
+    round trip; a write at the cap goes through."""
+    agent = VFSView(vfs, workspace_mounts(W1), policy, "agent", max_write=10)
+    assert agent.max_write == 10
+    for call, path in (
+        (agent.write("/workspace/notes.md", b"x" * 11), "/workspace/notes.md"),
+        (agent.append("/workspace/log.md", b"x" * 11), "/workspace/log.md"),
+        (agent.create("/workspace/new.md", b"x" * 11), "/workspace/new.md"),
+    ):
+        error = await raises("EFBIG", call, path)
+        assert (error.detail, error.db_error) == ("", None)  # refused before any round trip
+    assert (await agent.create("/workspace/new.md", b"x" * 10)).size == 10
+    assert (await agent.write("/workspace/new.md", b"y" * 10)).size == 10
+    assert await agent.append("/workspace/log.md", b"z" * 10) == 4  # the offset it landed at
+    assert (await vfs.pread(f"/workspaces/{W1}/new.md")).content == b"y" * 10
+
+
+async def test_a_denied_write_is_eacces_before_efbig(vfs: VFSClient, policy: Policy) -> None:
+    """The policy is checked first: over ``max_write`` at a path the actor may not write is EACCES."""
+    agent = VFSView(vfs, workspace_mounts(W1), policy, "agent", max_write=10)
+    await raises("EACCES", agent.write("/docs/guide.md", b"x" * 11), "/docs/guide.md")
+    await raises("EACCES", agent.append("/docs/guide.md", b"x" * 11), "/docs/guide.md")
+    await raises("EACCES", agent.create("/docs/new.md", b"x" * 11), "/docs/new.md")
+
+
+async def test_max_write_is_checked(vfs: VFSClient, policy: Policy) -> None:
+    """``max_write`` can only lower the cap every write has: below 0 or over MAX_FILE_SIZE is a ValueError."""
+    for bad in (-1, MAX_FILE_SIZE + 1):
+        with pytest.raises(ValueError, match="max_write must be between 0 and"):
+            VFSView(vfs, workspace_mounts(W1), policy, "agent", max_write=bad)
+
+
+async def test_edquot_comes_back_at_the_visible_path(vfs: VFSClient, policy: Policy) -> None:
+    """A quota refusal keeps its errno at the visible path, without the server's detail, which names real
+    node ids."""
+    await vfs.set_quota(f"/workspaces/{W1}", max_bytes=10)
+    agent = view(vfs, policy)
+    error = await raises("EDQUOT", agent.write("/workspace/notes.md", b"x" * 20), "/workspace/notes.md")
+    assert (error.detail, error.db_error) == ("", None)
+    assert W1 not in str(error) + error.message
+    assert (await vfs.pread(f"/workspaces/{W1}/notes.md")).content == b"mine"  # nothing changed
